@@ -124,6 +124,9 @@ enum Command {
         variable: Option<String>,
     },
     Estimates,
+    Soundness {
+        file: PathBuf,
+    },
     Lean {
         file: PathBuf,
     },
@@ -281,6 +284,15 @@ fn main() -> Result<()> {
                 "tool":"estimates_capability","resources":config.resources
             }))?,
         )?,
+        Command::Soundness { file } => {
+            let text = fs::read_to_string(&file)?;
+            print_value(
+                true,
+                &PythonCheck::new().run(serde_json::json!({
+                    "tool":"lean_soundness","text":text
+                }))?,
+            )?
+        }
         Command::Lean { file } => {
             print_value(true, &LeanCheck.run(serde_json::json!({"file":file}))?)?
         }

@@ -7,6 +7,7 @@ from typing import Any
 
 from .estimates_adapter import capability as estimates_capability
 from .falsify import search
+from .lean_soundness import check as lean_soundness_check
 from .safe_eval import evaluate
 from .symbolic import run as symbolic_run
 
@@ -28,6 +29,8 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         )
     if tool == "estimates_capability":
         return estimates_capability(request.get("resources", "resources"))
+    if tool == "lean_soundness":
+        return lean_soundness_check(request["text"])
     raise ValueError(f"unknown tool: {tool}")
 
 
