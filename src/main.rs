@@ -136,6 +136,9 @@ enum Command {
     Grade {
         request: String,
     },
+    Stages {
+        request: String,
+    },
     Imports {
         #[arg(default_value = "stats")]
         query: String,
@@ -326,6 +329,11 @@ fn main() -> Result<()> {
                     "tool":"grader","request":request
                 }))?,
             )?
+        }
+        Command::Stages { request } => {
+            let mut request: serde_json::Value = serde_json::from_str(&request)?;
+            request["tool"] = serde_json::json!("stages");
+            print_value(true, &PythonCheck::new().run(request)?)?
         }
         Command::Imports {
             query,

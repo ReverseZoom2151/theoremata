@@ -12,6 +12,7 @@ from .grader import run as grader_run
 from .lean_soundness import check as lean_soundness_check
 from .mathlib_index import run as mathlib_index_run
 from .safe_eval import evaluate
+from .stages import run as stages_run
 from .symbolic import run as symbolic_run
 
 
@@ -34,6 +35,8 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         return estimates_capability(request.get("resources", "resources"))
     if tool == "lean_soundness":
         return lean_soundness_check(request["text"])
+    if tool == "stages":
+        return stages_run(request)
     if tool == "feasibility":
         return feasibility(request["constraints"])
     if tool == "grader":
