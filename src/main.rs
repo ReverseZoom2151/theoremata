@@ -108,6 +108,22 @@ enum Command {
     Compute {
         expression: String,
     },
+    Falsify {
+        variables: String,
+        claim: String,
+        #[arg(long, default_value = "True")]
+        assumptions: String,
+        #[arg(long, default_value_t = 100_000)]
+        max_cases: u64,
+    },
+    Symbolic {
+        #[arg(value_parser=["simplify","factor","expand","solve","differentiate","integrate"])]
+        operation: String,
+        expression: String,
+        #[arg(long)]
+        variable: Option<String>,
+    },
+    Estimates,
     Lean {
         file: PathBuf,
     },
@@ -232,6 +248,38 @@ fn main() -> Result<()> {
         Command::Compute { expression } => print_value(
             true,
             &PythonCheck::new().run(serde_json::json!({"expression":expression}))?,
+        )?,
+        Command::Falsify {
+            variables,
+            claim,
+            assumptions,
+            max_cases,
+        } => {
+            let variables: serde_json::Value = serde_json::from_str(&variables)?;
+            print_value(
+                true,
+                &PythonCheck::new().run(serde_json::json!({
+                    "tool":"falsify","variables":variables,"claim":claim,
+                    "assumptions":assumptions,"max_cases":max_cases
+                }))?,
+            )?
+        }
+        Command::Symbolic {
+            operation,
+            expression,
+            variable,
+        } => print_value(
+            true,
+            &PythonCheck::new().run(serde_json::json!({
+                "tool":"symbolic","operation":operation,
+                "expression":expression,"variable":variable
+            }))?,
+        )?,
+        Command::Estimates => print_value(
+            true,
+            &PythonCheck::new().run(serde_json::json!({
+                "tool":"estimates_capability","resources":config.resources
+            }))?,
         )?,
         Command::Lean { file } => {
             print_value(true, &LeanCheck.run(serde_json::json!({"file":file}))?)?
