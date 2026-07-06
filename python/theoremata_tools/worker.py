@@ -8,6 +8,7 @@ from typing import Any
 from .asymptotics import asymptotic_feasibility, prove_asymptotic
 from .axioms import check_axioms
 from .decl_index import run as decl_index_run
+from .eval_harness import run as eval_run
 from .head_index import run as head_index_run
 from .lean_workspace import place_proof as lean_workspace_place
 from .lean_workspace import scaffold as lean_workspace_scaffold
@@ -17,6 +18,7 @@ from .feasibility import feasibility
 from .grader import run as grader_run
 from .lean_soundness import check as lean_soundness_check
 from .mathlib_index import run as mathlib_index_run
+from .retrieval import run as retrieval_run
 from .safe_eval import evaluate
 from .stages import run as stages_run
 from .symbolic import run as symbolic_run
@@ -59,6 +61,16 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         return prove_asymptotic(request["hypotheses"], request["goal"])
     if tool == "grader":
         return grader_run(request["request"])
+    if tool == "eval":
+        return eval_run(request["request"])
+    if tool == "retrieve":
+        return retrieval_run(
+            root=request.get("root"),
+            imports=request.get("imports"),
+            query=request["query"],
+            limit=int(request.get("limit", 20)),
+            op=request.get("op", "retrieve"),
+        )
     if tool == "mathlib_index":
         return mathlib_index_run(
             root=request["root"],

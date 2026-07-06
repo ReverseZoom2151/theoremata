@@ -217,6 +217,16 @@ enum Command {
     Rehash {
         project: String,
     },
+    Eval {
+        request: String,
+    },
+    Retrieve {
+        query: String,
+        #[arg(long)]
+        mathlib: bool,
+        #[arg(long, default_value_t = 20)]
+        limit: u64,
+    },
     Lean {
         file: PathBuf,
     },
@@ -576,6 +586,34 @@ fn main() -> Result<()> {
         Command::Rehash { project } => {
             store.recompute_all_hashes(&project)?;
             print_value(cli.json, &serde_json::json!({"rehashed": project}))?
+        }
+        Command::Eval { request } => {
+            let request: serde_json::Value = serde_json::from_str(&request)?;
+            print_value(
+                true,
+                &PythonCheck::new().run(serde_json::json!({"tool":"eval","request":request}))?,
+            )?
+        }
+        Command::Retrieve {
+            query,
+            mathlib,
+            limit,
+        } => {
+            let (root, imports) = if mathlib {
+                (
+                    Some(config.resources.join("mathlib4-master/mathlib4-master")),
+                    vec!["Mathlib".to_string()],
+                )
+            } else {
+                (None, vec!["Init".to_string()])
+            };
+            print_value(
+                true,
+                &PythonCheck::new().run(serde_json::json!({
+                    "tool":"retrieve","root":root,"imports":imports,
+                    "query":query,"limit":limit,"op":"retrieve"
+                }))?,
+            )?
         }
         Command::Lean { file } => print_value(
             true,
