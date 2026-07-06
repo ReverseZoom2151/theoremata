@@ -48,7 +48,8 @@ impl Store {
               project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
               source_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
               target_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
-              kind TEXT NOT NULL, created_at TEXT NOT NULL,
+              kind TEXT NOT NULL, evidence_strength TEXT NOT NULL DEFAULT 'numeric_screen',
+              created_at TEXT NOT NULL,
               UNIQUE(source_id, target_id, kind)
             );
             CREATE TABLE IF NOT EXISTS runs (
@@ -102,6 +103,16 @@ impl Store {
             if let Err(e) = self
                 .conn
                 .execute(&format!("ALTER TABLE nodes ADD COLUMN {column} {decl}"), [])
+            {
+                if !e.to_string().contains("duplicate column name") {
+                    return Err(e.into());
+                }
+            }
+        }
+        for (column, decl) in [("evidence_strength", "TEXT NOT NULL DEFAULT 'numeric_screen'")] {
+            if let Err(e) = self
+                .conn
+                .execute(&format!("ALTER TABLE edges ADD COLUMN {column} {decl}"), [])
             {
                 if !e.to_string().contains("duplicate column name") {
                     return Err(e.into());
@@ -366,8 +377,16 @@ impl Store {
             return Err(anyhow!("self edges are not allowed"));
         }
         self.conn.execute(
-            "INSERT INTO edges(project_id,source_id,target_id,kind,created_at) VALUES (?1,?2,?3,?4,?5)",
-            params![project_id, source, target, kind.to_string(), Utc::now().to_rfc3339()],
+            "INSERT INTO edges(project_id,source_id,target_id,kind,evidence_strength,created_at) \
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                project_id,
+                source,
+                target,
+                kind.to_string(),
+                EdgeStrength::NumericScreen.to_string(),
+                Utc::now().to_rfc3339()
+            ],
         ).context("adding edge (nodes must belong to the project and edge must be unique)")?;
         if self.has_cycle(project_id)? {
             self.conn.execute(
@@ -387,6 +406,40 @@ impl Store {
         Ok(())
     }
 
+    /// Record how strongly an existing edge's dependency is backed
+    /// (numeric_screen < prose_proof < lean_checked).
+    pub fn set_edge_strength(
+        &self,
+        project_id: &str,
+        source: &str,
+        target: &str,
+        kind: EdgeKind,
+        strength: EdgeStrength,
+    ) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE edges SET evidence_strength=?1 WHERE project_id=?2 AND source_id=?3 \
+             AND target_id=?4 AND kind=?5",
+            params![
+                strength.to_string(),
+                project_id,
+                source,
+                target,
+                kind.to_string()
+            ],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!("edge not found"));
+        }
+        self.event(
+            Some(project_id),
+            None,
+            "edge.strength_set",
+            "user",
+            json!({"source":source,"target":target,"kind":kind,"strength":strength.to_string()}),
+        )?;
+        Ok(())
+    }
+
     pub fn nodes(&self, project_id: &str) -> Result<Vec<Node>> {
         let mut st = self.conn.prepare(
             "SELECT id,project_id,kind,status,title,statement,formal_statement,provenance,
@@ -400,7 +453,7 @@ impl Store {
 
     pub fn edges(&self, project_id: &str) -> Result<Vec<Edge>> {
         let mut st = self.conn.prepare(
-            "SELECT id,project_id,source_id,target_id,kind,created_at FROM edges WHERE project_id=?1 ORDER BY id",
+            "SELECT id,project_id,source_id,target_id,kind,evidence_strength,created_at FROM edges WHERE project_id=?1 ORDER BY id",
         )?;
         let rows = st.query_map([project_id], edge_row)?;
         let values = rows.collect::<rusqlite::Result<_>>()?;
@@ -780,7 +833,14 @@ impl Store {
         loop {
             let before = tainted.len();
             for e in &edges {
-                if e.kind == EdgeKind::DependsOn && tainted.contains(&e.target_id) {
+                // Support edges carry taint from a rejected/blocked target up to
+                // the node that relies on it; adversarial/replacement links
+                // (Contradicts, Supersedes, Verifies) deliberately do not.
+                if matches!(
+                    e.kind,
+                    EdgeKind::DependsOn | EdgeKind::DerivedFrom | EdgeKind::Formalizes
+                ) && tainted.contains(&e.target_id)
+                {
                     tainted.insert(e.source_id.clone());
                 }
             }
@@ -842,13 +902,15 @@ fn node_row(r: &Row) -> rusqlite::Result<Node> {
 }
 fn edge_row(r: &Row) -> rusqlite::Result<Edge> {
     let kind: String = r.get(4)?;
+    let strength: String = r.get(5)?;
     Ok(Edge {
         id: r.get(0)?,
         project_id: r.get(1)?,
         source_id: r.get(2)?,
         target_id: r.get(3)?,
         kind: kind.parse().map_err(sql_parse)?,
-        created_at: dt(r.get(5)?)?,
+        evidence_strength: strength.parse().map_err(sql_parse)?,
+        created_at: dt(r.get(6)?)?,
     })
 }
 fn event_row(r: &Row) -> rusqlite::Result<Event> {
@@ -918,6 +980,34 @@ mod tests {
             .unwrap();
         let nodes = s.nodes(&p.id).unwrap();
         assert!(nodes.iter().find(|n| n.id == a.id).unwrap().tainted);
+    }
+
+    #[test]
+    fn taint_propagates_over_derived_from() {
+        let s = Store::open(Path::new(":memory:")).unwrap();
+        let p = s.create_project("p", "t").unwrap();
+        let base = s
+            .add_node(&p.id, NodeKind::Lemma, "base", "b", "test")
+            .unwrap();
+        let derived = s
+            .add_node(&p.id, NodeKind::Lemma, "derived", "d", "test")
+            .unwrap();
+        s.add_edge(&p.id, &derived.id, &base.id, EdgeKind::DerivedFrom)
+            .unwrap();
+        s.set_edge_strength(
+            &p.id,
+            &derived.id,
+            &base.id,
+            EdgeKind::DerivedFrom,
+            EdgeStrength::LeanChecked,
+        )
+        .unwrap();
+        s.set_node_status(&p.id, &base.id, NodeStatus::Blocked, "test")
+            .unwrap();
+        let nodes = s.nodes(&p.id).unwrap();
+        assert!(nodes.iter().find(|n| n.id == derived.id).unwrap().tainted);
+        let edge = s.edges(&p.id).unwrap().into_iter().next().unwrap();
+        assert_eq!(edge.evidence_strength, EdgeStrength::LeanChecked);
     }
 
     #[test]

@@ -131,6 +131,38 @@ impl FromStr for EdgeKind {
     }
 }
 
+/// How strongly a dependency edge is backed: numerics only *screen*, prose is a
+/// human argument, Lean is machine-checked. Variants are declared ascending so
+/// the derived ordering gives `lean_checked > prose_proof > numeric_screen`.
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeStrength {
+    NumericScreen,
+    ProseProof,
+    LeanChecked,
+}
+
+impl fmt::Display for EdgeStrength {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            serde_json::to_value(self).unwrap().as_str().unwrap()
+        )
+    }
+}
+
+impl FromStr for EdgeStrength {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(serde_json::from_value(serde_json::Value::String(
+            s.to_owned(),
+        ))?)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
@@ -167,6 +199,7 @@ pub struct Edge {
     pub source_id: String,
     pub target_id: String,
     pub kind: EdgeKind,
+    pub evidence_strength: EdgeStrength,
     pub created_at: DateTime<Utc>,
 }
 
