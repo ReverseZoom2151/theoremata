@@ -83,12 +83,12 @@ impl Tool for MathlibSearch {
 }
 
 pub struct PythonCheck {
-    worker: PathBuf,
+    package_root: PathBuf,
 }
 impl PythonCheck {
     pub fn new() -> Self {
         Self {
-            worker: PathBuf::from("scripts/python_worker.py"),
+            package_root: PathBuf::from("python"),
         }
     }
 }
@@ -97,12 +97,19 @@ impl Tool for PythonCheck {
         "python_check"
     }
     fn available(&self) -> bool {
-        self.worker.exists() && command_exists("python3")
+        self.package_root
+            .join("theoremata_tools/worker.py")
+            .exists()
+            && command_exists("python3")
     }
     fn run(&self, input: serde_json::Value) -> Result<ToolResult> {
         let started = Instant::now();
+        let bootstrap = format!(
+            "import sys;sys.path.insert(0,{:?});from theoremata_tools.worker import main;main()",
+            self.package_root.canonicalize()?.to_string_lossy()
+        );
         let mut child = Command::new("python3")
-            .args(["-I", self.worker.to_str().unwrap()])
+            .args(["-I", "-c", &bootstrap])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -118,7 +125,7 @@ impl Tool for PythonCheck {
             self.name(),
             started,
             output,
-            json!({"worker":self.worker}),
+            json!({"package_root":self.package_root}),
         ))
     }
 }

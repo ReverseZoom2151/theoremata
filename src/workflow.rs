@@ -79,9 +79,12 @@ impl ResearchWorkflow<'_> {
         created += 1;
         let py = PythonCheck::new();
         if py.available() {
-            let result = py.run(
-                json!({"expression":"all((n*n)%2 == 0 for n in range(-100,101) if n%2 == 0)"}),
-            )?;
+            let result = py.run(json!({
+                "tool":"falsify",
+                "variables":{"n":{"start":-100,"stop":101}},
+                "assumptions":"n % 2 == 0",
+                "claim":"(n * n) % 2 == 0"
+            }))?;
             self.store.add_evidence(
                 project_id,
                 &computation.id,
