@@ -1,0 +1,12 @@
+[project]
+name = "theoremata-tools"
+version = "0.1.0"
+description = "Deterministic mathematical workers for Theoremata"
+requires-python = ">=3.11"
+dependencies = ["sympy>=1.13"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
