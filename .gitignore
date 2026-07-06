@@ -1,0 +1,10 @@
+/target/
+/.theoremata/
+/resources/
+/.agents/
+/.codex/
+/.pdfenv/
+/.superdesign/
+*.db
+*.db-shm
+*.db-wal
