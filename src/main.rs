@@ -167,6 +167,10 @@ enum Command {
     Soundness {
         file: PathBuf,
     },
+    Axioms {
+        file: PathBuf,
+        theorem: String,
+    },
     Lean {
         file: PathBuf,
     },
@@ -403,6 +407,16 @@ fn main() -> Result<()> {
                 true,
                 &PythonCheck::new().run(serde_json::json!({
                     "tool":"lean_soundness","text":text
+                }))?,
+            )?
+        }
+        Command::Axioms { file, theorem } => {
+            let source = fs::read_to_string(&file)?;
+            print_value(
+                true,
+                &PythonCheck::new().run(serde_json::json!({
+                    "tool":"check_axioms","source":source,"theorem":theorem,
+                    "root":config.lean_project
                 }))?,
             )?
         }

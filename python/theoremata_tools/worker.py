@@ -6,6 +6,7 @@ import sys
 from typing import Any
 
 from .asymptotics import asymptotic_feasibility, prove_asymptotic
+from .axioms import check_axioms
 from .decl_index import run as decl_index_run
 from .estimates_adapter import capability as estimates_capability
 from .falsify import search
@@ -37,6 +38,14 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         return estimates_capability(request.get("resources", "resources"))
     if tool == "lean_soundness":
         return lean_soundness_check(request["text"])
+    if tool == "check_axioms":
+        return check_axioms(
+            source=request["source"],
+            theorem=request["theorem"],
+            root=request.get("root"),
+            allowed=request.get("allowed"),
+            timeout=float(request.get("timeout", 300.0)),
+        )
     if tool == "stages":
         return stages_run(request)
     if tool == "feasibility":
