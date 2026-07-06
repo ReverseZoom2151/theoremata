@@ -17,6 +17,11 @@ pub struct Config {
     /// run inside it so `import Mathlib` resolves against its build/cache.
     #[serde(default = "default_lean_project")]
     pub lean_project: Option<PathBuf>,
+    /// When true, low-risk model-proposed graph mutations (adding an ordinary
+    /// node or edge) are auto-approved; consequential ones (status changes,
+    /// formal statements, formal/verified nodes) always require a human.
+    #[serde(default)]
+    pub auto_approve_safe: bool,
 }
 
 fn default_lean_project() -> Option<PathBuf> {
@@ -33,6 +38,7 @@ impl Default for Config {
             max_iterations: 3,
             command_timeout_seconds: 60,
             lean_project: default_lean_project(),
+            auto_approve_safe: false,
         }
     }
 }

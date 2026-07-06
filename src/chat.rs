@@ -100,6 +100,29 @@ impl ChatEngine<'_> {
             .resolve_proposal(project_id, proposal_id, "rejected", note)
     }
 
+    /// Under a tiered approval policy, auto-approve the pending proposals that
+    /// are low-risk (ordinary node/edge additions), leaving consequential ones
+    /// (status changes, formal statements, formal/verified nodes) for a human.
+    /// Returns how many were auto-approved; a no-op when the policy is off.
+    /// Callers invoke this after `send`/`send_stream`.
+    pub fn resolve_auto_approvals(
+        &self,
+        project_id: &str,
+        auto_approve_safe: bool,
+    ) -> Result<usize> {
+        if !auto_approve_safe {
+            return Ok(0);
+        }
+        let mut approved = 0;
+        for proposal in self.store.proposals(project_id, true)? {
+            if is_low_risk(&proposal.action) {
+                self.approve(project_id, &proposal.id)?;
+                approved += 1;
+            }
+        }
+        Ok(approved)
+    }
+
     fn validate_mutation(&self, m: &Value) -> Result<()> {
         match m["action"].as_str().unwrap_or("") {
             "add_node" => {
@@ -190,6 +213,27 @@ fn required<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
         .ok_or_else(|| anyhow!("mutation missing {key}"))
 }
 
+/// Classify a proposed graph mutation for tiered approval. Low-risk mutations
+/// (adding an ordinary node or a dependency edge) may be auto-approved;
+/// everything that changes status, sets a formal statement, or introduces a
+/// formal/verified node stays gated for a human.
+pub fn is_low_risk(action: &Value) -> bool {
+    match action["action"].as_str().unwrap_or("") {
+        "add_node" => matches!(
+            action["kind"].as_str().unwrap_or("obligation"),
+            "conjecture"
+                | "definition"
+                | "assumption"
+                | "strategy"
+                | "lemma"
+                | "obligation"
+                | "computation"
+        ),
+        "add_edge" => true,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,5 +277,29 @@ mod tests {
         engine.approve(&project.id, &proposals[0].id).unwrap();
         assert_eq!(store.nodes(&project.id).unwrap().len(), 1);
         assert!(store.proposals(&project.id, true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn tiers_auto_approval_by_risk() {
+        assert!(is_low_risk(&json!({"action":"add_node","kind":"lemma"})));
+        assert!(is_low_risk(&json!({"action":"add_edge"})));
+        assert!(!is_low_risk(
+            &json!({"action":"add_node","kind":"formal_statement"})
+        ));
+        assert!(!is_low_risk(&json!({"action":"set_status"})));
+        assert!(!is_low_risk(&json!({"action":"set_formal_statement"})));
+
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("t", "x").unwrap();
+        let engine = ChatEngine {
+            store: &store,
+            provider: &ProposingProvider,
+        };
+        engine.send(&project.id, "decompose it").unwrap();
+        assert_eq!(store.proposals(&project.id, true).unwrap().len(), 1);
+        let approved = engine.resolve_auto_approvals(&project.id, true).unwrap();
+        assert_eq!(approved, 1);
+        assert!(store.proposals(&project.id, true).unwrap().is_empty());
+        assert_eq!(store.nodes(&project.id).unwrap().len(), 1);
     }
 }
