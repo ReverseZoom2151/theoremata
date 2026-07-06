@@ -191,6 +191,9 @@ enum Command {
     Paranoia {
         theorem: String,
     },
+    Workspace {
+        request: String,
+    },
     Lean {
         file: PathBuf,
     },
@@ -491,6 +494,16 @@ fn main() -> Result<()> {
             true,
             &LeanParanoia::new(&config).run(serde_json::json!({ "theorem": theorem }))?,
         )?,
+        Command::Workspace { request } => {
+            let mut request: serde_json::Value = serde_json::from_str(&request)?;
+            let tool = if request["op"].as_str() == Some("place") {
+                "lean_workspace_place"
+            } else {
+                "lean_workspace_scaffold"
+            };
+            request["tool"] = serde_json::json!(tool);
+            print_value(true, &PythonCheck::new().run(request)?)?
+        }
         Command::Lean { file } => print_value(
             true,
             &LeanCheck::new(&config).run(serde_json::json!({ "file": file }))?,
