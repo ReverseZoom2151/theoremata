@@ -1,9 +1,12 @@
 use crate::{config::Config, model::ToolResult};
 use anyhow::{anyhow, Context, Result};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     path::PathBuf,
     process::{Command, Stdio},
+    sync::{Mutex, OnceLock},
     time::Instant,
 };
 
@@ -175,6 +178,14 @@ impl Tool for PythonCheck {
     }
 }
 
+/// Process-global cache of Lean check results keyed on (project, file contents).
+/// Recompiling identical Lean against the same Mathlib project is deterministic,
+/// so a hit avoids a fresh (slow) `lake env lean` invocation.
+fn lean_cache() -> &'static Mutex<HashMap<String, ToolResult>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, ToolResult>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 pub struct LeanCheck {
     project: Option<PathBuf>,
 }
@@ -201,6 +212,24 @@ impl Tool for LeanCheck {
             .ok_or_else(|| anyhow!("file is required"))?;
         // Absolute path: the working directory may change to the Lake project.
         let path = std::fs::canonicalize(file).unwrap_or_else(|_| PathBuf::from(file));
+
+        // Cache identical (project, file contents) checks — the compile is
+        // deterministic, so return a prior result rather than recompiling.
+        let contents = std::fs::read_to_string(&path).unwrap_or_default();
+        let project_key = self
+            .project
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let key = format!(
+            "{:x}",
+            Sha256::digest(format!("{project_key}\u{0}{contents}"))
+        );
+        if let Some(mut hit) = lean_cache().lock().unwrap().get(&key).cloned() {
+            hit.metadata["cached"] = json!(true);
+            return Ok(hit);
+        }
+
         let started = Instant::now();
         let output = match (&self.project, resolve_command(&["lake"], "--version")) {
             (Some(project), Some(lake)) => Command::new(lake)
@@ -215,12 +244,14 @@ impl Tool for LeanCheck {
                 Command::new(lean).arg(&path).output()?
             }
         };
-        Ok(finish(
+        let result = finish(
             self.name(),
             started,
             output,
-            json!({"file":file,"project":self.project}),
-        ))
+            json!({"file":file,"project":self.project,"cached":false}),
+        );
+        lean_cache().lock().unwrap().insert(key, result.clone());
+        Ok(result)
     }
 }
 
@@ -233,28 +264,50 @@ impl LeanParanoia {
             root: config.resources.join("LeanParanoia-main/LeanParanoia-main"),
         }
     }
+    /// The built `paranoia` executable, if present.
+    fn exe(&self) -> Option<PathBuf> {
+        for name in ["paranoia.exe", "paranoia"] {
+            let candidate = self.root.join(".lake/build/bin").join(name);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
 }
 impl Tool for LeanParanoia {
     fn name(&self) -> &str {
         "lean_paranoia"
     }
     fn available(&self) -> bool {
-        self.root.exists() && command_exists("lake")
+        self.exe().is_some() && resolve_command(&["lake"], "--version").is_some()
     }
     fn run(&self, input: serde_json::Value) -> Result<ToolResult> {
         let theorem = input["theorem"]
             .as_str()
             .ok_or_else(|| anyhow!("theorem is required"))?;
         let started = Instant::now();
-        let output = Command::new("lake")
-            .current_dir(&self.root)
-            .args(["exe", "paranoia", theorem])
-            .output()?;
+        let lake = resolve_command(&["lake"], "--version")
+            .ok_or_else(|| anyhow!("no Lean toolchain found (lake)"))?;
+        // Run the built exe under `lake env` (in the project dir) so it inherits
+        // the correct LEAN_PATH; fall back to `lake exe paranoia` if unbuilt.
+        let output = match self.exe() {
+            Some(exe) => Command::new(lake)
+                .current_dir(&self.root)
+                .arg("env")
+                .arg(&exe)
+                .arg(theorem)
+                .output()?,
+            None => Command::new(lake)
+                .current_dir(&self.root)
+                .args(["exe", "paranoia", theorem])
+                .output()?,
+        };
         Ok(finish(
             self.name(),
             started,
             output,
-            json!({"theorem":theorem}),
+            json!({"theorem":theorem,"root":self.root}),
         ))
     }
 }
@@ -265,14 +318,16 @@ impl Tool for Comparator {
         "comparator"
     }
     fn available(&self) -> bool {
-        command_exists("comparator")
+        command_exists("comparator") || resolve_command(&["comparator"], "--version").is_some()
     }
     fn run(&self, input: serde_json::Value) -> Result<ToolResult> {
         let config = input["config"]
             .as_str()
             .ok_or_else(|| anyhow!("config is required"))?;
         let started = Instant::now();
-        let output = Command::new("comparator").arg(config).output()?;
+        let bin = resolve_command(&["comparator"], "--version")
+            .unwrap_or_else(|| "comparator".to_string());
+        let output = Command::new(bin).arg(config).output()?;
         Ok(finish(
             self.name(),
             started,
