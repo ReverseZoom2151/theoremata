@@ -124,6 +124,9 @@ enum Command {
         variable: Option<String>,
     },
     Estimates,
+    Feasibility {
+        constraints: String,
+    },
     Soundness {
         file: PathBuf,
     },
@@ -284,6 +287,15 @@ fn main() -> Result<()> {
                 "tool":"estimates_capability","resources":config.resources
             }))?,
         )?,
+        Command::Feasibility { constraints } => {
+            let constraints: serde_json::Value = serde_json::from_str(&constraints)?;
+            print_value(
+                true,
+                &PythonCheck::new().run(serde_json::json!({
+                    "tool":"feasibility","constraints":constraints
+                }))?,
+            )?
+        }
         Command::Soundness { file } => {
             let text = fs::read_to_string(&file)?;
             print_value(
