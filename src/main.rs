@@ -164,6 +164,18 @@ enum Command {
         #[arg(long)]
         mathlib: bool,
     },
+    Heads {
+        #[arg(default_value = "stats")]
+        query: String,
+        #[arg(long)]
+        head: Option<String>,
+        #[arg(long)]
+        pattern: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: u64,
+        #[arg(long)]
+        mathlib: bool,
+    },
     Soundness {
         file: PathBuf,
     },
@@ -398,6 +410,29 @@ fn main() -> Result<()> {
                 &PythonCheck::new().run(serde_json::json!({
                     "tool":"decl_index","root":root,"imports":imports,
                     "query":query,"kind":kind,"substring":substring,"limit":limit
+                }))?,
+            )?
+        }
+        Command::Heads {
+            query,
+            head,
+            pattern,
+            limit,
+            mathlib,
+        } => {
+            let (root, imports) = if mathlib {
+                (
+                    Some(config.resources.join("mathlib4-master/mathlib4-master")),
+                    vec!["Mathlib".to_string()],
+                )
+            } else {
+                (None, vec!["Init".to_string()])
+            };
+            print_value(
+                true,
+                &PythonCheck::new().run(serde_json::json!({
+                    "tool":"head_index","root":root,"imports":imports,
+                    "query":query,"head":head,"pattern":pattern,"limit":limit
                 }))?,
             )?
         }
