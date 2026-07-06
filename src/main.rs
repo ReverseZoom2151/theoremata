@@ -96,6 +96,11 @@ enum Command {
         #[arg(default_value_t = 30)]
         limit: usize,
     },
+    Attempts {
+        project: String,
+        #[arg(default_value_t = 30)]
+        limit: usize,
+    },
     Export {
         project: String,
         output: PathBuf,
@@ -249,6 +254,9 @@ fn main() -> Result<()> {
         }
         Command::Events { project, limit } => {
             print_value(cli.json, &store.events(&project, limit)?)?
+        }
+        Command::Attempts { project, limit } => {
+            print_value(cli.json, &store.attempts(&project, limit)?)?
         }
         Command::Export { project, output } => {
             fs::write(

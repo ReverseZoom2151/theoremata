@@ -79,12 +79,13 @@ impl ResearchWorkflow<'_> {
         created += 1;
         let py = PythonCheck::new();
         if py.available() {
-            let result = py.run(json!({
+            let falsify_input = json!({
                 "tool":"falsify",
                 "variables":{"n":{"start":-100,"stop":101}},
                 "assumptions":"n % 2 == 0",
                 "claim":"(n * n) % 2 == 0"
-            }))?;
+            });
+            let result = py.run(falsify_input.clone())?;
             self.store.add_evidence(
                 project_id,
                 &computation.id,
@@ -92,6 +93,15 @@ impl ResearchWorkflow<'_> {
                 py.name(),
                 if result.success { "pass" } else { "error" },
                 serde_json::to_value(&result)?,
+            )?;
+            self.store.add_attempt(
+                project_id,
+                Some(&computation.id),
+                Some(&run),
+                py.name(),
+                &falsify_input,
+                &serde_json::to_value(&result)?,
+                result.success,
             )?;
             if result.success {
                 self.store.set_node_status(
@@ -222,7 +232,8 @@ impl ResearchWorkflow<'_> {
 
         let lean = LeanCheck;
         if lean.available() {
-            let result = lean.run(json!({"file":lean_file}))?;
+            let lean_input = json!({ "file": lean_file });
+            let result = lean.run(lean_input.clone())?;
             let verdict = if result.success && soundness_clean {
                 "pass"
             } else if !soundness_clean {
@@ -237,6 +248,15 @@ impl ResearchWorkflow<'_> {
                 "lean",
                 verdict,
                 serde_json::to_value(&result)?,
+            )?;
+            self.store.add_attempt(
+                project_id,
+                Some(&formal_node.id),
+                Some(&run),
+                "lean",
+                &lean_input,
+                &serde_json::to_value(&result)?,
+                result.success,
             )?;
             if result.success && soundness_clean {
                 self.store.set_node_status(

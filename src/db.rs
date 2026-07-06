@@ -640,6 +640,66 @@ impl Store {
         Ok(id)
     }
 
+    /// Record a solver attempt — a single tool run or model call against a node
+    /// — with its input, output, and success. Attempts are the durable record
+    /// of failed strategies the retry policy and scheduler reason over.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_attempt(
+        &self,
+        project_id: &str,
+        node_id: Option<&str>,
+        run_id: Option<&str>,
+        actor: &str,
+        input: &serde_json::Value,
+        output: &serde_json::Value,
+        success: bool,
+    ) -> Result<Attempt> {
+        let now = Utc::now();
+        let attempt = Attempt {
+            id: Uuid::new_v4().to_string(),
+            project_id: project_id.to_owned(),
+            node_id: node_id.map(str::to_owned),
+            run_id: run_id.map(str::to_owned),
+            actor: actor.to_owned(),
+            input: input.clone(),
+            output: output.clone(),
+            success,
+            created_at: now,
+        };
+        self.conn.execute(
+            "INSERT INTO attempts(id,project_id,node_id,run_id,actor,input,output,success,created_at)\
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                attempt.id,
+                project_id,
+                node_id,
+                run_id,
+                actor,
+                input.to_string(),
+                output.to_string(),
+                success as i64,
+                now.to_rfc3339()
+            ],
+        )?;
+        self.event(
+            Some(project_id),
+            run_id,
+            "attempt.recorded",
+            actor,
+            json!({"attempt_id":attempt.id,"node_id":node_id,"success":success}),
+        )?;
+        Ok(attempt)
+    }
+
+    pub fn attempts(&self, project_id: &str, limit: usize) -> Result<Vec<Attempt>> {
+        let mut st = self.conn.prepare(
+            "SELECT id,project_id,node_id,run_id,actor,input,output,success,created_at
+             FROM attempts WHERE project_id=?1 ORDER BY created_at DESC LIMIT ?2",
+        )?;
+        let rows = st.query_map(params![project_id, limit as i64], attempt_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn event(
         &self,
         project_id: Option<&str>,
@@ -817,6 +877,21 @@ fn proposal_row(r: &Row) -> rusqlite::Result<Proposal> {
         resolved_at: resolved.map(dt).transpose()?,
     })
 }
+fn attempt_row(r: &Row) -> rusqlite::Result<Attempt> {
+    let input_raw: String = r.get(5)?;
+    let output_raw: String = r.get(6)?;
+    Ok(Attempt {
+        id: r.get(0)?,
+        project_id: r.get(1)?,
+        node_id: r.get(2)?,
+        run_id: r.get(3)?,
+        actor: r.get(4)?,
+        input: serde_json::from_str(&input_raw).unwrap_or(serde_json::Value::String(input_raw)),
+        output: serde_json::from_str(&output_raw).unwrap_or(serde_json::Value::String(output_raw)),
+        success: r.get::<_, i64>(7)? != 0,
+        created_at: dt(r.get(8)?)?,
+    })
+}
 fn sql_parse(e: anyhow::Error) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into())
 }
@@ -843,6 +918,39 @@ mod tests {
             .unwrap();
         let nodes = s.nodes(&p.id).unwrap();
         assert!(nodes.iter().find(|n| n.id == a.id).unwrap().tainted);
+    }
+
+    #[test]
+    fn records_attempts() {
+        let s = Store::open(Path::new(":memory:")).unwrap();
+        let p = s.create_project("p", "t").unwrap();
+        let n = s
+            .add_node(&p.id, NodeKind::Obligation, "o", "s", "test")
+            .unwrap();
+        s.add_attempt(
+            &p.id,
+            Some(&n.id),
+            None,
+            "lean",
+            &json!({"file":"m.lean"}),
+            &json!({"ok":false}),
+            false,
+        )
+        .unwrap();
+        s.add_attempt(
+            &p.id,
+            Some(&n.id),
+            None,
+            "python_check",
+            &json!({"tool":"falsify"}),
+            &json!({"verdict":"no_counterexample"}),
+            true,
+        )
+        .unwrap();
+        let got = s.attempts(&p.id, 10).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got.iter().filter(|a| a.success).count(), 1);
+        assert_eq!(got.iter().filter(|a| a.node_id.as_deref() == Some(n.id.as_str())).count(), 2);
     }
 
     #[test]

@@ -182,6 +182,19 @@ pub struct Event {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Attempt {
+    pub id: String,
+    pub project_id: String,
+    pub node_id: Option<String>,
+    pub run_id: Option<String>,
+    pub actor: String,
+    pub input: serde_json::Value,
+    pub output: serde_json::Value,
+    pub success: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub id: i64,
     pub project_id: String,
