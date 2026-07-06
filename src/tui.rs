@@ -1,7 +1,7 @@
 use crate::{
     chat::ChatEngine,
     db::Store,
-    model::{Event, Node},
+    model::{Event, Node, NodeKind, NodeStatus},
     provider::ModelProvider,
 };
 use anyhow::Result;
@@ -33,6 +33,9 @@ struct App {
     pane: Pane,
     status: String,
     selected: usize,
+    /// Detailed output lines from the last slash command; when non-empty they
+    /// take over the main pane until cleared with Esc.
+    output: Vec<String>,
 }
 
 pub fn run(store: &Store, provider: &dyn ModelProvider, project_id: &str) -> Result<()> {
@@ -59,8 +62,10 @@ fn run_loop(
         project_id: project_id.into(),
         input: String::new(),
         pane: Pane::Chat,
-        status: "Ready · Tab changes pane · Ctrl-C exits · /help lists commands".into(),
+        status: "Ready · Tab changes pane · /help lists commands · Esc clears · Ctrl-C exits"
+            .into(),
         selected: 0,
+        output: Vec::new(),
     };
     loop {
         let nodes = store.nodes(project_id)?;
@@ -93,6 +98,9 @@ fn run_loop(
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
                 .split(root[1]);
+            if !app.output.is_empty() {
+                render_command_output(f, cols[0], &app.output);
+            } else {
             match app.pane {
                 Pane::Chat => {
                     let lines = messages
@@ -125,6 +133,7 @@ fn run_loop(
                 Pane::Graph => render_nodes(f, cols[0], &nodes, app.selected),
                 Pane::Events => render_events(f, cols[0], &events),
             }
+            }
             render_inspector(f, cols[1], &nodes, app.selected, &app.status);
             f.render_widget(
                 Paragraph::new(format!("> {}", app.input)).block(
@@ -142,6 +151,10 @@ fn run_loop(
                 }
                 match (k.code, k.modifiers) {
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
+                    (KeyCode::Esc, _) => {
+                        app.output.clear();
+                        app.status = "Command output cleared".into();
+                    }
                     (KeyCode::Tab, _) => {
                         app.pane = match app.pane {
                             Pane::Chat => Pane::Graph,
@@ -163,8 +176,18 @@ fn run_loop(
                             continue;
                         }
                         if text.starts_with('/') {
-                            app.status = slash(store, provider, &app.project_id, &text)?;
+                            match slash(store, provider, &app.project_id, &text) {
+                                Ok((status, output)) => {
+                                    app.status = status;
+                                    app.output = output;
+                                }
+                                Err(e) => {
+                                    app.status = format!("Command error: {e}");
+                                    app.output.clear();
+                                }
+                            }
                         } else {
+                            app.output.clear();
                             app.status = "Agent working…".into();
                             let engine = ChatEngine { store, provider };
                             match engine.send(&app.project_id, &text) {
@@ -187,57 +210,166 @@ fn run_loop(
     Ok(())
 }
 
+/// Handle a slash command. Returns a short status line plus detailed output
+/// lines (rendered in the main pane until cleared with Esc).
 fn slash(
     store: &Store,
     provider: &dyn ModelProvider,
     project_id: &str,
     text: &str,
-) -> Result<String> {
+) -> Result<(String, Vec<String>)> {
     let mut parts = text.splitn(3, ' ');
-    Ok(match parts.next().unwrap_or("") {
+    let cmd = parts.next().unwrap_or("");
+    let mut out = Vec::new();
+    let status = match cmd {
         "/help" => {
-            "Commands: /help /graph /events /status /proposals /approve ID /reject ID [reason]"
-                .into()
+            out.push("/help                  this command reference".into());
+            out.push("/graph                 every node (id · kind · status · title)".into());
+            out.push("/obligations           obligation nodes with hints and lemmas".into());
+            out.push("/attempts              recent solver attempts".into());
+            out.push("/events                recent trajectory events".into());
+            out.push("/proposals             pending graph-mutation proposals".into());
+            out.push("/approve <id>          approve a pending proposal".into());
+            out.push("/reject <id> [reason]  reject a pending proposal".into());
+            out.push("/verify                verification status of every node".into());
+            out.push("/status                project name and theorem".into());
+            out.push("Esc clears output · Tab cycles panes · Ctrl-C exits".into());
+            "Command reference".into()
         }
-        "/graph" => format!("{} graph nodes", store.nodes(project_id)?.len()),
-        "/events" => format!("{} recent events", store.events(project_id, 100)?.len()),
+        "/graph" => {
+            let nodes = store.nodes(project_id)?;
+            for n in &nodes {
+                out.push(format!(
+                    "{}  {:<16} {:<20} {}",
+                    &n.id[..8.min(n.id.len())],
+                    n.kind,
+                    n.status,
+                    n.title
+                ));
+            }
+            format!("{} graph nodes", nodes.len())
+        }
+        "/obligations" => {
+            let nodes = store.nodes(project_id)?;
+            let obligations: Vec<&Node> = nodes
+                .iter()
+                .filter(|n| n.kind == NodeKind::Obligation)
+                .collect();
+            for n in &obligations {
+                out.push(format!("[{}] {}", n.status, n.title));
+                if let Some(hint) = &n.strategy_hint {
+                    out.push(format!("      hint: {hint}"));
+                }
+                if !n.suggested_lemmas.is_empty() {
+                    out.push(format!("      lemmas: {}", n.suggested_lemmas.join(", ")));
+                }
+            }
+            if obligations.is_empty() {
+                out.push("No obligation nodes yet".into());
+            }
+            format!("{} obligations", obligations.len())
+        }
+        "/attempts" => {
+            let attempts = store.attempts(project_id, 30)?;
+            for a in &attempts {
+                let mark = if a.success { "✓" } else { "×" };
+                let node = a
+                    .node_id
+                    .as_deref()
+                    .map(|s| &s[..8.min(s.len())])
+                    .unwrap_or("—");
+                out.push(format!(
+                    "{mark} {:<18} node={node} {}",
+                    a.actor,
+                    a.created_at.format("%H:%M:%S")
+                ));
+            }
+            if attempts.is_empty() {
+                out.push("No attempts recorded yet".into());
+            }
+            format!("{} recent attempts", attempts.len())
+        }
+        "/events" => {
+            let events = store.events(project_id, 40)?;
+            for e in events.iter().rev() {
+                out.push(format!(
+                    "{}  {:<24} {}",
+                    e.created_at.format("%H:%M:%S"),
+                    e.event_type,
+                    e.actor
+                ));
+            }
+            format!("{} recent events", events.len())
+        }
         "/status" => {
             let p = store.project(project_id)?;
-            format!("{} · {}", p.name, p.theorem)
+            out.push(format!("Project:  {}", p.name));
+            out.push(format!("Theorem:  {}", p.theorem));
+            p.name
         }
         "/proposals" => {
             let proposals = store.proposals(project_id, true)?;
-            if proposals.is_empty() {
-                "No pending proposals".into()
-            } else {
-                proposals
-                    .iter()
-                    .map(|proposal| {
-                        format!(
-                            "{}  {}",
-                            &proposal.id[..8],
-                            proposal.action["action"].as_str().unwrap_or("?")
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" · ")
+            for proposal in &proposals {
+                out.push(format!(
+                    "{}  {}",
+                    &proposal.id[..8.min(proposal.id.len())],
+                    proposal.action["action"].as_str().unwrap_or("?")
+                ));
             }
+            if proposals.is_empty() {
+                out.push("No pending proposals".into());
+            }
+            format!("{} pending proposals", proposals.len())
         }
         "/approve" => {
             let prefix = parts.next().unwrap_or("");
             let proposal = resolve_proposal(store, project_id, prefix)?;
             ChatEngine { store, provider }.approve(project_id, &proposal)?;
-            format!("Approved and applied {proposal}")
+            format!("Approved and applied {}", &proposal[..8.min(proposal.len())])
         }
         "/reject" => {
             let prefix = parts.next().unwrap_or("");
             let reason = parts.next().unwrap_or("rejected in TUI");
             let proposal = resolve_proposal(store, project_id, prefix)?;
             ChatEngine { store, provider }.reject(project_id, &proposal, reason)?;
-            format!("Rejected {proposal}")
+            format!("Rejected {}", &proposal[..8.min(proposal.len())])
         }
-        other => format!("Unknown command: {other}"),
-    })
+        "/verify" => {
+            let nodes = store.nodes(project_id)?;
+            let verified = nodes
+                .iter()
+                .filter(|n| n.status == NodeStatus::FormallyVerified)
+                .count();
+            for n in &nodes {
+                let layer = if n.formal_statement.is_some() {
+                    "formal"
+                } else {
+                    "informal"
+                };
+                out.push(format!("{:<20} {:<9} {}", n.status, layer, n.title));
+            }
+            out.push(String::new());
+            out.push("Run `theoremata run <project>` to drive verification.".into());
+            format!("{}/{} nodes formally verified", verified, nodes.len())
+        }
+        other => {
+            out.push("Type /help for the command reference.".into());
+            format!("Unknown command: {other}")
+        }
+    };
+    Ok((status, out))
+}
+
+fn render_command_output(f: &mut ratatui::Frame, area: ratatui::layout::Rect, output: &[String]) {
+    let lines: Vec<Line> = output.iter().map(|l| Line::raw(l.clone())).collect();
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Command output · Esc to clear "),
+        ),
+        area,
+    );
 }
 
 fn resolve_proposal(store: &Store, project_id: &str, prefix: &str) -> Result<String> {
