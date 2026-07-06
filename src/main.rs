@@ -127,6 +127,16 @@ enum Command {
     Feasibility {
         constraints: String,
     },
+    Imports {
+        #[arg(default_value = "stats")]
+        query: String,
+        #[arg(long)]
+        module: Option<String>,
+        #[arg(long)]
+        substring: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: u64,
+    },
     Soundness {
         file: PathBuf,
     },
@@ -293,6 +303,21 @@ fn main() -> Result<()> {
                 true,
                 &PythonCheck::new().run(serde_json::json!({
                     "tool":"feasibility","constraints":constraints
+                }))?,
+            )?
+        }
+        Command::Imports {
+            query,
+            module,
+            substring,
+            limit,
+        } => {
+            let root = config.resources.join("mathlib4-master/mathlib4-master");
+            print_value(
+                true,
+                &PythonCheck::new().run(serde_json::json!({
+                    "tool":"mathlib_index","root":root,"query":query,
+                    "module":module,"substring":substring,"limit":limit
                 }))?,
             )?
         }

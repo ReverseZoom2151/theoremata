@@ -9,6 +9,7 @@ from .estimates_adapter import capability as estimates_capability
 from .falsify import search
 from .feasibility import feasibility
 from .lean_soundness import check as lean_soundness_check
+from .mathlib_index import run as mathlib_index_run
 from .safe_eval import evaluate
 from .symbolic import run as symbolic_run
 
@@ -34,6 +35,15 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         return lean_soundness_check(request["text"])
     if tool == "feasibility":
         return feasibility(request["constraints"])
+    if tool == "mathlib_index":
+        return mathlib_index_run(
+            root=request["root"],
+            query=request.get("query", "stats"),
+            module=request.get("module"),
+            substring=request.get("substring"),
+            limit=int(request.get("limit", 50)),
+            package=request.get("package", "Mathlib"),
+        )
     raise ValueError(f"unknown tool: {tool}")
 
 
