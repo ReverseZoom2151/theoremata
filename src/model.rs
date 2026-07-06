@@ -228,6 +228,17 @@ pub struct Attempt {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Lemma {
+    pub id: String,
+    pub project_id: String,
+    pub name: String,
+    pub statement: String,
+    pub source_node_id: String,
+    pub taint: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub id: i64,
     pub project_id: String,

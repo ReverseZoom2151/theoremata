@@ -86,10 +86,18 @@ impl Store {
               action TEXT NOT NULL, status TEXT NOT NULL, proposed_by TEXT NOT NULL,
               resolution_note TEXT, created_at TEXT NOT NULL, resolved_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS lemmas (
+              id TEXT PRIMARY KEY,
+              project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+              name TEXT NOT NULL, statement TEXT NOT NULL,
+              source_node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+              taint INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_nodes_project ON nodes(project_id);
             CREATE INDEX IF NOT EXISTS idx_edges_project ON edges(project_id);
             CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id, id);
             CREATE INDEX IF NOT EXISTS idx_messages_project ON messages(project_id, id);
+            CREATE INDEX IF NOT EXISTS idx_lemmas_project ON lemmas(project_id);
             "#,
         )?;
         // Idempotent column additions so databases created before these fields
@@ -854,6 +862,144 @@ impl Store {
         }
         Ok(())
     }
+
+    /// Transitive DependsOn dependency closure of a node, including the node
+    /// itself. `A depends on B` is an edge `source=A, target=B`.
+    fn dependency_closure(&self, project_id: &str, root: &str) -> Result<Vec<String>> {
+        let edges = self.edges(project_id)?;
+        let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+        for e in edges {
+            if e.kind == EdgeKind::DependsOn {
+                adj.entry(e.source_id).or_default().push(e.target_id);
+            }
+        }
+        let mut set: HashSet<String> = HashSet::new();
+        let mut stack = vec![root.to_owned()];
+        while let Some(n) = stack.pop() {
+            if set.insert(n.clone()) {
+                if let Some(targets) = adj.get(&n) {
+                    stack.extend(targets.iter().cloned());
+                }
+            }
+        }
+        Ok(set.into_iter().collect())
+    }
+
+    /// Recompute a node's content hash over `(statement, sorted dependency
+    /// target ids, provenance)` — a fingerprint that changes when the node's
+    /// dependencies change, not only its own text. Callers opt in; the initial
+    /// hash set at creation time is left untouched.
+    pub fn recompute_content_hash(&self, project_id: &str, node_id: &str) -> Result<String> {
+        let nodes = self.nodes(project_id)?;
+        let node = nodes
+            .iter()
+            .find(|n| n.id == node_id)
+            .ok_or_else(|| anyhow!("node not found: {node_id}"))?;
+        let mut deps: Vec<String> = self
+            .edges(project_id)?
+            .into_iter()
+            .filter(|e| e.source_id == node_id && e.kind == EdgeKind::DependsOn)
+            .map(|e| e.target_id)
+            .collect();
+        deps.sort();
+        let material = format!("{}|{}|{}", node.statement, deps.join(","), node.provenance);
+        let hash = format!("{:x}", Sha256::digest(material));
+        self.conn.execute(
+            "UPDATE nodes SET content_hash=?1,updated_at=?2 WHERE id=?3 AND project_id=?4",
+            params![hash, Utc::now().to_rfc3339(), node_id, project_id],
+        )?;
+        Ok(hash)
+    }
+
+    pub fn recompute_all_hashes(&self, project_id: &str) -> Result<()> {
+        for node in self.nodes(project_id)? {
+            self.recompute_content_hash(project_id, &node.id)?;
+        }
+        Ok(())
+    }
+
+    /// Extract a reusable lemma from a verified subgraph (Alethfeld's context-
+    /// compression op). The extraction set is the root plus its transitive
+    /// DependsOn ancestors; every non-assumption node in it must be verified,
+    /// assumptions become the lemma's hypotheses, and the lemma is tainted if
+    /// any node in the set is tainted.
+    pub fn extract_lemma(&self, project_id: &str, root_node_id: &str, name: &str) -> Result<Lemma> {
+        let nodes = self.nodes(project_id)?;
+        let by_id: HashMap<&str, &Node> = nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+        let root = *by_id
+            .get(root_node_id)
+            .ok_or_else(|| anyhow!("node not found: {root_node_id}"))?;
+        let closure = self.dependency_closure(project_id, root_node_id)?;
+        let mut assumptions: Vec<String> = Vec::new();
+        let mut taint = false;
+        for id in &closure {
+            let Some(node) = by_id.get(id.as_str()).copied() else {
+                continue;
+            };
+            if node.tainted {
+                taint = true;
+            }
+            if node.kind == NodeKind::Assumption {
+                assumptions.push(node.statement.clone());
+                continue;
+            }
+            if !matches!(
+                node.status,
+                NodeStatus::InformallyVerified | NodeStatus::FormallyVerified
+            ) {
+                return Err(anyhow!(
+                    "cannot extract lemma: node '{}' ({}) is not verified",
+                    node.title,
+                    node.status
+                ));
+            }
+        }
+        assumptions.sort();
+        let statement = if assumptions.is_empty() {
+            root.statement.clone()
+        } else {
+            format!("If {}, then {}", assumptions.join(" and "), root.statement)
+        };
+        let now = Utc::now();
+        let lemma = Lemma {
+            id: Uuid::new_v4().to_string(),
+            project_id: project_id.to_owned(),
+            name: name.to_owned(),
+            statement,
+            source_node_id: root_node_id.to_owned(),
+            taint,
+            created_at: now,
+        };
+        self.conn.execute(
+            "INSERT INTO lemmas VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                lemma.id,
+                lemma.project_id,
+                lemma.name,
+                lemma.statement,
+                lemma.source_node_id,
+                taint as i64,
+                now.to_rfc3339()
+            ],
+        )?;
+        self.event(
+            Some(project_id),
+            None,
+            "lemma.extracted",
+            "extraction",
+            json!({"lemma_id":lemma.id,"name":name,"taint":taint}),
+        )?;
+        Ok(lemma)
+    }
+
+    pub fn lemmas(&self, project_id: &str) -> Result<Vec<Lemma>> {
+        let mut st = self.conn.prepare(
+            "SELECT id,project_id,name,statement,source_node_id,taint,created_at
+             FROM lemmas WHERE project_id=?1 ORDER BY created_at",
+        )?;
+        let rows = st.query_map([project_id], lemma_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
 }
 
 fn dt(s: String) -> rusqlite::Result<DateTime<Utc>> {
@@ -954,6 +1100,17 @@ fn attempt_row(r: &Row) -> rusqlite::Result<Attempt> {
         created_at: dt(r.get(8)?)?,
     })
 }
+fn lemma_row(r: &Row) -> rusqlite::Result<Lemma> {
+    Ok(Lemma {
+        id: r.get(0)?,
+        project_id: r.get(1)?,
+        name: r.get(2)?,
+        statement: r.get(3)?,
+        source_node_id: r.get(4)?,
+        taint: r.get::<_, i64>(5)? != 0,
+        created_at: dt(r.get(6)?)?,
+    })
+}
 fn sql_parse(e: anyhow::Error) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into())
 }
@@ -980,6 +1137,41 @@ mod tests {
             .unwrap();
         let nodes = s.nodes(&p.id).unwrap();
         assert!(nodes.iter().find(|n| n.id == a.id).unwrap().tainted);
+    }
+
+    #[test]
+    fn content_hash_covers_dependencies() {
+        let s = Store::open(Path::new(":memory:")).unwrap();
+        let p = s.create_project("p", "t").unwrap();
+        let a = s.add_node(&p.id, NodeKind::Lemma, "a", "a", "test").unwrap();
+        let b = s.add_node(&p.id, NodeKind::Lemma, "b", "b", "test").unwrap();
+        let h0 = s.recompute_content_hash(&p.id, &a.id).unwrap();
+        s.add_edge(&p.id, &a.id, &b.id, EdgeKind::DependsOn).unwrap();
+        let h1 = s.recompute_content_hash(&p.id, &a.id).unwrap();
+        assert_ne!(h0, h1, "hash must change when a dependency is added");
+    }
+
+    #[test]
+    fn extracts_lemma_from_verified_subgraph() {
+        let s = Store::open(Path::new(":memory:")).unwrap();
+        let p = s.create_project("p", "t").unwrap();
+        let assume = s
+            .add_node(&p.id, NodeKind::Assumption, "h", "n is even", "test")
+            .unwrap();
+        let root = s
+            .add_node(&p.id, NodeKind::Lemma, "root", "n squared is even", "test")
+            .unwrap();
+        s.add_edge(&p.id, &root.id, &assume.id, EdgeKind::DependsOn)
+            .unwrap();
+        // Unverified root: extraction must refuse.
+        assert!(s.extract_lemma(&p.id, &root.id, "even_square").is_err());
+        s.set_node_status(&p.id, &root.id, NodeStatus::FormallyVerified, "test")
+            .unwrap();
+        let lemma = s.extract_lemma(&p.id, &root.id, "even_square").unwrap();
+        assert_eq!(lemma.statement, "If n is even, then n squared is even");
+        let all = s.lemmas(&p.id).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].name, "even_square");
     }
 
     #[test]
