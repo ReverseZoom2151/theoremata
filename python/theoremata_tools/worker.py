@@ -5,6 +5,7 @@ import json
 import sys
 from typing import Any
 
+from .asymptotics import asymptotic_feasibility, prove_asymptotic
 from .estimates_adapter import capability as estimates_capability
 from .falsify import search
 from .feasibility import feasibility
@@ -39,6 +40,10 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         return stages_run(request)
     if tool == "feasibility":
         return feasibility(request["constraints"])
+    if tool == "asymptotic_feasibility":
+        return asymptotic_feasibility(request["constraints"])
+    if tool == "prove_asymptotic":
+        return prove_asymptotic(request["hypotheses"], request["goal"])
     if tool == "grader":
         return grader_run(request["request"])
     if tool == "mathlib_index":

@@ -133,6 +133,9 @@ enum Command {
     Feasibility {
         constraints: String,
     },
+    Asymptotic {
+        request: String,
+    },
     Grade {
         request: String,
     },
@@ -320,6 +323,15 @@ fn main() -> Result<()> {
                     "tool":"feasibility","constraints":constraints
                 }))?,
             )?
+        }
+        Command::Asymptotic { request } => {
+            let mut request: serde_json::Value = serde_json::from_str(&request)?;
+            let op = request["op"]
+                .as_str()
+                .unwrap_or("asymptotic_feasibility")
+                .to_string();
+            request["tool"] = serde_json::json!(op);
+            print_value(true, &PythonCheck::new().run(request)?)?
         }
         Command::Grade { request } => {
             let request: serde_json::Value = serde_json::from_str(&request)?;
