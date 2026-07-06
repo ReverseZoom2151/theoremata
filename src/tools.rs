@@ -22,38 +22,43 @@ fn command_exists(name: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// True if `cmd --version` actually runs and exits successfully. This is the
+/// True if `cmd <version_arg>` actually runs and exits successfully. This is the
 /// reliable availability test: it rejects the Microsoft Store `python`/`python3`
 /// stubs, which are on the Windows PATH but exit non-zero with an install prompt.
-fn python_runs(cmd: &str) -> bool {
+fn runs(cmd: &str, version_arg: &str) -> bool {
     Command::new(cmd)
-        .arg("--version")
+        .arg(version_arg)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
 }
 
-/// Resolve a Python interpreter that actually runs, as a spawnable command.
-/// Prefers bare `python3`/`python` (correct on Linux, macOS, and WSL). On
-/// Windows the real interpreter is frequently shadowed on this process's PATH
-/// by a Store stub, so we fall back to asking a login shell for the absolute
-/// native path of the first candidate whose `--version` genuinely succeeds.
-fn python_command() -> Option<String> {
-    for candidate in ["python3", "python"] {
-        if python_runs(candidate) {
-            return Some(candidate.to_owned());
+/// Resolve an executable that actually runs, as a spawnable command string.
+/// Tries the bare candidate names against this process's PATH first (correct on
+/// Linux, macOS, and WSL), then falls back to a login shell — which sources the
+/// user's profile — to recover the absolute native path. Needed on Windows,
+/// where a toolchain installed via elan/pip may be off the process PATH or
+/// shadowed there by a Microsoft Store stub.
+fn resolve_command(candidates: &[&str], version_arg: &str) -> Option<String> {
+    for candidate in candidates {
+        if runs(candidate, version_arg) {
+            return Some((*candidate).to_owned());
         }
     }
-    let resolved = Command::new("bash")
-        .args([
-            "-lc",
-            r#"for p in python3 python python3.12; do if command -v "$p" >/dev/null 2>&1 && "$p" --version >/dev/null 2>&1; then cygpath -w "$(command -v "$p")"; break; fi; done"#,
-        ])
-        .output()
-        .ok()?;
-    let path = String::from_utf8_lossy(&resolved.stdout).trim().to_owned();
-    (!path.is_empty() && python_runs(&path)).then_some(path)
+    let names = candidates.join(" ");
+    let script = format!(
+        "for p in {names}; do if command -v \"$p\" >/dev/null 2>&1 && \"$p\" {version_arg} \
+         >/dev/null 2>&1; then cygpath -w \"$(command -v \"$p\")\" 2>/dev/null || command -v \"$p\"; \
+         break; fi; done"
+    );
+    let out = Command::new("bash").args(["-lc", &script]).output().ok()?;
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (!path.is_empty() && runs(&path, version_arg)).then_some(path)
+}
+
+fn python_command() -> Option<String> {
+    resolve_command(&["python3", "python"], "--version")
 }
 
 fn finish(
@@ -176,7 +181,8 @@ impl Tool for LeanCheck {
         "lean_check"
     }
     fn available(&self) -> bool {
-        command_exists("lake") || command_exists("lean")
+        resolve_command(&["lake"], "--version").is_some()
+            || resolve_command(&["lean"], "--version").is_some()
     }
     fn run(&self, input: serde_json::Value) -> Result<ToolResult> {
         let file = input["file"]
@@ -184,13 +190,12 @@ impl Tool for LeanCheck {
             .ok_or_else(|| anyhow!("file is required"))?;
         let path = Path::new(file);
         let started = Instant::now();
-        let output = if command_exists("lake") {
-            Command::new("lake")
-                .args(["env", "lean"])
-                .arg(path)
-                .output()?
+        let output = if let Some(lake) = resolve_command(&["lake"], "--version") {
+            Command::new(lake).args(["env", "lean"]).arg(path).output()?
+        } else if let Some(lean) = resolve_command(&["lean"], "--version") {
+            Command::new(lean).arg(path).output()?
         } else {
-            Command::new("lean").arg(path).output()?
+            return Err(anyhow!("no Lean toolchain found (tried lake, lean)"));
         };
         Ok(finish(self.name(), started, output, json!({"file":file})))
     }
