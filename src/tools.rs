@@ -2,7 +2,7 @@ use crate::{config::Config, model::ToolResult};
 use anyhow::{anyhow, Context, Result};
 use serde_json::json;
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Command, Stdio},
     time::Instant,
 };
@@ -175,7 +175,18 @@ impl Tool for PythonCheck {
     }
 }
 
-pub struct LeanCheck;
+pub struct LeanCheck {
+    project: Option<PathBuf>,
+}
+impl LeanCheck {
+    /// Build a checker that compiles inside the configured Mathlib Lake project
+    /// (when it exists) so `import Mathlib` resolves against its olean cache.
+    pub fn new(config: &Config) -> Self {
+        Self {
+            project: config.lean_project.clone().filter(|p| p.exists()),
+        }
+    }
+}
 impl Tool for LeanCheck {
     fn name(&self) -> &str {
         "lean_check"
@@ -188,16 +199,28 @@ impl Tool for LeanCheck {
         let file = input["file"]
             .as_str()
             .ok_or_else(|| anyhow!("file is required"))?;
-        let path = Path::new(file);
+        // Absolute path: the working directory may change to the Lake project.
+        let path = std::fs::canonicalize(file).unwrap_or_else(|_| PathBuf::from(file));
         let started = Instant::now();
-        let output = if let Some(lake) = resolve_command(&["lake"], "--version") {
-            Command::new(lake).args(["env", "lean"]).arg(path).output()?
-        } else if let Some(lean) = resolve_command(&["lean"], "--version") {
-            Command::new(lean).arg(path).output()?
-        } else {
-            return Err(anyhow!("no Lean toolchain found (tried lake, lean)"));
+        let output = match (&self.project, resolve_command(&["lake"], "--version")) {
+            (Some(project), Some(lake)) => Command::new(lake)
+                .current_dir(project)
+                .args(["env", "lean"])
+                .arg(&path)
+                .output()?,
+            (None, Some(lake)) => Command::new(lake).args(["env", "lean"]).arg(&path).output()?,
+            (_, None) => {
+                let lean = resolve_command(&["lean"], "--version")
+                    .ok_or_else(|| anyhow!("no Lean toolchain found (tried lake, lean)"))?;
+                Command::new(lean).arg(&path).output()?
+            }
         };
-        Ok(finish(self.name(), started, output, json!({"file":file})))
+        Ok(finish(
+            self.name(),
+            started,
+            output,
+            json!({"file":file,"project":self.project}),
+        ))
     }
 }
 
@@ -263,7 +286,7 @@ pub fn capability_report(config: &Config) -> serde_json::Value {
     let tools: Vec<Box<dyn Tool>> = vec![
         Box::new(MathlibSearch::new(config)),
         Box::new(PythonCheck::new()),
-        Box::new(LeanCheck),
+        Box::new(LeanCheck::new(config)),
         Box::new(LeanParanoia::new(config)),
         Box::new(Comparator),
     ];

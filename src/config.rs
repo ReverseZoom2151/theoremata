@@ -13,6 +13,14 @@ pub struct Config {
     pub model_command: Option<String>,
     pub max_iterations: u32,
     pub command_timeout_seconds: u64,
+    /// A Lake project that provides Mathlib. When set (and present), Lean checks
+    /// run inside it so `import Mathlib` resolves against its build/cache.
+    #[serde(default = "default_lean_project")]
+    pub lean_project: Option<PathBuf>,
+}
+
+fn default_lean_project() -> Option<PathBuf> {
+    Some(PathBuf::from("resources/mathlib4-master/mathlib4-master"))
 }
 
 impl Default for Config {
@@ -24,6 +32,7 @@ impl Default for Config {
             model_command: std::env::var("THEOREMATA_MODEL_COMMAND").ok(),
             max_iterations: 3,
             command_timeout_seconds: 60,
+            lean_project: default_lean_project(),
         }
     }
 }

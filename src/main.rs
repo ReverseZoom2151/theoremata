@@ -406,9 +406,10 @@ fn main() -> Result<()> {
                 }))?,
             )?
         }
-        Command::Lean { file } => {
-            print_value(true, &LeanCheck.run(serde_json::json!({"file":file}))?)?
-        }
+        Command::Lean { file } => print_value(
+            true,
+            &LeanCheck::new(&config).run(serde_json::json!({ "file": file }))?,
+        )?,
     }
     Ok(())
 }

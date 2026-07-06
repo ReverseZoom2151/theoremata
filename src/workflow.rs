@@ -248,7 +248,7 @@ impl ResearchWorkflow<'_> {
             }
         }
 
-        let lean = LeanCheck;
+        let lean = LeanCheck::new(self.config);
         if lean.available() {
             let lean_input = json!({ "file": lean_file });
             let result = lean.run(lean_input.clone())?;
