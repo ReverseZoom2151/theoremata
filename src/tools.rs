@@ -60,7 +60,7 @@ fn resolve_command(candidates: &[&str], version_arg: &str) -> Option<String> {
     (!path.is_empty() && runs(&path, version_arg)).then_some(path)
 }
 
-fn python_command() -> Option<String> {
+pub fn python_command() -> Option<String> {
     resolve_command(&["python3", "python"], "--version")
 }
 

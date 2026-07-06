@@ -37,6 +37,7 @@ struct Cli {
 enum Command {
     Init,
     Doctor,
+    Mcp,
     New {
         name: String,
         theorem: String,
@@ -212,6 +213,21 @@ fn main() -> Result<()> {
             )?
         }
         Command::Doctor => print_value(true, &capability_report(&config))?,
+        Command::Mcp => {
+            // Launch the MCP stdio server: it speaks JSON-RPC over inherited
+            // stdin/stdout, so an MCP client drives the Python tool workers.
+            let python = tools::python_command()
+                .ok_or_else(|| anyhow::anyhow!("no python interpreter found"))?;
+            let root = PathBuf::from("python").canonicalize()?;
+            let bootstrap = format!(
+                "import sys;sys.path.insert(0,{:?});from theoremata_tools.mcp_server import main;main()",
+                root.to_string_lossy()
+            );
+            let status = std::process::Command::new(python)
+                .args(["-E", "-c", &bootstrap])
+                .status()?;
+            std::process::exit(status.code().unwrap_or(1));
+        }
         Command::New { name, theorem } => {
             print_value(cli.json, &store.create_project(&name, &theorem)?)?
         }
