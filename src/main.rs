@@ -3,6 +3,7 @@ mod config;
 mod db;
 mod model;
 mod provider;
+mod retry;
 mod tools;
 mod tui;
 mod workflow;

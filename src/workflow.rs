@@ -3,6 +3,7 @@ use crate::{
     db::Store,
     model::{EdgeKind, ModelRequest, NodeKind, NodeStatus},
     provider::ModelProvider,
+    retry::{Decision, RetryLimits, RetryState},
     tools::{LeanCheck, MathlibSearch, PythonCheck, Tool},
 };
 use anyhow::{Context, Result};
@@ -23,6 +24,29 @@ pub struct ResearchWorkflow<'a> {
     pub store: &'a Store,
     pub config: &'a Config,
     pub provider: &'a dyn ModelProvider,
+}
+
+/// Pull Lean declaration names out of ripgrep hits over Mathlib, so an
+/// obligation node can carry concrete lemmas to try as its `suggested_lemmas`.
+fn extract_lemma_names(stdout: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in stdout.lines() {
+        for kw in ["theorem ", "lemma "] {
+            if let Some(idx) = line.find(kw) {
+                let name: String = line[idx + kw.len()..]
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '\''))
+                    .collect();
+                if !name.is_empty() && !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        if names.len() >= 8 {
+            break;
+        }
+    }
+    names
 }
 
 impl ResearchWorkflow<'_> {
@@ -117,24 +141,7 @@ impl ResearchWorkflow<'_> {
 
         self.store
             .update_run(project_id, &run, "running", "decompose", 0)?;
-        let obligations = self.decompose(&project.theorem).unwrap_or_else(|error| {
-            notes.push(format!("Model decomposition unavailable: {error}"));
-            vec![
-                (
-                    "Assumption audit".into(),
-                    "Make every domain, quantifier, and side condition explicit.".into(),
-                ),
-                (
-                    "Core implication".into(),
-                    "Establish the main mathematical implication from the normalized assumptions."
-                        .into(),
-                ),
-                (
-                    "Edge-case audit".into(),
-                    "Check boundary, degenerate, and excluded cases.".into(),
-                ),
-            ]
-        });
+        let obligations = self.decompose_bounded(project_id, &run, &project.theorem, &mut notes)?;
         for (title, statement) in obligations {
             let node = self.store.add_node(
                 project_id,
@@ -146,6 +153,12 @@ impl ResearchWorkflow<'_> {
             self.store
                 .add_edge(project_id, &strategy.id, &node.id, EdgeKind::DependsOn)?;
             created += 1;
+            self.store.set_strategy_hint(
+                project_id,
+                &node.id,
+                Some("Search Mathlib for a matching lemma before attempting a manual proof."),
+                "workflow:decompose",
+            )?;
             let search = MathlibSearch::new(self.config);
             if search.available() {
                 let terms = title
@@ -154,6 +167,11 @@ impl ResearchWorkflow<'_> {
                     .collect::<Vec<_>>()
                     .join("|");
                 let result = search.run(json!({"query":terms,"limit":8}))?;
+                let lemmas = extract_lemma_names(&result.stdout);
+                if !lemmas.is_empty() {
+                    self.store
+                        .set_suggested_lemmas(project_id, &node.id, &lemmas, "workflow:retrieval")?;
+                }
                 self.store.add_evidence(
                     project_id,
                     &node.id,
@@ -294,6 +312,77 @@ impl ResearchWorkflow<'_> {
             state: state.into(),
             notes,
         })
+    }
+
+    /// Decompose the theorem into obligations, bounded by the QED-style retry
+    /// policy when a model provider is configured. Each model attempt is
+    /// recorded; if the provider is offline or the escalation budget is spent,
+    /// fall back to a fixed obligation skeleton so the workflow still proceeds.
+    fn decompose_bounded(
+        &self,
+        project_id: &str,
+        run: &str,
+        theorem: &str,
+        notes: &mut Vec<String>,
+    ) -> Result<Vec<(String, String)>> {
+        let fallback = || {
+            vec![
+                (
+                    "Assumption audit".to_string(),
+                    "Make every domain, quantifier, and side condition explicit.".to_string(),
+                ),
+                (
+                    "Core implication".to_string(),
+                    "Establish the main mathematical implication from the normalized assumptions."
+                        .to_string(),
+                ),
+                (
+                    "Edge-case audit".to_string(),
+                    "Check boundary, degenerate, and excluded cases.".to_string(),
+                ),
+            ]
+        };
+        if self.provider.name() == "offline" {
+            notes.push("Model decomposition unavailable: no model provider configured".into());
+            return Ok(fallback());
+        }
+        let mut state = RetryState::new(RetryLimits::default());
+        loop {
+            let outcome = self.decompose(theorem);
+            match outcome {
+                Ok(obligations) if !obligations.is_empty() => {
+                    self.store.add_attempt(
+                        project_id,
+                        None,
+                        Some(run),
+                        "proof_decomposer",
+                        &json!({ "theorem": theorem }),
+                        &json!({ "obligations": obligations.len() }),
+                        true,
+                    )?;
+                    return Ok(obligations);
+                }
+                other => {
+                    let detail = match &other {
+                        Ok(_) => "empty decomposition".to_string(),
+                        Err(e) => e.to_string(),
+                    };
+                    self.store.add_attempt(
+                        project_id,
+                        None,
+                        Some(run),
+                        "proof_decomposer",
+                        &json!({ "theorem": theorem }),
+                        &json!({ "error": detail }),
+                        false,
+                    )?;
+                    if state.resolve(Decision::ReviseProof) == Decision::Terminate {
+                        notes.push(format!("Model decomposition failed after retries: {detail}"));
+                        return Ok(fallback());
+                    }
+                }
+            }
+        }
     }
 
     fn decompose(&self, theorem: &str) -> Result<Vec<(String, String)>> {
