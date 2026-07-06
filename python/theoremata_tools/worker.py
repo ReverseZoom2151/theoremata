@@ -10,6 +10,7 @@ from .axioms import check_axioms
 from .decl_index import run as decl_index_run
 from .eval_harness import run as eval_run
 from .head_index import run as head_index_run
+from .lean_repl import run as lean_repl_run
 from .lean_workspace import place_proof as lean_workspace_place
 from .lean_workspace import scaffold as lean_workspace_scaffold
 from .estimates_adapter import capability as estimates_capability
@@ -91,6 +92,8 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
             lean_bin=request.get("lean_bin"),
             timeout=float(request.get("timeout", 300.0)),
         )
+    if tool == "lean_warm":
+        return lean_repl_run(request)
     if tool == "lean_workspace_scaffold":
         return lean_workspace_scaffold(request["target_dir"], request["mathlib_root"])
     if tool == "lean_workspace_place":

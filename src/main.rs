@@ -197,6 +197,9 @@ enum Command {
     Workspace {
         request: String,
     },
+    LeanWarm {
+        request: String,
+    },
     Research {
         project: String,
     },
@@ -535,6 +538,11 @@ fn main() -> Result<()> {
                 "lean_workspace_scaffold"
             };
             request["tool"] = serde_json::json!(tool);
+            print_value(true, &PythonCheck::new().run(request)?)?
+        }
+        Command::LeanWarm { request } => {
+            let mut request: serde_json::Value = serde_json::from_str(&request)?;
+            request["tool"] = serde_json::json!("lean_warm");
             print_value(true, &PythonCheck::new().run(request)?)?
         }
         Command::Research { project } => print_value(

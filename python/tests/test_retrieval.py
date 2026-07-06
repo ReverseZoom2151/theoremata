@@ -154,8 +154,9 @@ def test_cache_key_stable_and_order_independent():
 @pytest.mark.skipif(not _lean_available(), reason="Lean toolchain not available")
 def test_build_or_load_caches_over_init(tmp_path):
     root = str(tmp_path)  # bare root: no lake project, dumps run against `lean`
-    # first build (cold): may shell out to lean; allow generous time
-    first = R.build_or_load(None, ["Init"], timeout=180.0)
+    # first build (cold): force a rebuild so the cache state is deterministic
+    # regardless of any index left on disk by a prior run.
+    first = R.build_or_load(None, ["Init"], rebuild=True, timeout=180.0)
     if not first.get("ok"):
         pytest.skip(f"lean dump did not run: {first.get('stderr')}")
     assert first["count"] > 0
