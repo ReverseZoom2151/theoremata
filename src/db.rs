@@ -38,7 +38,10 @@ impl Store {
               id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
               kind TEXT NOT NULL, status TEXT NOT NULL, title TEXT NOT NULL, statement TEXT NOT NULL,
               formal_statement TEXT, provenance TEXT NOT NULL, content_hash TEXT NOT NULL,
-              tainted INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+              tainted INTEGER NOT NULL DEFAULT 0,
+              tier TEXT NOT NULL DEFAULT 'spine', parent_id TEXT,
+              strategy_hint TEXT, suggested_lemmas TEXT NOT NULL DEFAULT '[]',
+              created_at TEXT NOT NULL, updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS edges (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -88,6 +91,23 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_messages_project ON messages(project_id, id);
             "#,
         )?;
+        // Idempotent column additions so databases created before these fields
+        // existed are upgraded in place (a fresh table already has them).
+        for (column, decl) in [
+            ("tier", "TEXT NOT NULL DEFAULT 'spine'"),
+            ("parent_id", "TEXT"),
+            ("strategy_hint", "TEXT"),
+            ("suggested_lemmas", "TEXT NOT NULL DEFAULT '[]'"),
+        ] {
+            if let Err(e) = self
+                .conn
+                .execute(&format!("ALTER TABLE nodes ADD COLUMN {column} {decl}"), [])
+            {
+                if !e.to_string().contains("duplicate column name") {
+                    return Err(e.into());
+                }
+            }
+        }
         Ok(())
     }
 
@@ -142,12 +162,44 @@ impl Store {
         statement: &str,
         provenance: &str,
     ) -> Result<Node> {
+        self.add_node_detailed(
+            project_id,
+            kind,
+            NodeTier::Spine,
+            None,
+            title,
+            statement,
+            None,
+            &[],
+            provenance,
+        )
+    }
+
+    /// Create a node with full blueprint metadata: its tier (spine vs
+    /// implementation), an optional owning parent, a strategy hint, and
+    /// suggested Mathlib lemmas to try — the human convention of annotating
+    /// each obligation with its target lemma, which is what a proving agent
+    /// needs as a prompt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_node_detailed(
+        &self,
+        project_id: &str,
+        kind: NodeKind,
+        tier: NodeTier,
+        parent_id: Option<&str>,
+        title: &str,
+        statement: &str,
+        strategy_hint: Option<&str>,
+        suggested_lemmas: &[String],
+        provenance: &str,
+    ) -> Result<Node> {
         self.project(project_id)?;
         let now = Utc::now();
         let hash = format!(
             "{:x}",
             Sha256::digest(format!("{kind}|{title}|{statement}"))
         );
+        let lemmas_json = serde_json::to_string(suggested_lemmas)?;
         let node = Node {
             id: Uuid::new_v4().to_string(),
             project_id: project_id.to_owned(),
@@ -159,11 +211,18 @@ impl Store {
             provenance: provenance.to_owned(),
             content_hash: hash,
             tainted: false,
+            tier,
+            parent_id: parent_id.map(str::to_owned),
+            strategy_hint: strategy_hint.map(str::to_owned),
+            suggested_lemmas: suggested_lemmas.to_vec(),
             created_at: now,
             updated_at: now,
         };
         self.conn.execute(
-            "INSERT INTO nodes VALUES (?1,?2,?3,?4,?5,?6,NULL,?7,?8,0,?9,?9)",
+            "INSERT INTO nodes(id,project_id,kind,status,title,statement,formal_statement,\
+             provenance,content_hash,tainted,tier,parent_id,strategy_hint,suggested_lemmas,\
+             created_at,updated_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,NULL,?7,?8,0,?9,?10,?11,?12,?13,?13)",
             params![
                 node.id,
                 project_id,
@@ -173,6 +232,10 @@ impl Store {
                 statement,
                 provenance,
                 node.content_hash,
+                tier.to_string(),
+                parent_id,
+                strategy_hint,
+                lemmas_json,
                 now.to_rfc3339()
             ],
         )?;
@@ -182,9 +245,58 @@ impl Store {
             None,
             "node.created",
             provenance,
-            serde_json::json!({"node_id":node.id,"kind":kind,"title":title}),
+            serde_json::json!({"node_id":node.id,"kind":kind,"title":title,"tier":tier}),
         )?;
         Ok(node)
+    }
+
+    pub fn set_strategy_hint(
+        &self,
+        project_id: &str,
+        node_id: &str,
+        hint: Option<&str>,
+        actor: &str,
+    ) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE nodes SET strategy_hint=?1,updated_at=?2 WHERE id=?3 AND project_id=?4",
+            params![hint, Utc::now().to_rfc3339(), node_id, project_id],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!("node not found: {node_id}"));
+        }
+        self.event(
+            Some(project_id),
+            None,
+            "node.hint_set",
+            actor,
+            json!({ "node_id": node_id }),
+        )?;
+        Ok(())
+    }
+
+    pub fn set_suggested_lemmas(
+        &self,
+        project_id: &str,
+        node_id: &str,
+        lemmas: &[String],
+        actor: &str,
+    ) -> Result<()> {
+        let payload = serde_json::to_string(lemmas)?;
+        let changed = self.conn.execute(
+            "UPDATE nodes SET suggested_lemmas=?1,updated_at=?2 WHERE id=?3 AND project_id=?4",
+            params![payload, Utc::now().to_rfc3339(), node_id, project_id],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!("node not found: {node_id}"));
+        }
+        self.event(
+            Some(project_id),
+            None,
+            "node.lemmas_set",
+            actor,
+            json!({"node_id": node_id, "count": lemmas.len()}),
+        )?;
+        Ok(())
     }
 
     pub fn set_node_status(
@@ -278,7 +390,8 @@ impl Store {
     pub fn nodes(&self, project_id: &str) -> Result<Vec<Node>> {
         let mut st = self.conn.prepare(
             "SELECT id,project_id,kind,status,title,statement,formal_statement,provenance,
-             content_hash,tainted,created_at,updated_at FROM nodes WHERE project_id=?1 ORDER BY created_at",
+             content_hash,tainted,tier,parent_id,strategy_hint,suggested_lemmas,created_at,updated_at
+             FROM nodes WHERE project_id=?1 ORDER BY created_at",
         )?;
         let rows = st.query_map([project_id], node_row)?;
         let values = rows.collect::<rusqlite::Result<_>>()?;
@@ -646,6 +759,8 @@ fn project_row(r: &Row) -> rusqlite::Result<Project> {
 fn node_row(r: &Row) -> rusqlite::Result<Node> {
     let kind: String = r.get(2)?;
     let status: String = r.get(3)?;
+    let tier: String = r.get(10)?;
+    let lemmas_raw: String = r.get(13)?;
     Ok(Node {
         id: r.get(0)?,
         project_id: r.get(1)?,
@@ -657,8 +772,12 @@ fn node_row(r: &Row) -> rusqlite::Result<Node> {
         provenance: r.get(7)?,
         content_hash: r.get(8)?,
         tainted: r.get::<_, i64>(9)? != 0,
-        created_at: dt(r.get(10)?)?,
-        updated_at: dt(r.get(11)?)?,
+        tier: tier.parse().map_err(sql_parse)?,
+        parent_id: r.get(11)?,
+        strategy_hint: r.get(12)?,
+        suggested_lemmas: serde_json::from_str(&lemmas_raw).unwrap_or_default(),
+        created_at: dt(r.get(14)?)?,
+        updated_at: dt(r.get(15)?)?,
     })
 }
 fn edge_row(r: &Row) -> rusqlite::Result<Edge> {
@@ -724,5 +843,44 @@ mod tests {
             .unwrap();
         let nodes = s.nodes(&p.id).unwrap();
         assert!(nodes.iter().find(|n| n.id == a.id).unwrap().tainted);
+    }
+
+    #[test]
+    fn stores_node_blueprint_metadata() {
+        let s = Store::open(Path::new(":memory:")).unwrap();
+        let p = s.create_project("p", "t").unwrap();
+        let spine = s
+            .add_node(&p.id, NodeKind::Obligation, "spine", "S", "test")
+            .unwrap();
+        let child = s
+            .add_node_detailed(
+                &p.id,
+                NodeKind::Lemma,
+                NodeTier::Implementation,
+                Some(&spine.id),
+                "impl",
+                "L",
+                Some("induct on n"),
+                &["Nat.succ_le_succ".to_string()],
+                "agent",
+            )
+            .unwrap();
+        s.set_suggested_lemmas(&p.id, &spine.id, &["Nat.mul_comm".to_string()], "agent")
+            .unwrap();
+        s.set_strategy_hint(&p.id, &spine.id, Some("contrapositive"), "agent")
+            .unwrap();
+        let nodes = s.nodes(&p.id).unwrap();
+        let got_spine = nodes.iter().find(|n| n.id == spine.id).unwrap();
+        let got_child = nodes.iter().find(|n| n.id == child.id).unwrap();
+        assert_eq!(got_spine.tier, NodeTier::Spine);
+        assert_eq!(got_spine.strategy_hint.as_deref(), Some("contrapositive"));
+        assert_eq!(got_spine.suggested_lemmas, vec!["Nat.mul_comm".to_string()]);
+        assert_eq!(got_child.tier, NodeTier::Implementation);
+        assert_eq!(got_child.parent_id.as_deref(), Some(spine.id.as_str()));
+        assert_eq!(got_child.strategy_hint.as_deref(), Some("induct on n"));
+        assert_eq!(
+            got_child.suggested_lemmas,
+            vec!["Nat.succ_le_succ".to_string()]
+        );
     }
 }

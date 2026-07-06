@@ -70,6 +70,36 @@ impl FromStr for NodeStatus {
     }
 }
 
+/// Whether a node is a blueprint-visible mathematical step (the human/review/
+/// scheduling unit) or an agent-introduced sub-lemma owned by a parent spine
+/// node. Completed formalizations show a ~4-5x fan-out of implementation nodes
+/// beneath each spine node.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeTier {
+    Spine,
+    Implementation,
+}
+
+impl fmt::Display for NodeTier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            serde_json::to_value(self).unwrap().as_str().unwrap()
+        )
+    }
+}
+
+impl FromStr for NodeTier {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(serde_json::from_value(serde_json::Value::String(
+            s.to_owned(),
+        ))?)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeKind {
@@ -122,6 +152,10 @@ pub struct Node {
     pub provenance: String,
     pub content_hash: String,
     pub tainted: bool,
+    pub tier: NodeTier,
+    pub parent_id: Option<String>,
+    pub strategy_hint: Option<String>,
+    pub suggested_lemmas: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
