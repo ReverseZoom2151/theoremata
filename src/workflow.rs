@@ -26,6 +26,26 @@ pub struct ResearchWorkflow<'a> {
     pub provider: &'a dyn ModelProvider,
 }
 
+/// Find the first declared theorem/lemma name in a Lean source, so its axiom
+/// closure can be audited by name.
+fn extract_theorem_name(src: &str) -> Option<String> {
+    for line in src.lines() {
+        let trimmed = line.trim_start();
+        for kw in ["theorem ", "lemma "] {
+            if let Some(rest) = trimmed.strip_prefix(kw) {
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '\''))
+                    .collect();
+                if !name.is_empty() {
+                    return Some(name);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Pull Lean declaration names out of ripgrep hits over Mathlib, so an
 /// obligation node can carry concrete lemmas to try as its `suggested_lemmas`.
 fn extract_lemma_names(stdout: &str) -> Vec<String> {
@@ -276,7 +296,39 @@ impl ResearchWorkflow<'_> {
                 &serde_json::to_value(&result)?,
                 result.success,
             )?;
+            // Authoritative gate: certify only when the proof compiles, is
+            // lexically clean, AND its axiom closure is within the allowlist.
+            let mut certified = false;
             if result.success && soundness_clean {
+                match extract_theorem_name(&formal) {
+                    Some(thm) if py.available() => {
+                        let source = fs::read_to_string(&lean_file).unwrap_or_default();
+                        let audit = py.run(json!({
+                            "tool":"check_axioms","source":source,"theorem":thm,
+                            "root":self.config.lean_project
+                        }))?;
+                        let axioms_clean = serde_json::from_str::<serde_json::Value>(&audit.stdout)
+                            .ok()
+                            .and_then(|v| v["output"]["clean"].as_bool())
+                            .unwrap_or(false);
+                        self.store.add_evidence(
+                            project_id,
+                            &formal_node.id,
+                            "axiom_audit",
+                            py.name(),
+                            if axioms_clean { "clean" } else { "flagged" },
+                            serde_json::to_value(&audit)?,
+                        )?;
+                        certified = axioms_clean;
+                        if !axioms_clean {
+                            notes.push("Axiom audit flagged the proof; not certifying".into());
+                        }
+                    }
+                    _ => notes
+                        .push("No theorem name to audit; formal statement not certified".into()),
+                }
+            }
+            if certified {
                 self.store.set_node_status(
                     project_id,
                     &formal_node.id,
