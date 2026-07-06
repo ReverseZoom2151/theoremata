@@ -8,6 +8,7 @@ from typing import Any
 from .estimates_adapter import capability as estimates_capability
 from .falsify import search
 from .feasibility import feasibility
+from .grader import run as grader_run
 from .lean_soundness import check as lean_soundness_check
 from .mathlib_index import run as mathlib_index_run
 from .safe_eval import evaluate
@@ -35,6 +36,8 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         return lean_soundness_check(request["text"])
     if tool == "feasibility":
         return feasibility(request["constraints"])
+    if tool == "grader":
+        return grader_run(request["request"])
     if tool == "mathlib_index":
         return mathlib_index_run(
             root=request["root"],

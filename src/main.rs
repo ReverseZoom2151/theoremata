@@ -133,6 +133,9 @@ enum Command {
     Feasibility {
         constraints: String,
     },
+    Grade {
+        request: String,
+    },
     Imports {
         #[arg(default_value = "stats")]
         query: String,
@@ -312,6 +315,15 @@ fn main() -> Result<()> {
                 true,
                 &PythonCheck::new().run(serde_json::json!({
                     "tool":"feasibility","constraints":constraints
+                }))?,
+            )?
+        }
+        Command::Grade { request } => {
+            let request: serde_json::Value = serde_json::from_str(&request)?;
+            print_value(
+                true,
+                &PythonCheck::new().run(serde_json::json!({
+                    "tool":"grader","request":request
                 }))?,
             )?
         }
