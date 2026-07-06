@@ -22,6 +22,40 @@ fn command_exists(name: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// True if `cmd --version` actually runs and exits successfully. This is the
+/// reliable availability test: it rejects the Microsoft Store `python`/`python3`
+/// stubs, which are on the Windows PATH but exit non-zero with an install prompt.
+fn python_runs(cmd: &str) -> bool {
+    Command::new(cmd)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Resolve a Python interpreter that actually runs, as a spawnable command.
+/// Prefers bare `python3`/`python` (correct on Linux, macOS, and WSL). On
+/// Windows the real interpreter is frequently shadowed on this process's PATH
+/// by a Store stub, so we fall back to asking a login shell for the absolute
+/// native path of the first candidate whose `--version` genuinely succeeds.
+fn python_command() -> Option<String> {
+    for candidate in ["python3", "python"] {
+        if python_runs(candidate) {
+            return Some(candidate.to_owned());
+        }
+    }
+    let resolved = Command::new("bash")
+        .args([
+            "-lc",
+            r#"for p in python3 python python3.12; do if command -v "$p" >/dev/null 2>&1 && "$p" --version >/dev/null 2>&1; then cygpath -w "$(command -v "$p")"; break; fi; done"#,
+        ])
+        .output()
+        .ok()?;
+    let path = String::from_utf8_lossy(&resolved.stdout).trim().to_owned();
+    (!path.is_empty() && python_runs(&path)).then_some(path)
+}
+
 fn finish(
     name: &str,
     started: Instant,
@@ -100,7 +134,7 @@ impl Tool for PythonCheck {
         self.package_root
             .join("theoremata_tools/worker.py")
             .exists()
-            && command_exists("python3")
+            && python_command().is_some()
     }
     fn run(&self, input: serde_json::Value) -> Result<ToolResult> {
         let started = Instant::now();
@@ -108,7 +142,9 @@ impl Tool for PythonCheck {
             "import sys;sys.path.insert(0,{:?});from theoremata_tools.worker import main;main()",
             self.package_root.canonicalize()?.to_string_lossy()
         );
-        let mut child = Command::new("python3")
+        let python = python_command()
+            .ok_or_else(|| anyhow!("no python interpreter found (tried python3, python)"))?;
+        let mut child = Command::new(python)
             .args(["-I", "-c", &bootstrap])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
