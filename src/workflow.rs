@@ -194,14 +194,39 @@ impl ResearchWorkflow<'_> {
 
         self.store
             .update_run(project_id, &run, "running", "verify", 0)?;
+
+        // Cheap deterministic pre-gate: reject sorry/admit/axiom lexically
+        // (ignoring comments and strings) before trusting any compilation.
+        let mut soundness_clean = true;
+        if py.available() {
+            let sound = py.run(json!({"tool":"lean_soundness","text":formal}))?;
+            soundness_clean = sound.success
+                && serde_json::from_str::<serde_json::Value>(&sound.stdout)
+                    .ok()
+                    .and_then(|v| v["output"]["clean"].as_bool())
+                    .unwrap_or(false);
+            self.store.add_evidence(
+                project_id,
+                &formal_node.id,
+                "lexical_soundness",
+                py.name(),
+                if soundness_clean { "clean" } else { "flagged" },
+                serde_json::to_value(&sound)?,
+            )?;
+            if !soundness_clean {
+                notes.push(
+                    "Lexical soundness gate flagged the formal statement (sorry/admit/axiom)".into(),
+                );
+            }
+        }
+
         let lean = LeanCheck;
         if lean.available() {
             let result = lean.run(json!({"file":lean_file}))?;
-            let has_placeholder = formal.contains("sorry") || formal.contains("admit");
-            let verdict = if result.success && !has_placeholder {
+            let verdict = if result.success && soundness_clean {
                 "pass"
-            } else if has_placeholder {
-                "placeholder"
+            } else if !soundness_clean {
+                "unsound"
             } else {
                 "fail"
             };
@@ -213,7 +238,7 @@ impl ResearchWorkflow<'_> {
                 verdict,
                 serde_json::to_value(&result)?,
             )?;
-            if result.success && !has_placeholder {
+            if result.success && soundness_clean {
                 self.store.set_node_status(
                     project_id,
                     &formal_node.id,
