@@ -1,9 +1,12 @@
 mod chat;
 mod config;
+mod critic;
 mod db;
 mod model;
 mod provider;
+mod research;
 mod retry;
+mod router;
 mod scheduler;
 mod tools;
 mod tui;
@@ -193,6 +196,26 @@ enum Command {
     },
     Workspace {
         request: String,
+    },
+    Research {
+        project: String,
+    },
+    Critique {
+        project: String,
+    },
+    Route {
+        project: String,
+    },
+    Lemma {
+        project: String,
+        node: String,
+        name: String,
+    },
+    Lemmas {
+        project: String,
+    },
+    Rehash {
+        project: String,
     },
     Lean {
         file: PathBuf,
@@ -503,6 +526,56 @@ fn main() -> Result<()> {
             };
             request["tool"] = serde_json::json!(tool);
             print_value(true, &PythonCheck::new().run(request)?)?
+        }
+        Command::Research { project } => print_value(
+            true,
+            &research::ResearchEngine {
+                store: &store,
+                provider: provider.as_ref(),
+            }
+            .run(&project)?,
+        )?,
+        Command::Critique { project } => print_value(
+            true,
+            &critic::Critic {
+                store: &store,
+                provider: provider.as_ref(),
+            }
+            .critique(&project)?,
+        )?,
+        Command::Route { project } => {
+            let nodes = store.nodes(&project)?;
+            let tools = router::ToolAvailability {
+                python: PythonCheck::new().available(),
+                lean: LeanCheck::new(&config).available(),
+                mathlib_search: MathlibSearch::new(&config).available(),
+                model: config.model_command.is_some(),
+            };
+            let routes: Vec<_> = nodes
+                .iter()
+                .filter(|n| matches!(n.status, NodeStatus::Proposed | NodeStatus::Active))
+                .map(|n| {
+                    let signals = router::NodeSignals {
+                        has_formal_statement: n.formal_statement.is_some(),
+                        ..Default::default()
+                    };
+                    serde_json::json!({
+                        "node": n.id, "title": n.title,
+                        "route": router::route(n, &signals, &tools, config.max_iterations)
+                    })
+                })
+                .collect();
+            print_value(true, &routes)?
+        }
+        Command::Lemma {
+            project,
+            node,
+            name,
+        } => print_value(true, &store.extract_lemma(&project, &node, &name)?)?,
+        Command::Lemmas { project } => print_value(true, &store.lemmas(&project)?)?,
+        Command::Rehash { project } => {
+            store.recompute_all_hashes(&project)?;
+            print_value(cli.json, &serde_json::json!({"rehashed": project}))?
         }
         Command::Lean { file } => print_value(
             true,
