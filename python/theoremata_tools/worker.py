@@ -6,6 +6,7 @@ import sys
 from typing import Any
 
 from .asymptotics import asymptotic_feasibility, prove_asymptotic
+from .decl_index import run as decl_index_run
 from .estimates_adapter import capability as estimates_capability
 from .falsify import search
 from .feasibility import feasibility
@@ -54,6 +55,17 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
             substring=request.get("substring"),
             limit=int(request.get("limit", 50)),
             package=request.get("package", "Mathlib"),
+        )
+    if tool == "decl_index":
+        return decl_index_run(
+            root=request.get("root"),
+            imports=request.get("imports"),
+            query=request.get("query", "dump"),
+            kind=request.get("kind"),
+            substring=request.get("substring"),
+            limit=int(request.get("limit", 50)),
+            lean_bin=request.get("lean_bin"),
+            timeout=float(request.get("timeout", 300.0)),
         )
     raise ValueError(f"unknown tool: {tool}")
 

@@ -152,6 +152,18 @@ enum Command {
         #[arg(long, default_value_t = 50)]
         limit: u64,
     },
+    Decls {
+        #[arg(default_value = "stats")]
+        query: String,
+        #[arg(long)]
+        substring: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: u64,
+        #[arg(long)]
+        mathlib: bool,
+    },
     Soundness {
         file: PathBuf,
     },
@@ -359,6 +371,29 @@ fn main() -> Result<()> {
                 &PythonCheck::new().run(serde_json::json!({
                     "tool":"mathlib_index","root":root,"query":query,
                     "module":module,"substring":substring,"limit":limit
+                }))?,
+            )?
+        }
+        Command::Decls {
+            query,
+            substring,
+            kind,
+            limit,
+            mathlib,
+        } => {
+            let (root, imports) = if mathlib {
+                (
+                    Some(config.resources.join("mathlib4-master/mathlib4-master")),
+                    vec!["Mathlib".to_string()],
+                )
+            } else {
+                (None, vec!["Init".to_string()])
+            };
+            print_value(
+                true,
+                &PythonCheck::new().run(serde_json::json!({
+                    "tool":"decl_index","root":root,"imports":imports,
+                    "query":query,"kind":kind,"substring":substring,"limit":limit
                 }))?,
             )?
         }
