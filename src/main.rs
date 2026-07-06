@@ -4,6 +4,7 @@ mod db;
 mod model;
 mod provider;
 mod retry;
+mod scheduler;
 mod tools;
 mod tui;
 mod workflow;
@@ -15,7 +16,7 @@ use db::Store;
 use model::{EdgeKind, NodeKind, NodeStatus};
 use provider::{CommandProvider, ModelProvider, OfflineProvider};
 use std::{fs, path::PathBuf};
-use tools::{capability_report, LeanCheck, MathlibSearch, PythonCheck, Tool};
+use tools::{capability_report, LeanCheck, LeanParanoia, MathlibSearch, PythonCheck, Tool};
 use workflow::ResearchWorkflow;
 
 #[derive(Parser)]
@@ -183,6 +184,12 @@ enum Command {
         file: PathBuf,
         theorem: String,
     },
+    Schedule {
+        project: String,
+    },
+    Paranoia {
+        theorem: String,
+    },
     Lean {
         file: PathBuf,
     },
@@ -257,15 +264,19 @@ fn main() -> Result<()> {
                     }
                 }
             };
-            let reply = chat::ChatEngine {
+            let engine = chat::ChatEngine {
                 store: &store,
                 provider: provider.as_ref(),
-            }
-            .send_stream(&project, &message, &mut on_event)?;
+            };
+            let reply = engine.send_stream(&project, &message, &mut on_event)?;
+            let auto_approved = engine.resolve_auto_approvals(&project, config.auto_approve_safe)?;
             if !cli.json {
                 println!();
             }
-            print_value(cli.json, &serde_json::json!({"reply":reply}))?
+            print_value(
+                cli.json,
+                &serde_json::json!({"reply":reply,"auto_approved":auto_approved}),
+            )?
         }
         Command::Proposals { project, all } => {
             print_value(true, &store.proposals(&project, !all)?)?
@@ -455,6 +466,15 @@ fn main() -> Result<()> {
                 }))?,
             )?
         }
+        Command::Schedule { project } => {
+            let nodes = store.nodes(&project)?;
+            let edges = store.edges(&project)?;
+            print_value(true, &scheduler::plan(&nodes, &edges))?
+        }
+        Command::Paranoia { theorem } => print_value(
+            true,
+            &LeanParanoia::new(&config).run(serde_json::json!({ "theorem": theorem }))?,
+        )?,
         Command::Lean { file } => print_value(
             true,
             &LeanCheck::new(&config).run(serde_json::json!({ "file": file }))?,

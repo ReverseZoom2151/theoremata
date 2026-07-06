@@ -1,7 +1,7 @@
 use crate::{
     config::Config,
     db::Store,
-    model::{EdgeKind, ModelRequest, NodeKind, NodeStatus},
+    model::{EdgeKind, EdgeStrength, ModelRequest, NodeKind, NodeStatus},
     provider::ModelProvider,
     retry::{Decision, RetryLimits, RetryState},
     tools::{LeanCheck, MathlibSearch, PythonCheck, Tool},
@@ -334,6 +334,13 @@ impl ResearchWorkflow<'_> {
                     &formal_node.id,
                     NodeStatus::FormallyVerified,
                     "lean",
+                )?;
+                self.store.set_edge_strength(
+                    project_id,
+                    &conjecture.id,
+                    &formal_node.id,
+                    EdgeKind::Formalizes,
+                    EdgeStrength::LeanChecked,
                 )?;
             } else {
                 notes.push(format!(
