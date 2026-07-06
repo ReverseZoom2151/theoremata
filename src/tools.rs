@@ -144,8 +144,12 @@ impl Tool for PythonCheck {
         );
         let python = python_command()
             .ok_or_else(|| anyhow!("no python interpreter found (tried python3, python)"))?;
+        // `-E` (ignore PYTHON* env vars) rather than `-I`: the worker must be
+        // able to import its trusted dependencies (SymPy, z3) from site-packages,
+        // while untrusted *expressions* are sandboxed by safe_eval's AST allowlist
+        // and empty builtins, not by process isolation.
         let mut child = Command::new(python)
-            .args(["-I", "-c", &bootstrap])
+            .args(["-E", "-c", &bootstrap])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
