@@ -56,30 +56,30 @@ These items from the first adopt list are now built and pushed:
 
 - Run a live end-to-end real-model chain. The full system is tested through mocks and deterministic modules; the remaining unvalidated claim is live model behavior through falsify → decompose → formalize → verify → certify.
 - Keep `docs/PLAN.md` and this resource synthesis current whenever new repos are added or a roadmap tier ships.
-- Add a top-level `docs/TRUST_BOUNDARIES.md` modeled after TorchLean.
+- ~~Add a top-level `docs/TRUST_BOUNDARIES.md` modeled after TorchLean.~~ **Done** (`docs/TRUST_BOUNDARIES.md`).
 
 ### P1 — Lean/prover interaction layer
 
-- Add a first-class `ProofTask` / `ProofResult` contract, drawing from LeanDojo/open-atp/ReProver.
-- Add external-prover job state: submitted, queued, in-progress, proved, partial, failed, counterexample, error.
-- Add sparse polling/resume for external prover jobs.
-- Add Aristotle adapter behind the existing tool/provider seam, with mock mode and local hardening of returned Lean.
-- Add LeanDojo/ReProver-style premise retrieval and proof-state environment adapters as optional backends.
+- ~~Add a first-class `ProofTask` / `ProofResult` contract, drawing from LeanDojo/open-atp/ReProver.~~ **Done** (`components/prover/`).
+- ~~Add external-prover job state: submitted, queued, in-progress, proved, partial, failed, counterexample, error.~~ **Done** (`proof_jobs`, CLI).
+- ~~Add sparse polling/resume for external prover jobs.~~ **Partial** (poll count + `AttemptRun`; full resume scheduler deferred).
+- ~~Add Aristotle adapter behind the existing tool/provider seam, with mock mode and local hardening of returned Lean.~~ **Done** (mock/live + `verify.rs` + statement guard).
+- ~~Add LeanDojo/ReProver-style premise retrieval and proof-state environment adapters as optional backends.~~ **Partial** (mock LeanDojo, `accessible_retrieve`, ReProver backend; live Pantograph deferred).
 
 ### P2 — evaluation expansion
 
-- MiniF2F/Harmonic datasets: proof-completion + autoformalization track.
-- BRIDGE-178: verified programming track with Lean oracle tests and repair-loop rows.
-- QuantumLean-Bench: scientific/quantum formalization track with scaffolded prompts.
-- FormulationBench/FLARE: MILP reformulation proof track and harness-vs-harness experiments.
-- IMO2025 and Aristotle Putnam outputs: external-prover artifact verification track.
-- Lean Millennium statements: statement-quality/definition-design track, not proof-completion.
+- ~~MiniF2F/Harmonic datasets: proof-completion + autoformalization track.~~ **Partial** (loaders + `proof_completion` op; corpus vendoring + live smoke deferred).
+- ~~BRIDGE-178: verified programming track with Lean oracle tests and repair-loop rows.~~ **Partial** (loader + structural grader + `verified_programming` op; live oracle execution deferred).
+- ~~QuantumLean-Bench: scientific/quantum formalization track with scaffolded prompts.~~ **Partial** (loader + domain filter; scaffold prompts in `expected` metadata).
+- ~~FormulationBench/FLARE: MILP reformulation proof track and harness-vs-harness experiments.~~ **Partial** (`formulationbench` loader + `trace_normalize`; harness-vs-harness configs deferred).
+- ~~IMO2025 and Aristotle Putnam outputs: external-prover artifact verification track.~~ **Partial** (`imo2025`, `putnam_artifacts` loaders + structural graders; live compile suite deferred).
+- ~~Lean Millennium statements: statement-quality/definition-design track, not proof-completion.~~ **Partial** (`millennium` loader + `statement_target` kind).
 
 ### P3 — product and operations
 
-- Add `theoremata doctor` for Lean/Lake/Python/model-provider/mathlib setup checks.
-- Add artifact-directory discipline for every attempt: inputs, generated Lean, logs, verifier output, cost, duration.
-- Add trace normalization for tool/time/cost analysis, borrowing FLARE’s JSONL analysis pattern.
+- ~~Add `theoremata doctor` for Lean/Lake/Python/model-provider/mathlib setup checks.~~ **Partial** (`theoremata doctor` + corpus/env inventory).
+- ~~Add artifact-directory discipline for every attempt: inputs, generated Lean, logs, verifier output, cost, duration.~~ **Done** (`AttemptRun` artifact dirs).
+- ~~Add trace normalization for tool/time/cost analysis, borrowing FLARE's JSONL analysis pattern.~~ **Done** (`trace_normalize` worker tool).
 - Expose stable CLI/MCP APIs that an editor integration can call later; do not fork/build a desktop editor now.
 
 ### P4 — future/deferred
