@@ -19,7 +19,8 @@ mod verify;
 pub use graph::{db, model, scheduler};
 pub use reason::{
     agent, blueprint, chat, consolidate, critic, decompose, falsification, formal_generate, guard,
-    mcts, observe, plan_history, progress, research, retry, router, sampler, sampling, taint, team,
+    mcts, observe, plan_history, portfolio, progress, research, retry, router, sampler, sampling,
+    taint, team,
 };
 pub use prover::{aristotle, attempt_run, exec, formal, isabelle, lean, proof_job, rocq};
 pub use verify::{hardening, lean_session};
@@ -309,6 +310,15 @@ enum Command {
         /// `lean` | `rocq` (`coq`) | `isabelle`.
         system: String,
         statement: String,
+    },
+    /// Attempt a conjecture across Lean, Rocq, and Isabelle and take whichever
+    /// backend certifies first (the portfolio winner).
+    PortfolioProve {
+        statement: String,
+        /// Restrict the portfolio to a comma-separated subset
+        /// (e.g. `--systems lean,rocq`); defaults to all three.
+        #[arg(long)]
+        systems: Option<String>,
     },
     /// Submit an external proof job (ProofTask → async prover backend).
     ProofSubmit {
@@ -905,6 +915,33 @@ fn main() -> Result<()> {
                     "verified": report.lexically_verified,
                     "code": code,
                     "report": report,
+                }),
+            )?
+        }
+        Command::PortfolioProve { statement, systems } => {
+            let systems: Vec<prover::formal::FormalSystem> = match &systems {
+                Some(s) => s
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::parse)
+                    .collect::<Result<_>>()?,
+                None => Vec::new(),
+            };
+            let result = portfolio::portfolio_prove(
+                &store,
+                &config,
+                provider.as_ref(),
+                &statement,
+                &systems,
+            )?;
+            print_value(
+                true,
+                &serde_json::json!({
+                    "statement": result.statement,
+                    "winner": result.winner.map(|s| s.as_str()),
+                    "any_verified": result.any_verified,
+                    "per_system": result.per_system,
                 }),
             )?
         }

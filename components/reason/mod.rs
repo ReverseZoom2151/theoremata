@@ -10,5 +10,5 @@ pub mod search;
 // like `crate::mcts`) continue to resolve after the subgroup reorganization.
 pub use orchestration::{agent, chat, consolidate, observe, research, team};
 pub use search::{mcts, progress, sampler, sampling};
-pub use proving::{blueprint, decompose, falsification, formal_generate, retry, router};
+pub use proving::{blueprint, decompose, falsification, formal_generate, portfolio, retry, router};
 pub use critique::{critic, guard, plan_history, taint};
