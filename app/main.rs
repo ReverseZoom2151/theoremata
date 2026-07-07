@@ -16,8 +16,8 @@ mod tui;
 // paths unchanged — the physical layout is by component, the namespace is flat.
 pub use graph::{db, model, scheduler};
 pub use reason::{
-    agent, chat, consolidate, critic, guard, mcts, observe, research, retry, router, sampler,
-    sampling, team, workflow,
+    agent, chat, consolidate, critic, falsification, guard, mcts, observe, research, retry, router,
+    sampler, sampling, team, workflow,
 };
 pub use verify::{hardening, lean_session};
 

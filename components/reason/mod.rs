@@ -4,6 +4,7 @@ pub mod agent;
 pub mod chat;
 pub mod consolidate;
 pub mod critic;
+pub mod falsification;
 pub mod guard;
 pub mod mcts;
 pub mod observe;
