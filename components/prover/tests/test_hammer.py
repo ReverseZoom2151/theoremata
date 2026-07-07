@@ -6,6 +6,9 @@ explicitly to be robust even if a driver happens to be on ``PATH``.
 """
 from __future__ import annotations
 
+import os
+import re
+
 import pytest
 
 from theoremata_tools import hammer
@@ -212,3 +215,98 @@ def test_run_dispatch_passes_context():
     )
     assert out["tier"] == "full"
     assert out["provers_tried"] == hammer._ROCQ_ATP_PROVERS
+
+
+# --------------------------------------------------------------------------- #
+# Sledgehammer output parsing (offline, deterministic).
+# --------------------------------------------------------------------------- #
+def test_parse_sledgehammer_strips_millisecond_timing():
+    out = "Sledgehammering...\ne: Try this: by auto (0.3 ms)\n"
+    assert hammer._parse_sledgehammer(out) == "by auto"
+
+
+def test_parse_sledgehammer_using_form():
+    out = "e: Try this: using one_add_one by blast (0.4 ms)\n"
+    assert hammer._parse_sledgehammer(out) == "using one_add_one by blast"
+
+
+def test_parse_sledgehammer_metis_and_seconds():
+    out = "vampire: Try this: by (metis add.commute one_add_one) (1.2 s)\n"
+    assert hammer._parse_sledgehammer(out) == "by (metis add.commute one_add_one)"
+
+
+def test_parse_sledgehammer_no_reconstruction():
+    assert hammer._parse_sledgehammer("e found a proof...\nDuplicate proof\n") is None
+
+
+def test_parse_sledgehammer_takes_first():
+    out = (
+        "e: Try this: by simp (1 ms)\n"
+        "e: Try this: by linarith (11 ms)\n"
+    )
+    assert hammer._parse_sledgehammer(out) == "by simp"
+
+
+# --------------------------------------------------------------------------- #
+# WSL path translation (Windows-only; the real toolchains live in WSL Ubuntu).
+# --------------------------------------------------------------------------- #
+@pytest.mark.skipif(os.name != "nt", reason="Windows->WSL path form")
+def test_win_to_wsl_path():
+    assert hammer._win_to_wsl_path(r"C:\Users\x\Scratch.thy") == (
+        "/mnt/c/Users/x/Scratch.thy"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Real-mode gating: rocq (CoqHammer absent) and lean (no aesop project) must
+# degrade to mock with a clear, actionable note -- never raise.
+# --------------------------------------------------------------------------- #
+def test_rocq_real_notes_missing_coqhammer(monkeypatch):
+    # A coqc exists, but the CoqHammer plugin does not -> mock + opam hint.
+    monkeypatch.setattr(
+        hammer, "_command_for", lambda s: "coqc" if s == "rocq" else None
+    )
+    monkeypatch.setattr(
+        hammer, "_coqhammer_plugin_available", lambda cmd, full: False
+    )
+    out = hammer.run_hammer("rocq", TRIVIAL, mode="real")
+    assert out["mode"] == "mock"
+    assert out["requested_mode"] == "real"
+    assert "opam install coq-hammer" in out["message"]
+    assert out["tier"] == "pure"
+    assert out["success"] is True  # trivial goal still reconstructs in mock
+
+
+def test_lean_real_gated_without_project(monkeypatch):
+    monkeypatch.setattr(
+        hammer, "_command_for", lambda s: "lean" if s == "lean" else None
+    )
+    monkeypatch.delenv("THEOREMATA_LEAN_PROJECT", raising=False)
+    out = hammer.run_hammer("lean", TRIVIAL, mode="real")
+    assert out["mode"] == "mock"
+    assert "real mode unavailable" in out["message"]
+    assert "THEOREMATA_LEAN_PROJECT" in out["message"] or "aesop" in out["message"]
+
+
+# --------------------------------------------------------------------------- #
+# LIVE Sledgehammer: runs only when Isabelle is probeable (else skipped). Asserts
+# a kernel-checked `by (...)`-style reconstruction comes back for a trivial goal.
+# --------------------------------------------------------------------------- #
+@pytest.mark.skipif(
+    not hammer.tool_available("isabelle"),
+    reason="Isabelle/Sledgehammer not available on this machine",
+)
+def test_live_sledgehammer_reconstructs_trivial_goal():
+    out = hammer.run_hammer(
+        "isabelle",
+        "1 + 1 = (2::nat)",
+        mode="real",
+        timeout=30,
+        context={"provers": ["e"]},  # E is bundled with Isabelle2025-2
+    )
+    assert out["ok"] is True
+    assert out["mode"] == "live"
+    assert out["success"] is True
+    assert out["kernel_checked"] is True
+    tactic = out["reconstructed_tactic"]
+    assert tactic and re.search(r"\bby\b", tactic), tactic

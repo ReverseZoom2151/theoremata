@@ -20,9 +20,12 @@ Two execution modes
   Returns a reconstruction for a trivial goal and ``success: False`` for a
   nonsense/unprovable goal. ``kernel_checked`` is always ``True`` because the
   reconstruction *would* be re-checked by the kernel.
-* **real**: invokes the actual tool (documented per backend). Selected
-  automatically when the tool is probed on ``PATH`` (or via an env override);
-  otherwise the adapter falls back to mock and reports the mode it used.
+* **real**: invokes the actual tool (Sledgehammer via ``isabelle
+  process_theories``, CoqHammer via ``coqc``, aesop via ``lake env lean`` --
+  natively or, on Windows, through WSL Ubuntu). Selected automatically when the
+  tool is probed (``PATH``, WSL, or an env override). A successful live run
+  reports ``mode: "live"``; if the toolchain cannot be invoked the adapter
+  degrades to mock and says so (never raises).
 
 Rocq's two-tier split (modelled explicitly, see ``context["tier"]``)
 --------------------------------------------------------------------
@@ -57,6 +60,7 @@ Uses the Python standard library only.
 """
 from __future__ import annotations
 
+import functools
 import os
 import re
 import shutil
@@ -69,6 +73,22 @@ from typing import Any, Optional
 # Constants.
 # --------------------------------------------------------------------------- #
 DEFAULT_TIMEOUT = 30
+
+# True on native Windows, where the real toolchains live inside WSL Ubuntu and
+# must be reached through ``wsl.exe`` with Windows->/mnt path translation.
+_IS_WINDOWS = os.name == "nt"
+
+# WSL distro + in-WSL tool locations (overridable via env). The Isabelle path
+# keeps a literal ``$HOME`` so it resolves per-user inside the login shell.
+_WSL_DISTRO = os.environ.get("THEOREMATA_WSL_DISTRO", "Ubuntu")
+_ISABELLE_WSL_PATH = os.environ.get(
+    "THEOREMATA_ISABELLE_WSL_PATH", "$HOME/Isabelle2025-2/bin/isabelle"
+)
+# Prefix marking a ``_command_for`` result that must be run through WSL.
+_WSL_PREFIX = "wsl:"
+# Extra wall-clock head-room over the Sledgehammer soft timeout: HOL heap load
+# + process start-up cost of a cold ``isabelle process_theories`` run.
+_ISABELLE_STARTUP_BUDGET = 150
 
 # Canonical backend identifiers and their aliases.
 _SYSTEM_ALIASES = {
@@ -117,22 +137,63 @@ def normalize_system(system: str) -> str:
     return _SYSTEM_ALIASES[key]
 
 
+def _wsl_available() -> bool:
+    """True if a ``wsl.exe`` launcher is discoverable (Windows only)."""
+    return _IS_WINDOWS and bool(shutil.which("wsl.exe") or shutil.which("wsl"))
+
+
+@functools.lru_cache(maxsize=None)
+def _wsl_probe(check_cmd: str) -> bool:
+    """Run ``bash -lc <check_cmd>`` in WSL; True iff it exits 0.
+
+    Cached: toolchain presence is stable for the life of the process, and the
+    probe spawns a real ``wsl.exe`` (~1s cold), so we must not repeat it per
+    call. ``wsl.exe`` is invoked directly (no intermediate shell), so ``$HOME``
+    and friends expand normally.
+    """
+    if not _wsl_available():
+        return False
+    try:
+        proc = subprocess.run(
+            ["wsl.exe", "-d", _WSL_DISTRO, "--", "bash", "-lc", check_cmd],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
 def _command_for(system: str) -> Optional[str]:
     """Return the live driver command for ``system`` if one is available.
 
-    Honours an explicit env override first, then probes ``PATH``. Returns
-    ``None`` when nothing is available (-> mock).
+    Honours an explicit env override first, then probes ``PATH`` (native), then
+    probes WSL Ubuntu (the real toolchains live there on this Windows box). A
+    result prefixed ``wsl:`` denotes a command to be run through ``wsl.exe``.
+    Returns ``None`` when nothing is available (-> mock).
     """
     if system == "isabelle":
-        return os.environ.get("THEOREMATA_ISABELLE_COMMAND") or shutil.which(
-            "isabelle"
-        )
+        override = os.environ.get("THEOREMATA_ISABELLE_COMMAND")
+        if override:
+            return override
+        native = shutil.which("isabelle")
+        if native:
+            return native
+        if _wsl_probe(f'test -x "{_ISABELLE_WSL_PATH}"'):
+            return _WSL_PREFIX + _ISABELLE_WSL_PATH
+        return None
     if system == "rocq":
-        return (
-            os.environ.get("THEOREMATA_ROCQ_COMMAND")
-            or shutil.which("rocq")
-            or shutil.which("coqc")
-        )
+        override = os.environ.get("THEOREMATA_ROCQ_COMMAND")
+        if override:
+            return override
+        native = shutil.which("rocq") or shutil.which("coqc")
+        if native:
+            return native
+        if _wsl_probe("command -v coqc >/dev/null 2>&1"):
+            return _WSL_PREFIX + "coqc"
+        return None
     if system == "lean":
         return (
             os.environ.get("THEOREMATA_LEAN_COMMAND")
@@ -140,6 +201,49 @@ def _command_for(system: str) -> Optional[str]:
             or shutil.which("lean")
         )
     return None
+
+
+def _win_to_wsl_path(path: str) -> str:
+    """Translate a Windows path (``C:\\a\\b``) to its WSL form (``/mnt/c/a/b``)."""
+    ap = os.path.abspath(path)
+    drive, rest = os.path.splitdrive(ap)
+    rest = rest.replace("\\", "/")
+    if drive and len(drive) >= 2 and drive[1] == ":":
+        return f"/mnt/{drive[0].lower()}{rest}"
+    return ap.replace("\\", "/")
+
+
+def _wsl_bash(script_body: str, wall_timeout: int) -> "tuple[int, str]":
+    """Run a bash script in WSL and return ``(returncode, stdout+stderr)``.
+
+    The script is executed from a temp **file** (``bash <file>``) rather than
+    ``bash -lc <string>``: passing a multi-line script inline through the
+    ``wsl.exe`` argument layer silently drops command substitutions
+    (``D=$(mktemp -d)`` yields an empty ``D``), whereas a script file behaves
+    normally. Written with LF newlines for the Linux side. Raises
+    ``HammerUnavailable`` on spawn/timeout failure (-> graceful mock fallback).
+    """
+    fd, spath = tempfile.mkstemp(suffix=".sh")
+    os.close(fd)
+    try:
+        with open(spath, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(script_body)
+        try:
+            proc = subprocess.run(
+                ["wsl.exe", "-d", _WSL_DISTRO, "--", "bash", _win_to_wsl_path(spath)],
+                capture_output=True,
+                text=True,
+                timeout=wall_timeout,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise HammerUnavailable(f"wsl invocation failed: {exc}") from exc
+        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+    finally:
+        try:
+            os.unlink(spath)
+        except OSError:
+            pass
 
 
 def tool_available(system: str) -> bool:
@@ -388,41 +492,106 @@ def _run_subprocess(cmd: list[str], stdin: str, timeout: int) -> str:
     return (proc.stdout or "") + (proc.stderr or "")
 
 
+def _isabelle_theory_text(goal: str, provers: list[str], timeout: int) -> str:
+    """Build a self-contained ``Scratch.thy`` that fires Sledgehammer.
+
+    ``oops`` abandons the (still-open) goal after Sledgehammer has run, so the
+    theory always processes cleanly regardless of whether we reconstruct -- we
+    only care about the ``Try this: ...`` diagnostics it emits.
+    """
+    prover_opt = " ".join(provers)
+    return (
+        "theory Scratch\n"
+        "  imports Main\n"
+        "begin\n"
+        f'theorem sledgehammer_goal: "{goal}"\n'
+        f'  sledgehammer [provers = "{prover_opt}", timeout = {timeout}]\n'
+        "  oops\n"
+        "end\n"
+    )
+
+
+def _parse_sledgehammer(out: str) -> Optional[str]:
+    """Extract the first reconstructed tactic from Sledgehammer's output.
+
+    Lines look like ``e: Try this: by auto (0.3 ms)`` or
+    ``Try this: by (metis one_add_one) (12 ms)`` or
+    ``e: Try this: using one_add_one by blast (0.2 ms)``. We strip the trailing
+    ``(<time> ms|s)`` preplay annotation and return the bare Isar method.
+    """
+    for match in re.finditer(r"Try this:\s*(.+)", out):
+        cand = match.group(1).strip()
+        cand = re.sub(r"\s*\(\s*[\d.]+\s*(?:ms|s)\s*\)\s*$", "", cand).strip()
+        # Guard against a bare "Duplicate proof" / empty capture.
+        if cand and re.search(r"\b(by|using|unfolding|apply)\b", cand):
+            return cand
+    return None
+
+
+def _run_isabelle(theory_text: str, wall_timeout: int) -> str:
+    """Write ``Scratch.thy`` and run ``isabelle process_theories -O`` on it.
+
+    Native (Linux/PATH) invocation runs the ``isabelle`` binary directly. On
+    Windows the binary lives in WSL, so we translate the temp file to its
+    ``/mnt/...`` path, copy it into a fresh in-WSL scratch dir (native FS avoids
+    ``/mnt`` line-ending/permission quirks) and run there via ``wsl.exe``.
+    """
+    command = _command_for("isabelle")
+    if not command:
+        raise HammerUnavailable("no isabelle command")
+    with tempfile.TemporaryDirectory() as tmp:
+        thy_path = os.path.join(tmp, "Scratch.thy")
+        # LF newlines: the theory is consumed by Isabelle inside WSL/Linux.
+        with open(thy_path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(theory_text)
+        if command.startswith(_WSL_PREFIX):
+            isa = command[len(_WSL_PREFIX):]
+            mnt = _win_to_wsl_path(thy_path)
+            # Copy the theory onto WSL's native FS (mktemp dir) before running,
+            # sidestepping /mnt line-ending/permission quirks.
+            script = (
+                "set -e\n"
+                f'ISA="{isa}"\n'
+                "D=$(mktemp -d)\n"
+                f'cp "{mnt}" "$D/Scratch.thy"\n'
+                '"$ISA" process_theories -O -D "$D" Scratch\n'
+            )
+            _rc, out = _wsl_bash(script, wall_timeout)
+            return out
+        out = _run_subprocess(
+            [command, "process_theories", "-O", "-D", tmp, "Scratch"],
+            "",
+            wall_timeout,
+        )
+        return out
+
+
 def _real_isabelle(
     goal_or_state: Any,
     context: dict[str, Any],
     timeout: int,
     requested_mode: Optional[str],
 ) -> dict[str, Any]:
-    """Drive Sledgehammer headlessly.
+    """Drive Sledgehammer headlessly and return a kernel-checked reconstruction.
 
-    Live call (documented): write a ``Scratch.thy`` whose lemma body is::
-
-        lemma goal: "<GOAL>"
-          sledgehammer [provers = "<provers>", timeout = <t>]
-
-    and submit it to the Isabelle Server (``session_start {"session":"HOL"}``
-    then ``use_theories``), or run ``isabelle process``; then read the
-    ``Try this: by (metis ...)`` line out of the returned ``messages``. Here we
-    invoke the configured ``isabelle`` command and parse its stdout.
+    Writes a ``Scratch.thy`` with ``sledgehammer [provers = ..., timeout = t]``
+    at the goal, runs it through ``isabelle process_theories -O`` (natively or
+    via WSL), and parses the ``Try this: by (metis ...)`` / ``by (smt ...)`` /
+    ``by auto`` / ``using ... by ...`` line out of the emitted diagnostics. The
+    returned method is a native Isar proof re-checked by Isabelle's own kernel;
+    the external ATP is only a hint oracle.
     """
     command = _command_for("isabelle")
     if not command:
         raise HammerUnavailable("no isabelle command")
     provers = list(context.get("provers") or _ISABELLE_PROVERS)
     goal = _goal_text(goal_or_state)
-    with tempfile.TemporaryDirectory() as tmp:
-        thy = os.path.join(tmp, "Scratch.thy")
-        with open(thy, "w", encoding="utf-8") as fh:
-            fh.write(
-                "theory Scratch\n  imports Main\nbegin\n"
-                f'lemma goal: "{goal}"\n'
-                f'  sledgehammer [provers = "{" ".join(provers)}", '
-                f"timeout = {timeout}]\nend\n"
-            )
-        out = _run_subprocess([command, "process", "-T", "Scratch"], "", timeout)
-    match = re.search(r"Try this:\s*(by \([^\n]*\)|by [^\n]+)", out)
-    tactic = match.group(1).strip() if match else None
+    theory_text = _isabelle_theory_text(goal, provers, timeout)
+    # Generous wall-clock budget: the Sledgehammer soft timeout plus HOL-heap
+    # load + process start-up. A wall-clock overrun surfaces as HammerUnavailable
+    # (-> graceful mock fallback), never a raise to the caller.
+    out = _run_isabelle(theory_text, timeout + _ISABELLE_STARTUP_BUDGET)
+    tactic = _parse_sledgehammer(out)
     return _result(
         system="isabelle",
         tool="sledgehammer",
@@ -430,13 +599,51 @@ def _real_isabelle(
         reconstructed_tactic=tactic,
         provers_tried=provers,
         message=(
-            "Sledgehammer: reconstructed via preplay."
+            f"Sledgehammer: reconstructed `{tactic}` via preplay (kernel-checked)."
             if tactic
-            else "Sledgehammer: no reconstruction in output."
+            else "Sledgehammer: no reconstruction found in output."
         ),
-        mode="real",
+        mode="live",
         requested_mode=requested_mode,
     )
+
+
+@functools.lru_cache(maxsize=None)
+def _coqhammer_plugin_available(command: str, full: bool) -> bool:
+    """True iff the CoqHammer plugin required for ``tier`` compiles.
+
+    Pure tier needs ``coq-hammer-tactics`` (the ``Tactics`` module ->
+    ``sauto``/``hauto``); full tier additionally needs ``coq-hammer`` (the
+    ``Hammer`` module -> ``hammer`` + ATPs). We compile a one-line probe ``.v``
+    that just ``Require``s the module(s); a non-zero ``coqc`` exit means the
+    plugin is absent (``opam install coq-hammer[-tactics]`` needed).
+    """
+    require = (
+        "From Hammer Require Import Hammer Tactics."
+        if full
+        else "From Hammer Require Import Tactics."
+    )
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            vfile = os.path.join(tmp, "Probe.v")
+            with open(vfile, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(require + "\n")
+            if command.startswith(_WSL_PREFIX):
+                coqc = command[len(_WSL_PREFIX):]
+                rc, _out = _wsl_bash(
+                    f'{coqc} "{_win_to_wsl_path(vfile)}"\n', 90
+                )
+                return rc == 0
+            proc = subprocess.run(
+                [command, vfile],
+                capture_output=True,
+                text=True,
+                timeout=90,
+                check=False,
+            )
+            return proc.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def _real_rocq(
@@ -445,31 +652,50 @@ def _real_rocq(
     timeout: int,
     requested_mode: Optional[str],
 ) -> dict[str, Any]:
-    """Drive CoqHammer headlessly.
+    """Drive CoqHammer headlessly (pure ``sauto`` tier vs full ``hammer`` tier).
 
-    Live call (documented): compile a ``.v`` with ``From Hammer Require Import
-    Hammer Tactics.`` and either the pure-tier ``sauto``/``best`` (no ATP) or,
-    for the full tier, ``hammer`` (which fires Vampire/E/Z3/cvc4 then prints a
-    reconstruction tactic to substitute). We invoke ``rocq compile``/``coqc``
-    and parse the reconstruction line.
+    Live call: compile a ``.v`` with ``From Hammer Require Import Hammer
+    Tactics.`` and either the pure-tier ``sauto``/``best`` (no ATP) or the
+    full-tier ``hammer`` (fires Vampire/E/Z3/cvc4, prints a reconstruction
+    tactic to substitute). On this box CoqHammer is **not** installed, so the
+    plugin probe fails and we raise ``HammerUnavailable`` (-> graceful mock
+    fallback) with a note that ``opam install coq-hammer`` is required.
     """
     command = _command_for("rocq")
     if not command:
-        raise HammerUnavailable("no rocq command")
+        raise HammerUnavailable("no rocq command (coqc/rocq)")
     tier = str(context.get("tier", "pure")).lower()
     full = tier == "full"
+    if not _coqhammer_plugin_available(command, full):
+        pkg = "coq-hammer" if full else "coq-hammer-tactics"
+        raise HammerUnavailable(
+            f"CoqHammer not installed for the {tier} tier "
+            f"(run `opam install {pkg}`)"
+        )
     provers = list(context.get("provers") or (_ROCQ_ATP_PROVERS if full else []))
     tactic_cmd = "hammer" if full else ("best" if context.get("best") else "sauto")
     goal = _goal_text(goal_or_state)
+    require = (
+        "From Hammer Require Import Hammer Tactics."
+        if full
+        else "From Hammer Require Import Tactics."
+    )
+    vtext = (
+        f"{require}\n"
+        + (f"Set Hammer ATPLimit {timeout}.\n" if full else "")
+        + f"Lemma goal : {goal}.\nProof. {tactic_cmd}. Qed.\n"
+    )
     with tempfile.TemporaryDirectory() as tmp:
         vfile = os.path.join(tmp, "Generated.v")
-        with open(vfile, "w", encoding="utf-8") as fh:
-            fh.write(
-                "From Hammer Require Import Hammer Tactics.\n"
-                f"Set Hammer ATPLimit {timeout}.\n"
-                f"Lemma goal : {goal}.\nProof. {tactic_cmd}. Qed.\n"
+        with open(vfile, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(vtext)
+        if command.startswith(_WSL_PREFIX):
+            coqc = command[len(_WSL_PREFIX):]
+            _rc, out = _wsl_bash(
+                f'{coqc} "{_win_to_wsl_path(vfile)}"\n', timeout + 60
             )
-        out = _run_subprocess([command, vfile], "", timeout)
+        else:
+            out = _run_subprocess([command, vfile], "", timeout + 60)
     # `hammer` prints e.g. "Replace the hammer tactic with: hauto use: ...".
     match = re.search(
         r"(?:Replace the hammer tactic with:?\s*)?((?:s?auto|hauto|qauto|best)"
@@ -488,7 +714,7 @@ def _real_rocq(
         provers_tried=provers,
         message="CoqHammer: reconstruction accepted." if success else
         "CoqHammer: no reconstruction / kernel error.",
-        mode="real",
+        mode="live",
         requested_mode=requested_mode,
         tier=tier,
     )
@@ -500,27 +726,40 @@ def _real_lean(
     timeout: int,
     requested_mode: Optional[str],
 ) -> dict[str, Any]:
-    """Drive ``aesop?`` headlessly.
+    """Drive ``aesop?`` headlessly -- gated on a Lean project exposing aesop.
 
-    Live call (documented): elaborate a ``.lean`` proving the goal ``by aesop?``
-    under ``lake env lean`` (Mathlib on ``LEAN_PATH``); ``aesop?`` prints a
-    ``Try this: <script>`` line that is the kernel-checked reconstruction.
-    Duper/LeanHammer would be wired here as the external-ATP alternative.
+    ``aesop`` is not in the Lean core; it ships with Mathlib and must be
+    elaborated inside a Lake project whose dependencies expose it. Bare
+    ``lean``/``lake`` on ``PATH`` cannot run it, so we require an explicit
+    project via ``THEOREMATA_LEAN_PROJECT`` (a Lake workspace dir with
+    aesop/Mathlib on ``LEAN_PATH``). Without it we raise ``HammerUnavailable``
+    (-> graceful mock fallback) noting the gate.
+
+    When a project is supplied: elaborate a ``.lean`` proving the goal
+    ``by aesop?`` under ``lake env lean``; ``aesop?`` prints ``Try this:
+    <script>`` -- the kernel-checked reconstruction. Duper/LeanHammer would be
+    the external-ATP alternative wired at the same seam.
     """
     command = _command_for("lean")
     if not command:
-        raise HammerUnavailable("no lean command")
+        raise HammerUnavailable("no lean command (lake/lean)")
+    project = os.environ.get("THEOREMATA_LEAN_PROJECT")
+    if not project or not os.path.isdir(project):
+        raise HammerUnavailable(
+            "aesop requires a Lean project exposing aesop/Mathlib; set "
+            "THEOREMATA_LEAN_PROJECT to a Lake workspace (bare Lean lacks aesop)"
+        )
     goal = _goal_text(goal_or_state)
     with tempfile.TemporaryDirectory() as tmp:
         lean_file = os.path.join(tmp, "Generated.lean")
-        with open(lean_file, "w", encoding="utf-8") as fh:
+        with open(lean_file, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(f"import Mathlib\n\nexample : {goal} := by\n  aesop?\n")
         argv = (
             [command, "env", "lean", lean_file]
             if os.path.basename(command).startswith("lake")
             else [command, lean_file]
         )
-        out = _run_subprocess(argv, "", timeout)
+        out = _run_subprocess(argv, "", timeout + 60)
     match = re.search(r"Try this:\s*([^\n]+)", out)
     tactic = match.group(1).strip() if match else None
     return _result(
@@ -530,11 +769,11 @@ def _real_lean(
         reconstructed_tactic=tactic,
         provers_tried=[],
         message=(
-            "aesop?: reconstructed script."
+            f"aesop?: reconstructed script `{tactic}`."
             if tactic
             else "aesop?: no script emitted."
         ),
-        mode="real",
+        mode="live",
         requested_mode=requested_mode,
     )
 
