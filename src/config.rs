@@ -22,6 +22,11 @@ pub struct Config {
     /// formal statements, formal/verified nodes) always require a human.
     #[serde(default)]
     pub auto_approve_safe: bool,
+    /// Run the LeanParanoia hardening step on certification. Off by default:
+    /// the first `lake build` in a fresh workspace resolves Mathlib's transitive
+    /// git dependencies over the network and has no timeout.
+    #[serde(default)]
+    pub harden_proofs: bool,
 }
 
 fn default_lean_project() -> Option<PathBuf> {
@@ -39,6 +44,7 @@ impl Default for Config {
             command_timeout_seconds: 60,
             lean_project: default_lean_project(),
             auto_approve_safe: false,
+            harden_proofs: false,
         }
     }
 }

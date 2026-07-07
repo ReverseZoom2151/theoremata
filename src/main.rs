@@ -1,12 +1,16 @@
+mod agent;
 mod chat;
 mod config;
 mod critic;
 mod db;
+mod hardening;
+mod lean_session;
 mod model;
 mod provider;
 mod research;
 mod retry;
 mod router;
+mod sampling;
 mod scheduler;
 mod tools;
 mod tui;
@@ -199,6 +203,13 @@ enum Command {
     },
     LeanWarm {
         request: String,
+    },
+    Agent {
+        project: String,
+    },
+    Harden {
+        project: String,
+        node: String,
     },
     Research {
         project: String,
@@ -544,6 +555,31 @@ fn main() -> Result<()> {
             let mut request: serde_json::Value = serde_json::from_str(&request)?;
             request["tool"] = serde_json::json!("lean_warm");
             print_value(true, &PythonCheck::new().run(request)?)?
+        }
+        Command::Agent { project } => print_value(
+            true,
+            &agent::AgentLoop {
+                store: &store,
+                config: &config,
+                provider: provider.as_ref(),
+            }
+            .run(&project)?,
+        )?,
+        Command::Harden {
+            project,
+            node,
+        } => {
+            let target = store
+                .nodes(&project)?
+                .into_iter()
+                .find(|n| n.id == node)
+                .ok_or_else(|| anyhow::anyhow!("node not found: {node}"))?;
+            let source = target.formal_statement.clone().unwrap_or_default();
+            let module = format!("N{}", node.replace('-', "").chars().take(8).collect::<String>());
+            print_value(
+                true,
+                &hardening::harden(&store, &config, &project, &node, &module, &source)?,
+            )?
         }
         Command::Research { project } => print_value(
             true,
