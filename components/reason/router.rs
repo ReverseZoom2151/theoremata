@@ -134,6 +134,8 @@ mod tests {
             parent_id: None,
             strategy_hint: None,
             suggested_lemmas: Vec::new(),
+            stmt_formalized: false,
+            proof_done: false,
             created_at: now,
             updated_at: now,
         }

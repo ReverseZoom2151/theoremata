@@ -244,6 +244,8 @@ mod tests {
             parent_id: None,
             strategy_hint: None,
             suggested_lemmas: Vec::new(),
+            stmt_formalized: false,
+            proof_done: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -257,6 +259,7 @@ mod tests {
             target_id: target.into(),
             kind: EdgeKind::DependsOn,
             evidence_strength: crate::model::EdgeStrength::NumericScreen,
+            dep_scope: crate::model::DepScope::Statement,
             created_at: Utc::now(),
         }
     }

@@ -347,19 +347,23 @@ impl AgentLoop<'_> {
                     store: self.store,
                     provider: self.provider,
                 }
-                .run(project_id, run, &node.statement)?;
+                .run(project_id, run, &node.statement, self.config.node_granularity)?;
                 if obligations.is_empty() {
                     return Ok("noop");
                 }
-                for (title, statement) in obligations {
+                for ob in obligations {
+                    // A decomposed obligation may itself expand into helper
+                    // sub-lemmas later; carry the typed-claim / transfer-schema
+                    // tags forward as a strategy hint for the prover.
+                    let hint = decompose_hint(&ob);
                     let child = self.store.add_node_detailed(
                         project_id,
                         NodeKind::Obligation,
                         NodeTier::Implementation,
                         Some(&node.id),
-                        &title,
-                        &statement,
-                        None,
+                        &ob.title,
+                        &ob.statement,
+                        hint.as_deref(),
                         &[],
                         "agent:decompose",
                     )?;
@@ -544,6 +548,21 @@ impl AgentLoop<'_> {
         };
         Ok((compiles, axioms_clean))
     }
+}
+
+/// Fold an obligation's typed-claim / transfer-schema tags into a strategy hint
+/// (or `None` when the model tagged neither), so the prover sees how the claim
+/// should be approached.
+fn decompose_hint(ob: &crate::decompose::Obligation) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(kind) = ob.claim_kind {
+        parts.push(format!("claim: {kind}"));
+    }
+    if !ob.ingredients.is_empty() {
+        let names: Vec<String> = ob.ingredients.iter().map(|i| i.to_string()).collect();
+        parts.push(format!("ingredients: {}", names.join(", ")));
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
 }
 
 /// Extract the first declared theorem/lemma name from a Lean source.

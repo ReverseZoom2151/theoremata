@@ -1,6 +1,7 @@
 //! Orchestration and reasoning: the workflows, the autonomous agent loop, the
 //! research/critic/router/sampling/retry building blocks, and chat.
 pub mod agent;
+pub mod blueprint;
 pub mod chat;
 pub mod consolidate;
 pub mod critic;

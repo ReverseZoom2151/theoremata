@@ -163,6 +163,195 @@ impl FromStr for EdgeStrength {
     }
 }
 
+/// leanblueprint places `\uses` independently on a statement and inside its
+/// proof, so a dependency edge is either a *statement* dependency (needed even
+/// to state the claim), a *proof* dependency (needed only to close the proof),
+/// or both (the key appears in both `\uses` lists). Legacy edges — created
+/// before the split existed — default to `statement`, the conservative choice.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DepScope {
+    Statement,
+    Proof,
+    Both,
+}
+
+impl DepScope {
+    /// Merge two scopes: a key used at both statement and proof level becomes
+    /// `Both`. Used when ingesting a blueprint node whose statement and proof
+    /// both `\uses` the same target.
+    pub fn merge(self, other: DepScope) -> DepScope {
+        if self == other {
+            self
+        } else {
+            DepScope::Both
+        }
+    }
+}
+
+impl fmt::Display for DepScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            serde_json::to_value(self).unwrap().as_str().unwrap()
+        )
+    }
+}
+
+impl FromStr for DepScope {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(serde_json::from_value(serde_json::Value::String(
+            s.to_owned(),
+        ))?)
+    }
+}
+
+/// MathResearchPrompts typed-claim taxonomy (arXiv:2512.09443, template §5): the
+/// kind of assertion an obligation makes. Attaching it to obligations lets the
+/// router/critic reason about how a claim should be checked (e.g. an
+/// `Obstruction`/`Counterexample` claim is a disproof, a `Convergence` claim
+/// wants a rate argument).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClaimKind {
+    Invariant,
+    NormIdentity,
+    ScalarRecursion,
+    Spectral,
+    Convergence,
+    Stability,
+    NormalForm,
+    Obstruction,
+    Counterexample,
+}
+
+impl ClaimKind {
+    /// Parse a free-form label from a model ("norm identity", "Scalar_Recursion",
+    /// "spectral property") leniently: normalise spaces/underscores to hyphens,
+    /// lowercase, and drop a trailing descriptor word so "convergence guarantee"
+    /// and "stability statement" resolve. Returns `None` for unrecognised text.
+    pub fn from_label(label: &str) -> Option<ClaimKind> {
+        let norm = label.trim().to_ascii_lowercase().replace([' ', '_'], "-");
+        let canonical = match norm.as_str() {
+            "invariant" => "invariant",
+            "norm-identity" | "norm-identities" => "norm-identity",
+            "scalar-recursion" | "scalar-recurrence" => "scalar-recursion",
+            "spectral" | "spectral-property" => "spectral",
+            "convergence" | "convergence-guarantee" => "convergence",
+            "stability" | "stability-statement" => "stability",
+            "normal-form" => "normal-form",
+            "obstruction" => "obstruction",
+            "counterexample" | "counterexample-family" => "counterexample",
+            _ => return None,
+        };
+        serde_json::from_value(serde_json::Value::String(canonical.to_owned())).ok()
+    }
+}
+
+impl fmt::Display for ClaimKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            serde_json::to_value(self).unwrap().as_str().unwrap()
+        )
+    }
+}
+
+/// MathResearchPrompts transfer-schema ingredients (template §6): the structural
+/// pieces a decomposer emits when reducing a convergence/optimality theorem —
+/// reduce a theorem to (invariant subspace, progress coordinate, local update,
+/// comparison inequality) and re-instantiate in a nearby setting.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TransferIngredient {
+    InvariantSubspace,
+    GradientPlane,
+    ScalarProgressCoordinate,
+    StructuredLocalUpdate,
+    ComparisonInequality,
+    AdmissibleUpdates,
+}
+
+impl TransferIngredient {
+    /// Lenient parse of a free-form ingredient label (see `ClaimKind::from_label`).
+    pub fn from_label(label: &str) -> Option<TransferIngredient> {
+        let norm = label.trim().to_ascii_lowercase().replace([' ', '_'], "-");
+        let canonical = match norm.as_str() {
+            "invariant-subspace" | "working-invariant-subspace" => "invariant-subspace",
+            "gradient-plane" | "tangent-plane" | "gradient-tangent-plane" => "gradient-plane",
+            "scalar-progress-coordinate" | "progress-coordinate" => "scalar-progress-coordinate",
+            "structured-local-update" | "local-update" => "structured-local-update",
+            "comparison-inequality" => "comparison-inequality",
+            "admissible-updates" => "admissible-updates",
+            _ => return None,
+        };
+        serde_json::from_value(serde_json::Value::String(canonical.to_owned())).ok()
+    }
+}
+
+impl fmt::Display for TransferIngredient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            serde_json::to_value(self).unwrap().as_str().unwrap()
+        )
+    }
+}
+
+/// How finely the decomposer cuts a statement into obligations. The blueprint
+/// DAG is a *dial*: strongpnt uses trivial micro-lemmas (the DAG does the
+/// reasoning), ZkLinalg uses coarse paper-sized nodes. This controls both the
+/// prompt guidance and the hidden-helper fan-out budget.
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, ValueEnum, PartialEq, Eq, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Granularity {
+    /// Few, paper-sized obligations (ZkLinalg-style, ~1.6x fan-out).
+    Coarse,
+    /// Balanced (the default, ~1.8x fan-out).
+    #[default]
+    Medium,
+    /// Many micro-lemmas (strongpnt/Kakeya-style, ~2x fan-out).
+    Fine,
+}
+
+impl Granularity {
+    /// Measured un-blueprinted helper-decl fan-out multiplier per obligation:
+    /// executors invent ~1.8x extra helper decls (Kakeya 2x, RHCurves/strongpnt
+    /// 1.8x, ZkLinalg 1.6x). Finer granularity ⇒ more helpers per node.
+    pub fn fanout_multiplier(self) -> f64 {
+        match self {
+            Granularity::Coarse => 1.6,
+            Granularity::Medium => 1.8,
+            Granularity::Fine => 2.0,
+        }
+    }
+}
+
+impl fmt::Display for Granularity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            serde_json::to_value(self).unwrap().as_str().unwrap()
+        )
+    }
+}
+
+impl FromStr for Granularity {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(serde_json::from_value(serde_json::Value::String(
+            s.to_owned(),
+        ))?)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
@@ -188,6 +377,13 @@ pub struct Node {
     pub parent_id: Option<String>,
     pub strategy_hint: Option<String>,
     pub suggested_lemmas: Vec<String>,
+    /// leanblueprint `\leanok` on the *statement*: the claim has been formalised
+    /// in Lean (its type compiles), independent of whether its proof is done.
+    pub stmt_formalized: bool,
+    /// leanblueprint `\leanok` inside the *proof*: the proof is complete (no
+    /// `sorry`). A node can be `stmt_formalized` but not `proof_done` — exactly
+    /// the state a blueprint→formalize pipeline lives in.
+    pub proof_done: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -200,6 +396,9 @@ pub struct Edge {
     pub target_id: String,
     pub kind: EdgeKind,
     pub evidence_strength: EdgeStrength,
+    /// Whether this dependency is required to *state* the target, to *prove* it,
+    /// or both — the leanblueprint statement-vs-proof `\uses` split.
+    pub dep_scope: DepScope,
     pub created_at: DateTime<Utc>,
 }
 

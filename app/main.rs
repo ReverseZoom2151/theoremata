@@ -16,8 +16,8 @@ mod tui;
 // paths unchanged — the physical layout is by component, the namespace is flat.
 pub use graph::{db, model, scheduler};
 pub use reason::{
-    agent, chat, consolidate, critic, decompose, falsification, guard, mcts, observe, research,
-    retry, router, sampler, sampling, team,
+    agent, blueprint, chat, consolidate, critic, decompose, falsification, guard, mcts, observe,
+    research, retry, router, sampler, sampling, team,
 };
 pub use verify::{hardening, lean_session};
 
@@ -204,6 +204,27 @@ enum Command {
     },
     LeanWarm {
         request: String,
+    },
+    /// Call any Python worker tool with a raw JSON request (e.g.
+    /// `{"tool":"benchmark","request":{"op":"list"}}`).
+    Tool {
+        request: String,
+    },
+    /// Export a project's proof-DAG to a leanblueprint `content.tex` + `lean_decls`.
+    BlueprintExport {
+        project: String,
+        out_dir: PathBuf,
+    },
+    /// Import a leanblueprint `content.tex` into a project's proof-DAG.
+    BlueprintImport {
+        project: String,
+        file: PathBuf,
+    },
+    /// Referential-integrity gate: check every blueprint `\lean{}` decl resolves.
+    Checkdecls {
+        workspace: PathBuf,
+        #[arg(long)]
+        manifest: Option<PathBuf>,
     },
     Agent {
         project: String,
@@ -577,6 +598,44 @@ fn main() -> Result<()> {
             let mut request: serde_json::Value = serde_json::from_str(&request)?;
             request["tool"] = serde_json::json!("lean_warm");
             print_value(true, &PythonCheck::new().run(request)?)?
+        }
+        Command::Tool { request } => {
+            let request: serde_json::Value = serde_json::from_str(&request)?;
+            print_value(true, &PythonCheck::new().run(request)?)?
+        }
+        Command::BlueprintExport { project, out_dir } => {
+            let export = blueprint::export(&store, &project)?;
+            std::fs::create_dir_all(&out_dir)?;
+            std::fs::write(out_dir.join("content.tex"), &export.content_tex)?;
+            let decls_path = blueprint::lean_decls_path(&out_dir);
+            if let Some(parent) = decls_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let decls_count = export.lean_decls.lines().filter(|l| !l.trim().is_empty()).count();
+            std::fs::write(&decls_path, &export.lean_decls)?;
+            print_value(
+                cli.json,
+                &serde_json::json!({
+                    "content_tex": out_dir.join("content.tex"),
+                    "lean_decls": decls_path,
+                    "decls": decls_count,
+                }),
+            )?
+        }
+        Command::BlueprintImport { project, file } => {
+            let tex = std::fs::read_to_string(&file)?;
+            print_value(true, &blueprint::import(&store, &project, &tex)?)?
+        }
+        Command::Checkdecls { workspace, manifest } => {
+            let manifest = manifest.unwrap_or_else(|| blueprint::lean_decls_path(&workspace));
+            let decls: Vec<String> = std::fs::read_to_string(&manifest)
+                .unwrap_or_default()
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_owned)
+                .collect();
+            print_value(true, &blueprint::check_decls(&workspace, &decls)?)?
         }
         Command::Agent { project } => print_value(
             true,

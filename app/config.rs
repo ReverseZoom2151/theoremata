@@ -27,6 +27,10 @@ pub struct Config {
     /// git dependencies over the network and has no timeout.
     #[serde(default)]
     pub harden_proofs: bool,
+    /// How finely the decomposer cuts a statement into obligations (and how much
+    /// hidden-helper fan-out to budget). Defaults to `medium` (~1.8x).
+    #[serde(default)]
+    pub node_granularity: crate::model::Granularity,
 }
 
 fn default_lean_project() -> Option<PathBuf> {
@@ -45,6 +49,7 @@ impl Default for Config {
             lean_project: default_lean_project(),
             auto_approve_safe: false,
             harden_proofs: false,
+            node_granularity: crate::model::Granularity::default(),
         }
     }
 }

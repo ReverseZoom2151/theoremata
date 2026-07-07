@@ -41,6 +41,8 @@ impl Store {
               tainted INTEGER NOT NULL DEFAULT 0,
               tier TEXT NOT NULL DEFAULT 'spine', parent_id TEXT,
               strategy_hint TEXT, suggested_lemmas TEXT NOT NULL DEFAULT '[]',
+              stmt_formalized INTEGER NOT NULL DEFAULT 0,
+              proof_done INTEGER NOT NULL DEFAULT 0,
               created_at TEXT NOT NULL, updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS edges (
@@ -49,6 +51,7 @@ impl Store {
               source_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
               target_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
               kind TEXT NOT NULL, evidence_strength TEXT NOT NULL DEFAULT 'numeric_screen',
+              dep_scope TEXT NOT NULL DEFAULT 'statement',
               created_at TEXT NOT NULL,
               UNIQUE(source_id, target_id, kind)
             );
@@ -107,6 +110,8 @@ impl Store {
             ("parent_id", "TEXT"),
             ("strategy_hint", "TEXT"),
             ("suggested_lemmas", "TEXT NOT NULL DEFAULT '[]'"),
+            ("stmt_formalized", "INTEGER NOT NULL DEFAULT 0"),
+            ("proof_done", "INTEGER NOT NULL DEFAULT 0"),
         ] {
             if let Err(e) = self
                 .conn
@@ -117,7 +122,10 @@ impl Store {
                 }
             }
         }
-        for (column, decl) in [("evidence_strength", "TEXT NOT NULL DEFAULT 'numeric_screen'")] {
+        for (column, decl) in [
+            ("evidence_strength", "TEXT NOT NULL DEFAULT 'numeric_screen'"),
+            ("dep_scope", "TEXT NOT NULL DEFAULT 'statement'"),
+        ] {
             if let Err(e) = self
                 .conn
                 .execute(&format!("ALTER TABLE edges ADD COLUMN {column} {decl}"), [])
@@ -234,6 +242,8 @@ impl Store {
             parent_id: parent_id.map(str::to_owned),
             strategy_hint: strategy_hint.map(str::to_owned),
             suggested_lemmas: suggested_lemmas.to_vec(),
+            stmt_formalized: false,
+            proof_done: false,
             created_at: now,
             updated_at: now,
         };
@@ -374,6 +384,45 @@ impl Store {
         Ok(())
     }
 
+    /// Set the leanblueprint `\leanok` verification flags for a node: whether
+    /// its *statement* is formalised and whether its *proof* is complete. These
+    /// are independent — a node is commonly statement-formalised with an open
+    /// proof.
+    pub fn set_verification_flags(
+        &self,
+        project_id: &str,
+        node_id: &str,
+        stmt_formalized: bool,
+        proof_done: bool,
+        actor: &str,
+    ) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE nodes SET stmt_formalized=?1,proof_done=?2,updated_at=?3 \
+             WHERE id=?4 AND project_id=?5",
+            params![
+                stmt_formalized as i64,
+                proof_done as i64,
+                Utc::now().to_rfc3339(),
+                node_id,
+                project_id
+            ],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!("node not found: {node_id}"));
+        }
+        self.event(
+            Some(project_id),
+            None,
+            "node.leanok_set",
+            actor,
+            json!({"node_id":node_id,"stmt_formalized":stmt_formalized,"proof_done":proof_done}),
+        )?;
+        Ok(())
+    }
+
+    /// Add a dependency edge with a statement-scoped `\uses` (the conservative
+    /// default). Prefer [`Store::add_edge_scoped`] when the blueprint
+    /// distinguishes statement-deps from proof-deps.
     pub fn add_edge(
         &self,
         project_id: &str,
@@ -381,18 +430,32 @@ impl Store {
         target: &str,
         kind: EdgeKind,
     ) -> Result<()> {
+        self.add_edge_scoped(project_id, source, target, kind, DepScope::Statement)
+    }
+
+    /// Add a dependency edge tagged with its leanblueprint `\uses` scope
+    /// (statement / proof / both). Cycle-checked; taint recomputed.
+    pub fn add_edge_scoped(
+        &self,
+        project_id: &str,
+        source: &str,
+        target: &str,
+        kind: EdgeKind,
+        dep_scope: DepScope,
+    ) -> Result<()> {
         if source == target {
             return Err(anyhow!("self edges are not allowed"));
         }
         self.conn.execute(
-            "INSERT INTO edges(project_id,source_id,target_id,kind,evidence_strength,created_at) \
-             VALUES (?1,?2,?3,?4,?5,?6)",
+            "INSERT INTO edges(project_id,source_id,target_id,kind,evidence_strength,dep_scope,created_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
             params![
                 project_id,
                 source,
                 target,
                 kind.to_string(),
                 EdgeStrength::NumericScreen.to_string(),
+                dep_scope.to_string(),
                 Utc::now().to_rfc3339()
             ],
         ).context("adding edge (nodes must belong to the project and edge must be unique)")?;
@@ -409,7 +472,38 @@ impl Store {
             None,
             "edge.created",
             "user",
-            serde_json::json!({"source":source,"target":target,"kind":kind}),
+            serde_json::json!({"source":source,"target":target,"kind":kind,"dep_scope":dep_scope.to_string()}),
+        )?;
+        Ok(())
+    }
+
+    /// Widen an existing edge's `\uses` scope, merging the new scope into the
+    /// current one (statement + proof ⇒ both). No-op if the edge is absent.
+    pub fn widen_edge_scope(
+        &self,
+        project_id: &str,
+        source: &str,
+        target: &str,
+        kind: EdgeKind,
+        scope: DepScope,
+    ) -> Result<()> {
+        let current: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT dep_scope FROM edges WHERE project_id=?1 AND source_id=?2 \
+                 AND target_id=?3 AND kind=?4",
+                params![project_id, source, target, kind.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(current) = current else {
+            return Ok(());
+        };
+        let merged = current.parse::<DepScope>().unwrap_or(DepScope::Statement).merge(scope);
+        self.conn.execute(
+            "UPDATE edges SET dep_scope=?1 WHERE project_id=?2 AND source_id=?3 \
+             AND target_id=?4 AND kind=?5",
+            params![merged.to_string(), project_id, source, target, kind.to_string()],
         )?;
         Ok(())
     }
@@ -478,7 +572,8 @@ impl Store {
     pub fn nodes(&self, project_id: &str) -> Result<Vec<Node>> {
         let mut st = self.conn.prepare(
             "SELECT id,project_id,kind,status,title,statement,formal_statement,provenance,
-             content_hash,tainted,tier,parent_id,strategy_hint,suggested_lemmas,created_at,updated_at
+             content_hash,tainted,tier,parent_id,strategy_hint,suggested_lemmas,created_at,updated_at,
+             stmt_formalized,proof_done
              FROM nodes WHERE project_id=?1 ORDER BY created_at",
         )?;
         let rows = st.query_map([project_id], node_row)?;
@@ -488,7 +583,7 @@ impl Store {
 
     pub fn edges(&self, project_id: &str) -> Result<Vec<Edge>> {
         let mut st = self.conn.prepare(
-            "SELECT id,project_id,source_id,target_id,kind,evidence_strength,created_at FROM edges WHERE project_id=?1 ORDER BY id",
+            "SELECT id,project_id,source_id,target_id,kind,evidence_strength,dep_scope,created_at FROM edges WHERE project_id=?1 ORDER BY id",
         )?;
         let rows = st.query_map([project_id], edge_row)?;
         let values = rows.collect::<rusqlite::Result<_>>()?;
@@ -1071,11 +1166,14 @@ fn node_row(r: &Row) -> rusqlite::Result<Node> {
         suggested_lemmas: serde_json::from_str(&lemmas_raw).unwrap_or_default(),
         created_at: dt(r.get(14)?)?,
         updated_at: dt(r.get(15)?)?,
+        stmt_formalized: r.get::<_, i64>(16)? != 0,
+        proof_done: r.get::<_, i64>(17)? != 0,
     })
 }
 fn edge_row(r: &Row) -> rusqlite::Result<Edge> {
     let kind: String = r.get(4)?;
     let strength: String = r.get(5)?;
+    let dep_scope: String = r.get(6)?;
     Ok(Edge {
         id: r.get(0)?,
         project_id: r.get(1)?,
@@ -1083,7 +1181,8 @@ fn edge_row(r: &Row) -> rusqlite::Result<Edge> {
         target_id: r.get(3)?,
         kind: kind.parse().map_err(sql_parse)?,
         evidence_strength: strength.parse().map_err(sql_parse)?,
-        created_at: dt(r.get(6)?)?,
+        dep_scope: dep_scope.parse().map_err(sql_parse)?,
+        created_at: dt(r.get(7)?)?,
     })
 }
 fn event_row(r: &Row) -> rusqlite::Result<Event> {
@@ -1227,6 +1326,52 @@ mod tests {
         assert!(nodes.iter().find(|n| n.id == derived.id).unwrap().tainted);
         let edge = s.edges(&p.id).unwrap().into_iter().next().unwrap();
         assert_eq!(edge.evidence_strength, EdgeStrength::LeanChecked);
+    }
+
+    #[test]
+    fn statement_and_proof_dep_scopes_split_and_merge() {
+        let s = Store::open(Path::new(":memory:")).unwrap();
+        let p = s.create_project("p", "t").unwrap();
+        let root = s.add_node(&p.id, NodeKind::Lemma, "root", "R", "test").unwrap();
+        let a = s.add_node(&p.id, NodeKind::Lemma, "a", "A", "test").unwrap();
+        let b = s.add_node(&p.id, NodeKind::Lemma, "b", "B", "test").unwrap();
+        // A is used only to prove root; B is used in the statement itself.
+        s.add_edge_scoped(&p.id, &root.id, &a.id, EdgeKind::DependsOn, DepScope::Proof)
+            .unwrap();
+        s.add_edge_scoped(&p.id, &root.id, &b.id, EdgeKind::DependsOn, DepScope::Statement)
+            .unwrap();
+        // The statement also ends up needing A: widen to Both.
+        s.widen_edge_scope(&p.id, &root.id, &a.id, EdgeKind::DependsOn, DepScope::Statement)
+            .unwrap();
+        let edges = s.edges(&p.id).unwrap();
+        let ea = edges.iter().find(|e| e.target_id == a.id).unwrap();
+        let eb = edges.iter().find(|e| e.target_id == b.id).unwrap();
+        assert_eq!(ea.dep_scope, DepScope::Both);
+        assert_eq!(eb.dep_scope, DepScope::Statement);
+        // Legacy plain add_edge defaults to statement scope.
+        let c = s.add_node(&p.id, NodeKind::Lemma, "c", "C", "test").unwrap();
+        s.add_edge(&p.id, &root.id, &c.id, EdgeKind::DependsOn).unwrap();
+        let ec = s
+            .edges(&p.id)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.target_id == c.id)
+            .unwrap();
+        assert_eq!(ec.dep_scope, DepScope::Statement);
+    }
+
+    #[test]
+    fn verification_flags_track_statement_and_proof_independently() {
+        let s = Store::open(Path::new(":memory:")).unwrap();
+        let p = s.create_project("p", "t").unwrap();
+        let n = s.add_node(&p.id, NodeKind::Lemma, "n", "N", "test").unwrap();
+        // Fresh node: neither formalized nor proved.
+        let fresh = s.nodes(&p.id).unwrap().into_iter().next().unwrap();
+        assert!(!fresh.stmt_formalized && !fresh.proof_done);
+        // Statement formalized, proof still open — the blueprint mid-state.
+        s.set_verification_flags(&p.id, &n.id, true, false, "test").unwrap();
+        let mid = s.nodes(&p.id).unwrap().into_iter().next().unwrap();
+        assert!(mid.stmt_formalized && !mid.proof_done);
     }
 
     #[test]
