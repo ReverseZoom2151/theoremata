@@ -28,6 +28,12 @@ pub struct SearchConfig {
     pub expand_k: usize,
     /// Rollout depth cap before a non-terminal simulation is scored `0`.
     pub max_depth: usize,
+    /// Blend weight for the LeanProgress-style progress prior in PUCT selection
+    /// (see [`search_with_value`]). Higher biases expansion toward proof states
+    /// the value estimate rates as closer to done. Has no effect when the value
+    /// closure returns `0` for every state — so plain [`search`] is unaffected
+    /// regardless of this value.
+    pub progress_weight: f64,
 }
 
 impl Default for SearchConfig {
@@ -37,6 +43,7 @@ impl Default for SearchConfig {
             exploration: 1.41,
             expand_k: 4,
             max_depth: 12,
+            progress_weight: crate::progress::PROGRESS_PRIOR_WEIGHT,
         }
     }
 }
@@ -68,6 +75,9 @@ struct Node<S, A> {
     children: Vec<usize>,
     expanded: bool,
     terminal: Option<f64>,
+    /// LeanProgress-style value estimate of this state in `[0, 1]` (see
+    /// [`search_with_value`]); `0.0` under plain [`search`].
+    progress: f64,
 }
 
 /// Run MCTS from `root`.
@@ -76,18 +86,48 @@ struct Node<S, A> {
 /// `(action, next_state, prior_probability)` triples — this is where the model
 /// prior enters. `reward(&state)` returns `Some(r)` when the state is terminal
 /// (e.g. `1.0` if the proof compiles / `0.0` if refuted) and `None` otherwise.
+///
+/// This is the value-free entry point: it defers to [`search_with_value`] with a
+/// constant-`0` progress estimate, so PUCT selection is unchanged regardless of
+/// `cfg.progress_weight`.
 pub fn search<S, A, EXPAND, REWARD>(
     root: S,
     cfg: &SearchConfig,
-    mut prior_expand: EXPAND,
-    mut reward: REWARD,
+    prior_expand: EXPAND,
+    reward: REWARD,
 ) -> SearchResult<A>
 where
     A: Clone,
     EXPAND: FnMut(&S) -> Vec<(A, S, f64)>,
     REWARD: FnMut(&S) -> Option<f64>,
 {
+    search_with_value(root, cfg, prior_expand, reward, |_| 0.0)
+}
+
+/// Run MCTS from `root` with a LeanProgress-style state-value prior.
+///
+/// Identical to [`search`] but takes a `value(&state) -> f64` closure returning a
+/// progress estimate in `[0, 1]` (e.g. [`crate::progress::progress_value`]). The
+/// estimate is folded into PUCT selection: a child's score becomes
+/// `Q(s,a) + progress_weight · value(s') + c · P(a) · √N_parent / (1 + N_child)`,
+/// so before a node has been visited (`Q = 0`) selection is biased toward the
+/// children the value model rates as closest to `no goals`. This is the search
+/// prior LeanProgress-v2 wires in as "negative predicted remaining steps".
+pub fn search_with_value<S, A, EXPAND, REWARD, VALUE>(
+    root: S,
+    cfg: &SearchConfig,
+    mut prior_expand: EXPAND,
+    mut reward: REWARD,
+    mut value: VALUE,
+) -> SearchResult<A>
+where
+    A: Clone,
+    EXPAND: FnMut(&S) -> Vec<(A, S, f64)>,
+    REWARD: FnMut(&S) -> Option<f64>,
+    VALUE: FnMut(&S) -> f64,
+{
     let root_terminal = reward(&root);
+    let root_progress = value(&root);
     let mut nodes: Vec<Node<S, A>> = vec![Node {
         state: root,
         parent: None,
@@ -98,6 +138,7 @@ where
         children: Vec::new(),
         expanded: false,
         terminal: root_terminal,
+        progress: root_progress,
     }];
 
     let mut solved = matches!(root_terminal, Some(r) if r >= 1.0);
@@ -118,7 +159,9 @@ where
                     0.0
                 };
                 let u = cfg.exploration * c.prior * n_parent / (1.0 + c.visits as f64);
-                let score = q + u;
+                // LeanProgress-style value prior: nudge selection toward states
+                // rated closer to done. Zero under plain `search`.
+                let score = q + cfg.progress_weight * c.progress + u;
                 if score > best_score {
                     best_score = score;
                     best = ci;
@@ -140,6 +183,7 @@ where
                         break;
                     }
                     let terminal = reward(&state);
+                    let child_progress = value(&state);
                     let id = nodes.len();
                     nodes.push(Node {
                         state,
@@ -151,6 +195,7 @@ where
                         children: Vec::new(),
                         expanded: false,
                         terminal,
+                        progress: child_progress,
                     });
                     child_ids.push(id);
                 }
@@ -339,6 +384,32 @@ mod tests {
         assert!(!result.solved);
         assert!(result.root_visits <= cfg.max_nodes);
         assert!(!result.visit_counts.is_empty());
+    }
+
+    #[test]
+    fn progress_prior_biases_the_root_choice() {
+        // Unsolvable tree so the search never short-circuits: every terminal
+        // (n >= 8) scores 0. With a value prior that rates the even ("L") branch
+        // much closer to done, selection keeps descending the L child, so the
+        // most-visited (robust) root action is "L".
+        let expand = |n: &i64| vec![("L", n * 2, 0.5f64), ("R", n * 2 + 1, 0.5f64)];
+        let reward = |n: &i64| if *n >= 8 { Some(0.0) } else { None };
+        let value = |n: &i64| if n % 2 == 0 { 0.9 } else { 0.1 };
+        let cfg = SearchConfig {
+            max_nodes: 64,
+            progress_weight: 1.0,
+            ..SearchConfig::default()
+        };
+        let result = super::search_with_value(1i64, &cfg, expand, reward, value);
+        assert_eq!(result.best_action, Some("L"));
+
+        // Flipping the prior to favour the odd ("R") branch flips the choice —
+        // confirming it is the prior, not a fixed tie-break, driving selection.
+        let expand = |n: &i64| vec![("L", n * 2, 0.5f64), ("R", n * 2 + 1, 0.5f64)];
+        let reward = |n: &i64| if *n >= 8 { Some(0.0) } else { None };
+        let value_r = |n: &i64| if n % 2 == 0 { 0.1 } else { 0.9 };
+        let result_r = super::search_with_value(1i64, &cfg, expand, reward, value_r);
+        assert_eq!(result_r.best_action, Some("R"));
     }
 
     struct MockProposer;

@@ -11,6 +11,7 @@ pub mod guard;
 pub mod mcts;
 pub mod observe;
 pub mod plan_history;
+pub mod progress;
 pub mod research;
 pub mod retry;
 pub mod router;

@@ -19,7 +19,7 @@ mod verify;
 pub use graph::{db, model, scheduler};
 pub use reason::{
     agent, blueprint, chat, consolidate, critic, decompose, falsification, guard, mcts, observe,
-    plan_history, research, retry, router, sampler, sampling, taint, team,
+    plan_history, progress, research, retry, router, sampler, sampling, taint, team,
 };
 pub use prover::{aristotle, attempt_run, proof_job};
 pub use verify::{hardening, lean_session};

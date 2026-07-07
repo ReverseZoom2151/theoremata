@@ -199,6 +199,54 @@ pub fn select_by_phase<T>(candidates: Vec<PhasedCandidate<T>>) -> Option<PhasedC
     })
 }
 
+/// A candidate tagged with both the verification phase it reached AND a
+/// LeanProgress-style progress estimate of its current proof state. This layers
+/// the fine-grained progress prior on top of the coarse phase prior: phase says
+/// *how far through verification* a candidate got, progress says *how close to
+/// `no goals`* its proof state is.
+#[derive(Debug, Clone)]
+pub struct ProgressCandidate<T> {
+    pub value: T,
+    pub phase: VerificationPhase,
+    /// Progress value in `[0, 1]` (see [`crate::progress::progress_value`]).
+    pub progress: f64,
+}
+
+impl<T> ProgressCandidate<T> {
+    /// Build a candidate whose progress is scored from a pretty-printed goal
+    /// state via the [`crate::progress`] heuristic — the wiring point for the
+    /// LeanProgress-style prior into the sampler's selection.
+    pub fn from_goal_state(value: T, phase: VerificationPhase, goal_state: &str) -> Self {
+        Self {
+            value,
+            phase,
+            progress: crate::progress::progress_value_from_state(goal_state),
+        }
+    }
+}
+
+/// Phase-and-progress selector: rank by verification phase first (a candidate
+/// that reached a deeper gate is the safer bet), then break ties by the progress
+/// prior (closer to `no goals` wins), then by original order (stable — prefer the
+/// earlier, cheaper candidate). Returns `None` for an empty slate.
+///
+/// This generalises [`select_by_phase`]: with equal progress it reduces to the
+/// pure phase prior, and among same-phase candidates it spends the next effort on
+/// the one the progress heuristic rates closest to done.
+pub fn select_by_phase_and_progress<T>(
+    candidates: Vec<ProgressCandidate<T>>,
+) -> Option<ProgressCandidate<T>> {
+    candidates.into_iter().reduce(|best, c| {
+        let better_phase = c.phase > best.phase;
+        let tied_phase_more_progress = c.phase == best.phase && c.progress > best.progress;
+        if better_phase || tied_phase_more_progress {
+            c
+        } else {
+            best
+        }
+    })
+}
+
 /// Lexical-diversity score in [0, 1]: unique tokens / total tokens across the
 /// candidates' `approach` strings. Low values signal mode collapse (the model
 /// returned near-identical approaches).
@@ -304,6 +352,59 @@ mod tests {
         ];
         assert_eq!(select_by_phase(candidates).unwrap().value, 1);
         assert!(select_by_phase::<()>(Vec::new()).is_none());
+    }
+
+    #[test]
+    fn phase_and_progress_prefers_deeper_phase_over_progress() {
+        // Phase dominates: a Structural candidate with high progress still loses
+        // to a Detailed candidate with low progress.
+        let picked = select_by_phase_and_progress(vec![
+            ProgressCandidate {
+                value: "shallow_but_close",
+                phase: VerificationPhase::Structural,
+                progress: 0.95,
+            },
+            ProgressCandidate {
+                value: "deep_but_far",
+                phase: VerificationPhase::Detailed,
+                progress: 0.10,
+            },
+        ])
+        .unwrap();
+        assert_eq!(picked.value, "deep_but_far");
+    }
+
+    #[test]
+    fn phase_and_progress_breaks_phase_ties_by_progress() {
+        let picked = select_by_phase_and_progress(vec![
+            ProgressCandidate {
+                value: "far",
+                phase: VerificationPhase::Structural,
+                progress: 0.2,
+            },
+            ProgressCandidate {
+                value: "close",
+                phase: VerificationPhase::Structural,
+                progress: 0.8,
+            },
+        ])
+        .unwrap();
+        assert_eq!(picked.value, "close");
+        assert!(select_by_phase_and_progress::<()>(Vec::new()).is_none());
+    }
+
+    #[test]
+    fn progress_candidate_scores_from_goal_state() {
+        let done = ProgressCandidate::from_goal_state((), VerificationPhase::Detailed, "no goals");
+        let open = ProgressCandidate::from_goal_state(
+            (),
+            VerificationPhase::Detailed,
+            "n : Nat\n⊢ n + 0 = n",
+        );
+        assert!(done.progress > open.progress);
+        // Same phase ⇒ the closer-to-done state is selected.
+        let picked = select_by_phase_and_progress(vec![open, done]).unwrap();
+        assert_eq!(picked.progress, 1.0);
     }
 
     #[test]
