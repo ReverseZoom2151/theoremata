@@ -9,6 +9,9 @@ use std::{
 pub struct Config {
     pub database: PathBuf,
     pub workspace: PathBuf,
+    /// Per-attempt artifact root (FLARE-style inputs/lean/logs/verifier output).
+    #[serde(default = "default_artifacts")]
+    pub artifacts: PathBuf,
     pub resources: PathBuf,
     pub model_command: Option<String>,
     pub max_iterations: u32,
@@ -36,14 +39,32 @@ pub struct Config {
     /// resets to zero on any failed pass. Defaults to 3.
     #[serde(default = "default_k_consecutive_clean")]
     pub k_consecutive_clean: u32,
+    /// Default external prover backend for Route::Prove (`aristotle`, `leandojo`, `reprover`).
+    #[serde(default = "default_prover_backend")]
+    pub prover_backend: String,
+    /// Max sparse polls when the agent drives an AttemptRun to completion.
+    #[serde(default = "default_prover_max_polls")]
+    pub prover_max_polls: u32,
 }
 
 fn default_k_consecutive_clean() -> u32 {
     3
 }
 
+fn default_prover_backend() -> String {
+    "aristotle".into()
+}
+
+fn default_prover_max_polls() -> u32 {
+    8
+}
+
 fn default_lean_project() -> Option<PathBuf> {
     Some(PathBuf::from("resources/mathlib4-master/mathlib4-master"))
+}
+
+fn default_artifacts() -> PathBuf {
+    PathBuf::from(".theoremata/artifacts")
 }
 
 impl Default for Config {
@@ -51,6 +72,7 @@ impl Default for Config {
         Self {
             database: PathBuf::from(".theoremata/theoremata.db"),
             workspace: PathBuf::from(".theoremata/workspaces"),
+            artifacts: default_artifacts(),
             resources: PathBuf::from("resources"),
             model_command: std::env::var("THEOREMATA_MODEL_COMMAND").ok(),
             max_iterations: 3,
@@ -60,6 +82,8 @@ impl Default for Config {
             harden_proofs: false,
             node_granularity: crate::model::Granularity::default(),
             k_consecutive_clean: default_k_consecutive_clean(),
+            prover_backend: default_prover_backend(),
+            prover_max_polls: default_prover_max_polls(),
         }
     }
 }
@@ -81,6 +105,7 @@ impl Config {
             fs::create_dir_all(parent)?;
         }
         fs::create_dir_all(&self.workspace)?;
+        fs::create_dir_all(&self.artifacts)?;
         let path = Path::new(".theoremata/config.json");
         if !path.exists() {
             fs::write(path, serde_json::to_string_pretty(self)?)?;

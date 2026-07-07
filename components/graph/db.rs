@@ -102,6 +102,39 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id, id);
             CREATE INDEX IF NOT EXISTS idx_messages_project ON messages(project_id, id);
             CREATE INDEX IF NOT EXISTS idx_lemmas_project ON lemmas(project_id);
+            CREATE TABLE IF NOT EXISTS proof_jobs (
+              id TEXT PRIMARY KEY,
+              project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+              node_id TEXT REFERENCES nodes(id) ON DELETE SET NULL,
+              backend TEXT NOT NULL,
+              status TEXT NOT NULL,
+              task_json TEXT NOT NULL,
+              result_json TEXT,
+              external_id TEXT,
+              percent_complete REAL NOT NULL DEFAULT 0,
+              artifacts_dir TEXT,
+              poll_count INTEGER NOT NULL DEFAULT 0,
+              submitted_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              completed_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS attempt_runs (
+              id TEXT PRIMARY KEY,
+              project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+              node_id TEXT REFERENCES nodes(id) ON DELETE SET NULL,
+              proof_job_id TEXT REFERENCES proof_jobs(id) ON DELETE SET NULL,
+              status TEXT NOT NULL,
+              artifacts_dir TEXT NOT NULL,
+              input_json TEXT NOT NULL,
+              output_json TEXT,
+              started_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              completed_at TEXT,
+              duration_ms INTEGER,
+              cost REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_proof_jobs_project ON proof_jobs(project_id);
+            CREATE INDEX IF NOT EXISTS idx_attempt_runs_project ON attempt_runs(project_id);
             "#,
         )?;
         // Idempotent column additions so databases created before these fields
@@ -929,6 +962,185 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    pub fn create_proof_job(
+        &self,
+        task: &crate::prover::model::ProofTask,
+        backend: &str,
+        status: crate::prover::model::ProverJobStatus,
+        external_id: Option<&str>,
+        artifacts_dir: Option<&Path>,
+        percent_complete: f64,
+    ) -> Result<crate::prover::model::ProofJob> {
+        let now = Utc::now();
+        let job = crate::prover::model::ProofJob {
+            id: Uuid::new_v4().to_string(),
+            project_id: task.project_id.clone(),
+            node_id: task.node_id.clone(),
+            backend: backend.to_owned(),
+            status,
+            task: task.clone(),
+            result: None,
+            external_id: external_id.map(str::to_owned),
+            percent_complete,
+            artifacts_dir: artifacts_dir.map(Path::to_path_buf),
+            poll_count: 0,
+            submitted_at: now,
+            updated_at: now,
+            completed_at: None,
+        };
+        self.conn.execute(
+            "INSERT INTO proof_jobs(id,project_id,node_id,backend,status,task_json,result_json,\
+             external_id,percent_complete,artifacts_dir,poll_count,submitted_at,updated_at,completed_at)\
+             VALUES (?1,?2,?3,?4,?5,?6,NULL,?7,?8,?9,0,?10,?10,NULL)",
+            params![
+                job.id,
+                job.project_id,
+                job.node_id,
+                job.backend,
+                serde_json::to_string(&job.status)?,
+                serde_json::to_string(&job.task)?,
+                job.external_id,
+                job.percent_complete,
+                job.artifacts_dir.as_ref().map(|p| p.to_string_lossy().to_string()),
+                now.to_rfc3339(),
+            ],
+        )?;
+        Ok(job)
+    }
+
+    pub fn update_proof_job(&self, job: &crate::prover::model::ProofJob) -> Result<()> {
+        self.conn.execute(
+            "UPDATE proof_jobs SET status=?1, result_json=?2, percent_complete=?3, poll_count=?4,\
+             updated_at=?5, completed_at=?6 WHERE id=?7",
+            params![
+                serde_json::to_string(&job.status)?,
+                job.result
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+                job.percent_complete,
+                job.poll_count,
+                job.updated_at.to_rfc3339(),
+                job.completed_at.map(|t| t.to_rfc3339()),
+                job.id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_proof_job(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::prover::model::ProofJob>> {
+        self.conn
+            .query_row(
+                "SELECT id,project_id,node_id,backend,status,task_json,result_json,external_id,\
+                 percent_complete,artifacts_dir,poll_count,submitted_at,updated_at,completed_at \
+                 FROM proof_jobs WHERE id=?1",
+                params![id],
+                proof_job_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_proof_jobs(
+        &self,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::prover::model::ProofJob>> {
+        let mut st = self.conn.prepare(
+            "SELECT id,project_id,node_id,backend,status,task_json,result_json,external_id,\
+             percent_complete,artifacts_dir,poll_count,submitted_at,updated_at,completed_at \
+             FROM proof_jobs WHERE project_id=?1 ORDER BY submitted_at DESC LIMIT ?2",
+        )?;
+        let rows = st.query_map(params![project_id, limit as i64], proof_job_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn create_attempt_run(
+        &self,
+        project_id: &str,
+        node_id: Option<&str>,
+        proof_job_id: Option<&str>,
+        status: crate::prover::model::AttemptRunStatus,
+        artifacts_dir: &Path,
+        input: &serde_json::Value,
+    ) -> Result<crate::prover::model::AttemptRunRecord> {
+        let now = Utc::now();
+        let record = crate::prover::model::AttemptRunRecord {
+            id: Uuid::new_v4().to_string(),
+            project_id: project_id.to_owned(),
+            node_id: node_id.map(str::to_owned),
+            proof_job_id: proof_job_id.map(str::to_owned),
+            status,
+            artifacts_dir: artifacts_dir.to_path_buf(),
+            input: input.clone(),
+            output: None,
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+            duration_ms: None,
+            cost: None,
+        };
+        self.conn.execute(
+            "INSERT INTO attempt_runs(id,project_id,node_id,proof_job_id,status,artifacts_dir,\
+             input_json,output_json,started_at,updated_at,completed_at,duration_ms,cost)\
+             VALUES (?1,?2,?3,?4,?5,?6,?7,NULL,?8,?8,NULL,NULL,NULL)",
+            params![
+                record.id,
+                project_id,
+                node_id,
+                proof_job_id,
+                serde_json::to_string(&record.status)?,
+                artifacts_dir.to_string_lossy().to_string(),
+                input.to_string(),
+                now.to_rfc3339(),
+            ],
+        )?;
+        Ok(record)
+    }
+
+    pub fn update_attempt_run(
+        &self,
+        record: &crate::prover::model::AttemptRunRecord,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE attempt_runs SET status=?1, output_json=?2, updated_at=?3, completed_at=?4,\
+             duration_ms=?5, cost=?6 WHERE id=?7",
+            params![
+                serde_json::to_string(&record.status)?,
+                record
+                    .output
+                    .as_ref()
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+                record.updated_at.to_rfc3339(),
+                record.completed_at.map(|t| t.to_rfc3339()),
+                record.duration_ms.map(|v| v as i64),
+                record.cost,
+                record.id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_attempt_run(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::prover::model::AttemptRunRecord>> {
+        self.conn
+            .query_row(
+                "SELECT id,project_id,node_id,proof_job_id,status,artifacts_dir,input_json,\
+                 output_json,started_at,updated_at,completed_at,duration_ms,cost \
+                 FROM attempt_runs WHERE id=?1",
+                params![id],
+                attempt_run_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn event(
         &self,
         project_id: Option<&str>,
@@ -1315,6 +1527,63 @@ fn lemma_row(r: &Row) -> rusqlite::Result<Lemma> {
         created_at: dt(r.get(6)?)?,
     })
 }
+
+fn proof_job_row(r: &Row) -> rusqlite::Result<crate::prover::model::ProofJob> {
+    let status: String = r.get(4)?;
+    let task_raw: String = r.get(5)?;
+    let result_raw: Option<String> = r.get(6)?;
+    let artifacts: Option<String> = r.get(9)?;
+    let completed: Option<String> = r.get(13)?;
+    Ok(crate::prover::model::ProofJob {
+        id: r.get(0)?,
+        project_id: r.get(1)?,
+        node_id: r.get(2)?,
+        backend: r.get(3)?,
+        status: serde_json::from_str(&status).unwrap_or(crate::prover::model::ProverJobStatus::Error),
+        task: serde_json::from_str(&task_raw)
+            .map_err(|e| sql_parse(e.into()))?,
+        result: result_raw
+            .filter(|s| !s.is_empty())
+            .map(|s| serde_json::from_str(&s))
+            .transpose()
+            .map_err(|e| sql_parse(e.into()))?,
+        external_id: r.get(7)?,
+        percent_complete: r.get(8)?,
+        artifacts_dir: artifacts.map(std::path::PathBuf::from),
+        poll_count: r.get::<_, i64>(10)? as u32,
+        submitted_at: dt(r.get(11)?)?,
+        updated_at: dt(r.get(12)?)?,
+        completed_at: completed.map(dt).transpose()?,
+    })
+}
+
+fn attempt_run_row(r: &Row) -> rusqlite::Result<crate::prover::model::AttemptRunRecord> {
+    let status: String = r.get(4)?;
+    let input_raw: String = r.get(6)?;
+    let output_raw: Option<String> = r.get(7)?;
+    Ok(crate::prover::model::AttemptRunRecord {
+        id: r.get(0)?,
+        project_id: r.get(1)?,
+        node_id: r.get(2)?,
+        proof_job_id: r.get(3)?,
+        status: serde_json::from_str(&status)
+            .unwrap_or(crate::prover::model::AttemptRunStatus::Failed),
+        artifacts_dir: std::path::PathBuf::from(r.get::<_, String>(5)?),
+        input: serde_json::from_str(&input_raw)
+            .map_err(|e| sql_parse(e.into()))?,
+        output: output_raw
+            .filter(|s| !s.is_empty())
+            .map(|s| serde_json::from_str(&s))
+            .transpose()
+            .map_err(|e| sql_parse(e.into()))?,
+        started_at: dt(r.get(8)?)?,
+        updated_at: dt(r.get(9)?)?,
+        completed_at: r.get::<_, Option<String>>(10)?.map(dt).transpose()?,
+        duration_ms: r.get::<_, Option<i64>>(11)?.map(|v| v as u128),
+        cost: r.get(12)?,
+    })
+}
+
 fn sql_parse(e: anyhow::Error) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into())
 }
