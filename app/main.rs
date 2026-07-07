@@ -1,4 +1,6 @@
 mod config;
+#[path = "../components/prover/mod.rs"]
+mod prover;
 #[path = "../components/graph/mod.rs"]
 mod graph;
 #[path = "../components/provider/mod.rs"]
@@ -19,6 +21,7 @@ pub use reason::{
     agent, blueprint, chat, consolidate, critic, decompose, falsification, guard, mcts, observe,
     plan_history, research, retry, router, sampler, sampling, taint, team,
 };
+pub use prover::{aristotle, attempt_run, proof_job};
 pub use verify::{hardening, lean_session};
 
 use anyhow::Result;
@@ -299,6 +302,57 @@ enum Command {
     },
     Lean {
         file: PathBuf,
+    },
+    /// Submit an external proof job (ProofTask → async prover backend).
+    ProofSubmit {
+        project: String,
+        statement: String,
+        #[arg(long)]
+        node: Option<String>,
+        #[arg(long, default_value = "Theoremata.Main")]
+        theorem: String,
+        #[arg(long, default_value = "aristotle")]
+        backend: String,
+    },
+    /// Poll an in-flight proof job (sparse polling for external provers).
+    ProofPoll {
+        job: String,
+    },
+    /// Cancel a proof job.
+    ProofCancel {
+        job: String,
+    },
+    /// Fetch the ProofResult for a terminal proof job.
+    ProofResult {
+        job: String,
+    },
+    /// List proof jobs for a project.
+    ProofJobs {
+        project: String,
+        #[arg(default_value_t = 30)]
+        limit: usize,
+    },
+    /// Start an AttemptRun (FLARE-style) with artifact directory.
+    AttemptStart {
+        project: String,
+        #[arg(long)]
+        node: Option<String>,
+        /// JSON input: `{"statement":"...","theorem_name":"...","backend":"aristotle"}`.
+        request: String,
+    },
+    /// Cancel a running AttemptRun.
+    AttemptCancel {
+        attempt: String,
+    },
+    /// Get AttemptRun result (polls linked proof job if still running).
+    AttemptResult {
+        attempt: String,
+    },
+    /// Drive an AttemptRun to completion (mock-friendly).
+    AttemptRun {
+        attempt: String,
+        #[arg(default_value_t = 8)]
+        max_polls: u32,
     },
 }
 
@@ -766,11 +820,13 @@ fn main() -> Result<()> {
         }
         Command::Route { project } => {
             let nodes = store.nodes(&project)?;
+            let model_ready = config.model_command.is_some();
             let tools = router::ToolAvailability {
                 python: PythonCheck::new().available(),
                 lean: LeanCheck::new(&config).available(),
                 mathlib_search: MathlibSearch::new(&config).available(),
-                model: config.model_command.is_some(),
+                model: model_ready,
+                external_prover: proof_job::any_prover_available(&config, model_ready),
             };
             let routes: Vec<_> = nodes
                 .iter()
@@ -824,6 +880,72 @@ fn main() -> Result<()> {
                     "tool":"retrieve","root":root,"imports":imports,
                     "query":query,"limit":limit,"op":"retrieve"
                 }))?,
+            )?
+        }
+        Command::ProofSubmit {
+            project,
+            statement,
+            node,
+            theorem,
+            backend,
+        } => {
+            store.project(&project)?;
+            let mut task = aristotle::build_task(
+                Some(project.clone()),
+                node.clone(),
+                &statement,
+                &theorem,
+                &config,
+            );
+            task.backend = backend;
+            print_value(
+                true,
+                &proof_job::submit(&store, &config, task, None)?,
+            )?
+        }
+        Command::ProofPoll { job } => {
+            print_value(true, &proof_job::poll(&store, &config, &job, None)?)?
+        }
+        Command::ProofCancel { job } => {
+            print_value(true, &proof_job::cancel(&store, &job)?)?
+        }
+        Command::ProofResult { job } => {
+            print_value(true, &proof_job::result(&store, &job)?)?
+        }
+        Command::ProofJobs { project, limit } => {
+            print_value(true, &store.list_proof_jobs(&project, limit)?)?
+        }
+        Command::AttemptStart {
+            project,
+            node,
+            request,
+        } => {
+            let input: serde_json::Value = serde_json::from_str(&request)?;
+            print_value(
+                true,
+                &attempt_run::start(&store, &config, &project, node.as_deref(), input)?,
+            )?
+        }
+        Command::AttemptCancel { attempt } => {
+            print_value(true, &attempt_run::cancel(&store, &attempt)?)?
+        }
+        Command::AttemptResult { attempt } => {
+            print_value(
+                true,
+                &attempt_run::result(&store, &config, &attempt, None)?,
+            )?
+        }
+        Command::AttemptRun { attempt, max_polls } => {
+            std::env::set_var("THEOREMATA_ARISTOTLE_MOCK", "1");
+            print_value(
+                true,
+                &attempt_run::run_to_completion(
+                    &store,
+                    &config,
+                    &attempt,
+                    max_polls,
+                    None,
+                )?,
             )?
         }
         Command::Lean { file } => print_value(
