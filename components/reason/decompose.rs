@@ -68,9 +68,13 @@ impl Decomposer<'_> {
         if self.provider.name() == "offline" {
             return Ok(Vec::new());
         }
+        let history = crate::plan_history::PlanHistory::new(self.store);
         let mut state = RetryState::new(RetryLimits::default());
         loop {
-            match self.decompose(statement, granularity) {
+            // Read the cross-attempt strategy memory BEFORE proposing a plan so
+            // the model is steered away from strategies that already died.
+            let prior = history.render(project_id)?;
+            match self.decompose(statement, granularity, prior.as_deref()) {
                 Ok(obligations) if !obligations.is_empty() => {
                     let budget = Self::expected_helper_nodes(granularity, obligations.len());
                     self.store.add_attempt(
@@ -102,7 +106,19 @@ impl Decomposer<'_> {
                         &json!({ "error": detail }),
                         false,
                     )?;
-                    if state.resolve(Decision::ReviseProof) == Decision::Terminate {
+                    // Mechanical budget-exhaustion escalation, and append the
+                    // failed strategy to plan history so the next attempt reads
+                    // it and does not repeat this dead end.
+                    let escalation = state.escalate_exhausted();
+                    history.add(
+                        project_id,
+                        &crate::plan_history::PlanHistoryEntry::failed(
+                            state.attempt,
+                            format!("decomposition at {granularity} granularity"),
+                            detail,
+                        ),
+                    )?;
+                    if escalation.decision == Decision::Terminate {
                         return Ok(Vec::new());
                     }
                 }
@@ -110,11 +126,22 @@ impl Decomposer<'_> {
         }
     }
 
-    fn decompose(&self, statement: &str, granularity: Granularity) -> Result<Vec<Obligation>> {
+    fn decompose(
+        &self,
+        statement: &str,
+        granularity: Granularity,
+        plan_history: Option<&str>,
+    ) -> Result<Vec<Obligation>> {
         let granularity_hint = match granularity {
             Granularity::Coarse => "Prefer a few coarse, paper-sized obligations.",
             Granularity::Medium => "Aim for balanced, individually-provable obligations.",
             Granularity::Fine => "Prefer many small micro-lemma obligations; let the DAG carry the reasoning.",
+        };
+        let history_hint = if plan_history.is_some() {
+            " Prior attempts are recorded in `plan_history`; do NOT repeat a strategy on its \
+             'Do NOT try again' list."
+        } else {
+            ""
         };
         let response = self.provider.complete(&ModelRequest {
             role: "proof_decomposer".into(),
@@ -124,9 +151,13 @@ impl Decomposer<'_> {
                  scalar-recursion, spectral, convergence, stability, normal-form, obstruction, \
                  counterexample) and any transfer-schema ingredients it reduces to \
                  (invariant-subspace, gradient-plane, scalar-progress-coordinate, \
-                 structured-local-update, comparison-inequality, admissible-updates)."
+                 structured-local-update, comparison-inequality, admissible-updates).{history_hint}"
             ),
-            context: json!({ "statement": statement, "granularity": granularity.to_string() }),
+            context: json!({
+                "statement": statement,
+                "granularity": granularity.to_string(),
+                "plan_history": plan_history,
+            }),
             output_schema: json!({"type":"object","required":["obligations"],"properties":{
                 "obligations":{"type":"array","items":{"type":"object","required":["title","statement"],
                     "properties":{

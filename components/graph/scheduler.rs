@@ -225,7 +225,7 @@ pub fn plan(nodes: &[Node], edges: &[Edge]) -> Schedule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{NodeKind, NodeTier};
+    use crate::model::{NodeKind, NodeTier, Taint};
     use chrono::Utc;
 
     fn node(id: &str, title: &str, status: NodeStatus) -> Node {
@@ -240,6 +240,7 @@ mod tests {
             provenance: "test".into(),
             content_hash: String::new(),
             tainted: false,
+            taint: Taint::Clean,
             tier: NodeTier::Spine,
             parent_id: None,
             strategy_hint: None,

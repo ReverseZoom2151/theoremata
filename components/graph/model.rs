@@ -100,6 +100,57 @@ impl FromStr for NodeTier {
     }
 }
 
+/// Three-valued taint (alethfeld `graph.clj` `compute-taint`): a node is
+/// `Clean`, `Tainted` (it is rejected/counterexampled, or transitively depends
+/// on something that is), or `SelfAdmitted` (it is *itself* an admitted gap — a
+/// `sorry`/obligation the proof leans on). Cleaner than a boolean: it separates
+/// "poisoned by a dependency" from "is the poison". The legacy boolean maps
+/// `true → Tainted`, `false → Clean`; `SelfAdmitted` is the new state.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ValueEnum, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Taint {
+    #[default]
+    Clean,
+    Tainted,
+    SelfAdmitted,
+}
+
+impl Taint {
+    /// Backward-compat bridge: the old boolean `tainted` flag as a `Taint`.
+    pub fn from_bool(tainted: bool) -> Taint {
+        if tainted {
+            Taint::Tainted
+        } else {
+            Taint::Clean
+        }
+    }
+
+    /// True when the node is not clean (either propagated-tainted or a
+    /// self-admitted gap) — the value of the legacy boolean accessor.
+    pub fn is_tainted(self) -> bool {
+        !matches!(self, Taint::Clean)
+    }
+}
+
+impl fmt::Display for Taint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            serde_json::to_value(self).unwrap().as_str().unwrap()
+        )
+    }
+}
+
+impl FromStr for Taint {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(serde_json::from_value(serde_json::Value::String(
+            s.to_owned(),
+        ))?)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeKind {
@@ -372,7 +423,13 @@ pub struct Node {
     pub formal_statement: Option<String>,
     pub provenance: String,
     pub content_hash: String,
+    /// Legacy boolean taint flag, kept for backward compatibility. It is the
+    /// projection `taint.is_tainted()`; new code should read [`Node::taint`].
     pub tainted: bool,
+    /// Three-valued taint (`clean` / `tainted` / `self-admitted`). Additive over
+    /// the legacy `tainted` bool; defaults to `clean` when absent.
+    #[serde(default)]
+    pub taint: Taint,
     pub tier: NodeTier,
     pub parent_id: Option<String>,
     pub strategy_hint: Option<String>,

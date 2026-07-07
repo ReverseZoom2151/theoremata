@@ -112,6 +112,10 @@ impl Store {
             ("suggested_lemmas", "TEXT NOT NULL DEFAULT '[]'"),
             ("stmt_formalized", "INTEGER NOT NULL DEFAULT 0"),
             ("proof_done", "INTEGER NOT NULL DEFAULT 0"),
+            // Three-valued taint (clean|tainted|self_admitted). Additive over
+            // the legacy `tainted` bool: existing rows keep their bool, and the
+            // reader reconciles a `taint='clean'` default against `tainted=1`.
+            ("taint", "TEXT NOT NULL DEFAULT 'clean'"),
         ] {
             if let Err(e) = self
                 .conn
@@ -238,6 +242,7 @@ impl Store {
             provenance: provenance.to_owned(),
             content_hash: hash,
             tainted: false,
+            taint: Taint::Clean,
             tier,
             parent_id: parent_id.map(str::to_owned),
             strategy_hint: strategy_hint.map(str::to_owned),
@@ -573,7 +578,7 @@ impl Store {
         let mut st = self.conn.prepare(
             "SELECT id,project_id,kind,status,title,statement,formal_statement,provenance,
              content_hash,tainted,tier,parent_id,strategy_hint,suggested_lemmas,created_at,updated_at,
-             stmt_formalized,proof_done
+             stmt_formalized,proof_done,taint
              FROM nodes WHERE project_id=?1 ORDER BY created_at",
         )?;
         let rows = st.query_map([project_id], node_row)?;
@@ -948,40 +953,58 @@ impl Store {
         Ok(adj.keys().any(|n| visit(n, &adj, &mut gray, &mut black)))
     }
 
+    /// Recompute three-valued taint for the whole project and persist it.
+    /// Delegates the classification to the executable propagation in
+    /// [`crate::taint::propagate`] (rejected/blocked → `Tainted`, explicit gaps
+    /// stay `SelfAdmitted`, dependents of either become `Tainted`), then writes
+    /// both the three-valued `taint` column and the legacy `tainted` bool so
+    /// old call sites keep working.
     fn recompute_taint(&self, project_id: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE nodes SET tainted=0 WHERE project_id=?1",
-            [project_id],
-        )?;
         let nodes = self.nodes(project_id)?;
         let edges = self.edges(project_id)?;
-        let mut tainted: HashSet<String> = nodes
-            .iter()
-            .filter(|n| matches!(n.status, NodeStatus::Rejected | NodeStatus::Blocked))
-            .map(|n| n.id.clone())
-            .collect();
-        loop {
-            let before = tainted.len();
-            for e in &edges {
-                // Support edges carry taint from a rejected/blocked target up to
-                // the node that relies on it; adversarial/replacement links
-                // (Contradicts, Supersedes, Verifies) deliberately do not.
-                if matches!(
-                    e.kind,
-                    EdgeKind::DependsOn | EdgeKind::DerivedFrom | EdgeKind::Formalizes
-                ) && tainted.contains(&e.target_id)
-                {
-                    tainted.insert(e.source_id.clone());
-                }
-            }
-            if tainted.len() == before {
-                break;
-            }
+        let taints = crate::taint::propagate(&nodes, &edges);
+        for node in &nodes {
+            let taint = taints.get(&node.id).copied().unwrap_or(Taint::Clean);
+            self.conn.execute(
+                "UPDATE nodes SET taint=?1, tainted=?2 WHERE id=?3",
+                params![taint.to_string(), taint.is_tainted() as i64, node.id],
+            )?;
         }
-        for id in tainted {
-            self.conn
-                .execute("UPDATE nodes SET tainted=1 WHERE id=?1", [id])?;
+        Ok(())
+    }
+
+    /// Explicitly set a node's three-valued taint — used to mark a node as a
+    /// `SelfAdmitted` gap (an admitted `sorry`/obligation the proof leans on).
+    /// The mark is sticky: the subsequent propagation preserves `SelfAdmitted`
+    /// sources and poisons their dependents as `Tainted`.
+    pub fn set_taint(
+        &self,
+        project_id: &str,
+        node_id: &str,
+        taint: Taint,
+        actor: &str,
+    ) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE nodes SET taint=?1, tainted=?2, updated_at=?3 WHERE id=?4 AND project_id=?5",
+            params![
+                taint.to_string(),
+                taint.is_tainted() as i64,
+                Utc::now().to_rfc3339(),
+                node_id,
+                project_id
+            ],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!("node not found: {node_id}"));
         }
+        self.event(
+            Some(project_id),
+            None,
+            "node.taint_set",
+            actor,
+            json!({"node_id": node_id, "taint": taint.to_string()}),
+        )?;
+        self.recompute_taint(project_id)?;
         Ok(())
     }
 
@@ -1149,6 +1172,17 @@ fn node_row(r: &Row) -> rusqlite::Result<Node> {
     let status: String = r.get(3)?;
     let tier: String = r.get(10)?;
     let lemmas_raw: String = r.get(13)?;
+    let tainted_bool: i64 = r.get(9)?;
+    let taint_str: String = r.get(18)?;
+    // Reconcile the two columns for backward compatibility: a row written before
+    // the `taint` column existed has `taint='clean'` (the default) but may carry
+    // the old `tainted=1` bit — treat that as `Tainted`. Otherwise the explicit
+    // three-valued column wins.
+    let taint = if taint_str == "clean" && tainted_bool != 0 {
+        Taint::Tainted
+    } else {
+        taint_str.parse().map_err(sql_parse)?
+    };
     Ok(Node {
         id: r.get(0)?,
         project_id: r.get(1)?,
@@ -1159,7 +1193,8 @@ fn node_row(r: &Row) -> rusqlite::Result<Node> {
         formal_statement: r.get(6)?,
         provenance: r.get(7)?,
         content_hash: r.get(8)?,
-        tainted: r.get::<_, i64>(9)? != 0,
+        tainted: taint.is_tainted(),
+        taint,
         tier: tier.parse().map_err(sql_parse)?,
         parent_id: r.get(11)?,
         strategy_hint: r.get(12)?,

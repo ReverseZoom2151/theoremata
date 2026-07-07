@@ -17,7 +17,7 @@ mod tui;
 pub use graph::{db, model, scheduler};
 pub use reason::{
     agent, blueprint, chat, consolidate, critic, decompose, falsification, guard, mcts, observe,
-    research, retry, router, sampler, sampling, team,
+    plan_history, research, retry, router, sampler, sampling, taint, team,
 };
 pub use verify::{hardening, lean_session};
 

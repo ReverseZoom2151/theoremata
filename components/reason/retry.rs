@@ -89,6 +89,86 @@ impl RetryState {
             Decision::Terminate => Decision::Terminate,
         }
     }
+
+    /// True when the innermost (proof) budget is fully spent for the current
+    /// plan revision.
+    pub fn proof_budget_exhausted(&self) -> bool {
+        self.proof >= self.limits.max_proof_attempts
+    }
+
+    /// **Mechanical** budget-exhaustion escalation (QED
+    /// `decomposition_prover.py:1885`), deliberately SEPARATE from the semantic
+    /// regulator decision in [`RetryState::resolve`]. When the inner proof loop
+    /// spends its whole budget without the regulator having chosen to escalate,
+    /// the orchestrator escalates on its *own* — it does not trust the model to
+    /// notice it is stuck — and synthesises the escalation guidance rather than
+    /// reusing a stale REVISE_PROOF message.
+    ///
+    /// Escalates a spent proof budget to a plan revision (resetting the proof
+    /// counter), a spent revision budget to a full rewrite (resetting proof +
+    /// revision), and a spent decomposition budget to `Terminate`. The returned
+    /// [`Escalation`] carries the deterministic next decision and its synthetic
+    /// guidance string.
+    pub fn escalate_exhausted(&mut self) -> Escalation {
+        if self.revision < self.limits.max_revisions {
+            self.new_revision();
+            Escalation {
+                decision: Decision::RevisePlan,
+                guidance: format!(
+                    "# Automatic Escalation to Plan Revision\n\nAll {} proof attempts failed \
+                     verification. The repeated failures suggest structural issues with the \
+                     decomposition plan rather than the individual proofs. Revise the plan \
+                     (revision {}).",
+                    self.limits.max_proof_attempts, self.revision
+                ),
+            }
+        } else if self.attempt < self.limits.max_decompositions {
+            self.new_attempt();
+            Escalation {
+                decision: Decision::Rewrite,
+                guidance: format!(
+                    "# Automatic Escalation to Complete Rewrite\n\nAll {} plan revisions have \
+                     been exhausted without a verified proof. Discard the current decomposition \
+                     and rewrite it from scratch (attempt {}).",
+                    self.limits.max_revisions, self.attempt
+                ),
+            }
+        } else {
+            Escalation {
+                decision: Decision::Terminate,
+                guidance: format!(
+                    "# Budget Exhausted\n\nAll {} decompositions, {} revisions, and {} proof \
+                     attempts are spent. Escalating to a human.",
+                    self.limits.max_decompositions,
+                    self.limits.max_revisions,
+                    self.limits.max_proof_attempts
+                ),
+            }
+        }
+    }
+
+    /// REVISE_PLAN transition: bump the revision counter and reset the proof
+    /// counter to its first attempt.
+    fn new_revision(&mut self) {
+        self.revision += 1;
+        self.proof = 1;
+    }
+
+    /// REWRITE transition: bump the decomposition attempt and reset the inner
+    /// revision + proof counters.
+    fn new_attempt(&mut self) {
+        self.attempt += 1;
+        self.revision = 1;
+        self.proof = 1;
+    }
+}
+
+/// A mechanical escalation: the deterministic next [`Decision`] plus the
+/// synthesised guidance to inject into the next planning prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Escalation {
+    pub decision: Decision,
+    pub guidance: String,
 }
 
 #[cfg(test)]
@@ -129,6 +209,54 @@ mod tests {
         // every tier is already at its single-shot budget, so a proof revision
         // cascades plan -> rewrite -> terminate.
         assert_eq!(s.resolve(Decision::ReviseProof), Decision::Terminate);
+    }
+
+    #[test]
+    fn mechanical_escalation_bumps_plan_when_proof_budget_spent() {
+        let limits = RetryLimits {
+            max_proof_attempts: 3,
+            max_revisions: 4,
+            max_decompositions: 4,
+        };
+        let mut s = RetryState::new(limits);
+        s.proof = 3; // proof budget spent
+        assert!(s.proof_budget_exhausted());
+        let esc = s.escalate_exhausted();
+        assert_eq!(esc.decision, Decision::RevisePlan);
+        assert_eq!(s.revision, 2);
+        assert_eq!(s.proof, 1); // reset
+        assert!(esc.guidance.contains("Plan Revision"));
+    }
+
+    #[test]
+    fn mechanical_escalation_rewrites_when_revisions_spent() {
+        let limits = RetryLimits {
+            max_proof_attempts: 3,
+            max_revisions: 2,
+            max_decompositions: 4,
+        };
+        let mut s = RetryState::new(limits);
+        s.revision = 2; // revision budget spent
+        s.proof = 3;
+        let esc = s.escalate_exhausted();
+        assert_eq!(esc.decision, Decision::Rewrite);
+        assert_eq!(s.attempt, 2);
+        assert_eq!(s.revision, 1);
+        assert_eq!(s.proof, 1);
+    }
+
+    #[test]
+    fn mechanical_escalation_terminates_when_all_spent() {
+        let limits = RetryLimits {
+            max_proof_attempts: 1,
+            max_revisions: 1,
+            max_decompositions: 1,
+        };
+        let mut s = RetryState::new(limits);
+        s.revision = 1;
+        s.attempt = 1;
+        let esc = s.escalate_exhausted();
+        assert_eq!(esc.decision, Decision::Terminate);
     }
 
     #[test]

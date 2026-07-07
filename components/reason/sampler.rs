@@ -157,6 +157,48 @@ pub fn verbalized_sample(
         .collect())
 }
 
+/// How far a candidate proof got through the layered verifier (QED's
+/// structural-gate → detailed-check pipeline). Declared ascending so the derived
+/// ordering is `Certified > Detailed > Structural > Rejected` — a candidate that
+/// reached a deeper phase is a better bet even if none is fully certified yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationPhase {
+    /// Failed the first gate (or never ran).
+    Rejected,
+    /// Passed the cheap structural gate.
+    Structural,
+    /// Passed the expensive step-by-step detailed check.
+    Detailed,
+    /// Fully certified (compiled + axiom-clean).
+    Certified,
+}
+
+/// A candidate tagged with the verification phase it reached.
+#[derive(Debug, Clone)]
+pub struct PhasedCandidate<T> {
+    pub value: T,
+    pub phase: VerificationPhase,
+}
+
+/// QED's phase-prior selector: bias candidate selection by which verification
+/// phase each candidate reached. Among `candidates`, pick the one that got
+/// furthest through verification (ties broken by original order — a stable
+/// preference for earlier, cheaper candidates). Returns `None` for an empty
+/// slate. This is a *prior*, not a verdict: it ranks partial progress so
+/// best-of-N spends its next effort on the most promising branch rather than a
+/// uniformly-random one.
+pub fn select_by_phase<T>(candidates: Vec<PhasedCandidate<T>>) -> Option<PhasedCandidate<T>> {
+    candidates.into_iter().reduce(|best, c| {
+        // Strictly-greater keeps the earlier candidate on ties (stable).
+        if c.phase > best.phase {
+            c
+        } else {
+            best
+        }
+    })
+}
+
 /// Lexical-diversity score in [0, 1]: unique tokens / total tokens across the
 /// candidates' `approach` strings. Low values signal mode collapse (the model
 /// returned near-identical approaches).
@@ -225,6 +267,28 @@ mod tests {
         assert_eq!(out.len(), 3);
         assert_eq!(out[0].strategy, "induction");
         assert!((out.iter().map(|c| c.probability).sum::<f64>() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn phase_prior_prefers_the_deepest_candidate() {
+        let candidates = vec![
+            PhasedCandidate { value: "a", phase: VerificationPhase::Rejected },
+            PhasedCandidate { value: "b", phase: VerificationPhase::Detailed },
+            PhasedCandidate { value: "c", phase: VerificationPhase::Structural },
+        ];
+        let picked = select_by_phase(candidates).unwrap();
+        assert_eq!(picked.value, "b");
+        assert_eq!(picked.phase, VerificationPhase::Detailed);
+    }
+
+    #[test]
+    fn phase_prior_breaks_ties_toward_earlier() {
+        let candidates = vec![
+            PhasedCandidate { value: 1, phase: VerificationPhase::Structural },
+            PhasedCandidate { value: 2, phase: VerificationPhase::Structural },
+        ];
+        assert_eq!(select_by_phase(candidates).unwrap().value, 1);
+        assert!(select_by_phase::<()>(Vec::new()).is_none());
     }
 
     #[test]

@@ -31,6 +31,15 @@ pub struct Config {
     /// hidden-helper fan-out to budget). Defaults to `medium` (~1.8x).
     #[serde(default)]
     pub node_granularity: crate::model::Granularity,
+    /// Number of CONSECUTIVE clean verifier passes required before a node is
+    /// certified (AgentMathOlympiadMedalist's noisy-verifier hedge). The streak
+    /// resets to zero on any failed pass. Defaults to 3.
+    #[serde(default = "default_k_consecutive_clean")]
+    pub k_consecutive_clean: u32,
+}
+
+fn default_k_consecutive_clean() -> u32 {
+    3
 }
 
 fn default_lean_project() -> Option<PathBuf> {
@@ -50,6 +59,7 @@ impl Default for Config {
             auto_approve_safe: false,
             harden_proofs: false,
             node_granularity: crate::model::Granularity::default(),
+            k_consecutive_clean: default_k_consecutive_clean(),
         }
     }
 }

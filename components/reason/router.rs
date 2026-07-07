@@ -114,7 +114,7 @@ pub fn route(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{NodeStatus, NodeTier};
+    use crate::model::{NodeStatus, NodeTier, Taint};
     use chrono::Utc;
 
     fn node(kind: NodeKind, formal: Option<&str>) -> Node {
@@ -130,6 +130,7 @@ mod tests {
             provenance: "test".into(),
             content_hash: "hash".into(),
             tainted: false,
+            taint: Taint::Clean,
             tier: NodeTier::Spine,
             parent_id: None,
             strategy_hint: None,

@@ -264,7 +264,9 @@ impl AgentLoop<'_> {
                 )?;
                 if verdict.verdict == "counterexample" {
                     // Refuted: the branch is dead — record and let the router
-                    // escalate it to a human next pass.
+                    // escalate it to a human next pass. Rejecting the node
+                    // recomputes three-valued taint in the store, poisoning
+                    // every dependent; surface that blast radius as an event.
                     counterexamples.insert(node.id.clone());
                     self.store.set_node_status(
                         project_id,
@@ -272,6 +274,17 @@ impl AgentLoop<'_> {
                         NodeStatus::Rejected,
                         "falsifier",
                     )?;
+                    let edges = self.store.edges(project_id)?;
+                    let tainted = crate::taint::tainted_dependents(&node.id, &edges);
+                    if !tainted.is_empty() {
+                        self.store.event(
+                            Some(project_id),
+                            Some(run),
+                            "taint.propagated",
+                            "falsifier",
+                            json!({"root": node.id, "tainted_dependents": tainted}),
+                        )?;
+                    }
                 }
                 falsified.insert(node.id.clone());
                 Ok("falsify")
@@ -321,8 +334,9 @@ impl AgentLoop<'_> {
             Route::Formalize => self.formalize(project_id, run, node, session, certified),
             Route::Verify => {
                 if let Some(formal) = &node.formal_statement {
+                    let theorem = extract_theorem(formal);
                     let (compiles, axioms_clean) =
-                        self.verify_source(formal, extract_theorem(formal).as_deref(), session)?;
+                        self.verify_source(formal, theorem.as_deref(), session)?;
                     self.store.add_evidence(
                         project_id,
                         &node.id,
@@ -332,7 +346,14 @@ impl AgentLoop<'_> {
                         json!({"compiles":compiles,"axioms_clean":axioms_clean}),
                     )?;
                     if compiles && axioms_clean {
-                        self.certify(project_id, node, formal, certified)?;
+                        self.certify_k_consecutive(
+                            project_id,
+                            node,
+                            formal,
+                            theorem.as_deref(),
+                            session,
+                            certified,
+                        )?;
                     }
                     Ok("verify")
                 } else {
@@ -422,9 +443,58 @@ impl AgentLoop<'_> {
         self.store
             .set_formal_statement(project_id, &node.id, &sampled.value.lean, "formalizer")?;
         if sampled.accepted {
-            self.certify(project_id, node, &sampled.value.lean, certified)?;
+            let theorem = extract_theorem(&sampled.value.lean);
+            self.certify_k_consecutive(
+                project_id,
+                node,
+                &sampled.value.lean,
+                theorem.as_deref(),
+                session,
+                certified,
+            )?;
         }
         Ok("formalize")
+    }
+
+    /// Certify a node only after `config.k_consecutive_clean` CONSECUTIVE clean
+    /// verifier passes (streak resets on any fail), then hand off to
+    /// [`AgentLoop::certify`] — which keeps the authoritative `#print axioms`
+    /// gate intact. A hedge against a noisy verifier: one lucky clean pass is
+    /// not enough. Returns whether the node was certified.
+    fn certify_k_consecutive(
+        &self,
+        project_id: &str,
+        node: &Node,
+        lean: &str,
+        theorem: Option<&str>,
+        session: &mut Option<LeanSession>,
+        certified: &mut usize,
+    ) -> Result<bool> {
+        let k = self.config.k_consecutive_clean;
+        let gate = k_consecutive_clean(k, k.max(1), |_round| {
+            let (compiles, axioms_clean) = self.verify_source(lean, theorem, session)?;
+            Ok(compiles && axioms_clean)
+        })?;
+        self.store.add_evidence(
+            project_id,
+            &node.id,
+            "k_consecutive_clean",
+            "verifier",
+            if gate.certified {
+                "certified"
+            } else {
+                "streak_broken"
+            },
+            json!({
+                "k": k,
+                "rounds_run": gate.rounds_run,
+                "longest_streak": gate.longest_streak,
+            }),
+        )?;
+        if gate.certified {
+            self.certify(project_id, node, lean, certified)?;
+        }
+        Ok(gate.certified)
     }
 
     fn certify(
@@ -584,6 +654,59 @@ fn extract_theorem(src: &str) -> Option<String> {
     None
 }
 
+/// Outcome of the k-consecutive-clean acceptance gate.
+#[derive(Debug, Clone, Copy)]
+pub struct KConsecutiveOutcome {
+    /// Whether `k` consecutive clean passes were reached.
+    pub certified: bool,
+    /// How many verification rounds actually ran.
+    pub rounds_run: u32,
+    /// The longest clean streak observed (for telemetry).
+    pub longest_streak: u32,
+}
+
+/// AgentMathOlympiadMedalist's noisy-verifier hedge (`imo_client.py:339-346`):
+/// run `check` up to `max_rounds` times and only accept after `k` CONSECUTIVE
+/// clean passes, with the streak RESETTING to zero on any failed pass. Stops
+/// early the moment the streak reaches `k`. `k == 0` accepts immediately without
+/// running `check` (no consecutive requirement).
+pub fn k_consecutive_clean(
+    k: u32,
+    max_rounds: u32,
+    mut check: impl FnMut(u32) -> Result<bool>,
+) -> Result<KConsecutiveOutcome> {
+    if k == 0 {
+        return Ok(KConsecutiveOutcome {
+            certified: true,
+            rounds_run: 0,
+            longest_streak: 0,
+        });
+    }
+    let mut streak = 0u32;
+    let mut longest = 0u32;
+    let mut rounds = 0u32;
+    while rounds < max_rounds {
+        let clean = check(rounds)?;
+        rounds += 1;
+        if clean {
+            streak += 1;
+            longest = longest.max(streak);
+            if streak >= k {
+                break;
+            }
+        } else {
+            // A single failed pass wipes the streak — the hedge against a
+            // verifier that occasionally false-passes.
+            streak = 0;
+        }
+    }
+    Ok(KConsecutiveOutcome {
+        certified: streak >= k,
+        rounds_run: rounds,
+        longest_streak: longest,
+    })
+}
+
 /// Pull ranked lemma names out of the retrieval worker's JSON stdout.
 fn parse_lemma_names(stdout: &str) -> Vec<String> {
     let Ok(value) = serde_json::from_str::<Value>(stdout) else {
@@ -628,6 +751,37 @@ mod tests {
         fn name(&self) -> &str {
             "command"
         }
+    }
+
+    #[test]
+    fn k_consecutive_requires_a_clean_streak() {
+        // Three consecutive clean passes required.
+        let all_clean = k_consecutive_clean(3, 5, |_| Ok(true)).unwrap();
+        assert!(all_clean.certified);
+        assert_eq!(all_clean.rounds_run, 3); // stops early once the streak hits k
+
+        // A fail on round 1 resets the streak; only rounds after it count. With
+        // pattern clean,FAIL,clean,clean,clean the streak reaches 3 by round 5.
+        let cell = std::cell::Cell::new(0u32);
+        let recovers = k_consecutive_clean(3, 5, |_| {
+            let i = cell.get();
+            cell.set(i + 1);
+            Ok(i != 1) // round index 1 fails, all others clean
+        })
+        .unwrap();
+        assert!(recovers.certified);
+        assert_eq!(recovers.rounds_run, 5);
+
+        // Never enough consecutive clean passes within the round budget.
+        let clean = std::cell::Cell::new(true);
+        let never = k_consecutive_clean(3, 6, |_| {
+            let c = clean.get();
+            clean.set(!c); // alternating clean/fail: streak never reaches 2
+            Ok(c)
+        })
+        .unwrap();
+        assert!(!never.certified);
+        assert_eq!(never.longest_streak, 1);
     }
 
     #[test]
