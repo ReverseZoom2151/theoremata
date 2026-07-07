@@ -1,15 +1,15 @@
+mod config;
 #[path = "../components/graph/mod.rs"]
 mod graph;
 #[path = "../components/provider/mod.rs"]
 mod provider;
-#[path = "../components/tools/mod.rs"]
-mod tools;
-#[path = "../components/verify/mod.rs"]
-mod verify;
 #[path = "../components/reason/mod.rs"]
 mod reason;
-mod config;
+#[path = "../components/tools/mod.rs"]
+mod tools;
 mod tui;
+#[path = "../components/verify/mod.rs"]
+mod verify;
 
 // Re-export the grouped modules at the crate root so every component source
 // keeps its flat `crate::model` / `crate::workflow` / `crate::lean_session`
@@ -378,7 +378,8 @@ fn main() -> Result<()> {
                 provider: provider.as_ref(),
             };
             let reply = engine.send_stream(&project, &message, &mut on_event)?;
-            let auto_approved = engine.resolve_auto_approvals(&project, config.auto_approve_safe)?;
+            let auto_approved =
+                engine.resolve_auto_approvals(&project, config.auto_approve_safe)?;
             if !cli.json {
                 println!();
             }
@@ -611,7 +612,11 @@ fn main() -> Result<()> {
             if let Some(parent) = decls_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let decls_count = export.lean_decls.lines().filter(|l| !l.trim().is_empty()).count();
+            let decls_count = export
+                .lean_decls
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .count();
             std::fs::write(&decls_path, &export.lean_decls)?;
             print_value(
                 cli.json,
@@ -626,7 +631,10 @@ fn main() -> Result<()> {
             let tex = std::fs::read_to_string(&file)?;
             print_value(true, &blueprint::import(&store, &project, &tex)?)?
         }
-        Command::Checkdecls { workspace, manifest } => {
+        Command::Checkdecls {
+            workspace,
+            manifest,
+        } => {
             let manifest = manifest.unwrap_or_else(|| blueprint::lean_decls_path(&workspace));
             let decls: Vec<String> = std::fs::read_to_string(&manifest)
                 .unwrap_or_default()
@@ -646,17 +654,17 @@ fn main() -> Result<()> {
             }
             .run(&project)?,
         )?,
-        Command::Harden {
-            project,
-            node,
-        } => {
+        Command::Harden { project, node } => {
             let target = store
                 .nodes(&project)?
                 .into_iter()
                 .find(|n| n.id == node)
                 .ok_or_else(|| anyhow::anyhow!("node not found: {node}"))?;
             let source = target.formal_statement.clone().unwrap_or_default();
-            let module = format!("N{}", node.replace('-', "").chars().take(8).collect::<String>());
+            let module = format!(
+                "N{}",
+                node.replace('-', "").chars().take(8).collect::<String>()
+            );
             print_value(
                 true,
                 &hardening::harden(&store, &config, &project, &node, &module, &source)?,
@@ -698,12 +706,14 @@ fn main() -> Result<()> {
             }
             print_value(true, &outcomes)?
         }
-        Command::Trace { project, limit } => {
-            print_value(true, &observe::Observer { store: &store }.trace(&project, limit)?)?
-        }
-        Command::Metrics { project } => {
-            print_value(true, &observe::Observer { store: &store }.metrics(&project)?)?
-        }
+        Command::Trace { project, limit } => print_value(
+            true,
+            &observe::Observer { store: &store }.trace(&project, limit)?,
+        )?,
+        Command::Metrics { project } => print_value(
+            true,
+            &observe::Observer { store: &store }.metrics(&project)?,
+        )?,
         Command::Replay { project, run } => print_value(
             true,
             &observe::Observer { store: &store }.replay(&project, run.as_deref())?,
@@ -715,9 +725,10 @@ fn main() -> Result<()> {
             }
             .propose_tactics(&goal, 5)?,
         )?,
-        Command::Strategies { goal } => {
-            print_value(true, &sampler::verbalized_sample(provider.as_ref(), &goal, 4)?)?
-        }
+        Command::Strategies { goal } => print_value(
+            true,
+            &sampler::verbalized_sample(provider.as_ref(), &goal, 4)?,
+        )?,
         Command::SftExport { project } => {
             let records: Vec<serde_json::Value> = store
                 .nodes(&project)?

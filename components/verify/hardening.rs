@@ -350,8 +350,7 @@ pub fn harden(
                         }
                         if success {
                             outcome = HardeningOutcome::Passed;
-                            summary =
-                                format!("module '{qualified}' built and passed LeanParanoia");
+                            summary = format!("module '{qualified}' built and passed LeanParanoia");
                         } else {
                             outcome = HardeningOutcome::Flagged;
                             let names: Vec<&str> = failures
@@ -373,8 +372,7 @@ pub fn harden(
                         summary = format!(
                             "module '{qualified}' built; LeanParanoia could not audit '{theorem_target}' (import/name resolution) — INCONCLUSIVE, not clean; relying on axiom gate"
                         );
-                        paranoia_details =
-                            json!({"note":"no parseable verdict","stdout": stdout, "stderr": stderr});
+                        paranoia_details = json!({"note":"no parseable verdict","stdout": stdout, "stderr": stderr});
                     }
                 }
             }

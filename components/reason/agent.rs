@@ -15,8 +15,7 @@ use crate::{
     provider::ModelProvider,
     research::ResearchEngine,
     router::{self, NodeSignals, Route, ToolAvailability},
-    sampling,
-    scheduler,
+    sampling, scheduler,
     tools::{LeanCheck, MathlibSearch, PythonCheck, Tool},
 };
 use anyhow::{Context, Result};
@@ -151,7 +150,8 @@ impl AgentLoop<'_> {
                     steps.push(json!({"node":node.id,"escalated":"loop_detected","route":route}));
                     continue;
                 }
-                let tier = crate::guard::model_tier(node.kind, attempts, node.strategy_hint.as_deref());
+                let tier =
+                    crate::guard::model_tier(node.kind, attempts, node.strategy_hint.as_deref());
                 let outcome = self.act(
                     project_id,
                     &run,
@@ -317,7 +317,8 @@ impl AgentLoop<'_> {
                         .set_suggested_lemmas(project_id, &node.id, &lemmas, "librarian")?;
                     // Wrap retrieved (untrusted) text before it becomes a hint fed
                     // into later model prompts.
-                    let hint = crate::guard::wrap_untrusted("mathlib_retrieval", &lemmas.join(", "));
+                    let hint =
+                        crate::guard::wrap_untrusted("mathlib_retrieval", &lemmas.join(", "));
                     self.store
                         .set_strategy_hint(project_id, &node.id, Some(&hint), "librarian")?;
                 }
@@ -326,7 +327,11 @@ impl AgentLoop<'_> {
                     &node.id,
                     "retrieval",
                     "librarian",
-                    if lemmas.is_empty() { "none" } else { "candidates" },
+                    if lemmas.is_empty() {
+                        "none"
+                    } else {
+                        "candidates"
+                    },
                     serde_json::to_value(&result)?,
                 )?;
                 Ok("retrieve")
@@ -342,7 +347,11 @@ impl AgentLoop<'_> {
                         &node.id,
                         "lean_compile",
                         "verifier",
-                        if compiles && axioms_clean { "pass" } else { "fail" },
+                        if compiles && axioms_clean {
+                            "pass"
+                        } else {
+                            "fail"
+                        },
                         json!({"compiles":compiles,"axioms_clean":axioms_clean}),
                     )?;
                     if compiles && axioms_clean {
@@ -368,7 +377,12 @@ impl AgentLoop<'_> {
                     store: self.store,
                     provider: self.provider,
                 }
-                .run(project_id, run, &node.statement, self.config.node_granularity)?;
+                .run(
+                    project_id,
+                    run,
+                    &node.statement,
+                    self.config.node_granularity,
+                )?;
                 if obligations.is_empty() {
                     return Ok("noop");
                 }
@@ -517,7 +531,8 @@ impl AgentLoop<'_> {
             return Ok(());
         }
         let module = format!("N{}", node.id.replace('-', "").get(0..8).unwrap_or("node"));
-        if let Ok(report) = hardening::harden(self.store, self.config, project_id, &node.id, &module, lean)
+        if let Ok(report) =
+            hardening::harden(self.store, self.config, project_id, &node.id, &module, lean)
         {
             // Record the honest outcome. Only `Flagged` is a real soundness
             // failure: it taints the node (the `#print axioms` gate remains
@@ -733,8 +748,12 @@ mod tests {
     impl ModelProvider for MockProvider {
         fn complete(&self, request: &ModelRequest) -> Result<ModelResponse> {
             let content = match request.role.as_str() {
-                "object_identification" => json!({"objects":[{"name":"n","description":"integer"}]}),
-                "candidate_discovery" => json!({"candidates":[{"title":"c","statement":"s","type_label":"Invariant","status":"inconclusive"}]}),
+                "object_identification" => {
+                    json!({"objects":[{"name":"n","description":"integer"}]})
+                }
+                "candidate_discovery" => {
+                    json!({"candidates":[{"title":"c","statement":"s","type_label":"Invariant","status":"inconclusive"}]})
+                }
                 "formalization_target" => {
                     json!({"lean_signature":"theorem t : True := by sorry","symbol_dictionary":{}})
                 }

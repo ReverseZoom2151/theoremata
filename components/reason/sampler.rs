@@ -272,9 +272,18 @@ mod tests {
     #[test]
     fn phase_prior_prefers_the_deepest_candidate() {
         let candidates = vec![
-            PhasedCandidate { value: "a", phase: VerificationPhase::Rejected },
-            PhasedCandidate { value: "b", phase: VerificationPhase::Detailed },
-            PhasedCandidate { value: "c", phase: VerificationPhase::Structural },
+            PhasedCandidate {
+                value: "a",
+                phase: VerificationPhase::Rejected,
+            },
+            PhasedCandidate {
+                value: "b",
+                phase: VerificationPhase::Detailed,
+            },
+            PhasedCandidate {
+                value: "c",
+                phase: VerificationPhase::Structural,
+            },
         ];
         let picked = select_by_phase(candidates).unwrap();
         assert_eq!(picked.value, "b");
@@ -284,8 +293,14 @@ mod tests {
     #[test]
     fn phase_prior_breaks_ties_toward_earlier() {
         let candidates = vec![
-            PhasedCandidate { value: 1, phase: VerificationPhase::Structural },
-            PhasedCandidate { value: 2, phase: VerificationPhase::Structural },
+            PhasedCandidate {
+                value: 1,
+                phase: VerificationPhase::Structural,
+            },
+            PhasedCandidate {
+                value: 2,
+                phase: VerificationPhase::Structural,
+            },
         ];
         assert_eq!(select_by_phase(candidates).unwrap().value, 1);
         assert!(select_by_phase::<()>(Vec::new()).is_none());

@@ -94,7 +94,12 @@ mod tests {
 
     fn truthy_env(name: &str) -> bool {
         std::env::var(name)
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
             .unwrap_or(false)
     }
 
@@ -254,7 +259,10 @@ mod tests {
         // Some valid fixtures name their (honest) theorem `exploit_theorem`; the
         // Valid/ directory — not the name — decides the verdict.
         if has_exploit_theorem(src) {
-            return Some(("exploit_theorem".to_string(), count_word(src, "exploit_theorem") > 1));
+            return Some((
+                "exploit_theorem".to_string(),
+                count_word(src, "exploit_theorem") > 1,
+            ));
         }
         let mut thms: Vec<String> = Vec::new();
         let mut defs: Vec<String> = Vec::new();
@@ -570,7 +578,14 @@ mod tests {
         // project isn't properly built (import failures) — skip rather than
         // drown the run in spurious mismatches.
         let probe = &valid[0];
-        match run_paranoia(&lake, &exe, &project_dir, &probe.target, probe.no_replay, timeout) {
+        match run_paranoia(
+            &lake,
+            &exe,
+            &project_dir,
+            &probe.target,
+            probe.no_replay,
+            timeout,
+        ) {
             RunOutcome::Verdict { success: true, .. } => {}
             other => {
                 let why = match other {
@@ -615,8 +630,7 @@ mod tests {
         let mut mismatches: Vec<String> = Vec::new();
         let mut ran = 0usize;
         for f in &selected {
-            let outcome =
-                run_paranoia(&lake, &exe, &project_dir, &f.target, f.no_replay, timeout);
+            let outcome = run_paranoia(&lake, &exe, &project_dir, &f.target, f.no_replay, timeout);
             ran += 1;
             match outcome {
                 RunOutcome::Verdict {
@@ -649,14 +663,16 @@ mod tests {
                     "{} [{}]: could not launch paranoia ({})",
                     f.rel, f.category, e
                 )),
-                RunOutcome::Timeout => mismatches.push(format!(
-                    "{} [{}]: paranoia timed out",
-                    f.rel, f.category
-                )),
+                RunOutcome::Timeout => {
+                    mismatches.push(format!("{} [{}]: paranoia timed out", f.rel, f.category))
+                }
             }
         }
 
-        let valid_run = selected.iter().filter(|f| f.expected == Expected::Clean).count();
+        let valid_run = selected
+            .iter()
+            .filter(|f| f.expected == Expected::Clean)
+            .count();
         let exploit_run = ran - valid_run;
         eprintln!(
             "[paranoia_corpus] ran {ran} fixtures ({exploit_run} exploits, {valid_run} valid \
@@ -754,18 +770,25 @@ mod tests {
         // Even a non-zero build can leave enough oleans for a subset; the baseline
         // probe in the caller is the real gate. Only require the lakefile exists.
         let _ = status;
-        build_dir.join("lakefile.toml").exists().then_some(build_dir)
+        build_dir
+            .join("lakefile.toml")
+            .exists()
+            .then_some(build_dir)
     }
 
     // --- unit coverage for the pure discovery/parsing logic --------------------
 
     #[test]
     fn detects_exploit_theorem_declaration() {
-        assert!(has_exploit_theorem("theorem exploit_theorem : False := sorry\n"));
+        assert!(has_exploit_theorem(
+            "theorem exploit_theorem : False := sorry\n"
+        ));
         assert!(has_exploit_theorem(
             "@[implemented_by foo]\ndef exploit_theorem : True := trivial\n"
         ));
-        assert!(!has_exploit_theorem("theorem simple_theorem : True := trivial\n"));
+        assert!(!has_exploit_theorem(
+            "theorem simple_theorem : True := trivial\n"
+        ));
         // A mention inside a comment is not a declaration.
         assert!(!has_exploit_theorem("-- exploit_theorem is elsewhere\n"));
     }
@@ -815,13 +838,7 @@ mod tests {
             no_replay: false,
             rel: format!("{cat}/M{n}.lean"),
         };
-        let exploits = vec![
-            mk("A", 1),
-            mk("A", 2),
-            mk("A", 3),
-            mk("B", 1),
-            mk("C", 1),
-        ];
+        let exploits = vec![mk("A", 1), mk("A", 2), mk("A", 3), mk("B", 1), mk("C", 1)];
         let (sel, dropped) = select_exploits(exploits, 3);
         assert_eq!(sel.len(), 3);
         assert_eq!(dropped, 2);

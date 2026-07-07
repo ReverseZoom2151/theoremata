@@ -135,7 +135,9 @@ impl Decomposer<'_> {
         let granularity_hint = match granularity {
             Granularity::Coarse => "Prefer a few coarse, paper-sized obligations.",
             Granularity::Medium => "Aim for balanced, individually-provable obligations.",
-            Granularity::Fine => "Prefer many small micro-lemma obligations; let the DAG carry the reasoning.",
+            Granularity::Fine => {
+                "Prefer many small micro-lemma obligations; let the DAG carry the reasoning."
+            }
         };
         let history_hint = if plan_history.is_some() {
             " Prior attempts are recorded in `plan_history`; do NOT repeat a strategy on its \

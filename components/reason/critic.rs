@@ -377,7 +377,9 @@ mod tests {
     #[test]
     fn critique_grounds_findings_to_nodes() {
         let store = Store::open(Path::new(":memory:")).unwrap();
-        let project = store.create_project("p", "Every even square is even").unwrap();
+        let project = store
+            .create_project("p", "Every even square is even")
+            .unwrap();
         let node = store
             .add_node(&project.id, NodeKind::Obligation, "Core step", "S", "test")
             .unwrap();
@@ -389,7 +391,10 @@ mod tests {
         };
         let report = critic.critique(&project.id).unwrap();
         assert_eq!(report.findings.len(), 1);
-        assert_eq!(report.findings[0].node_id.as_deref(), Some(node.id.as_str()));
+        assert_eq!(
+            report.findings[0].node_id.as_deref(),
+            Some(node.id.as_str())
+        );
         assert_eq!(report.findings[0].severity, "major");
         assert_eq!(report.findings[0].class, FindingClass::JustificationGap);
         assert_eq!(report.summary, "One logical gap found.");
@@ -473,10 +478,16 @@ mod tests {
         let report = critic.critique(&project.id).unwrap();
         // Only the genuine finding survives; the false positive is pruned.
         assert_eq!(report.findings.len(), 1);
-        assert_eq!(report.findings[0].node_id.as_deref(), Some(real.id.as_str()));
+        assert_eq!(
+            report.findings[0].node_id.as_deref(),
+            Some(real.id.as_str())
+        );
         assert_eq!(report.findings[0].class, FindingClass::CriticalError);
         assert_eq!(report.pruned.len(), 1);
-        assert_eq!(report.pruned[0].finding.node_id.as_deref(), Some(bogus.id.as_str()));
+        assert_eq!(
+            report.pruned[0].finding.node_id.as_deref(),
+            Some(bogus.id.as_str())
+        );
         // The prune was logged, and no evidence was written for the bogus node.
         let events = store.events(&project.id, 50).unwrap();
         assert!(events.iter().any(|e| e.event_type == "critique.pruned"));

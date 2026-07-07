@@ -101,38 +101,38 @@ fn run_loop(
             if !app.output.is_empty() {
                 render_command_output(f, cols[0], &app.output);
             } else {
-            match app.pane {
-                Pane::Chat => {
-                    let lines = messages
-                        .iter()
-                        .flat_map(|m| {
-                            let color = if m.role == "user" {
-                                Color::Cyan
-                            } else {
-                                Color::Green
-                            };
-                            vec![
-                                Line::from(Span::styled(
-                                    format!("{} ›", m.role.to_uppercase()),
-                                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                                )),
-                                Line::raw(m.content.clone()),
-                                Line::raw(""),
-                            ]
-                        })
-                        .collect::<Vec<_>>();
-                    f.render_widget(
-                        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .title(" Conversation "),
-                        ),
-                        cols[0],
-                    );
+                match app.pane {
+                    Pane::Chat => {
+                        let lines = messages
+                            .iter()
+                            .flat_map(|m| {
+                                let color = if m.role == "user" {
+                                    Color::Cyan
+                                } else {
+                                    Color::Green
+                                };
+                                vec![
+                                    Line::from(Span::styled(
+                                        format!("{} ›", m.role.to_uppercase()),
+                                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                                    )),
+                                    Line::raw(m.content.clone()),
+                                    Line::raw(""),
+                                ]
+                            })
+                            .collect::<Vec<_>>();
+                        f.render_widget(
+                            Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+                                Block::default()
+                                    .borders(Borders::ALL)
+                                    .title(" Conversation "),
+                            ),
+                            cols[0],
+                        );
+                    }
+                    Pane::Graph => render_nodes(f, cols[0], &nodes, app.selected),
+                    Pane::Events => render_events(f, cols[0], &events),
                 }
-                Pane::Graph => render_nodes(f, cols[0], &nodes, app.selected),
-                Pane::Events => render_events(f, cols[0], &events),
-            }
             }
             render_inspector(f, cols[1], &nodes, app.selected, &app.status);
             f.render_widget(
@@ -325,7 +325,10 @@ fn slash(
             let prefix = parts.next().unwrap_or("");
             let proposal = resolve_proposal(store, project_id, prefix)?;
             ChatEngine { store, provider }.approve(project_id, &proposal)?;
-            format!("Approved and applied {}", &proposal[..8.min(proposal.len())])
+            format!(
+                "Approved and applied {}",
+                &proposal[..8.min(proposal.len())]
+            )
         }
         "/reject" => {
             let prefix = parts.next().unwrap_or("");

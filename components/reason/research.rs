@@ -39,7 +39,9 @@ struct Candidate {
 impl ResearchEngine<'_> {
     pub fn run(&self, project_id: &str) -> Result<ResearchSummary> {
         let project = self.store.project(project_id)?;
-        let run = self.store.begin_run(project_id, "research_to_formal_stages")?;
+        let run = self
+            .store
+            .begin_run(project_id, "research_to_formal_stages")?;
         let mut created = 0usize;
         let mut stages_run = Vec::new();
         let mut notes = Vec::new();
@@ -269,8 +271,7 @@ mod tests {
         assert!(nodes.iter().any(|n| n.kind == NodeKind::Definition));
         assert!(nodes
             .iter()
-            .any(|n| n.kind == NodeKind::Conjecture
-                && n.status == NodeStatus::InformallyVerified));
+            .any(|n| n.kind == NodeKind::Conjecture && n.status == NodeStatus::InformallyVerified));
         assert!(nodes
             .iter()
             .any(|n| n.kind == NodeKind::FormalStatement && n.formal_statement.is_some()));

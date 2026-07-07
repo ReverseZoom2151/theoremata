@@ -57,7 +57,11 @@ fn python_command() -> Option<String> {
 fn str_vec(value: &Value) -> Vec<String> {
     value
         .as_array()
-        .map(|a| a.iter().filter_map(|m| m.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|m| m.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 

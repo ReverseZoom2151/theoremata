@@ -98,7 +98,11 @@ impl Falsifier<'_> {
         let output: Value = serde_json::from_str(&result.stdout).unwrap_or(Value::Null);
         let verdict = output["output"]["verdict"]
             .as_str()
-            .unwrap_or(if result.success { "inconclusive" } else { "error" })
+            .unwrap_or(if result.success {
+                "inconclusive"
+            } else {
+                "error"
+            })
             .to_string();
         let assignment = output["output"].get("assignment").cloned();
         Ok(FalsifyVerdict {
@@ -152,8 +156,13 @@ mod tests {
         assert_eq!(v.spec["claim"], "(n * n) % 2 == 0");
         // verdict depends on whether the python worker is present; either way it
         // must not be a hardcoded constant — it reflects the spec that ran.
-        assert!(["no_counterexample_in_domain", "unavailable", "inconclusive", "counterexample"]
-            .contains(&v.verdict.as_str()));
+        assert!([
+            "no_counterexample_in_domain",
+            "unavailable",
+            "inconclusive",
+            "counterexample"
+        ]
+        .contains(&v.verdict.as_str()));
     }
 
     #[test]

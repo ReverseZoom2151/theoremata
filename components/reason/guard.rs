@@ -62,11 +62,7 @@ impl LoopGuard {
 
     /// Read-only: would this (goal, action) be at/over the loop threshold now?
     pub fn tripped(&self, goal: &str, action: &str) -> bool {
-        self.counts
-            .get(&key(goal, action))
-            .copied()
-            .unwrap_or(0)
-            >= LOOP_THRESHOLD
+        self.counts.get(&key(goal, action)).copied().unwrap_or(0) >= LOOP_THRESHOLD
     }
 }
 

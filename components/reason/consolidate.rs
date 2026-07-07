@@ -60,10 +60,12 @@ impl Consolidator<'_> {
         // 2. Dead-end summarization ------------------------------------------
         self.store
             .update_run(project_id, &run, "running", "lessons", 0)?;
-        let lessons = self.summarize_dead_ends(project_id, has_model).unwrap_or_else(|e| {
-            notes.push(format!("dead-end summarization failed: {e}"));
-            0
-        });
+        let lessons = self
+            .summarize_dead_ends(project_id, has_model)
+            .unwrap_or_else(|e| {
+                notes.push(format!("dead-end summarization failed: {e}"));
+                0
+            });
         if !has_model {
             notes.push("no model provider: dead-end lessons and sub-lemma closure skipped".into());
         }
@@ -106,10 +108,7 @@ impl Consolidator<'_> {
         let mut deduped = 0;
         for node in &nodes {
             // Never touch a node that is already retired or already a duplicate.
-            if matches!(
-                node.status,
-                NodeStatus::Superseded | NodeStatus::Rejected
-            ) {
+            if matches!(node.status, NodeStatus::Superseded | NodeStatus::Rejected) {
                 continue;
             }
             match seen.get(&node.content_hash) {
@@ -346,7 +345,9 @@ mod tests {
     #[test]
     fn dedups_and_summarizes() {
         let store = Store::open(Path::new(":memory:")).unwrap();
-        let project = store.create_project("p", "every even square is even").unwrap();
+        let project = store
+            .create_project("p", "every even square is even")
+            .unwrap();
         // Two identical nodes (same kind/title/statement -> same content_hash).
         let a = store
             .add_node(&project.id, NodeKind::Lemma, "dup", "S", "test")

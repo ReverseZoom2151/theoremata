@@ -167,7 +167,13 @@ mod tests {
         let ids: Vec<String> = (0..8)
             .map(|i| {
                 store
-                    .add_node(&project.id, NodeKind::Obligation, &format!("o{i}"), "s", "test")
+                    .add_node(
+                        &project.id,
+                        NodeKind::Obligation,
+                        &format!("o{i}"),
+                        "s",
+                        "test",
+                    )
                     .unwrap()
                     .id
             })
