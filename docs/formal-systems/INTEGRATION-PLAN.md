@@ -7,6 +7,21 @@ the core. Grounded in the three build-ready references in this folder
 (`lean.md`, `rocq.md`, `isabelle.md`) and our existing architecture
 (`components/prover/`, `components/verify/`).
 
+## BUILD STATUS — all phases shipped (2026-07-07)
+
+The plan below is **built and live on this machine**, commits `6245cd2`…`9f8b44f`:
+
+- **Phase 0/1** — `FormalSystem`/`FormalBackend`/`ProofSession` abstraction + mock Rocq/Isabelle backends (`6245cd2`).
+- **Layer 2c** — universal source-scan gate for all three (`0ea653e`).
+- **Drivers + hammer adapters** (`51be03a`), worker-wired (`ef134cd`).
+- **Phase 2 — live gates** via a runner-agnostic exec bridge (`Runner{Native,Wsl,Docker}`, per-system `Config.formal_runners`) (`1639530`). Toolchains installed: Lean 4.31 native, Coq 8.18 (WSL), Isabelle2025-2 (WSL). Live e2e tests pass: each certifies a trivial proof AND rejects the `sorry`/`Admitted` variant.
+- **Phase 3 — proof generators** (`8ef4b55`): `generate_and_verify(system, statement)`, best-of-N selected by the live gate; CLI `formal-prove <system> <statement>`.
+- **Phase 5 — portfolio proving** (`4a9bb8f`): `portfolio-prove <statement>` races all three; smoke on `"True"` certified via **all three live backends** (winner lean).
+- **Phase 4 — live hammer** (`9f8b44f`): **Sledgehammer genuinely works** here (`isabelle process_theories -O`, E prover, ~11s → real `by auto`/`by simp` reconstructions). CoqHammer/aesop gated (need `opam install coq-hammer-tactics` / a Mathlib Lake project) with graceful mock fallback.
+- **Hammer-assisted generation** (final): the hammer folded into `generate_and_verify` so Isabelle can *find* proofs via Sledgehammer even with no model in the loop.
+
+129+ Rust tests, warning-clean; the `reason`/`prover` components were regrouped into subdirectories (`01a3ac2`, `9193922`).
+
 ## The unifying insight
 
 All three systems expose the **same five-part integration surface**. The deep
