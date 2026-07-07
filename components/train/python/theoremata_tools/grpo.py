@@ -16,10 +16,14 @@ from __future__ import annotations
 
 import json
 import sys
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 # A verifier is the Lean compiler in real use: proof text -> did it verify?
 Verifier = Callable[[str], bool]
+
+# Linear temperature annealing bounds (DeepMath training_utils: hot -> cold).
+TEMPERATURE_START = 1.2
+TEMPERATURE_END = 0.7
 
 
 def grpo_config(model: str, dataset_path: str, **overrides: Any) -> dict[str, Any]:
@@ -41,8 +45,13 @@ def grpo_config(model: str, dataset_path: str, **overrides: Any) -> dict[str, An
         "num_generations": 8,
         "max_prompt_length": 1024,
         "max_completion_length": 1024,
-        "temperature": 1.0,
+        "temperature": TEMPERATURE_START,
         "top_p": 1.0,
+        # linear temperature annealing (DeepMath): start hot to explore diverse
+        # proof strategies, cool to stabilize. Applied per-step by
+        # ``linear_temperature`` in the real trainer / reported in the dry run.
+        "temperature_start": TEMPERATURE_START,
+        "temperature_end": TEMPERATURE_END,
         # --- optimization ------------------------------------------------
         "learning_rate": 1e-6,
         "beta": 0.0,  # KL penalty coefficient; DAPO drops the KL term (beta=0)
@@ -92,6 +101,106 @@ def goldilocks_keep(group_rewards: list[float]) -> bool:
     return 0.0 < total < len(group_rewards)
 
 
+def linear_temperature(step: int, total_steps: int, config: dict[str, Any]) -> float:
+    """Linearly annealed sampling temperature at ``step`` of ``total_steps``.
+
+    Interpolates ``temperature_start`` -> ``temperature_end`` (defaults 1.2 ->
+    0.7). ``step`` is clamped into ``[0, total_steps]``; a non-positive
+    ``total_steps`` returns the start temperature. Portable to any best-of-N /
+    MCTS sampler (DeepMath ``training_utils.GRPOTrainerTemperature``)."""
+    hot = float(config.get("temperature_start", TEMPERATURE_START))
+    cold = float(config.get("temperature_end", TEMPERATURE_END))
+    if total_steps <= 0:
+        return hot
+    frac = min(max(step, 0), total_steps) / total_steps
+    return hot + (cold - hot) * frac
+
+
+def _load_dataset(dataset: Any) -> list[dict[str, Any]]:
+    """Coerce a dataset argument into a list of sample dicts. Accepts an
+    in-memory list, a harvester result dict (``{"rows": [...]}``), or a path to
+    a JSONL file (one sample per line)."""
+    if isinstance(dataset, str):
+        rows: list[dict[str, Any]] = []
+        with open(dataset, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    rows.append(json.loads(line))
+        return rows
+    if isinstance(dataset, dict) and "rows" in dataset:
+        return list(dataset["rows"])
+    if isinstance(dataset, list):
+        return list(dataset)
+    raise ValueError("unrecognized dataset; expected list, {'rows': [...]}, or a JSONL path")
+
+
+def dry_run_grpo(
+    dataset: Any,
+    reward_fn: Callable[[dict[str, Any]], Optional[float]],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate a dataset + reward end-to-end WITHOUT a GPU / trainer.
+
+    Runs ``reward_fn`` over every sample, tallies scored vs. skipped
+    (``reward_fn`` returned ``None``), groups the scored rewards by
+    ``prompt``/``group``/``problem_id`` into GRPO groups and reports how many
+    survive the Goldilocks filter, and computes the temperature schedule the
+    real run would follow. This is exactly the plumbing a real GRPO step would
+    exercise, minus the model.
+
+    Returns a report describing what a real run *would* do.
+    """
+    samples = _load_dataset(dataset)
+    num_generations = int(config.get("num_generations", 8))
+
+    scored = 0
+    skipped = 0
+    reward_sum = 0.0
+    groups: dict[str, list[float]] = {}
+    for i, sample in enumerate(samples):
+        r = reward_fn(sample)
+        if r is None:
+            skipped += 1
+            continue
+        scored += 1
+        reward_sum += r
+        key = str(
+            sample.get("group")
+            or sample.get("problem_id")
+            or sample.get("prompt")
+            or i // max(num_generations, 1)
+        )
+        groups.setdefault(key, []).append(r)
+
+    kept_groups = {k: v for k, v in groups.items() if goldilocks_keep(v)}
+    total_steps = int(config.get("max_steps", 0))
+    temp_schedule = {
+        "start": linear_temperature(0, total_steps, config),
+        "mid": linear_temperature(total_steps // 2, total_steps, config),
+        "end": linear_temperature(total_steps, total_steps, config),
+    }
+
+    return {
+        "ok": True,
+        "dry_run": True,
+        "reason": "no_trainer_backend",
+        "dataset_size": len(samples),
+        "scored": scored,
+        "skipped": skipped,
+        "mean_reward": (reward_sum / scored) if scored else 0.0,
+        "num_groups": len(groups),
+        "groups_kept": len(kept_groups),
+        "groups_dropped": len(groups) - len(kept_groups),
+        "temperature_schedule": temp_schedule,
+        "would_run": {
+            "model": config.get("model"),
+            "num_generations": num_generations,
+            "max_steps": total_steps,
+        },
+    }
+
+
 def train(config: dict[str, Any], *, dry_run: bool = True) -> dict[str, Any]:
     """GRPO training entrypoint.
 
@@ -138,6 +247,16 @@ def run(request: dict[str, Any]) -> dict[str, Any]:
         return {"keep": goldilocks_keep(request["group_rewards"])}
     if op == "train":
         return train(request["config"], dry_run=request.get("dry_run", True))
+    if op == "dry_run":
+        from .reward import make_reward_fn
+
+        config = request.get("config") or grpo_config(
+            request.get("model", "model"),
+            request.get("dataset_path", request.get("dataset", "dataset")),
+            **request.get("overrides", {}),
+        )
+        reward_fn = make_reward_fn(tool_weight=request.get("tool_weight", 0.1))
+        return dry_run_grpo(request["dataset"], reward_fn, config)
     raise ValueError(f"unknown op: {op}")
 
 
