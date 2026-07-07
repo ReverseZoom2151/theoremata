@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -450,8 +451,128 @@ def run(request: dict) -> dict:
         session.close()
 
 
+# ---------------------------------------------------------------------------
+# Resident server: one warm session reused across many requests
+# ---------------------------------------------------------------------------
+
+_ALLOWED_AXIOMS = {"propext", "Classical.choice", "Quot.sound"}
+
+
+def _parse_axiom_names(axioms_msgs: list[str] | None) -> list[str]:
+    """Extract axiom names from ``#print axioms`` message text.
+
+    Handles both ``'t' does not depend on any axioms`` (-> ``[]``) and
+    ``'t' depends on axioms: [propext, Classical.choice]``."""
+    text = " ".join(a for a in (axioms_msgs or []) if a)
+    if "does not depend on any axioms" in text:
+        return []
+    match = re.search(r"\[([^\]]*)\]", text)
+    if not match:
+        return []
+    return [x.strip() for x in match.group(1).split(",") if x.strip()]
+
+
+def serve(stdin: Any = None, stdout: Any = None) -> int:
+    """Persistent newline-delimited JSON-RPC loop over ONE warm ``LeanSession``.
+
+    Reads one request object per line and writes one response line each:
+    request  ``{"op":"warm"|"check","source":?,"theorem":?,"imports":?,"root":?}``
+    response ``{"ok":bool,"axioms_clean":bool,"messages":[...],"axioms":[...],"elapsed":...}``
+
+    The session is created lazily and reused; it is recreated when the requested
+    ``imports``/``root`` change or the underlying process dies. Malformed lines
+    yield an error response but keep the loop alive; EOF exits cleanly."""
+    stdin = sys.stdin if stdin is None else stdin
+    stdout = sys.stdout if stdout is None else stdout
+    state: dict[str, Any] = {"session": None, "imports": None, "root": None}
+
+    def emit(obj: dict) -> None:
+        stdout.write(json.dumps(obj) + "\n")
+        stdout.flush()
+
+    def ensure(imports: list[str], root: str | None):
+        session = state["session"]
+        stale = (
+            session is None
+            or state["imports"] != imports
+            or state["root"] != root
+            or (getattr(session, "mode", None) == "repl" and not session._alive())
+        )
+        if stale:
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+            session = LeanSession(imports=imports, root=root)
+            warm = session.warm()
+            state.update(session=session, imports=imports, root=root)
+            return session, warm
+        return session, {"ok": True, "warmed": True, "elapsed": 0.0}
+
+    while True:
+        line = stdin.readline()
+        if not line:  # EOF
+            break
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            request = json.loads(line)
+        except Exception as exc:  # noqa: BLE001
+            emit({"ok": False, "error": f"malformed request: {exc}"})
+            continue
+        op = request.get("op", "check")
+        imports = request.get("imports") or ["Init"]
+        root = request.get("root")
+        try:
+            session, warm = ensure(imports, root)
+            if not warm.get("ok", True):
+                emit({"ok": False, "error": warm.get("error", "warm failed"), "warm": warm})
+                continue
+            if op == "warm":
+                emit({"ok": True, "warmed": True, "mode": session.mode,
+                      "elapsed": warm.get("elapsed", 0.0)})
+                continue
+            if op == "check":
+                theorem = request.get("theorem")
+                result = session.check(request.get("source", ""), print_axioms=theorem)
+                axioms = _parse_axiom_names(result.get("axioms")) if theorem else []
+                axioms_clean = bool(result.get("ok")) and (
+                    not theorem or all(a in _ALLOWED_AXIOMS for a in axioms)
+                )
+                emit({
+                    "ok": bool(result.get("ok")),
+                    "axioms_clean": axioms_clean,
+                    "messages": [m.get("data", "") for m in result.get("messages", [])],
+                    "axioms": axioms,
+                    "sorries": result.get("sorries", []),
+                    "mode": session.mode,
+                    "elapsed": result.get("elapsed"),
+                })
+                continue
+            emit({"ok": False, "error": f"unknown op: {op!r}"})
+        except Exception as exc:  # noqa: BLE001 -- reset session, keep serving
+            try:
+                if state["session"] is not None:
+                    state["session"].close()
+            except Exception:
+                pass
+            state["session"] = None
+            emit({"ok": False, "error": str(exc), "error_type": type(exc).__name__})
+
+    if state["session"] is not None:
+        try:
+            state["session"].close()
+        except Exception:
+            pass
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "serve":
+        return serve()
     if argv and argv[0] not in ("-", ""):
         raw = Path(argv[0]).read_text(encoding="utf-8")
     else:
