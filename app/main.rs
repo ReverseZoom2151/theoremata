@@ -15,7 +15,10 @@ mod tui;
 // keeps its flat `crate::model` / `crate::workflow` / `crate::lean_session`
 // paths unchanged — the physical layout is by component, the namespace is flat.
 pub use graph::{db, model, scheduler};
-pub use reason::{agent, chat, critic, research, retry, router, sampling, workflow};
+pub use reason::{
+    agent, chat, consolidate, critic, guard, mcts, observe, research, retry, router, sampler,
+    sampling, team, workflow,
+};
 pub use verify::{hardening, lean_session};
 
 use anyhow::Result;
@@ -221,6 +224,40 @@ enum Command {
     },
     Route {
         project: String,
+    },
+    Consolidate {
+        project: String,
+    },
+    Team {
+        project: String,
+    },
+    Trace {
+        project: String,
+        #[arg(default_value_t = 30)]
+        limit: usize,
+    },
+    Metrics {
+        project: String,
+    },
+    Replay {
+        project: String,
+        #[arg(long)]
+        run: Option<String>,
+    },
+    Tactics {
+        goal: String,
+    },
+    Strategies {
+        goal: String,
+    },
+    SftExport {
+        project: String,
+    },
+    Evolve {
+        request: String,
+    },
+    Grpo {
+        request: String,
     },
     Lemma {
         project: String,
@@ -595,6 +632,81 @@ fn main() -> Result<()> {
             }
             .critique(&project)?,
         )?,
+        Command::Consolidate { project } => print_value(
+            true,
+            &consolidate::Consolidator {
+                store: &store,
+                provider: provider.as_ref(),
+            }
+            .run(&project)?,
+        )?,
+        Command::Team { project } => {
+            let batches = team::parallel_batches(&store, &project)?;
+            let workers = team::Team {
+                db_path: config.database.clone(),
+                max_workers: 4,
+            };
+            let mut outcomes = Vec::new();
+            for batch in &batches {
+                outcomes.extend(workers.process_batch(&project, batch)?);
+            }
+            print_value(true, &outcomes)?
+        }
+        Command::Trace { project, limit } => {
+            print_value(true, &observe::Observer { store: &store }.trace(&project, limit)?)?
+        }
+        Command::Metrics { project } => {
+            print_value(true, &observe::Observer { store: &store }.metrics(&project)?)?
+        }
+        Command::Replay { project, run } => print_value(
+            true,
+            &observe::Observer { store: &store }.replay(&project, run.as_deref())?,
+        )?,
+        Command::Tactics { goal } => print_value(
+            true,
+            &mcts::TacticMcts {
+                provider: provider.as_ref(),
+            }
+            .propose_tactics(&goal, 5)?,
+        )?,
+        Command::Strategies { goal } => {
+            print_value(true, &sampler::verbalized_sample(provider.as_ref(), &goal, 4)?)?
+        }
+        Command::SftExport { project } => {
+            let records: Vec<serde_json::Value> = store
+                .nodes(&project)?
+                .into_iter()
+                .filter(|n| {
+                    n.status == NodeStatus::FormallyVerified && n.formal_statement.is_some()
+                })
+                .map(|n| {
+                    serde_json::json!({
+                        "goal": n.statement, "proof": n.formal_statement,
+                        "verified": true, "axioms_ok": true
+                    })
+                })
+                .collect();
+            print_value(
+                true,
+                &PythonCheck::new().run(serde_json::json!({
+                    "tool":"sft_export","request":{"op":"star_dataset","records":records}
+                }))?,
+            )?
+        }
+        Command::Evolve { request } => {
+            let request: serde_json::Value = serde_json::from_str(&request)?;
+            print_value(
+                true,
+                &PythonCheck::new().run(serde_json::json!({"tool":"evolve","request":request}))?,
+            )?
+        }
+        Command::Grpo { request } => {
+            let request: serde_json::Value = serde_json::from_str(&request)?;
+            print_value(
+                true,
+                &PythonCheck::new().run(serde_json::json!({"tool":"grpo","request":request}))?,
+            )?
+        }
         Command::Route { project } => {
             let nodes = store.nodes(&project)?;
             let tools = router::ToolAvailability {

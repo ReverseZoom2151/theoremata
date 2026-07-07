@@ -99,6 +99,7 @@ impl AgentLoop<'_> {
         let max_attempts = self.config.max_iterations.max(1);
         let mut falsified: HashSet<String> = HashSet::new();
         let mut certified = 0usize;
+        let mut loop_guard = crate::guard::LoopGuard::new(64);
         for _pass in 0..max_attempts {
             let nodes = self.store.nodes(project_id)?;
             let edges = self.store.edges(project_id)?;
@@ -117,6 +118,19 @@ impl AgentLoop<'_> {
                     attempts,
                 };
                 let route = router::route(&node, &signals, &tools, max_attempts);
+                // Loop detection: if we keep routing the same node the same way,
+                // escalate to a human instead of spinning.
+                if loop_guard.observe(&node.title, &format!("{route:?}")) {
+                    self.store.set_node_status(
+                        project_id,
+                        &node.id,
+                        NodeStatus::Blocked,
+                        "loop_guard",
+                    )?;
+                    steps.push(json!({"node":node.id,"escalated":"loop_detected","route":route}));
+                    continue;
+                }
+                let tier = crate::guard::model_tier(node.kind, attempts, node.strategy_hint.as_deref());
                 let outcome = self.act(
                     project_id,
                     &run,
@@ -126,7 +140,10 @@ impl AgentLoop<'_> {
                     &mut falsified,
                     &mut certified,
                 )?;
-                steps.push(json!({"node":node.id,"title":node.title,"route":route,"outcome":outcome}));
+                steps.push(json!({
+                    "node":node.id,"title":node.title,"route":route,
+                    "tier":crate::guard::tier_env_suffix(tier),"outcome":outcome
+                }));
                 if outcome != "noop" {
                     progressed = true;
                 }
@@ -241,9 +258,23 @@ impl AgentLoop<'_> {
                     "query":node.title,"limit":8,"op":"retrieve"
                 }))?;
                 let lemmas = parse_lemma_names(&result.stdout);
+                if crate::guard::looks_injected(&result.stdout) {
+                    self.store.event(
+                        Some(project_id),
+                        None,
+                        "guard.injection_flagged",
+                        "librarian",
+                        json!({ "node": node.id }),
+                    )?;
+                }
                 if !lemmas.is_empty() {
                     self.store
                         .set_suggested_lemmas(project_id, &node.id, &lemmas, "librarian")?;
+                    // Wrap retrieved (untrusted) text before it becomes a hint fed
+                    // into later model prompts.
+                    let hint = crate::guard::wrap_untrusted("mathlib_retrieval", &lemmas.join(", "));
+                    self.store
+                        .set_strategy_hint(project_id, &node.id, Some(&hint), "librarian")?;
                 }
                 self.store.add_evidence(
                     project_id,

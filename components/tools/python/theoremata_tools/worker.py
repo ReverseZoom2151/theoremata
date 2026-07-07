@@ -64,6 +64,18 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         return grader_run(request["request"])
     if tool == "eval":
         return eval_run(request["request"])
+    if tool == "evolve":
+        from .evolve import run as evolve_run
+
+        return evolve_run(request["request"])
+    if tool == "sft_export":
+        from .sft_export import run as sft_export_run
+
+        return sft_export_run(request["request"])
+    if tool == "grpo":
+        from .grpo import run as grpo_run
+
+        return grpo_run(request["request"])
     if tool == "retrieve":
         return retrieval_run(
             root=request.get("root"),
