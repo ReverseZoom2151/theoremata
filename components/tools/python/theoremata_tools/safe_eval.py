@@ -6,6 +6,13 @@ import math
 import statistics
 from typing import Any
 
+from .sandbox import (
+    DEFAULT_TIMEOUT_SECONDS,
+    SandboxResult,
+    guard_imports,
+    run_in_subprocess,
+)
+
 ALLOWED_NAMES: dict[str, Any] = {
     "abs": abs,
     "all": all,
@@ -43,6 +50,9 @@ ALLOWED_NODES = (
 
 
 def compile_expression(expression: str, variables: set[str] | None = None):
+    # Import allow-list first: gives a self-correcting "Import not allowed: X"
+    # hint before the generic AST-whitelist rejects the offending name.
+    guard_imports(expression)
     tree = ast.parse(expression, mode="eval")
     variables = variables or set()
     comprehension_targets = {
@@ -72,3 +82,21 @@ def evaluate(expression: str, variables: dict[str, Any] | None = None) -> Any:
     variables = variables or {}
     code = compile_expression(expression, set(variables))
     return eval(code, {"__builtins__": {}}, {**ALLOWED_NAMES, **variables})
+
+
+def evaluate_hardened(
+    expression: str,
+    variables: dict[str, Any] | None = None,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+) -> SandboxResult:
+    """Evaluate ``expression`` in a hard-kill subprocess (see :mod:`.sandbox`).
+
+    Returns a :class:`~theoremata_tools.sandbox.SandboxResult`; call
+    ``.unwrap()`` for the value-or-raise behaviour of :func:`evaluate`. Use this
+    when the expression is untrusted enough to warrant a killable child process
+    (e.g. it may contain an unbounded comprehension). ``evaluate`` itself keeps
+    its original, synchronous signature and return contract unchanged.
+    """
+    return run_in_subprocess(
+        evaluate, args=(expression, variables), timeout=timeout_seconds
+    )
