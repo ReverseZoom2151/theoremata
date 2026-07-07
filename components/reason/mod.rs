@@ -1,21 +1,14 @@
 //! Orchestration and reasoning: the workflows, the autonomous agent loop, the
 //! research/critic/router/sampling/retry building blocks, and chat.
-pub mod agent;
-pub mod blueprint;
-pub mod chat;
-pub mod consolidate;
-pub mod critic;
-pub mod decompose;
-pub mod falsification;
-pub mod guard;
-pub mod mcts;
-pub mod observe;
-pub mod plan_history;
-pub mod progress;
-pub mod research;
-pub mod retry;
-pub mod router;
-pub mod sampler;
-pub mod sampling;
-pub mod taint;
-pub mod team;
+pub mod critique;
+pub mod orchestration;
+pub mod proving;
+pub mod search;
+
+// Re-export every leaf module flat at the component root so existing paths
+// (`reason::mcts`, hence `crate::mcts` via app/main.rs, and sibling references
+// like `crate::mcts`) continue to resolve after the subgroup reorganization.
+pub use orchestration::{agent, chat, consolidate, observe, research, team};
+pub use search::{mcts, progress, sampler, sampling};
+pub use proving::{blueprint, decompose, falsification, retry, router};
+pub use critique::{critic, guard, plan_history, taint};
