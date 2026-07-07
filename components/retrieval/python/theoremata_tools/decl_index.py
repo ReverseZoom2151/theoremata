@@ -17,7 +17,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-_SCRIPT = Path(__file__).with_name("dump_decls.lean")
+_SCRIPT = Path(__file__).resolve().parents[2] / "lean" / "dump_decls.lean"
 
 
 def _resolve(name: str, override: str | None = None) -> str | None:

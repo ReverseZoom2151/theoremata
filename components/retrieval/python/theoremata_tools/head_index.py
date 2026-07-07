@@ -23,7 +23,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-_SCRIPT = Path(__file__).with_name("dump_types.lean")
+_SCRIPT = Path(__file__).resolve().parents[2] / "lean" / "dump_types.lean"
 
 # Outermost logical connective / relation, lowest precedence first, so the first
 # top-level match is the head of the conclusion. Maps Lean notation to the

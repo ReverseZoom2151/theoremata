@@ -270,11 +270,7 @@ fn main() -> Result<()> {
             // stdin/stdout, so an MCP client drives the Python tool workers.
             let python = tools::python_command()
                 .ok_or_else(|| anyhow::anyhow!("no python interpreter found"))?;
-            let root = PathBuf::from("python").canonicalize()?;
-            let bootstrap = format!(
-                "import sys;sys.path.insert(0,{:?});from theoremata_tools.mcp_server import main;main()",
-                root.to_string_lossy()
-            );
+            let bootstrap = tools::python_bootstrap("mcp_server");
             let status = std::process::Command::new(python)
                 .args(["-E", "-c", &bootstrap])
                 .status()?;

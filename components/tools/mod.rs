@@ -124,14 +124,21 @@ impl Tool for MathlibSearch {
     }
 }
 
-pub struct PythonCheck {
-    package_root: PathBuf,
+/// A `-c` bootstrap that puts every component's `python/` dir on `sys.path`
+/// (the `theoremata_tools` namespace package is split across them) and runs a
+/// worker module's `main`. Relative to the process cwd (the repo root).
+pub fn python_bootstrap(module: &str) -> String {
+    format!(
+        "import sys,glob,os;\
+         [sys.path.insert(0,os.path.abspath(p)) for p in sorted(glob.glob('components/*/python'))];\
+         from theoremata_tools.{module} import main;main()"
+    )
 }
+
+pub struct PythonCheck;
 impl PythonCheck {
     pub fn new() -> Self {
-        Self {
-            package_root: PathBuf::from("python"),
-        }
+        Self
     }
 }
 impl Tool for PythonCheck {
@@ -139,17 +146,12 @@ impl Tool for PythonCheck {
         "python_check"
     }
     fn available(&self) -> bool {
-        self.package_root
-            .join("theoremata_tools/worker.py")
-            .exists()
+        PathBuf::from("components/tools/python/theoremata_tools/worker.py").exists()
             && python_command().is_some()
     }
     fn run(&self, input: serde_json::Value) -> Result<ToolResult> {
         let started = Instant::now();
-        let bootstrap = format!(
-            "import sys;sys.path.insert(0,{:?});from theoremata_tools.worker import main;main()",
-            self.package_root.canonicalize()?.to_string_lossy()
-        );
+        let bootstrap = python_bootstrap("worker");
         let python = python_command()
             .ok_or_else(|| anyhow!("no python interpreter found (tried python3, python)"))?;
         // `-E` (ignore PYTHON* env vars) rather than `-I`: the worker must be
@@ -173,7 +175,7 @@ impl Tool for PythonCheck {
             self.name(),
             started,
             output,
-            json!({"package_root":self.package_root}),
+            json!({"workers": "components/*/python"}),
         ))
     }
 }
