@@ -5,6 +5,7 @@ the loader must return >0 items; when absent it must skip cleanly (return ``[]``
 without raising). Graders are tested deterministically (no network — the LLM
 fallback runs in mock mode).
 """
+import json
 import os
 import sys
 from pathlib import Path
@@ -25,6 +26,8 @@ from theoremata_tools.benchmarks import (  # noqa: E402
     load_benchmark,
     make_item,
 )
+from theoremata_tools.benchmarks.proof_completion import run_proof_completion  # noqa: E402
+from theoremata_tools.benchmarks.registry import run as benchmark_run  # noqa: E402
 from theoremata_tools.benchmarks.parsing import (  # noqa: E402
     extract_sorry_obligations,
     parse_blueprint_nodes,
@@ -50,6 +53,17 @@ _CORPUS_GLOB = {
     "aime26": "aime26-master",
     "brokenmath": "alethfeld-legacy",
     "goldbach_collatz": "goldbach-collatz-proof-main",
+    "minif2f": "datasets-main",
+    "minif2f_train": "datasets-main",
+    "minif2f_valid": "datasets-main",
+    "minif2f_test": "datasets-main",
+    "bridge178": "BRIDGE-main",
+    "quantumlean": "QuantumLean-Bench-main",
+    "quantumlean_physics": "QuantumLean-Bench-main",
+    "millennium": "LeanMillenniumPrizeProblems-main",
+    "imo2025": "IMO2025-main",
+    "putnam_artifacts": "aristotle_putnam25-main",
+    "formulationbench": "flare-main",
 }
 
 # corpora that exist but ship no structured problems (PDF-only data cards)
@@ -66,8 +80,16 @@ def _corpus_present(name: str) -> bool:
 
 def test_registry_lists_all_tracks():
     tracks = {b["track"] for b in list_benchmarks()}
-    assert tracks == {"formalization", "nl_answer", "falsification"}
-    assert len(ALL_NAMES) == 14
+    assert tracks == {
+        "formalization",
+        "nl_answer",
+        "falsification",
+        "verified_programming",
+        "statement_target",
+        "external_artifact",
+        "reformulation",
+    }
+    assert len(ALL_NAMES) == 25
 
 
 def test_load_unknown_benchmark_raises():
@@ -301,3 +323,78 @@ def test_brokenmath_end_to_end_if_present():
     assert len(items) == 10
     res = grade(items[0], "This claim is false — counterexample found.")
     assert res["is_correct"] is True
+
+
+# --------------------------------------------------------------------------- #
+# MiniF2F loader + proof-completion runner (synthetic corpus)
+# --------------------------------------------------------------------------- #
+
+def _write_minif2f_split(root: Path, split: str, records: list[dict]) -> None:
+    d = root / "datasets-main" / "datasets-main" / "MiniF2F"
+    d.mkdir(parents=True, exist_ok=True)
+    fname = {"train": "train.json", "valid": "validation.json", "test": "test.json"}[split]
+    (d / fname).write_text(json.dumps(records), encoding="utf-8")
+
+
+def test_minif2f_loader_parses_synthetic_corpus(monkeypatch, tmp_path):
+    _write_minif2f_split(
+        tmp_path,
+        "test",
+        [
+            {
+                "id": 42,
+                "name": "mathd_algebra_182",
+                "natural": "What is 1+1?",
+                "formal": "theorem mathd_algebra_182 : 1 + 1 = 2 := by sorry",
+            }
+        ],
+    )
+    monkeypatch.setenv("THEOREMATA_RESOURCES", str(tmp_path))
+    items = load_benchmark("minif2f_test")
+    assert len(items) == 1
+    it = items[0]
+    assert it["id"] == "minif2f:test:42"
+    assert it["kind"] == "formalization"
+    assert it["informal"] == "What is 1+1?"
+    assert "sorry" in it["formal"]
+    assert it["expected"]["lean_name"] == "mathd_algebra_182"
+    assert it["grading"]["task"] == "proof_completion"
+    assert it["provenance"]["split"] == "test"
+
+
+def test_minif2f_combined_loader(monkeypatch, tmp_path):
+    for split, rid in (("train", 1), ("valid", 2), ("test", 3)):
+        _write_minif2f_split(
+            tmp_path,
+            split,
+            [{"id": rid, "name": f"t{rid}", "natural": "n", "formal": f"theorem t{rid} : True := by sorry"}],
+        )
+    monkeypatch.setenv("THEOREMATA_RESOURCES", str(tmp_path))
+    items = load_benchmark("minif2f")
+    assert len(items) == 3
+    assert {it["provenance"]["split"] for it in items} == {"train", "valid", "test"}
+
+
+def test_proof_completion_smoke_runner(monkeypatch, tmp_path):
+    formal = "theorem smoke_thm (n : Nat) : n = n := by sorry"
+    _write_minif2f_split(
+        tmp_path,
+        "test",
+        [{"id": 7, "name": "smoke_thm", "natural": "n=n", "formal": formal}],
+    )
+    monkeypatch.setenv("THEOREMATA_RESOURCES", str(tmp_path))
+    items = load_benchmark("minif2f_test")
+    good = "theorem smoke_thm (n : Nat) : n = n := by exact rfl"
+    out = run_proof_completion(
+        benchmark="minif2f_test",
+        responses={items[0]["id"]: good},
+    )
+    assert out["n"] == 1
+    assert out["correct"] == 1
+    assert out["results"][0]["is_correct"] is True
+
+    via_registry = benchmark_run(
+        {"op": "proof_completion", "benchmark": "minif2f_test", "responses": {items[0]["id"]: good}}
+    )
+    assert via_registry["op"] == "proof_completion"
+    assert via_registry["correct"] == 1

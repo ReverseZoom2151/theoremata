@@ -6,7 +6,7 @@ grader dispatch and eval harness never has to special-case a corpus. The schema
 
     {
       "id":        str,          # stable, corpus-unique primary key
-      "kind":      str,          # "formalization" | "nl_answer" | "falsification"
+      "kind":      str,          # see KINDS below
       "informal":  str,          # NL statement: docstring / blueprint prose / problem
       "formal":    str | None,   # Lean statement/stub when one exists
       "expected":  Any,          # gold target (shape depends on the track)
@@ -24,7 +24,15 @@ from __future__ import annotations
 
 from typing import Any
 
-KINDS = ("formalization", "nl_answer", "falsification")
+KINDS = (
+    "formalization",
+    "nl_answer",
+    "falsification",
+    "verified_programming",
+    "statement_target",
+    "external_artifact",
+    "reformulation",
+)
 
 # The canonical Lean "consistency" axiom trio. Anything else (notably sorryAx)
 # fails the axioms gate. Straight from FormalQualBench's comparator recipe.

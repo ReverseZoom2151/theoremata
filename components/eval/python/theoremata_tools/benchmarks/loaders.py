@@ -22,6 +22,11 @@ import logging
 from pathlib import Path
 from typing import Any, Callable
 
+from .parsers_extra import (
+    extract_lean_headers,
+    extract_problem_comment,
+    parse_external_provenance,
+)
 from .parsing import (
     extract_sorry_obligations,
     parse_blueprint_nodes,
@@ -374,6 +379,487 @@ def load_aime26() -> list[dict[str, Any]]:
 
 
 # ===========================================================================
+# Proof-completion track (MiniF2F / Harmonic)
+# ===========================================================================
+
+_MINIF2F_SPLITS: dict[str, list[str]] = {
+    "train": [
+        "datasets-main/**/MiniF2F/train.json",
+        "datasets-main/**/minif2f/train.json",
+    ],
+    "valid": [
+        "datasets-main/**/MiniF2F/validation.json",
+        "datasets-main/**/MiniF2F/valid.json",
+        "datasets-main/**/minif2f/validation.json",
+    ],
+    "test": [
+        "datasets-main/**/MiniF2F/test.json",
+        "datasets-main/**/minif2f/test.json",
+    ],
+}
+
+
+def _minif2f_lean_name(rec: dict[str, Any]) -> str:
+    name = str(rec.get("name") or "").strip()
+    if name:
+        return name
+    return str(rec.get("id") or "MiniF2F.unknown")
+
+
+def _load_minif2f_split(split: str) -> list[dict[str, Any]]:
+    """Harmonic Lean 4 MiniF2F: NL + formal theorem pairs ending in ``by sorry``."""
+    patterns = _MINIF2F_SPLITS.get(split)
+    if not patterns:
+        raise ValueError(f"unknown MiniF2F split: {split!r}")
+    files = find_files(*patterns)
+    if not files:
+        _log_counts(f"minif2f_{split}", 0, 0, "corpus absent")
+        return []
+
+    items: list[dict[str, Any]] = []
+    skipped = 0
+    seen: set[str] = set()
+    for path in files:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            skipped += 1
+            continue
+        if not isinstance(data, list):
+            skipped += 1
+            continue
+        for rec in data:
+            if not isinstance(rec, dict):
+                skipped += 1
+                continue
+            rid = rec.get("id")
+            formal = str(rec.get("formal") or "").strip()
+            if rid is None or not formal:
+                skipped += 1
+                continue
+            lean_name = _minif2f_lean_name(rec)
+            uid = f"minif2f:{split}:{rid}"
+            if uid in seen:
+                continue
+            seen.add(uid)
+            items.append(
+                make_item(
+                    id=uid,
+                    kind="formalization",
+                    informal=str(rec.get("natural") or ""),
+                    formal=formal,
+                    expected={
+                        "formal_statement": formal,
+                        "lean_name": lean_name,
+                        "axioms_whitelist": list(AXIOMS_WHITELIST),
+                        "minif2f_id": rid,
+                        "minif2f_name": rec.get("name"),
+                    },
+                    grading={
+                        "track": "formalization",
+                        "method": "comparator_or_statement",
+                        "task": "proof_completion",
+                    },
+                    provenance={
+                        "corpus": "minif2f",
+                        "split": split,
+                        "minif2f_id": rid,
+                        "name": rec.get("name"),
+                        "path": rel(path),
+                    },
+                )
+            )
+    _log_counts(f"minif2f_{split}", len(items), skipped)
+    return items
+
+
+def load_minif2f_train() -> list[dict[str, Any]]:
+    return _load_minif2f_split("train")
+
+
+def load_minif2f_valid() -> list[dict[str, Any]]:
+    return _load_minif2f_split("valid")
+
+
+def load_minif2f_test() -> list[dict[str, Any]]:
+    return _load_minif2f_split("test")
+
+
+def load_minif2f() -> list[dict[str, Any]]:
+    """All MiniF2F splits concatenated (train, then valid, then test)."""
+    out: list[dict[str, Any]] = []
+    for split in ("train", "valid", "test"):
+        out.extend(_load_minif2f_split(split))
+    _log_counts("minif2f", len(out), 0, "all splits")
+    return out
+
+
+# ===========================================================================
+# Verified programming (BRIDGE-178)
+# ===========================================================================
+
+def load_bridge178() -> list[dict[str, Any]]:
+    """BRIDGE-178: NL problem + Lean signatures + executable oracle I/O pairs."""
+    files = find_files("BRIDGE-main/**/bridge178.jsonl", "BRIDGE-main/**/datasets/bridge178.jsonl")
+    if not files:
+        _log_counts("bridge178", 0, 0, "corpus absent")
+        return []
+    items: list[dict[str, Any]] = []
+    skipped = 0
+    seen: set[str] = set()
+    for path in files:
+        for rec in _read_records(path):
+            task_id = rec.get("task_id") or rec.get("id")
+            stmt = rec.get("problem_statement") or rec.get("problem")
+            lean_meta = rec.get("lean") or {}
+            tests = rec.get("tests") or {}
+            if not task_id or not stmt:
+                skipped += 1
+                continue
+            uid = f"bridge178:{task_id}"
+            if uid in seen:
+                continue
+            seen.add(uid)
+            signatures = []
+            if isinstance(lean_meta, dict):
+                signatures = lean_meta.get("signatures") or lean_meta.get("signature") or []
+                if isinstance(signatures, str):
+                    signatures = [signatures]
+            items.append(
+                make_item(
+                    id=uid,
+                    kind="verified_programming",
+                    informal=str(stmt),
+                    formal=None,
+                    expected={
+                        "lean_signatures": signatures,
+                        "oracle_tests": {
+                            "inputs": tests.get("inputs") or tests.get("input"),
+                            "expected_outputs": tests.get("expected_outputs")
+                            or tests.get("outputs"),
+                        },
+                        "python": rec.get("python"),
+                        "prompt_variants": ["direct", "functional", "theorem", "proof"],
+                    },
+                    grading={
+                        "track": "verified_programming",
+                        "method": "signature_and_oracle",
+                    },
+                    provenance={
+                        "corpus": "bridge178",
+                        "task_id": task_id,
+                        "dataset_id": rec.get("dataset_id"),
+                        "difficulty": rec.get("difficulty"),
+                        "tags": rec.get("tags"),
+                        "path": rel(path),
+                    },
+                )
+            )
+    _log_counts("bridge178", len(items), skipped)
+    return items
+
+
+# ===========================================================================
+# Scientific formalization (QuantumLean-Bench)
+# ===========================================================================
+
+def _load_quantumlean(domain: str | None = None) -> list[dict[str, Any]]:
+    files = find_files(
+        "QuantumLean-Bench-main/**/BenchmarkData/**/*_problems.json",
+        "QuantumLean-Bench-main/**/BenchmarkData/**/mitocw*.json",
+    )
+    if not files:
+        label = f"quantumlean_{domain}" if domain else "quantumlean"
+        _log_counts(label, 0, 0, "corpus absent")
+        return []
+    items: list[dict[str, Any]] = []
+    skipped = 0
+    seen: set[str] = set()
+    for path in files:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            skipped += 1
+            continue
+        records = data if isinstance(data, list) else data.get("data", [])
+        for rec in records:
+            if not isinstance(rec, dict):
+                skipped += 1
+                continue
+            dom = str(rec.get("domain") or path.stem)
+            if domain and domain.lower() not in dom.lower():
+                continue
+            rid = rec.get("id")
+            problem = rec.get("problem")
+            if rid is None or not problem:
+                skipped += 1
+                continue
+            uid = f"quantumlean:{dom}:{rid}"
+            if uid in seen:
+                continue
+            seen.add(uid)
+            formal = rec.get("solution_formal")
+            items.append(
+                make_item(
+                    id=uid,
+                    kind="formalization",
+                    informal=str(problem),
+                    formal=str(formal) if formal else None,
+                    expected={
+                        "solution_informal": rec.get("solution_informal"),
+                        "response_keys": ["response_key"],
+                        "manual_eval": rec.get("manual_eval"),
+                        "axioms_whitelist": list(AXIOMS_WHITELIST),
+                    },
+                    grading={
+                        "track": "formalization",
+                        "method": "comparator_or_statement",
+                        "task": "scientific_formalization",
+                        "domain": dom,
+                        "type": rec.get("type"),
+                    },
+                    provenance={
+                        "corpus": "quantumlean",
+                        "domain": dom,
+                        "source": rec.get("source"),
+                        "type": rec.get("type"),
+                        "metadata": rec.get("metadata"),
+                        "citations": rec.get("citations"),
+                        "path": rel(path),
+                    },
+                )
+            )
+    label = f"quantumlean_{domain}" if domain else "quantumlean"
+    _log_counts(label, len(items), skipped)
+    return items
+
+
+def load_quantumlean() -> list[dict[str, Any]]:
+    return _load_quantumlean(None)
+
+
+def load_quantumlean_physics() -> list[dict[str, Any]]:
+    return _load_quantumlean("Physics")
+
+
+# ===========================================================================
+# Statement targets (Millennium Prize)
+# ===========================================================================
+
+def load_millennium() -> list[dict[str, Any]]:
+    """Clay Millennium statements — definition/statement quality, not proof completion."""
+    files = find_files(
+        "LeanMillenniumPrizeProblems-main/**/Problems/**/*.lean",
+        "LeanMillenniumPrizeProblems-main/**/Millennium/**/*.lean",
+    )
+    if not files:
+        _log_counts("millennium", 0, 0, "corpus absent")
+        return []
+    items: list[dict[str, Any]] = []
+    skipped = 0
+    refs = find_files("LeanMillenniumPrizeProblems-main/**/references/**/*.pdf")
+    ref_index = {p.stem.lower(): rel(p) for p in refs}
+    for path in files:
+        src = path.read_text(encoding="utf-8", errors="replace")
+        headers = extract_lean_headers(src)
+        if not headers:
+            skipped += 1
+            continue
+        primary = headers[-1]
+        stem = path.stem.lower()
+        uid = f"millennium:{path.parent.name}:{primary['name']}"
+        items.append(
+            make_item(
+                id=uid,
+                kind="statement_target",
+                informal=extract_problem_comment(src) or path.stem,
+                formal=primary["signature"],
+                expected={
+                    "mode": "statement_quality",
+                    "lean_name": primary["name"],
+                    "headers": headers,
+                    "reference_pdf": ref_index.get(stem),
+                    "axioms_whitelist": list(AXIOMS_WHITELIST),
+                },
+                grading={
+                    "track": "statement_target",
+                    "method": "statement_preservation",
+                },
+                provenance={
+                    "corpus": "millennium",
+                    "problem_area": path.parent.name,
+                    "lean_name": primary["name"],
+                    "path": rel(path),
+                    "reference_pdf": ref_index.get(stem),
+                },
+            )
+        )
+    _log_counts("millennium", len(items), skipped)
+    return items
+
+
+# ===========================================================================
+# Olympiad formalization (IMO 2025 statement-only)
+# ===========================================================================
+
+def load_imo2025() -> list[dict[str, Any]]:
+    """Harmonic IMO 2025 `StatementOnly_*` files as proof obligations."""
+    files = find_files("IMO2025-main/**/StatementOnly_*.lean")
+    if not files:
+        _log_counts("imo2025", 0, 0, "corpus absent")
+        return []
+    items: list[dict[str, Any]] = []
+    skipped = 0
+    for path in sorted(files):
+        src = path.read_text(encoding="utf-8", errors="replace")
+        headers = extract_lean_headers(src)
+        if not headers:
+            skipped += 1
+            continue
+        primary = headers[-1]
+        problem = extract_problem_comment(src)
+        ref_glob = path.name.replace("StatementOnly_", "")
+        ref_files = find_files(f"IMO2025-main/**/IMO2025{ref_glob}")
+        uid = f"imo2025:{path.stem}"
+        items.append(
+            make_item(
+                id=uid,
+                kind="formalization",
+                informal=problem,
+                formal=primary["signature"],
+                expected={
+                    "formal_statement": primary["signature"],
+                    "lean_name": primary["name"],
+                    "reference_proof_path": rel(ref_files[0]) if ref_files else None,
+                    "axioms_whitelist": list(AXIOMS_WHITELIST),
+                },
+                grading={
+                    "track": "formalization",
+                    "method": "comparator_or_statement",
+                    "task": "olympiad_formalization",
+                },
+                provenance={
+                    "corpus": "imo2025",
+                    "statement_file": rel(path),
+                    "reference_proof": rel(ref_files[0]) if ref_files else None,
+                },
+            )
+        )
+    _log_counts("imo2025", len(items), skipped)
+    return items
+
+
+# ===========================================================================
+# External prover artifacts (Putnam 2025 / Aristotle outputs)
+# ===========================================================================
+
+def load_putnam_artifacts() -> list[dict[str, Any]]:
+    """Aristotle Putnam 2025 generated Lean + LaTeX inputs as trust-but-verify fixtures."""
+    outputs = find_files("aristotle_putnam25-main/**/aristotle_outputs/*.lean")
+    if not outputs:
+        _log_counts("putnam_artifacts", 0, 0, "corpus absent")
+        return []
+    inputs = {
+        p.stem.replace("aristotle_putnam25_", ""): p
+        for p in find_files("aristotle_putnam25-main/**/inputs/*.tex")
+    }
+    items: list[dict[str, Any]] = []
+    for path in sorted(outputs):
+        src = path.read_text(encoding="utf-8", errors="replace")
+        headers = extract_lean_headers(src)
+        primary = headers[-1] if headers else {"name": path.stem, "signature": ""}
+        key = path.stem.replace("aristotle_putnam25_", "").replace("aristotle_", "")
+        tex = inputs.get(key)
+        uid = f"putnam_artifact:{path.stem}"
+        items.append(
+            make_item(
+                id=uid,
+                kind="external_artifact",
+                informal=tex.read_text(encoding="utf-8", errors="replace")[:4000] if tex else "",
+                formal=src,
+                expected={
+                    "mode": "trust_but_verify",
+                    "lean_name": primary["name"],
+                    "headers": headers,
+                    "provenance": parse_external_provenance(src),
+                    "axioms_whitelist": list(AXIOMS_WHITELIST),
+                    "input_tex": rel(tex) if tex else None,
+                },
+                grading={
+                    "track": "external_artifact",
+                    "method": "structural_and_axiom_gate",
+                },
+                provenance={
+                    "corpus": "putnam_artifacts",
+                    "output_lean": rel(path),
+                    "input_tex": rel(tex) if tex else None,
+                    "external_prover": "aristotle",
+                },
+            )
+        )
+    _log_counts("putnam_artifacts", len(items), 0)
+    return items
+
+
+# ===========================================================================
+# MILP reformulation (FormulationBench / FLARE)
+# ===========================================================================
+
+def load_formulationbench() -> list[dict[str, Any]]:
+    """FLARE FormulationBench reformulation pairs from ``dataset/dataset.json``."""
+    files = find_files("flare-main/**/dataset/dataset.json")
+    if not files:
+        _log_counts("formulationbench", 0, 0, "corpus absent")
+        return []
+    path = files[0]
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        _log_counts("formulationbench", 0, 1, "invalid dataset.json")
+        return []
+    pairs = data.get("reformulations") or []
+    items: list[dict[str, Any]] = []
+    skipped = 0
+    for idx, rec in enumerate(pairs):
+        if not isinstance(rec, dict):
+            skipped += 1
+            continue
+        a = rec.get("a")
+        b = rec.get("b")
+        if not isinstance(a, dict) or not isinstance(b, dict):
+            skipped += 1
+            continue
+        rid = f"p{a.get('problem')}-{a.get('formulation')}_p{b.get('problem')}-{b.get('formulation')}"
+        uid = f"formulationbench:{rid}"
+        items.append(
+            make_item(
+                id=uid,
+                kind="reformulation",
+                informal=f"Problem {a.get('problem')}: reformulation {a.get('formulation')} vs {b.get('formulation')}",
+                formal=None,
+                expected={
+                    "formulation_a": a,
+                    "formulation_b": b,
+                    "is_reformulation": bool(rec.get("reformulation", True)),
+                    "response_keys": ["response_key"],
+                },
+                grading={
+                    "track": "reformulation",
+                    "method": "equivalence_claim",
+                },
+                provenance={
+                    "corpus": "formulationbench",
+                    "pair_index": idx,
+                    "pair_id": rid,
+                    "path": rel(path),
+                },
+            )
+        )
+    _log_counts("formulationbench", len(items), skipped)
+    return items
+
+
+# ===========================================================================
 # Falsification / critic track
 # ===========================================================================
 
@@ -481,4 +967,15 @@ LOADERS: dict[str, Callable[[], list[dict[str, Any]]]] = {
     "aime26": load_aime26,
     "brokenmath": load_brokenmath,
     "goldbach_collatz": load_goldbach_collatz,
+    "minif2f": load_minif2f,
+    "minif2f_train": load_minif2f_train,
+    "minif2f_valid": load_minif2f_valid,
+    "minif2f_test": load_minif2f_test,
+    "bridge178": load_bridge178,
+    "quantumlean": load_quantumlean,
+    "quantumlean_physics": load_quantumlean_physics,
+    "millennium": load_millennium,
+    "imo2025": load_imo2025,
+    "putnam_artifacts": load_putnam_artifacts,
+    "formulationbench": load_formulationbench,
 }

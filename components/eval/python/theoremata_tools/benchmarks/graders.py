@@ -26,11 +26,14 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
 from theoremata_tools import grader as base_grader
+
+from .schema import AXIOMS_WHITELIST
 
 # --------------------------------------------------------------------------- #
 # Formalization track
@@ -89,6 +92,55 @@ def _comparator_timeout() -> float:
         return 120.0
 
 
+def _comparator_argv(comparator: str, config: Path) -> list[str]:
+    """Build a cross-platform argv for a comparator executable or script.
+
+    Unix tests often ship extensionless scripts with shebangs; on Windows those
+    cannot be spawned directly, so we resolve the interpreter from the shebang
+    (or from the script body) before falling back to a bare path invocation.
+    """
+    path = Path(comparator)
+    cfg = str(config)
+    if not path.is_file():
+        return [comparator, cfg]
+
+    suffix = path.suffix.lower()
+    if suffix in {".py", ".pyw"}:
+        return [sys.executable, str(path), cfg]
+    if suffix in {".bat", ".cmd"}:
+        return ["cmd", "/c", str(path), cfg]
+    if suffix == ".exe":
+        return [str(path), cfg]
+
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return [str(path), cfg]
+
+    shebang = lines[0] if lines and lines[0].startswith("#!") else ""
+    body = "\n".join(lines[1:] if shebang else lines)
+
+    if shebang:
+        interp = shebang[2:].strip().lower()
+        if "python" in interp:
+            return [sys.executable, str(path), cfg]
+        if "sh" in interp or "bash" in interp:
+            # Honour one-line ``exit N`` stubs directly — Git-for-Windows sh can
+            # mis-run extensionless scripts, so tests stay portable.
+            m = re.match(r"^\s*exit\s+(\d+)\s*$", body.strip())
+            if m:
+                return [sys.executable, "-c", f"import sys; sys.exit({m.group(1)})"]
+            for shell in ("bash", "sh"):
+                found = shutil.which(shell)
+                if found:
+                    return [found, str(path), cfg]
+
+    if "sys.argv" in body or re.search(r"\bimport\s+json\b", body):
+        return [sys.executable, str(path), cfg]
+
+    return [str(path), cfg]
+
+
 def _run_comparator(
     comparator: str,
     *,
@@ -128,7 +180,7 @@ def _run_comparator(
             encoding="utf-8",
         )
 
-        cmd = [comparator, str(config)]
+        cmd = _comparator_argv(comparator, config)
         if os.environ.get("THEOREMATA_COMPARATOR_LAKE_ENV") == "1":
             lake = shutil.which("lake") or "lake"
             cmd = [lake, "env", *cmd]
@@ -404,6 +456,144 @@ def grade_falsification(item: dict[str, Any], response: Any) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# Verified programming (BRIDGE)
+# --------------------------------------------------------------------------- #
+
+_FENCE_LEAN = re.compile(r"```(?:lean)?\s*([\s\S]*?)```", re.IGNORECASE)
+
+
+def _extract_lean_text(response: Any) -> str:
+    if isinstance(response, dict):
+        for key in ("lean", "code", "text", "solution"):
+            if key in response and response[key]:
+                response = response[key]
+                break
+    text = response if isinstance(response, str) else str(response or "")
+    m = _FENCE_LEAN.search(text)
+    return (m.group(1) if m else text).strip()
+
+
+def grade_verified_programming(item: dict[str, Any], response: Any) -> dict[str, Any]:
+    """Structural BRIDGE grading: signatures present, no sorry; oracle deferred."""
+    expected = item.get("expected") or {}
+    lean = _extract_lean_text(response)
+    signatures = expected.get("lean_signatures") or []
+    sig_hits = [
+        s for s in signatures
+        if s and _normalize_lean(str(s)) in _normalize_lean(lean)
+    ]
+    signatures_ok = bool(signatures) and len(sig_hits) == len(signatures)
+    axioms_ok, axiom_detail = _axioms_ok(lean, list(AXIOMS_WHITELIST))
+    oracle = expected.get("oracle_tests") or {}
+    has_oracle = bool(oracle.get("inputs")) and bool(oracle.get("expected_outputs"))
+    is_solved = bool(lean.strip())
+    is_correct = is_solved and signatures_ok and axioms_ok
+    return {
+        "is_solved": is_solved,
+        "is_correct": is_correct,
+        "detail": {
+            "track": "verified_programming",
+            "method": "signature_and_oracle",
+            "signatures_ok": signatures_ok,
+            "signatures_matched": sig_hits,
+            "axioms_ok": axioms_ok,
+            "axiom_detail": axiom_detail,
+            "oracle_present": has_oracle,
+            "oracle_executed": False,
+            "oracle_note": "oracle execution requires live Lean; structural gate only",
+        },
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Statement target (Millennium)
+# --------------------------------------------------------------------------- #
+
+def grade_statement_target(item: dict[str, Any], response: Any) -> dict[str, Any]:
+    expected = item.get("expected") or {}
+    lean = _extract_lean_text(response)
+    formal = item.get("formal") or expected.get("lean_name") or ""
+    lean_name = str(expected.get("lean_name") or "")
+    preserved = _statement_preserved(str(formal), lean) or (
+        lean_name and lean_name in lean
+    )
+    axioms_ok, axiom_detail = _axioms_ok(lean, list(expected.get("axioms_whitelist") or AXIOMS_WHITELIST))
+    is_solved = bool(lean.strip())
+    is_correct = is_solved and preserved and axioms_ok
+    return {
+        "is_solved": is_solved,
+        "is_correct": is_correct,
+        "detail": {
+            "track": "statement_target",
+            "method": "statement_preservation",
+            "statement_preserved": preserved,
+            "axioms_ok": axioms_ok,
+            "axiom_detail": axiom_detail,
+            "reference_pdf": expected.get("reference_pdf"),
+        },
+    }
+
+
+# --------------------------------------------------------------------------- #
+# External artifact (Putnam / Aristotle outputs)
+# --------------------------------------------------------------------------- #
+
+def grade_external_artifact(item: dict[str, Any], response: Any) -> dict[str, Any]:
+    expected = item.get("expected") or {}
+    lean = _extract_lean_text(response) or str(item.get("formal") or "")
+    headers = expected.get("headers") or []
+    lean_name = str(expected.get("lean_name") or "")
+    header_ok = not headers or any(h.get("name") in lean for h in headers)
+    axioms_ok, axiom_detail = _axioms_ok(lean, list(expected.get("axioms_whitelist") or AXIOMS_WHITELIST))
+    is_solved = bool(lean.strip())
+    is_correct = is_solved and header_ok and axioms_ok
+    return {
+        "is_solved": is_solved,
+        "is_correct": is_correct,
+        "detail": {
+            "track": "external_artifact",
+            "method": "structural_and_axiom_gate",
+            "headers_ok": header_ok,
+            "axioms_ok": axioms_ok,
+            "axiom_detail": axiom_detail,
+            "provenance": expected.get("provenance") or {},
+            "compile_checked": False,
+            "note": "full compile/hardening requires live Lean suite",
+        },
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Reformulation (FormulationBench / FLARE)
+# --------------------------------------------------------------------------- #
+
+def grade_reformulation(item: dict[str, Any], response: Any) -> dict[str, Any]:
+    expected = item.get("expected") or {}
+    text = response if isinstance(response, str) else str(response or "")
+    if isinstance(response, dict):
+        text = str(response.get("is_reformulation", response.get("verdict", text)))
+    positive = bool(expected.get("is_reformulation", True))
+    claims_yes = _has_any(text, ("equivalent", "reformulation", "is_reformulation", "true", "yes"))
+    claims_no = _has_any(text, ("not equivalent", "not a reformulation", "false", "no"))
+    if positive:
+        is_correct = claims_yes and not claims_no
+    else:
+        is_correct = claims_no and not claims_yes
+    return {
+        "is_solved": bool(text.strip()),
+        "is_correct": bool(is_correct),
+        "detail": {
+            "track": "reformulation",
+            "method": "equivalence_claim",
+            "expected_positive": positive,
+            "claims_yes": claims_yes,
+            "claims_no": claims_no,
+            "lean_proof_checked": False,
+        },
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Dispatch by track
 # --------------------------------------------------------------------------- #
 
@@ -419,4 +609,12 @@ def grade(item: dict[str, Any], response: Any, **kw: Any) -> dict[str, Any]:
         )
     if kind == "falsification":
         return grade_falsification(item, response)
+    if kind == "verified_programming":
+        return grade_verified_programming(item, response)
+    if kind == "statement_target":
+        return grade_statement_target(item, response)
+    if kind == "external_artifact":
+        return grade_external_artifact(item, response)
+    if kind == "reformulation":
+        return grade_reformulation(item, response)
     raise ValueError(f"cannot grade item of kind {kind!r}")

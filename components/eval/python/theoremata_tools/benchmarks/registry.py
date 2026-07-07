@@ -15,6 +15,8 @@ from typing import Any
 
 from . import graders
 from .loaders import LOADERS
+from .proof_completion import run_proof_completion
+from .verified_programming import run_verified_programming
 
 # name -> (track, kind) for a self-documenting catalogue
 _TRACK_KIND = {
@@ -32,6 +34,17 @@ _TRACK_KIND = {
     "aime26": ("nl_answer", "nl_answer"),
     "brokenmath": ("falsification", "falsification"),
     "goldbach_collatz": ("falsification", "falsification"),
+    "minif2f": ("formalization", "formalization"),
+    "minif2f_train": ("formalization", "formalization"),
+    "minif2f_valid": ("formalization", "formalization"),
+    "minif2f_test": ("formalization", "formalization"),
+    "bridge178": ("verified_programming", "verified_programming"),
+    "quantumlean": ("formalization", "formalization"),
+    "quantumlean_physics": ("formalization", "formalization"),
+    "millennium": ("statement_target", "statement_target"),
+    "imo2025": ("formalization", "formalization"),
+    "putnam_artifacts": ("external_artifact", "external_artifact"),
+    "formulationbench": ("reformulation", "reformulation"),
 }
 
 
@@ -83,6 +96,24 @@ def run(request: dict[str, Any]) -> dict[str, Any]:
         item = request["item"]
         results = [grade(item, r) for r in request.get("responses", [])]
         return {"op": "grade_batch", "results": results}
+    if op == "proof_completion":
+        return {
+            "op": "proof_completion",
+            **run_proof_completion(
+                benchmark=request.get("benchmark", "minif2f_test"),
+                responses=request.get("responses"),
+                limit=request.get("limit"),
+            ),
+        }
+    if op == "verified_programming":
+        return {
+            "op": "verified_programming",
+            **run_verified_programming(
+                benchmark=request.get("benchmark", "bridge178"),
+                responses=request.get("responses"),
+                limit=request.get("limit"),
+            ),
+        }
     raise ValueError(f"unknown op: {op}")
 
 
