@@ -98,6 +98,7 @@ impl AgentLoop<'_> {
             .update_run(project_id, &run, "running", "solve", 0)?;
         let max_attempts = self.config.max_iterations.max(1);
         let mut falsified: HashSet<String> = HashSet::new();
+        let mut counterexamples: HashSet<String> = HashSet::new();
         let mut certified = 0usize;
         let mut loop_guard = crate::guard::LoopGuard::new(64);
         for _pass in 0..max_attempts {
@@ -112,7 +113,7 @@ impl AgentLoop<'_> {
                 let attempts = self.node_attempts(project_id, &node.id)?;
                 let signals = NodeSignals {
                     falsified: falsified.contains(&node.id),
-                    counterexample_found: false,
+                    counterexample_found: counterexamples.contains(&node.id),
                     retrieved: !node.suggested_lemmas.is_empty(),
                     has_formal_statement: node.formal_statement.is_some(),
                     attempts,
@@ -138,6 +139,7 @@ impl AgentLoop<'_> {
                     route,
                     &mut session,
                     &mut falsified,
+                    &mut counterexamples,
                     &mut certified,
                 )?;
                 steps.push(json!({
@@ -208,39 +210,47 @@ impl AgentLoop<'_> {
         route: Route,
         session: &mut Option<LeanSession>,
         falsified: &mut HashSet<String>,
+        counterexamples: &mut HashSet<String>,
         certified: &mut usize,
     ) -> Result<&'static str> {
         match route {
             Route::Falsify => {
-                let py = PythonCheck::new();
-                if !py.available() {
-                    return Ok("noop");
+                // The model derives an executable bounded check from THIS node's
+                // statement (never a hardcoded example); the generic worker runs
+                // it. Numerics only screen — a clean run is not a proof.
+                let verdict = crate::falsification::Falsifier {
+                    provider: self.provider,
                 }
-                // Best-effort bounded computational falsification over the claim.
-                let input = json!({
-                    "tool":"falsify",
-                    "variables":{"n":{"start":-50,"stop":51}},
-                    "assumptions":"True",
-                    "claim":"True"
-                });
-                let result = py.run(input.clone())?;
+                .falsify(&node.statement)?;
+                let details = serde_json::to_value(&verdict)?;
                 self.store.add_attempt(
                     project_id,
                     Some(&node.id),
                     Some(run),
                     "falsifier",
-                    &input,
-                    &serde_json::to_value(&result)?,
-                    result.success,
+                    &json!({ "statement": node.statement }),
+                    &details,
+                    verdict.verdict != "counterexample",
                 )?;
                 self.store.add_evidence(
                     project_id,
                     &node.id,
                     "falsification",
                     "falsifier",
-                    if result.success { "no_counterexample" } else { "error" },
-                    serde_json::to_value(&result)?,
+                    &verdict.verdict,
+                    details,
                 )?;
+                if verdict.verdict == "counterexample" {
+                    // Refuted: the branch is dead — record and let the router
+                    // escalate it to a human next pass.
+                    counterexamples.insert(node.id.clone());
+                    self.store.set_node_status(
+                        project_id,
+                        &node.id,
+                        NodeStatus::Rejected,
+                        "falsifier",
+                    )?;
+                }
                 falsified.insert(node.id.clone());
                 Ok("falsify")
             }

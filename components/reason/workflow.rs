@@ -122,41 +122,44 @@ impl ResearchWorkflow<'_> {
         )?;
         created += 1;
         let py = PythonCheck::new();
-        if py.available() {
-            let falsify_input = json!({
-                "tool":"falsify",
-                "variables":{"n":{"start":-100,"stop":101}},
-                "assumptions":"n % 2 == 0",
-                "claim":"(n * n) % 2 == 0"
-            });
-            let result = py.run(falsify_input.clone())?;
-            self.store.add_evidence(
+        // Derive the bounded check from the actual theorem — the model emits the
+        // executable falsifier, the generic worker runs it. Numerics only screen.
+        let verdict = crate::falsification::Falsifier {
+            provider: self.provider,
+        }
+        .falsify(&project.theorem)?;
+        let details = serde_json::to_value(&verdict)?;
+        self.store.add_evidence(
+            project_id,
+            &computation.id,
+            "falsification",
+            "falsifier",
+            &verdict.verdict,
+            details.clone(),
+        )?;
+        self.store.add_attempt(
+            project_id,
+            Some(&computation.id),
+            Some(&run),
+            "falsifier",
+            &json!({ "statement": project.theorem }),
+            &details,
+            verdict.verdict != "counterexample",
+        )?;
+        match verdict.verdict.as_str() {
+            "counterexample" => notes.push(format!(
+                "Counterexample found for the conjecture: {}",
+                verdict.assignment.clone().unwrap_or(serde_json::Value::Null)
+            )),
+            "no_counterexample_in_domain" => self.store.set_node_status(
                 project_id,
                 &computation.id,
-                "bounded_computation",
-                py.name(),
-                if result.success { "pass" } else { "error" },
-                serde_json::to_value(&result)?,
-            )?;
-            self.store.add_attempt(
-                project_id,
-                Some(&computation.id),
-                Some(&run),
-                py.name(),
-                &falsify_input,
-                &serde_json::to_value(&result)?,
-                result.success,
-            )?;
-            if result.success {
-                self.store.set_node_status(
-                    project_id,
-                    &computation.id,
-                    NodeStatus::InformallyVerified,
-                    "python_check",
-                )?;
-            }
-        } else {
-            notes.push("Python worker unavailable; falsification obligation remains open".into());
+                NodeStatus::InformallyVerified,
+                "falsifier",
+            )?,
+            other => notes.push(format!(
+                "Falsification screen did not run to a verdict ({other}); obligation remains open"
+            )),
         }
 
         self.store
