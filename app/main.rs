@@ -18,8 +18,8 @@ mod verify;
 // paths unchanged — the physical layout is by component, the namespace is flat.
 pub use graph::{db, model, scheduler};
 pub use reason::{
-    agent, blueprint, chat, consolidate, critic, decompose, falsification, guard, mcts, observe,
-    plan_history, progress, research, retry, router, sampler, sampling, taint, team,
+    agent, blueprint, chat, consolidate, critic, decompose, falsification, formal_generate, guard,
+    mcts, observe, plan_history, progress, research, retry, router, sampler, sampling, taint, team,
 };
 pub use prover::{aristotle, attempt_run, exec, formal, isabelle, lean, proof_job, rocq};
 pub use verify::{hardening, lean_session};
@@ -302,6 +302,13 @@ enum Command {
     },
     Lean {
         file: PathBuf,
+    },
+    /// Generate AND verify a proof for a formal system (lean/rocq/isabelle):
+    /// model-driven best-of-N selected by the live 3+1-layer gate.
+    FormalProve {
+        /// `lean` | `rocq` (`coq`) | `isabelle`.
+        system: String,
+        statement: String,
     },
     /// Submit an external proof job (ProofTask → async prover backend).
     ProofSubmit {
@@ -880,6 +887,25 @@ fn main() -> Result<()> {
                     "tool":"retrieve","root":root,"imports":imports,
                     "query":query,"limit":limit,"op":"retrieve"
                 }))?,
+            )?
+        }
+        Command::FormalProve { system, statement } => {
+            let system: prover::formal::FormalSystem = system.parse()?;
+            let (code, report) = formal_generate::generate_and_verify(
+                &store,
+                &config,
+                provider.as_ref(),
+                system,
+                &statement,
+            )?;
+            print_value(
+                true,
+                &serde_json::json!({
+                    "system": system.as_str(),
+                    "verified": report.lexically_verified,
+                    "code": code,
+                    "report": report,
+                }),
             )?
         }
         Command::ProofSubmit {

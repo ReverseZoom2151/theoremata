@@ -66,6 +66,11 @@ pub struct Config {
     /// Binary for the live Isabelle build. Env: `THEOREMATA_ISABELLE`.
     #[serde(default = "default_isabelle_bin")]
     pub isabelle_bin: String,
+    /// Which formal system the agent targets when generating proofs for
+    /// `Route::Prove`/`Route::Formalize`. Defaults to Lean (existing behavior);
+    /// set to `rocq`/`isabelle` to route through the per-system generator.
+    #[serde(default)]
+    pub target_system: crate::prover::formal::FormalSystem,
 }
 
 fn default_lean_bin() -> String {
@@ -127,6 +132,7 @@ impl Default for Config {
             coqc_bin: default_coqc_bin(),
             coqchk_bin: default_coqchk_bin(),
             isabelle_bin: default_isabelle_bin(),
+            target_system: crate::prover::formal::FormalSystem::default(),
         }
     }
 }

@@ -16,7 +16,7 @@ use crate::{
     research::ResearchEngine,
     router::{self, NodeSignals, Route, ToolAvailability},
     sampling, scheduler,
-    prover::{attempt_run, proof_job},
+    prover::{attempt_run, proof_job, formal::FormalSystem},
     tools::{LeanCheck, MathlibSearch, PythonCheck, Tool},
 };
 use anyhow::{Context, Result};
@@ -426,6 +426,11 @@ impl AgentLoop<'_> {
         session: &mut Option<LeanSession>,
         certified: &mut usize,
     ) -> Result<&'static str> {
+        // Non-Lean targets go through the per-system generator + live backend
+        // (Coq/Isar are produced and verified natively, not via the Lean path).
+        if self.config.target_system != FormalSystem::Lean {
+            return self.generate_formal(project_id, run, node, certified);
+        }
         let input = json!({
             "statement": node.statement,
             "theorem_name": format!("Theoremata.N{}", node.id.replace('-', "").get(0..8).unwrap_or("ode")),
@@ -508,6 +513,11 @@ impl AgentLoop<'_> {
         session: &mut Option<LeanSession>,
         certified: &mut usize,
     ) -> Result<&'static str> {
+        // Non-Lean targets are formalized+proved through the per-system generator
+        // (system-native Coq/Isar) rather than the Lean-only best-of-N below.
+        if self.config.target_system != FormalSystem::Lean {
+            return self.generate_formal(project_id, run, node, certified);
+        }
         if self.config.model_command.is_none() {
             return Ok("noop");
         }
@@ -555,6 +565,62 @@ impl AgentLoop<'_> {
             )?;
         }
         Ok("formalize")
+    }
+
+    /// Route a Rocq/Isabelle target through the per-system proof generator: emit
+    /// system-native code, verify it through the live 3+1-layer gate (mock
+    /// backend offline), and certify on a clean report. Mirrors `formalize` but
+    /// the backend gate — not the Lean compiler — is the acceptance selector.
+    fn generate_formal(
+        &self,
+        project_id: &str,
+        run: &str,
+        node: &Node,
+        certified: &mut usize,
+    ) -> Result<&'static str> {
+        let system = self.config.target_system;
+        let (code, report) = crate::formal_generate::generate_and_verify(
+            self.store,
+            self.config,
+            self.provider,
+            system,
+            &node.statement,
+        )?;
+        self.store.add_attempt(
+            project_id,
+            Some(&node.id),
+            Some(run),
+            "formal_generator",
+            &json!({"statement": node.statement, "system": system.as_str()}),
+            &json!({"verified": report.lexically_verified}),
+            report.lexically_verified,
+        )?;
+        self.store
+            .set_formal_statement(project_id, &node.id, &code, "formal_generator")?;
+        self.store.add_evidence(
+            project_id,
+            &node.id,
+            "formal_verify",
+            "verifier",
+            if report.lexically_verified {
+                "pass"
+            } else {
+                "fail"
+            },
+            serde_json::to_value(&report)?,
+        )?;
+        if report.lexically_verified {
+            self.store.set_node_status(
+                project_id,
+                &node.id,
+                NodeStatus::FormallyVerified,
+                "verifier",
+            )?;
+            *certified += 1;
+            Ok("formal_generate")
+        } else {
+            Ok("formal_generate_unverified")
+        }
     }
 
     /// Certify a node only after `config.k_consecutive_clean` CONSECUTIVE clean
