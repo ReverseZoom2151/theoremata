@@ -46,7 +46,8 @@ pub fn verify_lean_round_trip(
                 .map(|s| code_norm.contains(&s.split_whitespace().collect::<String>()))
                 .unwrap_or(false));
 
-    let compiles = lexical && axioms_clean;
+    // Lexical pre-screen only — the real compile happens at the certify step.
+    let lexically_verified = lexical && axioms_clean;
     let hardening_clean = if config.harden_proofs {
         // Deep hardening requires a graph node + Lake workspace; external-prover
         // verification records the intent and leaves hardening to the certify step.
@@ -56,7 +57,7 @@ pub fn verify_lean_round_trip(
     };
 
     Ok(VerificationReport {
-        compiles,
+        lexically_verified,
         axioms_clean,
         statement_preserved,
         lexical_clean: lexical,

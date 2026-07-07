@@ -73,9 +73,15 @@ impl ProverJobStatus {
 }
 
 /// Local verification summary attached to a [`ProofResult`].
+///
+/// NOTE: `lexically_verified` is the best-available *lexical* screen (soundness
+/// scan + no `sorry`/`admit`) — it does NOT mean the Lean compiled. Authoritative
+/// certification runs the real compile + `#print axioms` gate in the agent loop
+/// (`verify_source`); this report is a cheap trust-but-verify pre-screen for
+/// external-prover output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationReport {
-    pub compiles: bool,
+    pub lexically_verified: bool,
     pub axioms_clean: bool,
     pub statement_preserved: bool,
     pub lexical_clean: bool,

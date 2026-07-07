@@ -69,7 +69,7 @@ pub fn poll_with_provider(
         return Ok(job);
     }
 
-    let premises = fetch_accessible_premises(config, &job.task)?;
+    let premises = fetch_accessible_premises(&job.task)?;
     let premise_names: Vec<String> = premises
         .iter()
         .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(str::to_owned))
@@ -102,7 +102,7 @@ pub fn poll_with_provider(
     };
     let proved = verification
         .as_ref()
-        .map(|v| v.compiles && v.axioms_clean)
+        .map(|v| v.lexically_verified && v.axioms_clean)
         .unwrap_or(false);
 
     job.status = if proved {
@@ -143,24 +143,7 @@ pub fn poll_with_provider(
     Ok(job)
 }
 
-pub fn poll(store: &Store, config: &Config, job_id: &str) -> Result<ProofJob> {
-    let job = store
-        .get_proof_job(job_id)?
-        .ok_or_else(|| anyhow!("unknown proof job {job_id}"))?;
-    if job.status.is_terminal() {
-        return Ok(job);
-    }
-    if job.poll_count >= 1 {
-        let mut j = job;
-        j.status = ProverJobStatus::Failed;
-        j.completed_at = Some(Utc::now());
-        j.updated_at = Utc::now();
-        store.update_proof_job(&j)?;
-    }
-    store.get_proof_job(job_id)?.ok_or_else(|| anyhow!("job missing"))
-}
-
-fn fetch_accessible_premises(config: &Config, task: &ProofTask) -> Result<Vec<Value>> {
+fn fetch_accessible_premises(task: &ProofTask) -> Result<Vec<Value>> {
     let py = PythonCheck::new();
     let root = task.lean_project.root.clone();
     let result = py.run(json!({

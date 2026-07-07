@@ -460,6 +460,25 @@ impl AgentLoop<'_> {
         let Some(lean) = result.lean_code else {
             return Ok("prove_failed");
         };
+        // Statement-change guard: if this node already carries a formal statement,
+        // the external prover must return a proof of THAT statement — not a weaker
+        // or different one (the mock, e.g., returns `: True := trivial`). Reject the
+        // drift before trusting/overwriting the node, so a header that goes missing
+        // or is weakened can never be certified.
+        if let Some(formal) = node.formal_statement.as_deref() {
+            let guard = crate::prover::statement_guard::guard_lean_round_trip(formal, &lean);
+            if !guard.preserved {
+                self.store.add_evidence(
+                    project_id,
+                    &node.id,
+                    "statement_guard",
+                    "verifier",
+                    "drift",
+                    crate::prover::statement_guard::guard_report_json(&guard),
+                )?;
+                return Ok("prove_statement_drift");
+            }
+        }
         self.store
             .set_formal_statement(project_id, &node.id, &lean, "external_prover")?;
         let theorem = extract_theorem(&lean);
