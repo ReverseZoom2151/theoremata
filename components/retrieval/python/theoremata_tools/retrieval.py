@@ -31,6 +31,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from . import accessible_premises
 from . import decl_index
 from . import head_index
 
@@ -342,11 +343,13 @@ def run(
     rebuild: bool = False,
     lean_bin: str | None = None,
     timeout: float = 300.0,
+    theorem_module: str | None = None,
+    theorem_line: int | None = None,
 ) -> dict[str, Any]:
     """Build/load the cached index, then answer one retrieval request.
 
-    ``op="retrieve"`` ranks declarations for ``query``; ``op="warm"`` just
-    prebuilds (and caches) the index.
+    ``op="retrieve"`` ranks declarations for ``query``; ``op="accessible_retrieve"``
+    applies ReProver-style visibility filtering first; ``op="warm"`` prebuilds the index.
     """
     index = build_or_load(
         root, imports, rebuild=rebuild, lean_bin=lean_bin, timeout=timeout
@@ -365,13 +368,22 @@ def run(
             "stderr": index.get("stderr", ""),
         }
 
-    if op != "retrieve":
+    if op not in {"retrieve", "accessible_retrieve"}:
         return {"ok": False, "stderr": f"unknown op: {op}"}
 
-    if not index["ok"] and not index["decls"]:
+    decls = index["decls"]
+    if op == "accessible_retrieve":
+        decls = accessible_premises.filter_accessible(
+            decls,
+            imports=list(imports or ["Init"]),
+            file_path=theorem_module,
+            theorem_line=theorem_line,
+        )
+
+    if not index["ok"] and not decls:
         return {
             "ok": False,
-            "op": "retrieve",
+            "op": op,
             "query": query,
             "count": 0,
             "results": [],
@@ -379,11 +391,11 @@ def run(
         }
 
     results = retrieve(
-        query, index["decls"], head_index=index.get("head_index"), limit=limit
+        query, decls, head_index=index.get("head_index"), limit=limit
     )
     return {
         "ok": True,
-        "op": "retrieve",
+        "op": op,
         "query": query,
         "root": index["root"],
         "imports": index["imports"],
@@ -408,6 +420,8 @@ def main() -> None:
         rebuild=bool(req.get("rebuild", False)),
         lean_bin=req.get("lean_bin"),
         timeout=float(req.get("timeout", 300.0)),
+        theorem_module=req.get("theorem_module"),
+        theorem_line=req.get("theorem_line"),
     )
     print(json.dumps(result))
     raise SystemExit(0 if result.get("ok") else 1)
