@@ -239,7 +239,10 @@ impl Tool for LeanCheck {
                 .args(["env", "lean"])
                 .arg(&path)
                 .output()?,
-            (None, Some(lake)) => Command::new(lake).args(["env", "lean"]).arg(&path).output()?,
+            (None, Some(lake)) => Command::new(lake)
+                .args(["env", "lean"])
+                .arg(&path)
+                .output()?,
             (_, None) => {
                 let lean = resolve_command(&["lean"], "--version")
                     .ok_or_else(|| anyhow!("no Lean toolchain found (tried lake, lean)"))?;
@@ -298,18 +301,26 @@ impl Tool for LeanParanoia {
                 .current_dir(&self.root)
                 .arg("env")
                 .arg(&exe)
+                .arg("--trust-modules")
+                .arg("Std,Mathlib,Init")
                 .arg(theorem)
                 .output()?,
             None => Command::new(lake)
                 .current_dir(&self.root)
-                .args(["exe", "paranoia", theorem])
+                .args([
+                    "exe",
+                    "paranoia",
+                    "--trust-modules",
+                    "Std,Mathlib,Init",
+                    theorem,
+                ])
                 .output()?,
         };
         Ok(finish(
             self.name(),
             started,
             output,
-            json!({"theorem":theorem,"root":self.root}),
+            json!({"theorem":theorem,"root":self.root,"trust_modules":"Std,Mathlib,Init"}),
         ))
     }
 }

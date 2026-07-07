@@ -187,12 +187,7 @@ pub fn plan(nodes: &[Node], edges: &[Edge]) -> Schedule {
     let mut order: Vec<String> = Vec::new();
     for level in &levels {
         let mut lvl = level.clone();
-        lvl.sort_by(|a, b| {
-            central
-                .get(b)
-                .cmp(&central.get(a))
-                .then_with(|| a.cmp(b))
-        });
+        lvl.sort_by(|a, b| central.get(b).cmp(&central.get(a)).then_with(|| a.cmp(b)));
         order.extend(lvl);
     }
 
@@ -245,6 +240,7 @@ mod tests {
             parent_id: None,
             strategy_hint: None,
             suggested_lemmas: Vec::new(),
+            lean_decls: Vec::new(),
             stmt_formalized: false,
             proof_done: false,
             created_at: Utc::now(),

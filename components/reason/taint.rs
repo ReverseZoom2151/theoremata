@@ -280,6 +280,7 @@ mod tests {
             parent_id: None,
             strategy_hint: None,
             suggested_lemmas: Vec::new(),
+            lean_decls: Vec::new(),
             stmt_formalized: false,
             proof_done: false,
             created_at: now,
@@ -322,7 +323,12 @@ mod tests {
     fn self_admitted_is_preserved_and_poisons_dependents() {
         // B is a self-admitted gap; C depends on B.
         let nodes = vec![
-            node("B", NodeKind::Lemma, NodeStatus::Proposed, Taint::SelfAdmitted),
+            node(
+                "B",
+                NodeKind::Lemma,
+                NodeStatus::Proposed,
+                Taint::SelfAdmitted,
+            ),
             node("C", NodeKind::Lemma, NodeStatus::Proposed, Taint::Clean),
         ];
         let edges = vec![dep(1, "C", "B")];
@@ -338,7 +344,10 @@ mod tests {
         let edges = vec![dep(1, "B", "A"), dep(2, "C", "B"), dep(3, "D", "A")];
         let mut deps = tainted_dependents("A", &edges);
         deps.sort();
-        assert_eq!(deps, vec!["B".to_string(), "C".to_string(), "D".to_string()]);
+        assert_eq!(
+            deps,
+            vec!["B".to_string(), "C".to_string(), "D".to_string()]
+        );
     }
 
     #[test]
@@ -375,10 +384,24 @@ mod tests {
         let nodes = vec![
             node("root", NodeKind::Lemma, NodeStatus::Proposed, Taint::Clean),
             node("mid", NodeKind::Lemma, NodeStatus::Proposed, Taint::Clean),
-            node("h1", NodeKind::Assumption, NodeStatus::Proposed, Taint::Clean),
-            node("h2", NodeKind::Assumption, NodeStatus::Proposed, Taint::Clean),
+            node(
+                "h1",
+                NodeKind::Assumption,
+                NodeStatus::Proposed,
+                Taint::Clean,
+            ),
+            node(
+                "h2",
+                NodeKind::Assumption,
+                NodeStatus::Proposed,
+                Taint::Clean,
+            ),
         ];
-        let edges = vec![dep(1, "root", "mid"), dep(2, "mid", "h1"), dep(3, "root", "h2")];
+        let edges = vec![
+            dep(1, "root", "mid"),
+            dep(2, "mid", "h1"),
+            dep(3, "root", "h2"),
+        ];
         let scope = assumption_scope("root", &nodes, &edges);
         assert_eq!(scope, vec!["h1".to_string(), "h2".to_string()]);
     }

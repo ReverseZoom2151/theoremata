@@ -185,9 +185,7 @@ impl FromStr for EdgeKind {
 /// How strongly a dependency edge is backed: numerics only *screen*, prose is a
 /// human argument, Lean is machine-checked. Variants are declared ascending so
 /// the derived ordering gives `lean_checked > prose_proof > numeric_screen`.
-#[derive(
-    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord,
-)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeStrength {
     NumericScreen,
@@ -357,9 +355,7 @@ impl fmt::Display for TransferIngredient {
 /// DAG is a *dial*: strongpnt uses trivial micro-lemmas (the DAG does the
 /// reasoning), ZkLinalg uses coarse paper-sized nodes. This controls both the
 /// prompt guidance and the hidden-helper fan-out budget.
-#[derive(
-    Debug, Clone, Copy, Serialize, Deserialize, ValueEnum, PartialEq, Eq, Default,
-)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ValueEnum, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Granularity {
     /// Few, paper-sized obligations (ZkLinalg-style, ~1.6x fan-out).
@@ -434,6 +430,11 @@ pub struct Node {
     pub parent_id: Option<String>,
     pub strategy_hint: Option<String>,
     pub suggested_lemmas: Vec<String>,
+    /// Fully-qualified Lean declaration names bound to this node, typically
+    /// imported from leanblueprint `\lean{...}`. This is distinct from
+    /// `formal_statement`: a blueprint binding may name an external theorem
+    /// whose source body is not stored in Theoremata.
+    pub lean_decls: Vec<String>,
     /// leanblueprint `\leanok` on the *statement*: the claim has been formalised
     /// in Lean (its type compiles), independent of whether its proof is done.
     pub stmt_formalized: bool,

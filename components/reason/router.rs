@@ -135,6 +135,7 @@ mod tests {
             parent_id: None,
             strategy_hint: None,
             suggested_lemmas: Vec::new(),
+            lean_decls: Vec::new(),
             stmt_formalized: false,
             proof_done: false,
             created_at: now,
@@ -188,7 +189,10 @@ mod tests {
 
     #[test]
     fn formal_statement_verifies() {
-        let n = node(NodeKind::FormalStatement, Some("theorem t : True := trivial"));
+        let n = node(
+            NodeKind::FormalStatement,
+            Some("theorem t : True := trivial"),
+        );
         let sig = NodeSignals {
             falsified: true,
             retrieved: true,

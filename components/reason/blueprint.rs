@@ -217,7 +217,10 @@ pub fn export(store: &Store, project_id: &str) -> Result<BlueprintExport> {
         // Partition this node's outgoing dependency edges by \uses scope.
         let mut statement_uses = Vec::new();
         let mut proof_uses = Vec::new();
-        for e in edges.iter().filter(|e| e.source_id == n.id && e.kind == EdgeKind::DependsOn) {
+        for e in edges
+            .iter()
+            .filter(|e| e.source_id == n.id && e.kind == EdgeKind::DependsOn)
+        {
             let Some(target_label) = labels.get(&e.target_id) else {
                 continue;
             };
@@ -231,15 +234,19 @@ pub fn export(store: &Store, project_id: &str) -> Result<BlueprintExport> {
             }
         }
         let verified = n.status == NodeStatus::FormallyVerified;
+        let mut lean = n.lean_decls.clone();
+        if let Some(src) = n.formal_statement.as_deref() {
+            for decl in lean_decl_names(src) {
+                if !lean.contains(&decl) {
+                    lean.push(decl);
+                }
+            }
+        }
         bp.nodes.push(BlueprintNode {
             env: env_for_kind(n.kind).to_string(),
             label: labels[&n.id].clone(),
             title: Some(n.title.clone()),
-            lean: n
-                .formal_statement
-                .as_deref()
-                .map(lean_decl_names)
-                .unwrap_or_default(),
+            lean,
             statement_uses,
             proof_uses,
             statement_leanok: n.stmt_formalized || verified,
@@ -265,7 +272,16 @@ pub fn import(store: &Store, project_id: &str, tex: &str) -> Result<BlueprintImp
     for bnode in &bp.nodes {
         let kind = kind_for_env(&bnode.env);
         let title = bnode.title.clone().unwrap_or_else(|| bnode.label.clone());
-        let node = store.add_node(project_id, kind, &title, &bnode.statement_body, "blueprint:import")?;
+        let node = store.add_node(
+            project_id,
+            kind,
+            &title,
+            &bnode.statement_body,
+            "blueprint:import",
+        )?;
+        if !bnode.lean.is_empty() {
+            store.set_lean_decls(project_id, &node.id, &bnode.lean, "blueprint:import")?;
+        }
         if bnode.statement_leanok || bnode.proof_leanok {
             store.set_verification_flags(
                 project_id,
@@ -433,7 +449,11 @@ fn try_lake_checkdecls(workspace: &Path, decls: &[String]) -> Option<CheckDeclsR
     let summary = if missing.is_empty() {
         format!("checkdecls: all {} declaration(s) resolve", decls.len())
     } else {
-        format!("checkdecls: {} of {} declaration(s) missing", missing.len(), decls.len())
+        format!(
+            "checkdecls: {} of {} declaration(s) missing",
+            missing.len(),
+            decls.len()
+        )
     };
     Some(CheckDeclsReport {
         ran: true,
@@ -455,16 +475,26 @@ fn static_check_decls(workspace: &Path, decls: &[String]) -> CheckDeclsReport {
     for d in decls {
         let last = d.rsplit('.').next().unwrap_or(d.as_str());
         let present = sources.contains(d.as_str())
-            || ["theorem", "lemma", "def", "abbrev", "instance", "noncomputable def"]
-                .iter()
-                .any(|kw| sources.contains(&format!("{kw} {last}")));
+            || [
+                "theorem",
+                "lemma",
+                "def",
+                "abbrev",
+                "instance",
+                "noncomputable def",
+            ]
+            .iter()
+            .any(|kw| sources.contains(&format!("{kw} {last}")));
         if !present {
             missing.push(d.clone());
         }
     }
     let resolved = decls.len() - missing.len();
     let summary = if missing.is_empty() {
-        format!("static check: all {} declaration(s) found in source", decls.len())
+        format!(
+            "static check: all {} declaration(s) found in source",
+            decls.len()
+        )
     } else {
         format!(
             "static check: {} of {} declaration(s) not found in source",
@@ -586,7 +616,9 @@ fn environment_blocks(tex: &str) -> Vec<EnvBlock> {
 
 /// Byte index of `needle` in `hay` at or after `from`.
 fn find_from(hay: &str, needle: &str, from: usize) -> Option<usize> {
-    hay.get(from..).and_then(|s| s.find(needle)).map(|p| p + from)
+    hay.get(from..)
+        .and_then(|s| s.find(needle))
+        .map(|p| p + from)
 }
 
 /// All `\uses{...}` keys in `text`, comma-split and flattened across multiple
@@ -911,20 +943,56 @@ mod tests {
     fn store_export_import_round_trip() {
         let store = Store::open(Path::new(":memory:")).unwrap();
         let p = store.create_project("p", "t").unwrap();
-        let a = store.add_node(&p.id, NodeKind::Lemma, "Alpha bound", "A holds", "test").unwrap();
-        let b = store.add_node(&p.id, NodeKind::Lemma, "Beta bound", "B holds", "test").unwrap();
+        let a = store
+            .add_node(&p.id, NodeKind::Lemma, "Alpha bound", "A holds", "test")
+            .unwrap();
+        let b = store
+            .add_node(&p.id, NodeKind::Lemma, "Beta bound", "B holds", "test")
+            .unwrap();
         let main = store
-            .add_node(&p.id, NodeKind::Conjecture, "Main theorem", "T holds", "test")
+            .add_node(
+                &p.id,
+                NodeKind::Conjecture,
+                "Main theorem",
+                "T holds",
+                "test",
+            )
             .unwrap();
         // main's statement depends on a; its proof additionally depends on b.
         store
-            .add_edge_scoped(&p.id, &main.id, &a.id, EdgeKind::DependsOn, DepScope::Statement)
+            .add_edge_scoped(
+                &p.id,
+                &main.id,
+                &a.id,
+                EdgeKind::DependsOn,
+                DepScope::Statement,
+            )
             .unwrap();
         store
             .add_edge_scoped(&p.id, &main.id, &b.id, EdgeKind::DependsOn, DepScope::Proof)
             .unwrap();
-        store.set_verification_flags(&p.id, &a.id, true, true, "test").unwrap();
-        store.set_verification_flags(&p.id, &main.id, true, false, "test").unwrap();
+        store
+            .set_lean_decls(
+                &p.id,
+                &a.id,
+                &["PrimitiveSetsAboveX.mertens".to_string()],
+                "test",
+            )
+            .unwrap();
+        store
+            .set_lean_decls(
+                &p.id,
+                &main.id,
+                &["Erdos1196.main".to_string(), "Erdos1196.main'".to_string()],
+                "test",
+            )
+            .unwrap();
+        store
+            .set_verification_flags(&p.id, &a.id, true, true, "test")
+            .unwrap();
+        store
+            .set_verification_flags(&p.id, &main.id, true, false, "test")
+            .unwrap();
 
         let exported = export(&store, &p.id).unwrap();
 
@@ -938,8 +1006,10 @@ mod tests {
         let qnodes = store.nodes(&q.id).unwrap();
         assert_eq!(qnodes.len(), 3);
         let qmain = qnodes.iter().find(|n| n.title == "Main theorem").unwrap();
+        assert_eq!(qmain.lean_decls, vec!["Erdos1196.main", "Erdos1196.main'"]);
         assert!(qmain.stmt_formalized && !qmain.proof_done);
         let qa = qnodes.iter().find(|n| n.title == "Alpha bound").unwrap();
+        assert_eq!(qa.lean_decls, vec!["PrimitiveSetsAboveX.mertens"]);
         assert!(qa.stmt_formalized && qa.proof_done);
 
         let qedges = store.edges(&q.id).unwrap();

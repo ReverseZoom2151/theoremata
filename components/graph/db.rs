@@ -41,6 +41,7 @@ impl Store {
               tainted INTEGER NOT NULL DEFAULT 0,
               tier TEXT NOT NULL DEFAULT 'spine', parent_id TEXT,
               strategy_hint TEXT, suggested_lemmas TEXT NOT NULL DEFAULT '[]',
+              lean_decls TEXT NOT NULL DEFAULT '[]',
               stmt_formalized INTEGER NOT NULL DEFAULT 0,
               proof_done INTEGER NOT NULL DEFAULT 0,
               created_at TEXT NOT NULL, updated_at TEXT NOT NULL
@@ -110,6 +111,7 @@ impl Store {
             ("parent_id", "TEXT"),
             ("strategy_hint", "TEXT"),
             ("suggested_lemmas", "TEXT NOT NULL DEFAULT '[]'"),
+            ("lean_decls", "TEXT NOT NULL DEFAULT '[]'"),
             ("stmt_formalized", "INTEGER NOT NULL DEFAULT 0"),
             ("proof_done", "INTEGER NOT NULL DEFAULT 0"),
             // Three-valued taint (clean|tainted|self_admitted). Additive over
@@ -127,7 +129,10 @@ impl Store {
             }
         }
         for (column, decl) in [
-            ("evidence_strength", "TEXT NOT NULL DEFAULT 'numeric_screen'"),
+            (
+                "evidence_strength",
+                "TEXT NOT NULL DEFAULT 'numeric_screen'",
+            ),
             ("dep_scope", "TEXT NOT NULL DEFAULT 'statement'"),
         ] {
             if let Err(e) = self
@@ -247,6 +252,7 @@ impl Store {
             parent_id: parent_id.map(str::to_owned),
             strategy_hint: strategy_hint.map(str::to_owned),
             suggested_lemmas: suggested_lemmas.to_vec(),
+            lean_decls: Vec::new(),
             stmt_formalized: false,
             proof_done: false,
             created_at: now,
@@ -255,8 +261,8 @@ impl Store {
         self.conn.execute(
             "INSERT INTO nodes(id,project_id,kind,status,title,statement,formal_statement,\
              provenance,content_hash,tainted,tier,parent_id,strategy_hint,suggested_lemmas,\
-             created_at,updated_at) \
-             VALUES (?1,?2,?3,?4,?5,?6,NULL,?7,?8,0,?9,?10,?11,?12,?13,?13)",
+             lean_decls,created_at,updated_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,NULL,?7,?8,0,?9,?10,?11,?12,'[]',?13,?13)",
             params![
                 node.id,
                 project_id,
@@ -329,6 +335,31 @@ impl Store {
             "node.lemmas_set",
             actor,
             json!({"node_id": node_id, "count": lemmas.len()}),
+        )?;
+        Ok(())
+    }
+
+    pub fn set_lean_decls(
+        &self,
+        project_id: &str,
+        node_id: &str,
+        decls: &[String],
+        actor: &str,
+    ) -> Result<()> {
+        let payload = serde_json::to_string(decls)?;
+        let changed = self.conn.execute(
+            "UPDATE nodes SET lean_decls=?1,updated_at=?2 WHERE id=?3 AND project_id=?4",
+            params![payload, Utc::now().to_rfc3339(), node_id, project_id],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!("node not found: {node_id}"));
+        }
+        self.event(
+            Some(project_id),
+            None,
+            "node.lean_decls_set",
+            actor,
+            json!({"node_id": node_id, "count": decls.len()}),
         )?;
         Ok(())
     }
@@ -504,11 +535,20 @@ impl Store {
         let Some(current) = current else {
             return Ok(());
         };
-        let merged = current.parse::<DepScope>().unwrap_or(DepScope::Statement).merge(scope);
+        let merged = current
+            .parse::<DepScope>()
+            .unwrap_or(DepScope::Statement)
+            .merge(scope);
         self.conn.execute(
             "UPDATE edges SET dep_scope=?1 WHERE project_id=?2 AND source_id=?3 \
              AND target_id=?4 AND kind=?5",
-            params![merged.to_string(), project_id, source, target, kind.to_string()],
+            params![
+                merged.to_string(),
+                project_id,
+                source,
+                target,
+                kind.to_string()
+            ],
         )?;
         Ok(())
     }
@@ -577,7 +617,8 @@ impl Store {
     pub fn nodes(&self, project_id: &str) -> Result<Vec<Node>> {
         let mut st = self.conn.prepare(
             "SELECT id,project_id,kind,status,title,statement,formal_statement,provenance,
-             content_hash,tainted,tier,parent_id,strategy_hint,suggested_lemmas,created_at,updated_at,
+             content_hash,tainted,tier,parent_id,strategy_hint,suggested_lemmas,lean_decls,
+             created_at,updated_at,
              stmt_formalized,proof_done,taint
              FROM nodes WHERE project_id=?1 ORDER BY created_at",
         )?;
@@ -1172,8 +1213,9 @@ fn node_row(r: &Row) -> rusqlite::Result<Node> {
     let status: String = r.get(3)?;
     let tier: String = r.get(10)?;
     let lemmas_raw: String = r.get(13)?;
+    let lean_decls_raw: String = r.get(14)?;
     let tainted_bool: i64 = r.get(9)?;
-    let taint_str: String = r.get(18)?;
+    let taint_str: String = r.get(19)?;
     // Reconcile the two columns for backward compatibility: a row written before
     // the `taint` column existed has `taint='clean'` (the default) but may carry
     // the old `tainted=1` bit — treat that as `Tainted`. Otherwise the explicit
@@ -1199,10 +1241,11 @@ fn node_row(r: &Row) -> rusqlite::Result<Node> {
         parent_id: r.get(11)?,
         strategy_hint: r.get(12)?,
         suggested_lemmas: serde_json::from_str(&lemmas_raw).unwrap_or_default(),
-        created_at: dt(r.get(14)?)?,
-        updated_at: dt(r.get(15)?)?,
-        stmt_formalized: r.get::<_, i64>(16)? != 0,
-        proof_done: r.get::<_, i64>(17)? != 0,
+        lean_decls: serde_json::from_str(&lean_decls_raw).unwrap_or_default(),
+        created_at: dt(r.get(15)?)?,
+        updated_at: dt(r.get(16)?)?,
+        stmt_formalized: r.get::<_, i64>(17)? != 0,
+        proof_done: r.get::<_, i64>(18)? != 0,
     })
 }
 fn edge_row(r: &Row) -> rusqlite::Result<Edge> {
@@ -1304,10 +1347,15 @@ mod tests {
     fn content_hash_covers_dependencies() {
         let s = Store::open(Path::new(":memory:")).unwrap();
         let p = s.create_project("p", "t").unwrap();
-        let a = s.add_node(&p.id, NodeKind::Lemma, "a", "a", "test").unwrap();
-        let b = s.add_node(&p.id, NodeKind::Lemma, "b", "b", "test").unwrap();
+        let a = s
+            .add_node(&p.id, NodeKind::Lemma, "a", "a", "test")
+            .unwrap();
+        let b = s
+            .add_node(&p.id, NodeKind::Lemma, "b", "b", "test")
+            .unwrap();
         let h0 = s.recompute_content_hash(&p.id, &a.id).unwrap();
-        s.add_edge(&p.id, &a.id, &b.id, EdgeKind::DependsOn).unwrap();
+        s.add_edge(&p.id, &a.id, &b.id, EdgeKind::DependsOn)
+            .unwrap();
         let h1 = s.recompute_content_hash(&p.id, &a.id).unwrap();
         assert_ne!(h0, h1, "hash must change when a dependency is added");
     }
@@ -1367,25 +1415,46 @@ mod tests {
     fn statement_and_proof_dep_scopes_split_and_merge() {
         let s = Store::open(Path::new(":memory:")).unwrap();
         let p = s.create_project("p", "t").unwrap();
-        let root = s.add_node(&p.id, NodeKind::Lemma, "root", "R", "test").unwrap();
-        let a = s.add_node(&p.id, NodeKind::Lemma, "a", "A", "test").unwrap();
-        let b = s.add_node(&p.id, NodeKind::Lemma, "b", "B", "test").unwrap();
+        let root = s
+            .add_node(&p.id, NodeKind::Lemma, "root", "R", "test")
+            .unwrap();
+        let a = s
+            .add_node(&p.id, NodeKind::Lemma, "a", "A", "test")
+            .unwrap();
+        let b = s
+            .add_node(&p.id, NodeKind::Lemma, "b", "B", "test")
+            .unwrap();
         // A is used only to prove root; B is used in the statement itself.
         s.add_edge_scoped(&p.id, &root.id, &a.id, EdgeKind::DependsOn, DepScope::Proof)
             .unwrap();
-        s.add_edge_scoped(&p.id, &root.id, &b.id, EdgeKind::DependsOn, DepScope::Statement)
-            .unwrap();
+        s.add_edge_scoped(
+            &p.id,
+            &root.id,
+            &b.id,
+            EdgeKind::DependsOn,
+            DepScope::Statement,
+        )
+        .unwrap();
         // The statement also ends up needing A: widen to Both.
-        s.widen_edge_scope(&p.id, &root.id, &a.id, EdgeKind::DependsOn, DepScope::Statement)
-            .unwrap();
+        s.widen_edge_scope(
+            &p.id,
+            &root.id,
+            &a.id,
+            EdgeKind::DependsOn,
+            DepScope::Statement,
+        )
+        .unwrap();
         let edges = s.edges(&p.id).unwrap();
         let ea = edges.iter().find(|e| e.target_id == a.id).unwrap();
         let eb = edges.iter().find(|e| e.target_id == b.id).unwrap();
         assert_eq!(ea.dep_scope, DepScope::Both);
         assert_eq!(eb.dep_scope, DepScope::Statement);
         // Legacy plain add_edge defaults to statement scope.
-        let c = s.add_node(&p.id, NodeKind::Lemma, "c", "C", "test").unwrap();
-        s.add_edge(&p.id, &root.id, &c.id, EdgeKind::DependsOn).unwrap();
+        let c = s
+            .add_node(&p.id, NodeKind::Lemma, "c", "C", "test")
+            .unwrap();
+        s.add_edge(&p.id, &root.id, &c.id, EdgeKind::DependsOn)
+            .unwrap();
         let ec = s
             .edges(&p.id)
             .unwrap()
@@ -1399,12 +1468,15 @@ mod tests {
     fn verification_flags_track_statement_and_proof_independently() {
         let s = Store::open(Path::new(":memory:")).unwrap();
         let p = s.create_project("p", "t").unwrap();
-        let n = s.add_node(&p.id, NodeKind::Lemma, "n", "N", "test").unwrap();
+        let n = s
+            .add_node(&p.id, NodeKind::Lemma, "n", "N", "test")
+            .unwrap();
         // Fresh node: neither formalized nor proved.
         let fresh = s.nodes(&p.id).unwrap().into_iter().next().unwrap();
         assert!(!fresh.stmt_formalized && !fresh.proof_done);
         // Statement formalized, proof still open — the blueprint mid-state.
-        s.set_verification_flags(&p.id, &n.id, true, false, "test").unwrap();
+        s.set_verification_flags(&p.id, &n.id, true, false, "test")
+            .unwrap();
         let mid = s.nodes(&p.id).unwrap().into_iter().next().unwrap();
         assert!(mid.stmt_formalized && !mid.proof_done);
     }
@@ -1439,7 +1511,12 @@ mod tests {
         let got = s.attempts(&p.id, 10).unwrap();
         assert_eq!(got.len(), 2);
         assert_eq!(got.iter().filter(|a| a.success).count(), 1);
-        assert_eq!(got.iter().filter(|a| a.node_id.as_deref() == Some(n.id.as_str())).count(), 2);
+        assert_eq!(
+            got.iter()
+                .filter(|a| a.node_id.as_deref() == Some(n.id.as_str()))
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -1472,6 +1549,7 @@ mod tests {
         assert_eq!(got_spine.tier, NodeTier::Spine);
         assert_eq!(got_spine.strategy_hint.as_deref(), Some("contrapositive"));
         assert_eq!(got_spine.suggested_lemmas, vec!["Nat.mul_comm".to_string()]);
+        assert!(got_spine.lean_decls.is_empty());
         assert_eq!(got_child.tier, NodeTier::Implementation);
         assert_eq!(got_child.parent_id.as_deref(), Some(spine.id.as_str()));
         assert_eq!(got_child.strategy_hint.as_deref(), Some("induct on n"));
@@ -1479,5 +1557,23 @@ mod tests {
             got_child.suggested_lemmas,
             vec!["Nat.succ_le_succ".to_string()]
         );
+    }
+
+    #[test]
+    fn stores_lean_declaration_bindings() {
+        let s = Store::open(Path::new(":memory:")).unwrap();
+        let p = s.create_project("p", "t").unwrap();
+        let n = s
+            .add_node(&p.id, NodeKind::Lemma, "n", "N", "test")
+            .unwrap();
+        s.set_lean_decls(
+            &p.id,
+            &n.id,
+            &["Ns.main".to_string(), "Ns.helper".to_string()],
+            "blueprint",
+        )
+        .unwrap();
+        let got = s.nodes(&p.id).unwrap().into_iter().next().unwrap();
+        assert_eq!(got.lean_decls, vec!["Ns.main", "Ns.helper"]);
     }
 }
