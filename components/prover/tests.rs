@@ -6,8 +6,9 @@ use crate::{
     prover::{
         aristotle,
         attempt_run,
-        formal::{FormalSystem, ProofSession, SessionError},
+        formal::{FormalBackend, FormalSystem, ProofSession, SessionError},
         isabelle,
+        lean,
         model::{AttemptRunStatus, ProverJobStatus},
         proof_job,
         rocq,
@@ -154,7 +155,7 @@ fn isabelle_submit_poll_result_mock() {
 
 #[test]
 fn isabelle_step_tactic_is_unsupported() {
-    let mut backend = isabelle::IsabelleBackend { mock: true };
+    let mut backend = isabelle::IsabelleBackend::mock();
     let err = backend.step_tactic(0, "by simp").unwrap_err();
     assert!(
         matches!(err.downcast_ref::<SessionError>(), Some(SessionError::Unsupported(_))),
@@ -167,7 +168,7 @@ fn isabelle_step_tactic_is_unsupported() {
 
 #[test]
 fn rocq_step_tactic_is_supported() {
-    let mut backend = rocq::RocqBackend { mock: true };
+    let mut backend = rocq::RocqBackend::mock();
     let step = backend.step_tactic(0, "exact I").unwrap();
     assert!(step.finished);
     assert_eq!(step.state, 1);
@@ -175,10 +176,9 @@ fn rocq_step_tactic_is_supported() {
 
 #[test]
 fn source_scan_rejects_escape_hatches() {
-    use crate::prover::formal::FormalBackend;
-    let rocq_b = rocq::RocqBackend { mock: true };
+    let rocq_b = rocq::RocqBackend::mock();
     assert!(!rocq_b.source_scan("Theorem t: True. Admitted.").unwrap().clean);
-    let isa_b = isabelle::IsabelleBackend { mock: true };
+    let isa_b = isabelle::IsabelleBackend::mock();
     assert!(!isa_b.source_scan("theorem t: \"True\" sorry").unwrap().clean);
 }
 
@@ -218,6 +218,104 @@ fn lean_project_alias_deserializes() {
     });
     let res: crate::prover::model::ProofResult = serde_json::from_value(legacy_res).unwrap();
     assert!(res.formal_code.unwrap().contains("trivial"));
+}
+
+// --- Phase 2 live gate tests -------------------------------------------------
+//
+// These exercise the REAL toolchains through the configured runner. Each probes
+// availability first and skips cleanly (returns) when the toolchain is absent,
+// so the suite stays green on machines without Lean/Rocq/Isabelle. On this
+// machine the toolchains are installed, so they run and must pass. Every system
+// gets a POSITIVE case (trivial proof certifies) and a NEGATIVE case (a
+// sorry/admit proof is rejected — the source scan bites even if it compiles).
+
+/// A Config whose live formal workspaces land under a throwaway temp dir.
+fn live_config(tmp: &Path) -> Config {
+    let mut c = Config::default();
+    c.workspace = tmp.join("workspaces");
+    c
+}
+
+#[test]
+fn lean_live_verifies_trivial_and_rejects_sorry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = live_config(tmp.path());
+    let backend = lean::LeanBackend::live(&cfg);
+    if !backend.available() {
+        eprintln!("SKIP lean_live: lean toolchain unavailable via configured runner");
+        return;
+    }
+    let ok = backend
+        .verify(&cfg, "theorem t : True := trivial\n", "theorem t : True")
+        .unwrap();
+    assert!(ok.lexically_verified, "trivial Lean proof must certify: {ok:?}");
+    assert!(ok.axioms_clean, "trivial Lean proof is axiom-clean: {ok:?}");
+
+    let bad = backend
+        .verify(&cfg, "theorem t : True := by sorry\n", "theorem t : True")
+        .unwrap();
+    assert!(
+        !bad.lexically_verified,
+        "a `sorry` Lean proof must be rejected even if it compiles: {bad:?}"
+    );
+}
+
+#[test]
+fn rocq_live_verifies_trivial_and_rejects_admitted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = live_config(tmp.path());
+    let backend = rocq::RocqBackend::live(&cfg);
+    if !backend.available() {
+        eprintln!("SKIP rocq_live: coqc unavailable via configured runner");
+        return;
+    }
+    let ok = backend
+        .verify(
+            &cfg,
+            "Theorem t : True.\nProof.\n  exact I.\nQed.\n",
+            "Theorem t : True",
+        )
+        .unwrap();
+    assert!(ok.lexically_verified, "trivial Rocq proof must certify: {ok:?}");
+    assert!(ok.axioms_clean, "trivial Rocq proof is axiom-clean: {ok:?}");
+
+    let bad = backend
+        .verify(
+            &cfg,
+            "Theorem t : True.\nProof.\nAdmitted.\n",
+            "Theorem t : True",
+        )
+        .unwrap();
+    assert!(
+        !bad.lexically_verified,
+        "an `Admitted` Rocq proof must be rejected: {bad:?}"
+    );
+}
+
+#[test]
+fn isabelle_live_verifies_trivial_and_rejects_sorry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = live_config(tmp.path());
+    let backend = isabelle::IsabelleBackend::live(&cfg);
+    if !backend.available() {
+        eprintln!("SKIP isabelle_live: isabelle unavailable via configured runner");
+        return;
+    }
+    let ok = backend
+        .verify(&cfg, "theorem t: \"True\"\n  by simp", "\"True\"")
+        .unwrap();
+    assert!(
+        ok.lexically_verified,
+        "trivial Isabelle proof must certify: {ok:?}"
+    );
+
+    let bad = backend
+        .verify(&cfg, "theorem t: \"True\"\n  sorry", "\"True\"")
+        .unwrap();
+    assert!(
+        !bad.lexically_verified,
+        "a `sorry` Isabelle proof must be rejected: {bad:?}"
+    );
 }
 
 #[test]

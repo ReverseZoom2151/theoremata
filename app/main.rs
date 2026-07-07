@@ -21,7 +21,7 @@ pub use reason::{
     agent, blueprint, chat, consolidate, critic, decompose, falsification, guard, mcts, observe,
     plan_history, progress, research, retry, router, sampler, sampling, taint, team,
 };
-pub use prover::{aristotle, attempt_run, formal, isabelle, proof_job, rocq};
+pub use prover::{aristotle, attempt_run, exec, formal, isabelle, lean, proof_job, rocq};
 pub use verify::{hardening, lean_session};
 
 use anyhow::Result;

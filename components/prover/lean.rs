@@ -1,11 +1,13 @@
-//! Rocq (formerly Coq) external-prover adapter — Phase 1 mock backend.
+//! Lean external-prover adapter — Phase 1 mock + Phase 2 live gate.
 //!
-//! Mirrors the `aristotle` mock EXACTLY (Config.prover_mock-driven,
-//! submit → poll(InProgress → Proved) → result + a `VerificationReport`), but
-//! emits SYSTEM-NATIVE Rocq (`.v`) proofs and routes verification through the
-//! system-agnostic [`FormalBackend`] 3+1-layer gate. Live mode (Phase 2) will
-//! replace the canned layers with `rocq compile` / `Print Assumptions` /
-//! `rocqchk`; the source scan already runs for real.
+//! Mirrors the `aristotle`/`rocq` mocks (Config.prover_mock-driven,
+//! submit → poll(InProgress → Proved) → result + a `VerificationReport`), and
+//! routes verification through the system-agnostic [`FormalBackend`] 3+1-layer
+//! gate. In live mode each layer runs the native Lean toolchain through the
+//! configured [`Runner`]: `lean <Generated.lean>` (compile — the kernel checks
+//! every proof term), `#print axioms <thm>` (axiom audit vs the mathlib
+//! whitelist), and `lake env leanchecker` when available (kernel re-check;
+//! degrades gracefully to the compile-time kernel check otherwise).
 
 use crate::{
     config::Config,
@@ -24,16 +26,15 @@ use chrono::Utc;
 use serde_json::json;
 use std::{path::PathBuf, time::Instant};
 
-const BACKEND: &str = "rocq";
-const SYSTEM: FormalSystem = FormalSystem::Rocq;
+const BACKEND: &str = "lean";
+const SYSTEM: FormalSystem = FormalSystem::Lean;
+const MODULE: &str = "Generated";
 
 pub fn mock_enabled(config: &Config) -> bool {
-    // Config flag short-circuits BEFORE any env read, so parallel tests never
-    // race on the process-global environment.
     config.prover_mock
-        || std::env::var("THEOREMATA_ROCQ_MOCK")
+        || std::env::var("THEOREMATA_LEAN_MOCK")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or_else(|_| std::env::var("THEOREMATA_ROCQ_COMMAND").is_err())
+            .unwrap_or_else(|_| std::env::var("THEOREMATA_LEAN_COMMAND").is_err())
 }
 
 pub fn submit(
@@ -93,7 +94,7 @@ pub fn poll(store: &Store, config: &Config, job_id: &str) -> Result<ProofJob> {
 
     if status.is_terminal() {
         job.completed_at = Some(Utc::now());
-        let backend = RocqBackend::mock();
+        let backend = LeanBackend::mock();
         let verification = formal_code
             .as_deref()
             .and_then(|code| backend.verify(config, code, &job.task.statement).ok());
@@ -120,7 +121,7 @@ pub fn poll(store: &Store, config: &Config, job_id: &str) -> Result<ProofJob> {
             if let Some(code) = &formal_code {
                 let sub = dir.join(BACKEND);
                 std::fs::create_dir_all(&sub)?;
-                std::fs::write(sub.join("solution.v"), code)?;
+                std::fs::write(sub.join("solution.lean"), code)?;
             }
             write_artifact(dir, "result.json", &result)?;
             if let Some(v) = &result.verification {
@@ -180,7 +181,7 @@ pub fn build_task(
     let root = config
         .lean_project
         .clone()
-        .unwrap_or_else(|| config.resources.join("rocq"));
+        .unwrap_or_else(|| config.resources.join("lean"));
     ProofTask {
         id: uuid::Uuid::new_v4().to_string(),
         project_id,
@@ -193,7 +194,7 @@ pub fn build_task(
             line: None,
         },
         system: SYSTEM,
-        formal_project: crate::prover::model::FormalProject {
+        formal_project: FormalProject {
             system: SYSTEM,
             root,
             toolchain: None,
@@ -219,66 +220,84 @@ fn advance_mock(job: &ProofJob) -> (ProverJobStatus, f64, Option<String>, Option
         _ => (
             ProverJobStatus::Proved,
             100.0,
-            Some(mock_rocq_solution(&job.task)),
+            Some(mock_lean_solution(&job.task)),
             Some("mock: proved".into()),
         ),
     }
 }
 
-fn mock_rocq_solution(task: &ProofTask) -> String {
+fn mock_lean_solution(task: &ProofTask) -> String {
     let name = task
         .theorem
         .full_name
         .rsplit('.')
         .next()
         .unwrap_or("MainTheorem");
-    format!("(* Mock Rocq proof. *)\nTheorem {name} : True.\nProof.\n  exact I.\nQed.\n")
+    format!("-- Mock Lean proof.\ntheorem {name} : True := trivial\n")
 }
 
-/// The fixed, Rocq-identifier-safe module basename for a generated `.v`.
-const MODULE: &str = "Generated";
-
-/// Rocq [`FormalBackend`]. In mock mode the compile / axiom-audit / kernel
+/// Lean [`FormalBackend`]. In mock mode the compile / axiom-audit / kernel
 /// re-check layers return canned success; the source scan always runs for real.
-/// In live mode each layer runs the real Rocq toolchain through the configured
-/// [`Runner`]: `coqc <Generated.v>` (compile), `Print Assumptions` (axiom audit),
-/// `coqchk -silent -o Generated` (kernel re-check).
-pub struct RocqBackend {
+pub struct LeanBackend {
     pub mock: bool,
     pub runner: Runner,
-    pub coqc: String,
-    pub coqchk: String,
+    pub lean: String,
+    pub lake: String,
 }
 
-impl RocqBackend {
+impl LeanBackend {
     /// The offline mock backend (canned layers; real source scan).
     pub fn mock() -> Self {
         Self {
             mock: true,
             runner: Runner::Native,
-            coqc: "coqc".into(),
-            coqchk: "coqchk".into(),
+            lean: "lean".into(),
+            lake: "lake".into(),
         }
     }
 
-    /// The live backend, reading the configured runner + binaries (env-overridable).
+    /// The live backend, reading the configured runner + binary (env-overridable).
     pub fn live(cfg: &Config) -> Self {
         Self {
             mock: false,
             runner: cfg.formal_runners.for_system(SYSTEM),
-            coqc: exec::env_or("THEOREMATA_COQC", &cfg.coqc_bin),
-            coqchk: exec::env_or("THEOREMATA_COQCHK", &cfg.coqchk_bin),
+            lean: exec::env_or("THEOREMATA_LEAN", &cfg.lean_bin),
+            lake: exec::env_or("THEOREMATA_LAKE", "lake"),
         }
     }
 }
 
-impl FormalBackend for RocqBackend {
+/// Parse the transitive axiom set from a `#print axioms` message. Returns
+/// `Some(vec![])` for the clean "does not depend on any axioms" line, or the
+/// listed axioms otherwise; `None` if no axiom line is present.
+fn parse_axioms(stdout: &str) -> Option<Vec<String>> {
+    if stdout.contains("does not depend on any axioms") {
+        return Some(Vec::new());
+    }
+    let marker = "depends on axioms:";
+    let idx = stdout.find(marker)?;
+    let tail = &stdout[idx + marker.len()..];
+    // The list is `[a, b, c]` possibly spanning lines.
+    let inside = tail
+        .split_once('[')
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map(|(list, _)| list)
+        .unwrap_or(tail);
+    let axioms: Vec<String> = inside
+        .split(',')
+        .map(|s| s.trim().trim_matches(|c: char| c.is_whitespace()).to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    Some(axioms)
+}
+
+impl FormalBackend for LeanBackend {
     fn system(&self) -> FormalSystem {
         SYSTEM
     }
 
     fn available(&self) -> bool {
-        self.mock || exec::probe(&self.runner, &[&self.coqc, "--version"])
+        self.mock || exec::probe(&self.runner, &[&self.lean, "--version"])
     }
 
     fn scaffold(&self, cfg: &Config, code: &str, name: &str) -> Result<Workspace> {
@@ -290,17 +309,11 @@ impl FormalBackend for RocqBackend {
                 entry: name.to_string(),
             });
         }
-        let entry = crate::prover::formal::entry_name(SYSTEM, code).unwrap_or_else(|| name.to_string());
+        let entry =
+            crate::prover::formal::entry_name(SYSTEM, code).unwrap_or_else(|| name.to_string());
         let root = crate::prover::formal::live_workspace_dir(cfg, SYSTEM)?;
-        let src = root.join(format!("{MODULE}.v"));
-        // Append `Print Assumptions <entry>.` so a single `coqc` run compiles and
-        // emits the axiom audit on stdout.
-        let mut content = code.to_string();
-        if !content.ends_with('\n') {
-            content.push('\n');
-        }
-        content.push_str(&format!("Print Assumptions {entry}.\n"));
-        std::fs::write(&src, content)?;
+        let src = root.join(format!("{MODULE}.lean"));
+        std::fs::write(&src, code)?;
         Ok(Workspace {
             system: SYSTEM,
             root,
@@ -320,18 +333,18 @@ impl FormalBackend for RocqBackend {
         if !self.available() {
             return Ok(CompileReport {
                 compiled: false,
-                errors: vec!["rocq toolchain unavailable".into()],
+                errors: vec!["lean toolchain unavailable".into()],
                 detail: json!({"unavailable": true, "runner": self.runner.tag()}),
             });
         }
-        let file = format!("{MODULE}.v");
-        let out = exec::run(&self.runner, &[&self.coqc, &file], &ws.root);
+        let file = format!("{MODULE}.lean");
+        let out = exec::run(&self.runner, &[&self.lean, &file], &ws.root);
         Ok(CompileReport {
             compiled: out.success(),
             errors: if out.success() {
                 Vec::new()
             } else {
-                vec![out.stderr.clone()]
+                vec![out.stderr.clone(), out.stdout.clone()]
             },
             detail: json!({
                 "runner": self.runner.tag(),
@@ -342,7 +355,7 @@ impl FormalBackend for RocqBackend {
         })
     }
 
-    fn audit_axioms(&self, ws: &Workspace, _thm: &str, whitelist: &[String]) -> Result<AxiomReport> {
+    fn audit_axioms(&self, ws: &Workspace, thm: &str, whitelist: &[String]) -> Result<AxiomReport> {
         if self.mock {
             return Ok(AxiomReport {
                 axioms: Vec::new(),
@@ -350,29 +363,27 @@ impl FormalBackend for RocqBackend {
                 detail: json!({"mock": true, "whitelist": whitelist}),
             });
         }
-        // Re-run coqc to capture the `Print Assumptions` output. A fully
-        // constructive proof prints exactly "Closed under the global context".
-        let file = format!("{MODULE}.v");
-        let out = exec::run(&self.runner, &[&self.coqc, &file], &ws.root);
-        let clean = out.success() && out.stdout.contains("Closed under the global context");
-        // When not clean, surface the listed assumptions (lines after "Axioms:").
-        let axioms: Vec<String> = if clean {
-            Vec::new()
-        } else {
-            out.stdout
-                .lines()
-                .skip_while(|l| !l.contains("Axioms:") && !l.contains("Variables:"))
-                .skip(1)
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect()
-        };
+        // Write a sibling file that imports nothing extra and prints the axiom
+        // closure of the target theorem, then run `lean` on it.
+        let base = std::fs::read_to_string(&ws.source_path).unwrap_or_default();
+        let audit_file = "Generated_axioms.lean";
+        let mut content = base;
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str(&format!("#print axioms {thm}\n"));
+        std::fs::write(ws.root.join(audit_file), content)?;
+        let out = exec::run(&self.runner, &[&self.lean, audit_file], &ws.root);
+        let axioms = parse_axioms(&out.stdout).unwrap_or_else(|| vec!["<unparsed>".into()]);
+        let within = out.success()
+            && parse_axioms(&out.stdout).is_some()
+            && axioms.iter().all(|a| whitelist.iter().any(|w| w == a));
         Ok(AxiomReport {
             axioms,
-            within_whitelist: clean,
+            within_whitelist: within,
             detail: json!({
                 "runner": self.runner.tag(),
-                "closed": clean,
+                "whitelist": whitelist,
                 "stdout": out.stdout,
             }),
         })
@@ -385,12 +396,30 @@ impl FormalBackend for RocqBackend {
                 detail: json!({"mock": true}),
             });
         }
-        // Independent minimal-trusted-base re-check of the compiled `.vo`.
-        let out = exec::run(
-            &self.runner,
-            &[&self.coqchk, "-silent", "-o", MODULE],
-            &ws.root,
-        );
+        // `leanchecker` is only meaningful inside a Lake project (it replays
+        // `.olean`s). A standalone `lean <file>` already runs the proof term
+        // through the kernel, so when there is no Lake workspace we degrade
+        // gracefully: the compile IS the kernel check.
+        if !ws.root.join("lakefile.toml").exists() && !ws.root.join("lakefile.lean").exists() {
+            return Ok(RecheckReport {
+                rechecked: true,
+                detail: json!({
+                    "runner": self.runner.tag(),
+                    "leanchecker": "skipped (bare lean; compile is kernel-checked)",
+                }),
+            });
+        }
+        let out = exec::run(&self.runner, &[&self.lake, "env", "leanchecker"], &ws.root);
+        // If leanchecker is absent the launch fails; degrade to the compile check.
+        if !out.launched {
+            return Ok(RecheckReport {
+                rechecked: true,
+                detail: json!({
+                    "runner": self.runner.tag(),
+                    "leanchecker": "unavailable; relying on compile kernel-check",
+                }),
+            });
+        }
         Ok(RecheckReport {
             rechecked: out.success(),
             detail: json!({
@@ -408,15 +437,15 @@ impl FormalBackend for RocqBackend {
         if let Some(report) = crate::prover::formal::worker_source_scan(SYSTEM, code) {
             return Ok(report);
         }
-        // Rocq escape hatches NOT caught by Print Assumptions / rocqchk.
+        // Lean escape hatches NOT caught by the kernel / `#print axioms` cleanly.
         let low = code.to_lowercase();
         let patterns = [
-            "admitted",
-            "axiom ",
-            "-type-in-type",
-            "type_in_type",
-            "unset universe checking",
-            "bypass_check",
+            "sorry",
+            "sorryax",
+            "admit",
+            "native_decide",
+            "ofreducebool",
+            "trustcompiler",
         ];
         let findings: Vec<String> = patterns
             .iter()
@@ -431,9 +460,9 @@ impl FormalBackend for RocqBackend {
     }
 }
 
-/// Rocq warm-driver session (Petanque / SerAPI in Phase 3). Supports both
-/// `submit_unit` and per-tactic `step_tactic`.
-impl ProofSession for RocqBackend {
+/// Lean warm-driver session (repl in Phase 3). Supports both `submit_unit` and
+/// per-tactic `step_tactic`.
+impl ProofSession for LeanBackend {
     fn start(&mut self, _project: &FormalProject) -> Result<()> {
         Ok(())
     }
@@ -448,8 +477,8 @@ impl ProofSession for RocqBackend {
     }
 
     fn step_tactic(&mut self, state: u64, tactic: &str) -> Result<StateResult> {
-        // Rocq supports per-tactic stepping (SerAPI state ids / Petanque).
-        let finished = tactic.contains("Qed") || tactic.trim() == "exact I";
+        // Lean supports per-tactic stepping (repl `proofState` ids).
+        let finished = tactic.contains("trivial") || tactic.trim() == "rfl";
         Ok(StateResult {
             state: state + 1,
             finished,

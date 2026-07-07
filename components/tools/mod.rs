@@ -421,9 +421,27 @@ pub fn capability_report(config: &Config) -> serde_json::Value {
                 .exists(),
         ),
     ];
+    // Live formal-system gates (Phase 2): each system's configured runner and a
+    // real toolchain probe. Read-only, so `doctor` doubles as a live smoke.
+    use crate::prover::formal::{backend_for, FormalSystem};
+    let formal_backends = [
+        FormalSystem::Lean,
+        FormalSystem::Rocq,
+        FormalSystem::Isabelle,
+    ]
+    .into_iter()
+    .map(|system| {
+        json!({
+            "system": system.as_str(),
+            "runner": config.formal_runners.for_system(system).tag(),
+            "available": backend_for(config, system, false).available(),
+        })
+    })
+    .collect::<Vec<_>>();
     json!({
         "model_provider": config.model_command.as_ref().map(|_|"command").unwrap_or("offline"),
         "tools": tools.into_iter().map(|t|json!({"name":t.name(),"available":t.available()})).collect::<Vec<_>>(),
+        "formal_backends": formal_backends,
         "prover": {
             "backend": config.prover_backend,
             "max_polls": config.prover_max_polls,

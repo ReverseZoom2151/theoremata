@@ -49,6 +49,39 @@ pub struct Config {
     /// avoid `std::env::set_var` races under parallel execution).
     #[serde(default)]
     pub prover_mock: bool,
+    /// Per-formal-system runner map (Native / Wsl / Docker). Defaults on this
+    /// machine: `lean = Native`, `rocq = Wsl{Ubuntu}`, `isabelle = Wsl{Ubuntu}`.
+    /// Any system can be re-pointed at another runner purely through config.
+    #[serde(default)]
+    pub formal_runners: crate::prover::exec::FormalRunners,
+    /// Binary for the live Lean gate (`lean <file>`). Env: `THEOREMATA_LEAN`.
+    #[serde(default = "default_lean_bin")]
+    pub lean_bin: String,
+    /// Binary for the live Rocq compile (`coqc`). Env: `THEOREMATA_COQC`.
+    #[serde(default = "default_coqc_bin")]
+    pub coqc_bin: String,
+    /// Binary for the live Rocq kernel re-check (`coqchk`). Env: `THEOREMATA_COQCHK`.
+    #[serde(default = "default_coqchk_bin")]
+    pub coqchk_bin: String,
+    /// Binary for the live Isabelle build. Env: `THEOREMATA_ISABELLE`.
+    #[serde(default = "default_isabelle_bin")]
+    pub isabelle_bin: String,
+}
+
+fn default_lean_bin() -> String {
+    "lean".into()
+}
+
+fn default_coqc_bin() -> String {
+    "coqc".into()
+}
+
+fn default_coqchk_bin() -> String {
+    "coqchk".into()
+}
+
+fn default_isabelle_bin() -> String {
+    "~/Isabelle2025-2/bin/isabelle".into()
 }
 
 fn default_k_consecutive_clean() -> u32 {
@@ -89,6 +122,11 @@ impl Default for Config {
             prover_backend: default_prover_backend(),
             prover_max_polls: default_prover_max_polls(),
             prover_mock: false,
+            formal_runners: crate::prover::exec::FormalRunners::default(),
+            lean_bin: default_lean_bin(),
+            coqc_bin: default_coqc_bin(),
+            coqchk_bin: default_coqchk_bin(),
+            isabelle_bin: default_isabelle_bin(),
         }
     }
 }

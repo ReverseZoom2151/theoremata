@@ -15,14 +15,20 @@
 //! concrete per-system producers arrive in later phases (mock backends in
 //! Phase 1; real gates in Phase 2; live drivers in Phase 3).
 
-use crate::{config::Config, prover::model::VerificationReport};
+use crate::{
+    config::Config,
+    db::Store,
+    prover::model::{ProofJob, ProofResult, ProverJobStatus, VerificationReport},
+};
 use anyhow::Result;
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     fmt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     str::FromStr,
+    time::Instant,
 };
 
 /// Which formal system a proof object belongs to. Serialized `snake_case`
@@ -166,6 +172,14 @@ pub struct ScanReport {
 /// wires the four layers together, fail-closed: ALL must pass.
 pub trait FormalBackend {
     fn system(&self) -> FormalSystem;
+
+    /// Probe whether this backend's toolchain is usable right now. The default is
+    /// `true` (mock backends are always available); live backends override this
+    /// to actually probe the configured runner, so callers can skip cleanly when
+    /// the toolchain is absent.
+    fn available(&self) -> bool {
+        true
+    }
 
     /// Layer 3: build a project/workspace around `code`.
     fn scaffold(&self, cfg: &Config, code: &str, name: &str) -> Result<Workspace>;
@@ -330,4 +344,227 @@ pub(crate) fn statement_mentioned(stmt: &str, code: &str) -> bool {
             !head_norm.is_empty() && code_norm.contains(&head_norm)
         })
         .unwrap_or(false)
+}
+
+// --- live-gate shared helpers (Phase 2) ----------------------------------
+
+/// Extract the declared entry (theorem/lemma) name from generated source for a
+/// system, so the axiom audit targets the real declaration rather than a guess
+/// derived from the statement. Falls back to `None` when nothing matches.
+pub(crate) fn entry_name(system: FormalSystem, code: &str) -> Option<String> {
+    let keywords: &[&str] = match system {
+        FormalSystem::Lean => &["theorem", "lemma", "example", "def"],
+        FormalSystem::Rocq => &[
+            "Theorem",
+            "Lemma",
+            "Corollary",
+            "Proposition",
+            "Example",
+            "Fact",
+            "Remark",
+            "Definition",
+        ],
+        FormalSystem::Isabelle => &["theorem", "lemma", "corollary", "proposition"],
+    };
+    for raw in code.lines() {
+        let line = raw.trim_start();
+        for kw in keywords {
+            if let Some(rest) = line.strip_prefix(kw) {
+                // Require a separator after the keyword so `theorematic` etc. do
+                // not match.
+                if !rest.starts_with(|c: char| c.is_whitespace()) {
+                    continue;
+                }
+                let name: String = rest
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || matches!(c, '_' | '\'' | '.'))
+                    .collect();
+                if !name.is_empty() {
+                    return Some(name);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Create (and `create_dir_all`) a unique, canonicalized workspace directory for
+/// a live scaffold under the state dir (`.theoremata/formal/<system>/<uuid>`).
+/// Canonicalization yields an absolute path so WSL/Docker runners can translate
+/// or bind-mount it.
+pub(crate) fn live_workspace_dir(cfg: &Config, system: FormalSystem) -> Result<PathBuf> {
+    let base = cfg
+        .workspace
+        .parent()
+        .map(|p| p.join("formal"))
+        .unwrap_or_else(|| PathBuf::from(".theoremata/formal"));
+    let dir = base
+        .join(system.as_str())
+        .join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&dir)?;
+    Ok(std::fs::canonicalize(&dir).unwrap_or(dir))
+}
+
+/// Run the Python `source_scan` worker (layer 2c) for `system`, returning a
+/// [`ScanReport`] when the worker is available and answered, else `None` (the
+/// caller then falls back to its built-in lexical patterns).
+pub(crate) fn worker_source_scan(system: FormalSystem, code: &str) -> Option<ScanReport> {
+    use crate::tools::{PythonCheck, Tool};
+    let py = PythonCheck::new();
+    if !py.available() {
+        return None;
+    }
+    let result = py
+        .run(json!({"tool": "source_scan", "system": system.as_str(), "source": code}))
+        .ok()?;
+    let v: Value = serde_json::from_str(&result.stdout).ok()?;
+    if !v.get("ok")?.as_bool()? {
+        return None;
+    }
+    let output = v.get("output")?;
+    let clean = output.get("clean")?.as_bool()?;
+    let findings = output
+        .get("flags")
+        .and_then(Value::as_array)
+        .map(|flags| {
+            flags
+                .iter()
+                .filter(|f| f.get("severity").and_then(Value::as_str) == Some("critical"))
+                .filter_map(|f| f.get("pattern").and_then(Value::as_str).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(ScanReport {
+        clean,
+        findings,
+        detail: json!({"system": system.as_str(), "worker": output}),
+    })
+}
+
+/// Build the live or mock [`FormalBackend`] for `system`.
+pub fn backend_for(cfg: &Config, system: FormalSystem, mock: bool) -> Box<dyn FormalBackend> {
+    match (system, mock) {
+        (FormalSystem::Lean, true) => Box::new(crate::prover::lean::LeanBackend::mock()),
+        (FormalSystem::Lean, false) => Box::new(crate::prover::lean::LeanBackend::live(cfg)),
+        (FormalSystem::Rocq, true) => Box::new(crate::prover::rocq::RocqBackend::mock()),
+        (FormalSystem::Rocq, false) => Box::new(crate::prover::rocq::RocqBackend::live(cfg)),
+        (FormalSystem::Isabelle, true) => {
+            Box::new(crate::prover::isabelle::IsabelleBackend::mock())
+        }
+        (FormalSystem::Isabelle, false) => {
+            Box::new(crate::prover::isabelle::IsabelleBackend::live(cfg))
+        }
+    }
+}
+
+fn write_artifact(dir: &Path, rel: &str, value: &impl Serialize) -> Result<()> {
+    let path = dir.join(rel);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_string_pretty(value)?)?;
+    Ok(())
+}
+
+/// Drive a non-mock proof job to a terminal state through the real 3+1-layer
+/// gate. The candidate proof is taken from `task.stub`; the backend probes its
+/// toolchain first and FAILS CLOSED (`Error`) when unavailable — a live gate
+/// never silently passes an un-verified proof.
+pub fn live_poll(
+    store: &Store,
+    cfg: &Config,
+    mut job: ProofJob,
+    backend_name: &str,
+    system: FormalSystem,
+) -> Result<ProofJob> {
+    let started = Instant::now();
+    let backend = backend_for(cfg, system, false);
+    let code = job.task.stub.clone();
+
+    let (status, verification, message) = if !backend.available() {
+        (
+            ProverJobStatus::Error,
+            None,
+            format!("{system} toolchain unavailable (fail-closed)"),
+        )
+    } else if let Some(code) = code.clone() {
+        match backend.verify(cfg, &code, &job.task.statement) {
+            Ok(v) => {
+                let ok = v.lexically_verified;
+                (
+                    if ok {
+                        ProverJobStatus::Proved
+                    } else {
+                        ProverJobStatus::Failed
+                    },
+                    Some(v),
+                    if ok {
+                        "live: verified through the 3+1-layer gate".to_string()
+                    } else {
+                        "live: rejected by the 3+1-layer gate".to_string()
+                    },
+                )
+            }
+            Err(e) => (ProverJobStatus::Error, None, format!("live verify error: {e}")),
+        }
+    } else {
+        (
+            ProverJobStatus::Failed,
+            None,
+            "live job requires a candidate proof in task.stub".to_string(),
+        )
+    };
+
+    job.status = status;
+    job.percent_complete = 100.0;
+    job.poll_count += 1;
+    job.completed_at = Some(Utc::now());
+    job.updated_at = Utc::now();
+
+    let result = ProofResult {
+        task_id: job.task.id.clone(),
+        job_id: job.id.clone(),
+        status,
+        formal_code: code,
+        counterexample: None,
+        verification,
+        artifacts_dir: job.artifacts_dir.clone(),
+        duration_ms: started.elapsed().as_millis(),
+        cost: None,
+        message: Some(message),
+        provenance: json!({
+            "backend": backend_name,
+            "system": system.as_str(),
+            "mock": false,
+            "runner": cfg.formal_runners.for_system(system).tag(),
+            "poll_count": job.poll_count,
+        }),
+    };
+
+    if let Some(dir) = &job.artifacts_dir {
+        if let Some(c) = &result.formal_code {
+            let sub = dir.join(backend_name);
+            std::fs::create_dir_all(&sub)?;
+            std::fs::write(
+                sub.join(format!("solution{}", system.source_extension())),
+                c,
+            )?;
+        }
+        write_artifact(dir, "result.json", &result)?;
+        if let Some(v) = &result.verification {
+            write_artifact(dir, "verifier/report.json", v)?;
+        }
+    }
+
+    job.result = Some(result);
+    store.update_proof_job(&job)?;
+    store.event(
+        job.project_id.as_deref(),
+        None,
+        "proof_job.completed",
+        backend_name,
+        json!({"job_id": job.id, "status": status, "live": true}),
+    )?;
+    Ok(job)
 }

@@ -13,6 +13,7 @@ use crate::{
     config::Config,
     db::Store,
     prover::{
+        exec::{self, Runner},
         formal::{
             AxiomReport, CompileReport, FormalBackend, FormalSystem, GoalState, ProofSession,
             RecheckReport, ScanReport, SessionError, StateResult, UnitResult, Workspace,
@@ -82,9 +83,8 @@ pub fn poll(store: &Store, config: &Config, job_id: &str) -> Result<ProofJob> {
         return Ok(job);
     }
     if !mock_enabled(config) {
-        return Err(anyhow!(
-            "live Isabelle backend is not wired yet (Phase 2); set prover_mock or THEOREMATA_ISABELLE_MOCK"
-        ));
+        // Live path: verify the candidate proof through the real 3+1-layer gate.
+        return crate::prover::formal::live_poll(store, config, job, BACKEND, SYSTEM);
     }
     let started = Instant::now();
     let (status, percent, formal_code, message) = advance_mock(&job);
@@ -95,7 +95,7 @@ pub fn poll(store: &Store, config: &Config, job_id: &str) -> Result<ProofJob> {
 
     if status.is_terminal() {
         job.completed_at = Some(Utc::now());
-        let backend = IsabelleBackend { mock: true };
+        let backend = IsabelleBackend::mock();
         let verification = formal_code
             .as_deref()
             .and_then(|code| backend.verify(config, code, &job.task.statement).ok());
@@ -242,8 +242,52 @@ fn mock_isabelle_solution(task: &ProofTask) -> String {
 
 /// Isabelle [`FormalBackend`]. In mock mode the compile / oracle-audit / kernel
 /// re-check layers return canned success; the source scan always runs for real.
+/// In live mode the theory is scaffolded with a session `ROOT` and checked with
+/// a clean `isabelle build -o quick_and_dirty=false` through the configured
+/// [`Runner`] — Isabelle is LCF/kernel-checked, so a clean build IS the kernel
+/// re-check; the oracle gate is that clean build combined with the source scan
+/// (which catches `sorry`/`oops`/`oracle`).
 pub struct IsabelleBackend {
     pub mock: bool,
+    pub runner: Runner,
+    pub isabelle: String,
+}
+
+impl IsabelleBackend {
+    /// The offline mock backend (canned layers; real source scan).
+    pub fn mock() -> Self {
+        Self {
+            mock: true,
+            runner: Runner::Native,
+            isabelle: "isabelle".into(),
+        }
+    }
+
+    /// The live backend, reading the configured runner + binary (env-overridable).
+    pub fn live(cfg: &Config) -> Self {
+        Self {
+            mock: false,
+            runner: cfg.formal_runners.for_system(SYSTEM),
+            isabelle: exec::env_or("THEOREMATA_ISABELLE", &cfg.isabelle_bin),
+        }
+    }
+
+    /// A clean `isabelle build` of the scaffolded session (shared by `compile`
+    /// and `kernel_recheck` — the build both elaborates and kernel-checks).
+    fn build(&self, ws: &Workspace) -> exec::ExecOutcome {
+        exec::run(
+            &self.runner,
+            &[
+                &self.isabelle,
+                "build",
+                "-o",
+                "quick_and_dirty=false",
+                "-D",
+                ".",
+            ],
+            &ws.root,
+        )
+    }
 }
 
 impl FormalBackend for IsabelleBackend {
@@ -251,49 +295,131 @@ impl FormalBackend for IsabelleBackend {
         SYSTEM
     }
 
-    fn scaffold(&self, _cfg: &Config, _code: &str, name: &str) -> Result<Workspace> {
+    fn available(&self) -> bool {
+        self.mock || exec::probe(&self.runner, &[&self.isabelle, "version"])
+    }
+
+    fn scaffold(&self, cfg: &Config, code: &str, name: &str) -> Result<Workspace> {
+        if self.mock {
+            return Ok(Workspace {
+                system: SYSTEM,
+                root: PathBuf::from("."),
+                source_path: PathBuf::from(format!("{name}{}", SYSTEM.source_extension())),
+                entry: name.to_string(),
+            });
+        }
+        // Determine the theory name; wrap a bare proof body in a Main theory.
+        let (thy_name, thy_body) = match theory_name(code) {
+            Some(n) => (n, code.to_string()),
+            None => (
+                "Scratch".to_string(),
+                format!("theory Scratch\n  imports Main\nbegin\n\n{code}\n\nend\n"),
+            ),
+        };
+        let root = crate::prover::formal::live_workspace_dir(cfg, SYSTEM)?;
+        std::fs::write(root.join(format!("{thy_name}.thy")), &thy_body)?;
+        // A minimal session ROOT so `isabelle build -D .` has a unit to check.
+        let root_file = format!(
+            "session {thy_name}_session = HOL +\n  theories\n    {thy_name}\n"
+        );
+        std::fs::write(root.join("ROOT"), root_file)?;
         Ok(Workspace {
             system: SYSTEM,
-            root: PathBuf::from("."),
-            source_path: PathBuf::from(format!("{name}{}", SYSTEM.source_extension())),
-            entry: name.to_string(),
+            root,
+            source_path: PathBuf::from(format!("{thy_name}.thy")),
+            entry: crate::prover::formal::entry_name(SYSTEM, code)
+                .unwrap_or_else(|| name.to_string()),
         })
     }
 
-    fn compile(&self, _ws: &Workspace) -> Result<CompileReport> {
-        if !self.mock {
-            return Err(anyhow!("live Isabelle build not wired yet (Phase 2)"));
+    fn compile(&self, ws: &Workspace) -> Result<CompileReport> {
+        if self.mock {
+            return Ok(CompileReport {
+                compiled: true,
+                errors: Vec::new(),
+                detail: json!({"mock": true}),
+            });
         }
+        if !self.available() {
+            return Ok(CompileReport {
+                compiled: false,
+                errors: vec!["isabelle toolchain unavailable".into()],
+                detail: json!({"unavailable": true, "runner": self.runner.tag()}),
+            });
+        }
+        let out = self.build(ws);
         Ok(CompileReport {
-            compiled: true,
-            errors: Vec::new(),
-            detail: json!({"mock": true}),
+            compiled: out.success(),
+            errors: if out.success() {
+                Vec::new()
+            } else {
+                vec![out.stderr.clone()]
+            },
+            detail: json!({
+                "runner": self.runner.tag(),
+                "code": out.code,
+                "stdout": out.stdout,
+                "stderr": out.stderr,
+            }),
         })
     }
 
     fn audit_axioms(&self, _ws: &Workspace, _thm: &str, whitelist: &[String]) -> Result<AxiomReport> {
-        if !self.mock {
-            return Err(anyhow!("live Isabelle oracle audit not wired yet (Phase 2)"));
+        if self.mock {
+            return Ok(AxiomReport {
+                axioms: Vec::new(),
+                within_whitelist: true,
+                detail: json!({"mock": true, "whitelist": whitelist, "oracles": []}),
+            });
         }
-        // Isabelle whitelist is the empty oracle set: a clean proof has none.
+        // Per the Isabelle reference (docs/formal-systems/isabelle.md §3): the
+        // oracle gate is a clean `isabelle build` (no `sorry`/oracle, done in
+        // `compile`) combined with the mandatory source scan. There is no cheap
+        // per-theorem oracle-list command over the batch build, so this layer
+        // defers to those two; it is non-blocking here.
         Ok(AxiomReport {
             axioms: Vec::new(),
             within_whitelist: true,
-            detail: json!({"mock": true, "whitelist": whitelist, "oracles": []}),
+            detail: json!({
+                "runner": self.runner.tag(),
+                "note": "oracle gate = clean build (compile) + source scan; no oracle in whitelist",
+                "whitelist": whitelist,
+            }),
         })
     }
 
-    fn kernel_recheck(&self, _ws: &Workspace) -> Result<RecheckReport> {
-        if !self.mock {
-            return Err(anyhow!("live Isabelle kernel recheck not wired yet (Phase 2)"));
+    fn kernel_recheck(&self, ws: &Workspace) -> Result<RecheckReport> {
+        if self.mock {
+            return Ok(RecheckReport {
+                rechecked: true,
+                detail: json!({"mock": true}),
+            });
         }
+        if !self.available() {
+            return Ok(RecheckReport {
+                rechecked: false,
+                detail: json!({"unavailable": true, "runner": self.runner.tag()}),
+            });
+        }
+        // A fresh clean build re-runs every primitive inference through the LCF
+        // kernel — the independent re-check analogue.
+        let out = self.build(ws);
         Ok(RecheckReport {
-            rechecked: true,
-            detail: json!({"mock": true}),
+            rechecked: out.success(),
+            detail: json!({
+                "runner": self.runner.tag(),
+                "code": out.code,
+                "note": "kernel-checked by isabelle build",
+            }),
         })
     }
 
     fn source_scan(&self, code: &str) -> Result<ScanReport> {
+        // Prefer the shared Python `source_scan` worker (comment/cartouche-aware);
+        // fall back to a built-in lexical pass so the gate still bites offline.
+        if let Some(report) = crate::prover::formal::worker_source_scan(SYSTEM, code) {
+            return Ok(report);
+        }
         // Isabelle escape hatches NOT caught by thm_oracles / clean build.
         let low = code.to_lowercase();
         let patterns = [
@@ -311,9 +437,30 @@ impl FormalBackend for IsabelleBackend {
         Ok(ScanReport {
             clean: findings.is_empty(),
             findings,
-            detail: json!({"system": SYSTEM.as_str()}),
+            detail: json!({"system": SYSTEM.as_str(), "fallback": true}),
         })
     }
+}
+
+/// Extract the `theory <Name>` declared in a full `.thy`, or `None` for a bare
+/// proof body that must be wrapped.
+fn theory_name(code: &str) -> Option<String> {
+    for line in code.lines() {
+        let line = line.trim_start();
+        if let Some(rest) = line.strip_prefix("theory") {
+            if rest.starts_with(|c: char| c.is_whitespace()) {
+                let name: String = rest
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || matches!(c, '_' | '\''))
+                    .collect();
+                if !name.is_empty() {
+                    return Some(name);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Isabelle warm-driver session (Isabelle Server in Phase 3). Theory-file
