@@ -52,7 +52,9 @@ pub fn start(
             full_name: theorem_name.into(),
             line: None,
         },
-        lean_project: crate::prover::model::LeanProject {
+        system: crate::prover::formal::FormalSystem::Lean,
+        formal_project: crate::prover::model::FormalProject {
+            system: crate::prover::formal::FormalSystem::Lean,
             root: config
                 .lean_project
                 .clone()

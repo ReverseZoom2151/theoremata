@@ -1,5 +1,6 @@
 //! Proof-task contracts (open-atp / LeanDojo / lean-aristotle-mcp).
 
+use crate::prover::formal::FormalSystem;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,10 +17,16 @@ pub struct TheoremIdentity {
     pub line: Option<u32>,
 }
 
-/// A complete Lake project context for a proof task (open-atp `LeanProject`).
+/// A complete project context for a proof task, generalized across formal
+/// systems (open-atp `LeanProject` → `FormalProject`). `system` defaults to
+/// [`FormalSystem::Lean`] so pre-existing serialized data (which had no such
+/// field) still loads unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LeanProject {
+pub struct FormalProject {
+    #[serde(default)]
+    pub system: FormalSystem,
     pub root: PathBuf,
+    /// `lean-toolchain` / opam switch / Isabelle version.
     pub toolchain: Option<String>,
     #[serde(default)]
     pub imports: Vec<String>,
@@ -34,7 +41,11 @@ pub struct ProofTask {
     pub project_id: Option<String>,
     pub node_id: Option<String>,
     pub theorem: TheoremIdentity,
-    pub lean_project: LeanProject,
+    /// Which formal system this task targets (defaults to Lean for back-compat).
+    #[serde(default)]
+    pub system: FormalSystem,
+    #[serde(alias = "lean_project")]
+    pub formal_project: FormalProject,
     pub statement: String,
     pub stub: Option<String>,
     pub prompt: Option<String>,
@@ -97,7 +108,8 @@ pub struct ProofResult {
     pub task_id: String,
     pub job_id: String,
     pub status: ProverJobStatus,
-    pub lean_code: Option<String>,
+    #[serde(alias = "lean_code")]
+    pub formal_code: Option<String>,
     pub counterexample: Option<String>,
     pub verification: Option<VerificationReport>,
     pub artifacts_dir: Option<PathBuf>,

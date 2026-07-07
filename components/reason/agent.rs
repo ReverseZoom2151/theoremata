@@ -457,7 +457,7 @@ impl AgentLoop<'_> {
         let Some(result) = out.proof_result else {
             return Ok("prove_failed");
         };
-        let Some(lean) = result.lean_code else {
+        let Some(lean) = result.formal_code else {
             return Ok("prove_failed");
         };
         // Statement-change guard: if this node already carries a formal statement,

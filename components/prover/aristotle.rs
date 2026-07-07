@@ -74,7 +74,7 @@ pub fn poll(store: &Store, config: &Config, job_id: &str) -> Result<ProofJob> {
         return Ok(job);
     }
     let started = Instant::now();
-    let (status, percent, lean_code, counterexample, message) = if mock_enabled(config) {
+    let (status, percent, formal_code, counterexample, message) = if mock_enabled(config) {
         advance_mock(&job)?
     } else {
         poll_live(&job)?
@@ -86,14 +86,14 @@ pub fn poll(store: &Store, config: &Config, job_id: &str) -> Result<ProofJob> {
 
     if status.is_terminal() {
         job.completed_at = Some(Utc::now());
-        let verification = lean_code
+        let verification = formal_code
             .as_deref()
             .and_then(|code| verify_lean_output(config, code, &job.task.statement).ok());
         let result = ProofResult {
             task_id: job.task.id.clone(),
             job_id: job.id.clone(),
             status,
-            lean_code: lean_code.clone(),
+            formal_code: formal_code.clone(),
             counterexample,
             verification,
             artifacts_dir: job.artifacts_dir.clone(),
@@ -108,7 +108,7 @@ pub fn poll(store: &Store, config: &Config, job_id: &str) -> Result<ProofJob> {
         };
         job.result = Some(result.clone());
         if let Some(dir) = &job.artifacts_dir {
-            if let Some(code) = &lean_code {
+            if let Some(code) = &formal_code {
                 let lean_dir = dir.join("lean");
                 std::fs::create_dir_all(&lean_dir)?;
                 std::fs::write(lean_dir.join("solution.lean"), code)?;
@@ -183,7 +183,9 @@ pub fn build_task(
             full_name: theorem_name.into(),
             line: None,
         },
-        lean_project: crate::prover::model::LeanProject {
+        system: crate::prover::formal::FormalSystem::Lean,
+        formal_project: crate::prover::model::FormalProject {
+            system: crate::prover::formal::FormalSystem::Lean,
             root,
             toolchain: None,
             imports: vec!["Mathlib".into()],

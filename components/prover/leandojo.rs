@@ -70,7 +70,7 @@ pub fn poll(store: &Store, config: &Config, job_id: &str) -> Result<ProofJob> {
         "op": "initialize",
         "theorem": job.task.theorem,
         "statement": job.task.statement,
-        "imports": job.task.lean_project.imports,
+        "imports": job.task.formal_project.imports,
     }))?;
     if !session.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
         job.status = ProverJobStatus::Error;
@@ -97,7 +97,7 @@ pub fn poll(store: &Store, config: &Config, job_id: &str) -> Result<ProofJob> {
         "tactic": "trivial",
     }))?;
     let status_str = tactic["status"].as_str().unwrap_or("error");
-    let lean_code = tactic["lean_code"].as_str().map(str::to_owned);
+    let formal_code = tactic["lean_code"].as_str().map(str::to_owned);
     let status = match status_str {
         "proved" => ProverJobStatus::Proved,
         "in_progress" => ProverJobStatus::InProgress,
@@ -114,14 +114,14 @@ pub fn poll(store: &Store, config: &Config, job_id: &str) -> Result<ProofJob> {
 
     if status.is_terminal() {
         job.completed_at = Some(Utc::now());
-        let verification = lean_code
+        let verification = formal_code
             .as_deref()
             .and_then(|code| verify_lean_output(config, code, &job.task.statement).ok());
         let result = ProofResult {
             task_id: job.task.id.clone(),
             job_id: job.id.clone(),
             status,
-            lean_code,
+            formal_code,
             counterexample: None,
             verification,
             artifacts_dir: job.artifacts_dir.clone(),

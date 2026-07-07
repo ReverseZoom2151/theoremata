@@ -118,7 +118,7 @@ pub fn poll_with_provider(
         task_id: job.task.id.clone(),
         job_id: job.id.clone(),
         status: job.status,
-        lean_code: if lean_code.is_empty() {
+        formal_code: if lean_code.is_empty() {
             None
         } else {
             Some(lean_code)
@@ -145,11 +145,11 @@ pub fn poll_with_provider(
 
 fn fetch_accessible_premises(task: &ProofTask) -> Result<Vec<Value>> {
     let py = PythonCheck::new();
-    let root = task.lean_project.root.clone();
+    let root = task.formal_project.root.clone();
     let result = py.run(json!({
         "tool": "retrieve",
         "root": root,
-        "imports": task.lean_project.imports,
+        "imports": task.formal_project.imports,
         "query": task.statement,
         "limit": 24,
         "op": "accessible_retrieve",
