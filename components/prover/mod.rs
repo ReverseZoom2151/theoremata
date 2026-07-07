@@ -1,18 +1,17 @@
 //! Prover interaction layer: ProofTask/ProofResult contracts, AttemptRun API,
 //! and external-prover backends (Aristotle).
-pub mod aristotle;
-pub mod attempt_run;
-pub mod exec;
+pub mod backends;
+pub mod session;
 pub mod formal;
-pub mod isabelle;
-pub mod lean;
-pub mod leandojo;
 pub mod model;
 pub mod proof_job;
-pub mod reprover;
-pub mod rocq;
-pub mod statement_guard;
-pub mod verify;
+pub mod attempt_run;
+
+// Re-export every leaf module flat at the component root so existing paths
+// (`prover::aristotle`, hence `crate::prover::aristotle`, and sibling
+// references) continue to resolve after the subgroup reorganization.
+pub use backends::{aristotle, isabelle, lean, leandojo, reprover, rocq};
+pub use session::{exec, statement_guard, verify};
 
 #[cfg(test)]
 mod tests;
