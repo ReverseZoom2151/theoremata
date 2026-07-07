@@ -41,9 +41,11 @@
 | **Stack** | **Rust** (CLI, TUI, orchestration, SQLite graph, events, approvals, process supervision) + **Python** (SymPy, falsification, safe eval, Estimates, specialist workers) + **Lean** (Lake workspaces, diagnostics, formal checking, LeanParanoia/Comparator hardening) |
 | **Tagline** | "From conjecture to checked proof." |
 
-**Status (current):** Rust crate `theoremata` compiles clean; `cargo test` green (2/2). History is granular
-(13 commits: 11 from the Codex build + `dcd9e57` python-worker wiring + `ec2b88c` falsify/symbolic/estimates
-CLI). Reference repos live under `resources/` (git-ignored). The audit is `REPOSITORY_AUDIT.md`.
+**Status (current, 2026-07-07):** Rust + Python + Lean-facing harness is implemented as a CLI-first
+agent runtime. Full local verification is green: `cargo test` = **94 passed**; `python -m pytest -q` =
+**339 passed / 21 skipped**. Reference repos live under `resources/` (git-ignored). Resource mining now
+covers 45 idea-bearing repos with reports under `docs/resource-mining/` plus the two agentic-systems
+books in `harness-resources/`.
 
 **The full stack is intended, not aspirational:** Rust owns orchestration/TUI/state; Python owns
 symbolic/numerical/domain workers; Lean owns formal proof checking and generated project support.
@@ -435,58 +437,91 @@ theorem_names?, permitted_axioms?, toolchain_pin?, usage_tag, contamination_risk
 
 ## 15. Current State & Known Gaps
 
-**Built & committed (Rust core):** `model.rs` (Node/Edge/Status enums + protocol types); `db.rs` (SQLite:
-projects, nodes, edges, runs, attempts, evidence, events, messages, proposals; cycle detection; taint over
-`DependsOn`; event sourcing; content hashes); `provider.rs` (provider-neutral `ModelProvider`; `CommandProvider`
-shells to `THEOREMATA_MODEL_COMMAND`; `OfflineProvider`); `tools.rs` (MathlibSearch=ripgrep, PythonCheck,
-LeanCheck; LeanParanoia + Comparator = **stubs**); `workflow.rs` (normalize→falsify→decompose→formalize→verify,
-degrades gracefully); `chat.rs` (approval-gated mutation proposals; models can't self-grant verified); `tui.rs`
-(Ratatui three-pane); `main.rs` (clap CLI). **Python** `theoremata_tools/`: safe_eval (AST-allowlist), falsify
-(bounded counterexample search), symbolic (SymPy), estimates_adapter, worker (JSON-lines dispatch). 2 Rust tests
-pass. Latest commits wired PythonCheck to the package worker + exposed `falsify`/`symbolic`/`estimates` CLI.
+**Built & committed:**
 
-**Verified gaps (what to fix):**
-- **Portability:** adapters shell out to `python3` and `command -v python3`; on the Windows dev box only
-  `python` resolves (and `lean`/`lake` are absent), so the tool layer is dead locally. **Detect `python3` else `python`.**
-- `attempts` table has **no writer** — the retry machinery isn't wired.
-- **Taint propagates only over `DependsOn`** (not other edge kinds).
-- **LeanParanoia + Comparator adapters are stubs.**
-- Decompose / formalize / adversarial-review need a **live model provider** (OfflineProvider errors otherwise).
-- No **warm Lean process**; no **`#print axioms` gate**; no **Mathlib decl index**.
+- Rust CLI/TUI/orchestrator with SQLite graph, runs, attempts, evidence, events, messages, approval proposals,
+  cycle detection, content hashes, taint propagation, lemma extraction, scheduler, and typed provider/tools seams.
+- Proof-DAG schema upgrades from the resource sweep: leanblueprint import/export, `lean_decls`, statement-vs-proof
+  dependency/status split, checkdecls-style binding gate, node tiers, hidden-helper budgeting, and typed-claim enums.
+- Reasoning control craft: QED plan history, mechanical escalation, phase-prior selector, k-consecutive-clean
+  acceptance, critic taxonomy, meta-critic pruning, and three-valued taint (`clean`/`tainted`/`self-admitted`).
+- Verification/hardening: warm Lean session, lexical soundness gate, `#print axioms` path, LeanParanoia integration
+  with trusted modules and fail-closed handling, adversarial-corpus regression tests, and Comparator-backed
+  formalization grading when `THEOREMATA_COMPARATOR` is configured.
+- Python worker modules: safe eval, falsification, symbolic/SymPy checks, estimates/LogLinarith/Farkas certificates,
+  sandbox hard-kill/import allow-list/budget governor, LM-as-scorer reranker, lemma cache, proof telemetry,
+  verified-decide template, benchmark harness, STaR harvester, reward module, and GRPO dry-run.
+- Evaluation/training scaffolds: loaders/graders for formalization, NL/answer, falsification, hardening, and
+  training-data harvest tracks.
+- Resource mining: original 21 idea-bearing repos + 24 newly added repos reported under `docs/resource-mining/`;
+  `harness-resources/` books read; AIME datasets characterized; `mathlib4` retained as retrieval corpus.
+
+**Verification status:** local full suite on 2026-07-07:
+
+- `cargo test`: 94 passed.
+- `python -m pytest -q`: 339 passed, 21 skipped.
+
+**Known gaps that still matter:**
+
+- The full falsify → decompose → formalize → verify → certify chain has not yet been validated against a live real
+  model/API key; mocks and deterministic modules are green.
+- External-prover integration is not yet built: Aristotle/Harmonic should be async job state + sparse polling +
+  local verification, not a blocking call.
+- LeanDojo/ReProver/open-atp style proof-task/environment abstractions are not yet first-class backends.
+- The benchmark harness has broad loaders/graders, but newly mined datasets still need selected smoke runs and
+  pinned Lean environments before we claim operational coverage.
+- No top-level trust-boundary document yet. TorchLean shows this should be explicit documentation plus lint checks.
+- Web viewer/editor integration remains deferred; the product remains CLI/TUI-first.
 
 ---
 
 ## 16. Prioritized Build Roadmap
 
-Each milestone is a candidate for **one granular commit** (build + test + push).
+Keep each item as a granular build/test/push milestone.
 
-### P0 — needs neither a model nor Lean installed (do these first; runnable locally)
+### P0 — validate the built agent
 
-| # | Milestone | Why | Depends on |
-|---|---|---|---|
-| 0.1 | **Portable Python invocation** (`python3` else `python`; drop the `bash -lc` for `command_exists`) | Resurrects `compute`/`falsify`/`symbolic` on the Windows box; unblocks all Python tools | — |
-| 0.2 | **Lexical soundness gate** — port `_lean_masking` + `axiom_checker` as a Python worker + `theoremata soundness <file>` + workflow wiring | The goldbach-immunity gate; deterministic; testable without Lean | 0.1 |
-| 0.3 | **Node-schema enrichment** — `strategy_hint`, `suggested_lemmas`, statement-vs-proof edges, spine/implementation `tier`, `evidence_strength` on edges (DB migration) | Matches the convergent blueprint schema; enables real obligation tracking | — |
-| 0.4 | **Wire `attempts` + QED retry scaffolding** — attempt writer, three-tier counters, resume-from-DB | Turns the dead table into the retry state machine | 0.3 |
-| 0.5 | **Estimates `feasibility` worker** — Python SymPy+Z3 `feasibility(ineqs)->(bool, model or Farkas cert)` behind the JSON seam | A domain verifier that returns re-checkable certificates | 0.1 |
-| 0.6 | **Mathlib retrieval Layer A** — source-only import DAG + `docs/*.yaml` seed table | Cheap structured retrieval substrate; no build needed | — |
+| # | Milestone | Why |
+|---|---|---|
+| 0.1 | **Live real-model end-to-end run** on a small benchmark item | This is the one unvalidated system claim after the mock/deterministic suite |
+| 0.2 | **Record the live trace as a fixture** | Prevents future regressions in the whole chain |
+| 0.3 | **Update `docs/TRUST_BOUNDARIES.md`** | Makes LLM/Python/Lean/external-prover trust explicit |
 
-### P1 — needs Lean/Lake installed
+### P1 — Lean/prover interaction backends
 
-| # | Milestone | Why | Depends on |
-|---|---|---|---|
-| 1.1 | **Warm Lean process** — persistent `lake env lean`/REPL with `(statement,proof)`-hash cache; fallback ladder | The single biggest UX lever (~0.4s/check after warmup) | tools |
-| 1.2 | **LeanParanoia kernel-replay gate** — real adapter (replay-first battery + axiom allowlist + `#print axioms`) | Authoritative trust; flips a node to `formally_verified` | 1.1, 0.2 |
-| 1.3 | **Env-dump decl index (Layer B) + `#find` head-index (Layer C)** | Type-aware Mathlib retrieval | 1.1, 0.6 |
+| # | Milestone | Why |
+|---|---|---|
+| 1.1 | **ProofTask / ProofResult contract** from LeanDojo/open-atp/ReProver patterns | Stabilizes theorem-proving backends behind one interface |
+| 1.2 | **Aristotle external-prover adapter** with mock/live modes | Converts the Harmonic/Aristotle resources into a usable tool |
+| 1.3 | **Async prover job state + sparse polling/resume** | External proofs are minute-to-hour jobs, not synchronous subcommands |
+| 1.4 | **Premise/proof-state backend adapters** for LeanDojo/ReProver style retrieval | Upgrades retrieval from raw text to environment-aware proof state |
 
-### P2 — needs a model provider
+### P2 — benchmark activation
 
-| # | Milestone | Why | Depends on |
-|---|---|---|---|
-| 2.1 | **Real decompose / formalize / adversarial-review roles** | Makes the workflow actually reason, not stub | provider, 0.3 |
-| 2.2 | **Research→formal stage engine** — the 12-stage claim-DAG + FormalizationTarget artifact | The differentiated research pipeline | 2.1, 0.3 |
-| 2.3 | **Evaluation harness** — six-axis struct + two-pipeline grader + contamination flags | Measure progress honestly | 1.2, 2.1 |
-| 2.4 | **Scheduler** — parallel subtrees, resource-aware routing, falsify-before-prove gate | Turns the DAG into concurrent work | 0.4, 0.5 |
+| # | Milestone | Why |
+|---|---|---|
+| 2.1 | **MiniF2F/Harmonic smoke track** | Canonical formal proof-completion and autoformalization eval |
+| 2.2 | **BRIDGE-178 verified-programming smoke track** | Tests total Lean code + oracle checks + repair rows |
+| 2.3 | **QuantumLean-Bench scaffolded formalization track** | Tests scientific/physics formalization, not just olympiad math |
+| 2.4 | **FormulationBench/FLARE harness track** | Tests agentic proof generation with artifact dirs, cost, duration |
+| 2.5 | **IMO/Putnam external-prover artifact track** | Verifies existing Aristotle-generated Lean as trust-but-verify fixtures |
+| 2.6 | **Millennium statement-quality track** | Evaluates honest formalization/definition design without pretending proof completion is near-term |
+
+### P3 — product/ops
+
+| # | Milestone | Why |
+|---|---|---|
+| 3.1 | **`theoremata doctor`** | Setup diagnostics for Lean/Lake/Python/mathlib/model/provider state |
+| 3.2 | **Attempt artifact directories** | Persist inputs, generated Lean, logs, verifier output, cost, and duration per attempt |
+| 3.3 | **Trace/time/cost analysis** | Borrow FLARE-style normalized JSONL telemetry for harness optimization |
+| 3.4 | **Stable CLI/MCP API surface** | Lets future editor/web integrations call Theoremata without forking the product |
+
+### P4 — deferred
+
+- Web graph viewer.
+- Editor extension integration.
+- Optional heavy domain fixtures such as TorchLean.
+- Real GPU/RL training runs beyond dry-run scaffolds.
 
 ---
 
@@ -509,3 +544,15 @@ Each milestone is a candidate for **one granular commit** (build + test + push).
 | **FlashSampling** | Optional `TacticSampler` backend kept strictly below the proof representation (removability = boundary is correct) |
 | **Mathlib** | The 3-layer integration surface (import-DAG → env-dump decl index → warm `#find`); `shake` import minimization — **not raw-text RAG** |
 | **Agentic Design Patterns** / **Hitchhiker's Guide** | Harness-as-OS separation; explicit state machines; grounded reflection; tiered HITL; RLVR/GRPO; A-MEM graph memory; observability + replay from day one |
+| **LeanDojo / LeanDojo v2 / ReProver** | Environment-aware proof interaction, theorem/task extraction, dense premise retrieval, and proof-state-first APIs |
+| **LeanCopilot / LeanProgress** | In-Lean suggestion/search hooks and learned progress heuristics as optional tactic/prior backends |
+| **LeanAgent / open-atp** | Lifelong-learning/prover loops and a clean LeanProject/ProofTask/ProofResult/backend harness abstraction |
+| **lean-aristotle-mcp / Aristotle Putnam / IMO2025** | Async external-prover job contract, provenance-rich generated proofs, and trust-but-verify artifact ingestion |
+| **BRIDGE** | Domain-guided verified-programming pipeline: prompt JSONL → generation → fenced-code extraction → checker → verifier-error repair |
+| **datasets-main / MiniF2F** | Natural-language + formal statement pairs for proof-completion and autoformalization scoring |
+| **QuantumLean-Bench** | Domain-scaffolded scientific formalization benchmark with response-key metadata |
+| **FLARE / FormulationBench** | Start/cancel/result verifier abstraction, attempt artifact directories, harness-vs-harness experiments, trace/cost analysis |
+| **TorchLean** | Explicit trust-boundary inventory for kernel proofs, executable checkers, Prop-valued contracts, FFI/native runtime, and external producers |
+| **zero-to-qed** | Proof-state pedagogy and tactic decision templates for explanations, critic rubrics, and small smoke tests |
+| **Lean4Code** | Setup/onboarding ideas only; keep Theoremata CLI/TUI-first and expose APIs for later editor integration |
+| **LeanMillenniumPrizeProblems** | Honest statement-target track, reference-file provenance, and parameterized data-package pattern for missing foundations |

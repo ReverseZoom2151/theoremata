@@ -1,57 +1,141 @@
 # Resource mining — synthesis & adopt list
 
-Exhaustive full-pass study of every repo in `resources/` (code + prose + data), done for the Theoremata harness. One report per repo in this folder. This index rolls up the **cross-cutting themes** and a single **prioritized adopt list**.
+This folder is the durable resource-mining record for Theoremata.
 
-Coverage: 21 repos studied in full (5 previously-unmined + 16 previously-only-skimmed). `mathlib4` excluded (it is the retrieval corpus, not a study target). `aime24/25/26` are benchmark datasets (problem PDFs), characterized inline.
+Coverage as of 2026-07-07:
 
-## Cross-cutting themes (what recurred)
+- 45 idea-bearing repos have full reports: the original 21-resource sweep plus 24 newly added repos under `docs/resource-mining/new/`.
+- `harness-resources/` contains the two agentic-systems books already read separately.
+- `aime24/25/26` are benchmark datasets characterized as eval inputs, not architecture sources.
+- `mathlib4` is treated as the retrieval corpus/dependency, not a repo to mine for product architecture.
 
-1. **`leanblueprint` is the de-facto proof-DAG standard, and it *is* our core.** Seven formalization repos (Erdos1196, FrontierMath-Hypergraphs, RiemannHypothesisCurves, KakeyaFiniteFields, Sphere-Packing-Lean, strongpnt, ZkLinalg) all use the identical schema: theorem-env `\label{kind:slug}` = node, `\lean{FQN}` = node→Lean binding (a *separate* namespace from the label), `\uses{...}` = directed dependency edges, `\leanok` = verified flag. Two refinements our DAG lacks: `\uses` and `\leanok` are placed **independently on the statement vs inside the proof** → statement-deps ≠ proof-deps, and statement-formalized ≠ proof-done. Richer statuses exist too (`\mathlibok`/`\notready`/`\discussion`).
+## What changed after the new 24-resource sweep
 
-2. **The blueprint DAG is a *skeleton*; the executor invents 40–100% more hidden helper decls.** Measured fan-out: Kakeya 5 nodes→10 decls (2×), RHCurves 31→~55 (1.8×), strongpnt 615→1,118 (~1.8×), ZkLinalg 34→55 (~1.6×). Node granularity is a **dial** (strongpnt = trivial micro-lemmas, DAG does the reasoning; ZkLinalg = coarse paper-sized nodes). Our decomposer/executor must budget for un-blueprinted sub-node helpers rather than expect 1:1.
+The first sweep established the core Theoremata shape: persistent proof DAG, leanblueprint interoperability, falsify-before-prove, layered verification, QED-style retry, hardening, benchmark ingestion, and training scaffolds.
 
-3. **`checkdecls` binding gate — a cheap check we're missing.** All seven blueprint repos emit `blueprint/lean_decls` (flat decl list) and run `lake exe checkdecls` in CI to verify every `\lean{}` name actually compiles — a referential-integrity gate *distinct from and cheaper than* the full proof/`#print axioms` gate. Erdos1196 even showed real drift (`lean_decls` 19 vs `decls.json` 16).
+The second sweep adds four major themes:
 
-4. **Answer-matching ≠ sound proof — our central thesis, externally confirmed.** IneqMath: top models score 66–76% *answer* accuracy but **<10% overall (proof-sound)** accuracy, and scaling flattens the overall curve. Direct evidence for step/DAG verification over answer checking.
+1. **Lean interaction infrastructure is its own product surface.** LeanDojo/ReProver/LeanAgent/LeanProgress/LeanCopilot/open-atp all point to the same separation: theorem proving needs a clean environment/task/backend interface, not ad-hoc shell calls. Theoremata should expose this internally as stable proof-task and proof-result contracts.
 
-5. **Falsify-before-prove is validated everywhere, and always as *executable* code.** MathResearchPrompts (two-branch prove-or-disprove, disproof gets the same tooling), IneqMath (bound/relation reformulation, "(F) none of the above" decided by counterexample), ZkLinalg (`friRoundBadEvent` = bad event as a `Set Ω` with a measure bound), estimates (`LogLinarith` returns asymptotic counterexamples), alethfeld (`COUNTEREXAMPLE:` node + `native_decide` Lean file), DeepMath (sandboxed code execution). None hardcode; all run code.
+2. **External provers must be async, provenance-rich, and locally verified.** Aristotle outputs, IMO/Putnam results, and `lean-aristotle-mcp` show that cloud provers can be strong but slow. The correct integration is submitted/queued/in-progress/proved/partial/failed/counterexample jobs with sparse polling, request provenance, and mandatory local compile/axiom/hardening checks.
 
-6. **Verifier discipline / anti-sycophancy is a first-class design axis.** Recurring devices: k-consecutive-clean-verification acceptance (AgentMathMedalist: 5 clean passes, reset on any failure), Critical-Error-vs-Justification-Gap taxonomy, meta-critic that prunes false-positive bugs (AgentMathMedalist, QED Phase-4f), 7-item critic failure-mode rubric + "every proof ends with its own adversarial-check list" (MathResearchPrompts), anti-sycophancy prompts *derived from measured BrokenMath failures* (alethfeld), two-phase gated LLM-judge (QED).
+3. **Evaluation must split theorem proving, verified programming, domain formalization, and statement design.** MiniF2F, BRIDGE-178, QuantumLean-Bench, FormulationBench/FLARE, IMO/Putnam, and Millennium statements are not one benchmark. They are separate tracks with different acceptance criteria.
 
-7. **Math Inc's "Gauss" is the closest external precedent to Theoremata** (Kakeya, RHCurves, strongpnt, ZkLinalg, Sphere-Packing are all Gauss output). Pattern: hand-written LaTeX blueprint → agent autoformalizes → `lake build` + `checkdecls` gate, zero `sorry`. Observed infra: self-hosted `morph` CI runners, comment-free Lean (all prose in the blueprint), blueprint proofs pre-name exact Mathlib lemmas as retrieval anchors and embed anti-counterexample "Note/Key insight" warnings.
+4. **Trust-boundary discipline needs to be explicit documentation plus checks.** TorchLean’s strongest contribution is not neural-net code; it is the trust inventory separating kernel proofs, executable checkers, Prop-valued contracts, FFI/native runtime, and external producers. Theoremata needs the same discipline for LLMs, Python tools, Lean, external provers, and generated certificates.
 
-## Prioritized adopt list
+## Cross-cutting themes retained from the first sweep
 
-### P0 — fix real bugs the full pass found in *our* code (`components/verify/hardening.rs`)
-- **Replay check silently no-ops**: we shell out to `paranoia.exe` but never pass `--trust-modules Std,Mathlib`, so its kernel Replay re-verifies all of Mathlib and times out. The deepest check isn't actually running. → pass the flag.
-- **Fail-open**: on unparseable paranoia output we default `clean = true`. → fail closed.
-- **Target-selection bug**: `first_theorem_name` only grabs the first `theorem`/`lemma`; fixtures using `def exploit_theorem` audit the wrong constant. → resolve the actual target constant.
-- **Discarded taxonomy**: we read only `success` and drop the per-check `failures` list (repair signal). → surface it.
-- Wire LeanParanoia's **66-file adversarial corpus** (15 attack families + 6 valid negatives) as a CI regression suite for the gate.
+1. **`leanblueprint` is the de-facto proof-DAG standard.** The formalization repos converge on theorem-env labels, `\lean{}` declaration bindings, `\uses{}` dependency edges, `\leanok`, and `lean_decls`/`checkdecls`. Theoremata now has a leanblueprint dialect, statement/proof status split, and node-binding gate.
 
-### P1 — schema & gate upgrades (high leverage, low risk)
-- Adopt the **`leanblueprint` dialect** (`\lean`/`\uses`/`\leanok`/`\proves` + `lean_decls`) as our blueprint interchange format → free interop with the Lean-community tooling, PDF/web dep-graph render, and a second existence check.
-- Add the **statement-vs-proof split** to the DAG edge/status schema (statement-deps vs proof-deps; statement-formalized vs proof-done).
-- Add a **`checkdecls`-style node-binding gate** between blueprint and compile.
-- Make the decomposer **budget for hidden-helper fan-out** (expect ~1.8× decls per node); expose node granularity as a config dial.
+2. **The blueprint DAG is a skeleton, not the full implementation.** Real projects invent roughly 40–100% more helper declarations than blueprint nodes. Theoremata should keep helper fan-out as an explicit budget and granularity dial.
 
-### P2 — reasoning/verification craft (prompts + control)
-- **QED**: `plan_history.md` append-only cross-attempt strategy memory ("Do NOT try again"), verification-phase prior into the selector, mechanical budget-exhaustion escalation separate from the semantic regulator, structured `<cite>`/`<key-original-step>` tags.
-- **AgentMathMedalist**: k-consecutive-clean acceptance rule, Critical-Error/Justification-Gap taxonomy, meta-critic prune layer, "report significant partial results, never guess" solver contract.
-- **MathResearchPrompts**: typed-claim & transfer-schema enums for the decomposer, 7-item critic rubric, reparameterization ("intrinsic vs coordinate-artifact") gate, proof-carries-its-own-adversarial-checks output contract, prove-or-disprove two-branch, "never fabricate references — flag as an explicit obligation".
-- **alethfeld**: three-valued **taint** (`clean`/`tainted`/`self-admitted`) with executable propagation over the subtree, 25-keyword fixed justification vocabulary, flaws encoded in the graph's own vocabulary (rejected-QED + verified COUNTEREXAMPLE node, no special error field), ready graph algorithms (topo-sort, scope algebra, acyclicity-with-cycle-path, lemma-extraction benefit metric).
+3. **Answer matching is not proof soundness.** IneqMath’s answer accuracy versus proof-soundness gap supports Theoremata’s graph/verification thesis.
 
-### P3 — new capability modules
-- **estimates**: port the `Θ`/`OrderOfMagnitude` SymPy semiring + `LogLinarith` (asymptotic goal → LP over exponents, integrality-gap trick, returns counterexamples) + `linprog.py` exact-rational LP with **Farkas/dual certificates either way** into our asymptotic/feasibility layer. Deterministic, explainable.
-- **DeepMath**: harden our executable-falsifier sandbox with its subprocess hard-kill + pickle→thread fallback, import allow-list + "Import not allowed" hinting, and a **global token-budget governor** (decouple #turns from total tokens, graceful termination).
-- **AutoMathText**: LM-as-scorer (affirmative-token logprob) as a retrieval reranker / SFT-data curator via our LiteLLM logprobs path (method is citation-only — fetch arXiv 2402.07625 to implement). Dataset is EULA-restricted.
-- **mathcode**: per-stage model routing (formalize_plan/formalize/formalize_eval/prove_plan/prove each independently routable), plan-level (not just proof-level) best-of-N, `-- @stored-theorem` compilable lemma-cache, proof telemetry (tactic histogram) for ranking DAG nodes; lift `_lean_masking.py` (nested comment/string masker) and the YAML-frontmatter tool contract verbatim.
+4. **Falsify-before-prove is always executable.** Counterexample search, symbolic checks, Lean `native_decide` fixtures, bad-event formalizations, and asymptotic LP refutations all point to executable falsification before proof search.
 
-### P4 — benchmarks & eval fixtures to ingest
-- **Formalization track** (blueprint→Lean, graded by compile + axiom-whitelist `[propext,Quot.sound,Classical.choice]` + statement-match): FormalQualBench (23 qual stubs), Sphere-Packing (82 live `sorry`s), ZkLinalg (34 nodes, fast smoke), strongpnt (615 nodes, scale stress), Kakeya, RiemannHypothesisCurves, FrontierMath-Hypergraphs (honesty test — partial result), Erdos1196. Same tooling across domains = a clean eval matrix.
-- **NL / answer track**: IneqMath (dev 100 / train 1,252, bound+relation, deterministic-rubric grader), AIME 24/25/26, estimates (~30 named problems with informal↔SymPy↔expected).
-- **Falsification / critic track**: alethfeld `brokenmath/` (10 problems, ground-truth JSON, baseline 5/10 @ 0 false-positives), goldbach-collatz (negative fixture — empty crank artifact the pipeline must reject).
-- **Hardening track**: LeanParanoia 66-file adversarial corpus.
+5. **Verifier discipline and anti-sycophancy are first-class.** k-consecutive acceptance, critic taxonomies, taint propagation, repair provenance, and adversarial corpora matter as much as generation prompts.
+
+## Adopted already
+
+These items from the first adopt list are now built and pushed:
+
+- LeanParanoia hardening bugs fixed: trusted modules passed, fail-closed handling, target parsing, and failure taxonomy surfaced.
+- LeanParanoia adversarial-corpus regression tests added.
+- `leanblueprint` import/export, `lean_decls`, statement/proof split, checkdecls-style binding gate, hidden-helper budgeting, and typed-claim enums.
+- QED-style plan history, mechanical escalation, phase-prior selector, k-consecutive acceptance, critic taxonomy, meta-critic, and three-valued taint propagation.
+- Estimates-inspired asymptotic/LogLinarith/Farkas modules.
+- Hardened Python falsifier sandbox.
+- LM-as-scorer retrieval reranker.
+- Lemma cache, proof telemetry, verified-decide certificate template.
+- Benchmark harness and training/STaR/GRPO scaffolds.
+- Comparator invocation for formalization grading.
+
+## Current prioritized adopt list
+
+### P0 — validation and documentation
+
+- Run a live end-to-end real-model chain. The full system is tested through mocks and deterministic modules; the remaining unvalidated claim is live model behavior through falsify → decompose → formalize → verify → certify.
+- Keep `docs/PLAN.md` and this resource synthesis current whenever new repos are added or a roadmap tier ships.
+- Add a top-level `docs/TRUST_BOUNDARIES.md` modeled after TorchLean.
+
+### P1 — Lean/prover interaction layer
+
+- Add a first-class `ProofTask` / `ProofResult` contract, drawing from LeanDojo/open-atp/ReProver.
+- Add external-prover job state: submitted, queued, in-progress, proved, partial, failed, counterexample, error.
+- Add sparse polling/resume for external prover jobs.
+- Add Aristotle adapter behind the existing tool/provider seam, with mock mode and local hardening of returned Lean.
+- Add LeanDojo/ReProver-style premise retrieval and proof-state environment adapters as optional backends.
+
+### P2 — evaluation expansion
+
+- MiniF2F/Harmonic datasets: proof-completion + autoformalization track.
+- BRIDGE-178: verified programming track with Lean oracle tests and repair-loop rows.
+- QuantumLean-Bench: scientific/quantum formalization track with scaffolded prompts.
+- FormulationBench/FLARE: MILP reformulation proof track and harness-vs-harness experiments.
+- IMO2025 and Aristotle Putnam outputs: external-prover artifact verification track.
+- Lean Millennium statements: statement-quality/definition-design track, not proof-completion.
+
+### P3 — product and operations
+
+- Add `theoremata doctor` for Lean/Lake/Python/model-provider/mathlib setup checks.
+- Add artifact-directory discipline for every attempt: inputs, generated Lean, logs, verifier output, cost, duration.
+- Add trace normalization for tool/time/cost analysis, borrowing FLARE’s JSONL analysis pattern.
+- Expose stable CLI/MCP APIs that an editor integration can call later; do not fork/build a desktop editor now.
+
+### P4 — future/deferred
+
+- Web viewer / browser UI for graph inspection.
+- Editor extension integration.
+- Heavy domain-specific optional fixtures such as TorchLean.
+- GPU/RL training runs beyond dry-run scaffolds.
 
 ## Per-repo reports
-Erdos1196 · FrontierMathOpen-Hypergraphs · RiemannHypothesisCurves · KakeyaFiniteFields · M4R_Thesis · DeepMath · QED · estimates · LeanParanoia · mathcode · MathResearchPrompts · AgentMathOlympiadMedalist · FlashSampling · ineqmath · alethfeld · Sphere-Packing-Lean · strongpnt-and-ZkLinalg · AutoMathText-and-goldbach-collatz · FormalQualBench
+
+Original reports:
+
+- AgentMathOlympiadMedalist
+- AutoMathText-and-goldbach-collatz
+- DeepMath
+- Erdos1196
+- FlashSampling
+- FormalQualBench
+- FrontierMathOpen-Hypergraphs
+- KakeyaFiniteFields
+- LeanParanoia
+- M4R_Thesis
+- MathResearchPrompts
+- QED
+- RiemannHypothesisCurves
+- Sphere-Packing-Lean
+- alethfeld
+- estimates
+- ineqmath
+- mathcode
+- strongpnt-and-ZkLinalg
+
+New reports are under `docs/resource-mining/new/`:
+
+- BRIDGE-main
+- IMO2025-main
+- LeanAgent
+- LeanCopilot
+- LeanDojo
+- LeanDojo-v2
+- LeanDojoChatGPT
+- LeanMillenniumPrizeProblems-main
+- LeanProgress
+- LeanVision-main
+- QuantumLean-Bench-main
+- ReProver
+- TorchLean-main
+- aristotle_putnam25-main
+- datasets-main
+- flare-main
+- gilp-master
+- lean-aristotle-mcp-main
+- lean4code-main
+- open-atp-main
+- pbcc-main
+- proofgrader-main
+- python-memtools-main
+- zero-to-qed-main
