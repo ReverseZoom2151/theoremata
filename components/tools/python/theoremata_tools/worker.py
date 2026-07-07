@@ -123,6 +123,39 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
             lean_bin=request.get("lean_bin"),
             timeout=float(request.get("timeout", 300.0)),
         )
+    if tool == "rerank":
+        from .reranker import run as reranker_run
+
+        return reranker_run(
+            query=request["query"],
+            candidates=request.get("candidates", []),
+            k=request.get("k"),
+            samples=int(request.get("samples", 1)),
+        )
+    if tool == "loglinarith":
+        from .log_linarith import evaluate as loglinarith_evaluate
+
+        return loglinarith_evaluate(request)
+    if tool == "linprog_cert":
+        from .linprog_cert import evaluate as linprog_cert_evaluate
+
+        return linprog_cert_evaluate(request)
+    if tool == "lemma_cache":
+        from .lemma_cache import run as lemma_cache_run
+
+        return lemma_cache_run(request)
+    if tool == "proof_telemetry":
+        from .proof_telemetry import run as proof_telemetry_run
+
+        return proof_telemetry_run(request)
+    if tool == "benchmark":
+        from .benchmarks.registry import run as benchmark_run
+
+        return benchmark_run(request["request"])
+    if tool == "star_harvest":
+        from .star_harvester import run as star_harvest_run
+
+        return star_harvest_run(request["request"])
     raise ValueError(f"unknown tool: {tool}")
 
 
