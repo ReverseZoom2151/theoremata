@@ -45,6 +45,10 @@ pub struct Config {
     /// Max sparse polls when the agent drives an AttemptRun to completion.
     #[serde(default = "default_prover_max_polls")]
     pub prover_max_polls: u32,
+    /// Force mock prover mode without touching the process env (used by tests to
+    /// avoid `std::env::set_var` races under parallel execution).
+    #[serde(default)]
+    pub prover_mock: bool,
 }
 
 fn default_k_consecutive_clean() -> u32 {
@@ -84,6 +88,7 @@ impl Default for Config {
             k_consecutive_clean: default_k_consecutive_clean(),
             prover_backend: default_prover_backend(),
             prover_max_polls: default_prover_max_polls(),
+            prover_mock: false,
         }
     }
 }

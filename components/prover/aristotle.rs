@@ -23,10 +23,13 @@ use std::{
 
 const BACKEND: &str = "aristotle";
 
-pub fn mock_enabled() -> bool {
-    std::env::var("THEOREMATA_ARISTOTLE_MOCK")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or_else(|_| std::env::var("THEOREMATA_ARISTOTLE_API_KEY").is_err())
+pub fn mock_enabled(config: &Config) -> bool {
+    // Config flag short-circuits BEFORE any env read, so parallel tests never
+    // race on the process-global environment.
+    config.prover_mock
+        || std::env::var("THEOREMATA_ARISTOTLE_MOCK")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or_else(|_| std::env::var("THEOREMATA_ARISTOTLE_API_KEY").is_err())
 }
 
 pub fn submit(
@@ -35,7 +38,7 @@ pub fn submit(
     task: ProofTask,
     artifacts_dir: Option<std::path::PathBuf>,
 ) -> Result<ProofJob> {
-    let external_id = if mock_enabled() {
+    let external_id = if mock_enabled(config) {
         Some(format!("mock-{}", &task.id[..8.min(task.id.len())]))
     } else {
         None
@@ -53,11 +56,11 @@ pub fn submit(
         None,
         "proof_job.submitted",
         BACKEND,
-        json!({"job_id": job.id, "task_id": task.id, "mock": mock_enabled()}),
+        json!({"job_id": job.id, "task_id": task.id, "mock": mock_enabled(config)}),
     )?;
     if let Some(dir) = &artifacts_dir {
         write_artifact(dir, "task.json", &task)?;
-        write_artifact(dir, "submit.json", &json!({"mock": mock_enabled(), "backend": BACKEND}))?;
+        write_artifact(dir, "submit.json", &json!({"mock": mock_enabled(config), "backend": BACKEND}))?;
     }
     let _ = config;
     Ok(job)
@@ -71,7 +74,7 @@ pub fn poll(store: &Store, config: &Config, job_id: &str) -> Result<ProofJob> {
         return Ok(job);
     }
     let started = Instant::now();
-    let (status, percent, lean_code, counterexample, message) = if mock_enabled() {
+    let (status, percent, lean_code, counterexample, message) = if mock_enabled(config) {
         advance_mock(&job)?
     } else {
         poll_live(&job)?
@@ -99,7 +102,7 @@ pub fn poll(store: &Store, config: &Config, job_id: &str) -> Result<ProofJob> {
             message: message.clone(),
             provenance: json!({
                 "backend": BACKEND,
-                "mock": mock_enabled(),
+                "mock": mock_enabled(config),
                 "poll_count": job.poll_count,
             }),
         };

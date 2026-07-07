@@ -72,7 +72,7 @@ pub fn materialize_result(job: &ProofJob) -> Option<ProofResult> {
 pub fn any_prover_available(config: &Config, model_ready: bool) -> bool {
     match config.prover_backend.as_str() {
         "aristotle" => {
-            aristotle::mock_enabled() || std::env::var("THEOREMATA_ARISTOTLE_COMMAND").is_ok()
+            aristotle::mock_enabled(config) || std::env::var("THEOREMATA_ARISTOTLE_COMMAND").is_ok()
         }
         "leandojo" => leandojo::available(),
         "reprover" => reprover::available(model_ready),
