@@ -311,6 +311,17 @@ enum Command {
         system: String,
         statement: String,
     },
+    /// Force the HAMMER-assisted path: ask the `hammer` worker (Sledgehammer /
+    /// CoqHammer / aesop) to FIND a tactic for the goal, assemble a complete
+    /// system-native proof around it, and verify it through the live 3+1-layer
+    /// gate. Prints the assembled proof and its VerificationReport.
+    HammerProve {
+        /// `lean` | `rocq` (`coq`) | `isabelle`.
+        system: String,
+        /// The goal, in the target system's native syntax
+        /// (e.g. `1 + 1 = (2::nat)` for Isabelle).
+        goal: String,
+    },
     /// Attempt a conjecture across Lean, Rocq, and Isabelle and take whichever
     /// backend certifies first (the portfolio winner).
     PortfolioProve {
@@ -917,6 +928,48 @@ fn main() -> Result<()> {
                     "report": report,
                 }),
             )?
+        }
+        Command::HammerProve { system, goal } => {
+            let system: prover::formal::FormalSystem = system.parse()?;
+            // Ask the hammer worker to FIND a tactic and assemble a native proof.
+            let assembled = formal_generate::hammer_prove(&config, system, &goal);
+            match assembled {
+                Some(code) => {
+                    // Verify through the live gate when its toolchain is present,
+                    // else the mock backend (whose source scan still runs for real).
+                    let live = prover::formal::backend_for(&config, system, false);
+                    let used_live = !config.prover_mock && live.available();
+                    let backend = if used_live {
+                        live
+                    } else {
+                        prover::formal::backend_for(&config, system, true)
+                    };
+                    let report = backend.verify(&config, &code, &goal)?;
+                    print_value(
+                        true,
+                        &serde_json::json!({
+                            "system": system.as_str(),
+                            "goal": goal,
+                            "path": "hammer",
+                            "backend": if used_live { "live" } else { "mock" },
+                            "verified": report.lexically_verified,
+                            "code": code,
+                            "report": report,
+                        }),
+                    )?
+                }
+                None => print_value(
+                    true,
+                    &serde_json::json!({
+                        "system": system.as_str(),
+                        "goal": goal,
+                        "path": "hammer",
+                        "verified": false,
+                        "code": serde_json::Value::Null,
+                        "message": "hammer produced no reconstruction (worker unavailable or no proof found)",
+                    }),
+                )?,
+            }
         }
         Command::PortfolioProve { statement, systems } => {
             let systems: Vec<prover::formal::FormalSystem> = match &systems {

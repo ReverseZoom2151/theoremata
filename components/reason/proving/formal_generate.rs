@@ -27,7 +27,7 @@ use crate::{
     sampling,
 };
 use anyhow::{Context, Result};
-use serde_json::json;
+use serde_json::{json, Value};
 
 /// How many candidate proofs to sample before giving up (best-of-N).
 const N: usize = 3;
@@ -65,10 +65,34 @@ pub fn generate_and_verify(
         backend_for(config, system, true)
     };
 
+    // An ADDITIONAL best-of-N candidate: a hammer-assisted proof. We ask the
+    // `hammer` worker (Sledgehammer / CoqHammer / aesop) to FIND a tactic for the
+    // goal and assemble a complete system-native proof around it. The external
+    // ATP is only a hint oracle — the acceptance predicate below is unchanged (the
+    // real `FormalBackend::verify` 3+1-layer gate), so a hammer proof is trusted
+    // only if it genuinely verifies. When the model is offline/mock but the hammer
+    // is live (Isabelle on this box), the hammer can still produce a VERIFIED
+    // proof; when unavailable it yields `None` and the candidate is simply skipped.
+    //
+    // Gated on the LIVE backend: only a real 3+1-layer gate keeps a hammer-found
+    // proof honest. Under the mock backend the "verification" is canned, so a mock
+    // hammer would fabricate a clean pass — we therefore skip it entirely there.
+    let hammer_candidate = if used_live {
+        hammer_prove(config, system, statement)
+    } else {
+        None
+    };
+    let total = N + hammer_candidate.is_some() as usize;
+
     let selection = sampling::best_of_n(
-        N,
-        |_i| -> Result<Candidate> {
-            let code = generate_once(provider, system, statement)?;
+        total,
+        |i| -> Result<Candidate> {
+            // Slot 0 is the hammer-assisted candidate when one was produced; every
+            // other slot is a fresh model (or offline-stub) generation.
+            let code = match (i, &hammer_candidate) {
+                (0, Some(h)) => h.clone(),
+                _ => generate_once(provider, system, statement)?,
+            };
             let report = backend.verify(config, &code, statement)?;
             Ok(Candidate { code, report })
         },
@@ -89,10 +113,85 @@ pub fn generate_and_verify(
             "index": sampled.index,
             "verified": sampled.value.report.lexically_verified,
             "backend": if used_live { "live" } else { "mock" },
+            "hammer_candidate": hammer_candidate.is_some(),
         }),
     )?;
 
     Ok((sampled.value.code, sampled.value.report))
+}
+
+/// Ask the `hammer` worker (Sledgehammer / CoqHammer / aesop) to FIND a proof of
+/// `goal` in `system`, and — if it returns a kernel-checked `reconstructed_tactic`
+/// — assemble a complete, system-native proof around it (see [`assemble_proof`]).
+///
+/// Returns `None` when the worker is unavailable, the hammer finds nothing, or the
+/// tactic is empty. Never errors: a failed hammer just means "skip this candidate".
+///
+/// The mode is auto-resolved by the worker (live when the toolchain is probeable,
+/// else mock), except that `config.prover_mock` forces the offline mock hammer so
+/// mock-mode callers stay deterministic.
+pub fn hammer_prove(config: &Config, system: FormalSystem, goal: &str) -> Option<String> {
+    use crate::tools::{PythonCheck, Tool};
+    let py = PythonCheck::new();
+    if !py.available() {
+        return None;
+    }
+    // `null` mode = auto (live if the toolchain is present); force `mock` only when
+    // the whole prover is pinned to mock so offline runs are deterministic.
+    let mode: Option<&str> = if config.prover_mock { Some("mock") } else { None };
+    let result = py
+        .run(json!({
+            "tool": "hammer",
+            "system": system.as_str(),
+            "goal": goal,
+            "mode": mode,
+        }))
+        .ok()?;
+    // The worker wraps the tool result: `{"ok": true, "output": {<hammer dict>}}`.
+    let v: Value = serde_json::from_str(&result.stdout).ok()?;
+    if !v.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    let output = v.get("output")?;
+    if !output.get("success").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    let tactic = output
+        .get("reconstructed_tactic")
+        .and_then(Value::as_str)?
+        .trim();
+    if tactic.is_empty() {
+        return None;
+    }
+    Some(assemble_proof(system, goal, tactic))
+}
+
+/// Splice a hammer's reconstructed `tactic` into a complete, verifiable,
+/// system-native proof of `goal`.
+///
+/// * Isabelle — the tactic is already a full Isar method (`by (metis …)` /
+///   `by auto` / `using … by …`), so it drops straight after the goal:
+///   `theory T imports Main begin theorem t: "<goal>" <tactic> end`.
+/// * Rocq — the tactic is a proof-script body (`sauto` / `hauto use: …`); wrap it
+///   in `Theorem t : <goal>. Proof. <tactic>. Qed.` (trailing `.` de-duplicated so
+///   a tactic that already ends in `.` is not doubled).
+/// * Lean — the tactic is a tactic-block body (`aesop`, `simp`, …):
+///   `theorem t : <goal> := by <tactic>`.
+pub fn assemble_proof(system: FormalSystem, goal: &str, tactic: &str) -> String {
+    let goal = goal.trim();
+    let tactic = tactic.trim();
+    match system {
+        FormalSystem::Isabelle => format!(
+            "theory T\n  imports Main\nbegin\n\ntheorem t: \"{goal}\"\n  {tactic}\n\nend\n"
+        ),
+        FormalSystem::Rocq => {
+            // The Rocq reconstruction is a tactic script; normalize a single
+            // terminating `.` so `sauto` and `sauto.` both yield one period.
+            let body = tactic.trim_end_matches('.').trim_end();
+            format!("Theorem t : {goal}.\nProof.\n  {body}.\nQed.\n")
+        }
+        FormalSystem::Lean => format!("theorem t : {goal} := by\n  {tactic}\n"),
+    }
 }
 
 /// Produce ONE candidate proof: ask the provider (system-specific role/task), or
@@ -270,6 +369,83 @@ mod tests {
         .unwrap();
         assert!(code.contains("trivial"));
         assert!(report.lexically_verified);
+    }
+
+    #[test]
+    fn assemble_proof_is_well_formed_per_system() {
+        // Isabelle: the tactic is already a full Isar method (`by …`).
+        let isa = assemble_proof(FormalSystem::Isabelle, "1 + 1 = (2::nat)", "by auto");
+        assert!(isa.starts_with("theory T"));
+        assert!(isa.contains("imports Main"));
+        assert!(isa.contains("theorem t: \"1 + 1 = (2::nat)\""));
+        assert!(isa.contains("by auto"));
+        assert!(isa.trim_end().ends_with("end"));
+
+        // Rocq: a tactic-script body wrapped in Theorem/Proof/Qed with exactly
+        // one terminating period (no doubling when the tactic already has one).
+        let rocq = assemble_proof(FormalSystem::Rocq, "1 + 1 = 2", "sauto");
+        assert!(rocq.starts_with("Theorem t : 1 + 1 = 2."));
+        assert!(rocq.contains("Proof."));
+        assert!(rocq.contains("  sauto.\n"));
+        assert!(!rocq.contains("sauto..")); // no doubled period
+        assert!(rocq.trim_end().ends_with("Qed."));
+        let rocq_dotted = assemble_proof(FormalSystem::Rocq, "True", "exact I.");
+        assert!(rocq_dotted.contains("  exact I.\n"));
+        assert!(!rocq_dotted.contains("exact I.."));
+
+        // Lean: a tactic-block body after `:= by`.
+        let lean = assemble_proof(FormalSystem::Lean, "1 + 1 = 2", "decide");
+        assert_eq!(lean, "theorem t : 1 + 1 = 2 := by\n  decide\n");
+    }
+
+    #[test]
+    fn mock_hammer_assembles_a_proof_when_worker_present() {
+        // With the whole prover pinned to mock, `hammer_prove` forces the offline
+        // mock hammer, which returns a reconstruction for a (provable-looking)
+        // goal. Guard on the Python worker being present so the suite still passes
+        // where it is absent.
+        use crate::tools::{PythonCheck, Tool};
+        if !PythonCheck::new().available() {
+            eprintln!("skip: no Python worker for the hammer tool");
+            return;
+        }
+        let config = mock_config();
+        let assembled = hammer_prove(&config, FormalSystem::Isabelle, "1 + 1 = (2::nat)");
+        let code = assembled.expect("mock hammer should assemble a proof for a trivial goal");
+        assert!(code.contains("theorem t: \"1 + 1 = (2::nat)\""));
+        // The mock Sledgehammer reconstruction is `by (metis)`.
+        assert!(code.contains("by"));
+    }
+
+    #[test]
+    fn live_isabelle_hammer_finds_and_verifies_end_to_end() {
+        use crate::prover::formal::FormalBackend;
+        use crate::tools::{PythonCheck, Tool};
+        if !PythonCheck::new().available() {
+            eprintln!("skip: no Python worker for the hammer tool");
+            return;
+        }
+        let config = Config::default();
+        let backend = crate::prover::isabelle::IsabelleBackend::live(&config);
+        if !backend.available() {
+            eprintln!("skip: no live Isabelle toolchain");
+            return;
+        }
+        // Live (auto) mode: Sledgehammer FINDS a tactic; we assemble a native
+        // theory and the live 3+1-layer gate must VERIFY it end-to-end.
+        let goal = "1 + 1 = (2::nat)";
+        let code = match hammer_prove(&config, FormalSystem::Isabelle, goal) {
+            Some(c) => c,
+            None => {
+                eprintln!("skip: live hammer produced no reconstruction");
+                return;
+            }
+        };
+        let report = backend.verify(&config, &code, goal).unwrap();
+        assert!(
+            report.lexically_verified,
+            "live Isabelle Sledgehammer-assisted proof should verify:\n{code}\n{report:?}"
+        );
     }
 
     #[test]
