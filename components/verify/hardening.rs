@@ -5,10 +5,20 @@
 //! on the theorem — the deep kernel-replay / csimp / native-decide /
 //! constructor-recursor battery beyond the lexical and `#print axioms` gates.
 //!
-//! This is best-effort and NON-FATAL: any missing tool or unresolved import
-//! yields `ran:false`/`clean:false` with a clear summary rather than an error.
-//! The caller uses it as *additional* evidence, never the sole gate — the
-//! authoritative axiom check remains the workflow's `#print axioms` step.
+//! This layer now FAILS CLOSED: a proof is only reported `clean:true` when
+//! LeanParanoia was actually run and emitted a parseable success verdict
+//! (`HardeningOutcome::Passed`). Every other state — `Flagged` (checks failed),
+//! `Inconclusive` (paranoia present but no parseable verdict / launch error),
+//! `Unavailable` (executable absent), `BuildFailed`, and `Skipped`
+//! (preconditions unmet) — is NOT clean. In particular `Inconclusive` and
+//! `Unavailable` are never treated as clean: an un-audited proof no longer
+//! passes silently.
+//!
+//! It remains best-effort as a *gate*: missing tooling or unresolved imports
+//! yield a non-clean outcome with a clear summary rather than an error, and the
+//! caller uses this as *additional* evidence. Only `Flagged` denotes a real
+//! soundness failure; the authoritative axiom check remains the workflow's
+//! `#print axioms` step.
 
 use crate::{
     config::Config,
@@ -22,10 +32,31 @@ use std::{
     process::{Command, Stdio},
 };
 
+/// The terminal state of a hardening run. Only `Passed` is `clean`; every other
+/// variant is non-clean so an un-audited proof never passes silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HardeningOutcome {
+    /// LeanParanoia ran and emitted a parseable success verdict.
+    Passed,
+    /// LeanParanoia ran and reported one or more failing checks.
+    Flagged,
+    /// LeanParanoia is present but produced no parseable verdict (import/name
+    /// resolution failure) or could not be launched.
+    Inconclusive,
+    /// The LeanParanoia executable was not present.
+    Unavailable,
+    /// The generated module (scaffold/place/build) failed to produce an olean.
+    BuildFailed,
+    /// A precondition was unmet (no Mathlib project, no python worker, no lake).
+    Skipped,
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct HardeningReport {
     pub ran: bool,
     pub clean: bool,
+    pub outcome: HardeningOutcome,
     pub summary: String,
     pub details: Value,
 }
@@ -35,6 +66,7 @@ impl HardeningReport {
         Self {
             ran: false,
             clean: false,
+            outcome: HardeningOutcome::Skipped,
             summary: summary.into(),
             details: Value::Null,
         }
@@ -74,24 +106,76 @@ fn worker_output(result: &crate::model::ToolResult) -> Option<Value> {
     }
 }
 
-/// The first declared theorem/lemma name in a Lean source (for the paranoia
-/// target), or None.
-fn first_theorem_name(src: &str) -> Option<String> {
+/// The paranoia target declaration in a Lean source, or None.
+///
+/// Robust to leading attributes (`@[...]`, possibly stacked) and stacked
+/// declaration modifiers (`private`, `noncomputable`, …). Prefers the LAST
+/// `theorem`/`lemma` (the main result is usually last), falling back to the LAST
+/// `def`/`abbrev`/`instance` (exploit fixtures sometimes use `def exploit_...`).
+fn target_declaration_name(src: &str) -> Option<String> {
+    const MODIFIERS: &[&str] = &[
+        "private ",
+        "protected ",
+        "noncomputable ",
+        "nonrec ",
+        "partial ",
+        "unsafe ",
+        "public ",
+        "scoped ",
+        "local ",
+        "mutual ",
+    ];
+    const DECLS: &[&str] = &["theorem ", "lemma ", "def ", "abbrev ", "instance "];
+
+    let mut last_theorem: Option<String> = None;
+    let mut last_def: Option<String> = None;
+
     for line in src.lines() {
-        let trimmed = line.trim_start();
-        for kw in ["theorem ", "lemma "] {
-            if let Some(rest) = trimmed.strip_prefix(kw) {
-                let name: String = rest
+        let mut rest = line.trim_start();
+
+        // Strip leading attributes (`@[...]`), possibly stacked on one line.
+        while let Some(after) = rest.strip_prefix("@[") {
+            match after.find(']') {
+                Some(close) => rest = after[close + 1..].trim_start(),
+                None => break,
+            }
+        }
+
+        // Strip stacked declaration modifiers.
+        loop {
+            let mut stripped = false;
+            for m in MODIFIERS {
+                if let Some(after) = rest.strip_prefix(m) {
+                    rest = after.trim_start();
+                    stripped = true;
+                    break;
+                }
+            }
+            if !stripped {
+                break;
+            }
+        }
+
+        // Recognize a declaration keyword and collect its name.
+        for kw in DECLS {
+            if let Some(after) = rest.strip_prefix(kw) {
+                let name: String = after
                     .chars()
                     .take_while(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '\''))
                     .collect();
                 if !name.is_empty() {
-                    return Some(name);
+                    if *kw == "theorem " || *kw == "lemma " {
+                        last_theorem = Some(name);
+                    } else {
+                        last_def = Some(name);
+                    }
                 }
+                break;
             }
         }
     }
-    None
+
+    last_theorem.or(last_def)
 }
 
 /// Run the deep hardening battery on a generated proof.
@@ -152,6 +236,7 @@ pub fn harden(
             return Ok(HardeningReport {
                 ran: false,
                 clean: false,
+                outcome: HardeningOutcome::BuildFailed,
                 summary: "workspace scaffold failed".into(),
                 details: json!({"stage":"scaffold","stdout": scaffold.stdout, "stderr": scaffold.stderr}),
             });
@@ -171,6 +256,7 @@ pub fn harden(
             return Ok(HardeningReport {
                 ran: false,
                 clean: false,
+                outcome: HardeningOutcome::BuildFailed,
                 summary: "placing the proof module failed".into(),
                 details: json!({"stage":"place","stdout": place.stdout, "stderr": place.stderr}),
             })
@@ -199,6 +285,7 @@ pub fn harden(
         return Ok(HardeningReport {
             ran: true,
             clean: false,
+            outcome: HardeningOutcome::BuildFailed,
             summary: format!("module '{qualified}' failed to build"),
             details: json!({
                 "stage": "build",
@@ -227,7 +314,7 @@ pub fn harden(
         }
     };
 
-    let theorem_target = match first_theorem_name(lean_source) {
+    let theorem_target = match target_declaration_name(lean_source) {
         Some(thm) if thm.contains('.') => thm,
         Some(thm) => format!("{qualified}.{thm}"),
         None => qualified.clone(),
@@ -235,13 +322,20 @@ pub fn harden(
 
     let mut summary = format!("module '{qualified}' built cleanly");
     let mut paranoia_details = Value::Null;
-    let mut paranoia_success: Option<bool> = None;
+    // The failing-check taxonomy (CheckName -> reasons) from the verdict.
+    let mut failures = Value::Null;
+    let outcome: HardeningOutcome;
 
     if let Some(exe) = paranoia_exe {
+        // `--trust-modules Std,Mathlib,Init` MUST precede the theorem target:
+        // without it the kernel Replay check re-verifies the entire transitive
+        // Mathlib closure and times out, so the deepest check silently no-ops.
         match Command::new(&lake)
             .current_dir(&ws_root)
             .arg("env")
             .arg(&exe)
+            .arg("--trust-modules")
+            .arg("Std,Mathlib,Init")
             .arg(&theorem_target)
             .output()
         {
@@ -251,17 +345,33 @@ pub fn harden(
                 match serde_json::from_str::<Value>(stdout.trim()) {
                     Ok(v) => {
                         let success = v.get("success").and_then(Value::as_bool).unwrap_or(false);
-                        paranoia_success = Some(success);
-                        summary = if success {
-                            format!("module '{qualified}' built and passed LeanParanoia")
+                        if let Some(f) = v.get("failures") {
+                            failures = f.clone();
+                        }
+                        if success {
+                            outcome = HardeningOutcome::Passed;
+                            summary =
+                                format!("module '{qualified}' built and passed LeanParanoia");
                         } else {
-                            format!("module '{qualified}' built but LeanParanoia reported failures")
-                        };
+                            outcome = HardeningOutcome::Flagged;
+                            let names: Vec<&str> = failures
+                                .as_object()
+                                .map(|m| m.keys().map(String::as_str).collect())
+                                .unwrap_or_default();
+                            summary = if names.is_empty() {
+                                format!(
+                                    "module '{qualified}' built but LeanParanoia reported failures"
+                                )
+                            } else {
+                                format!("LeanParanoia flagged: {}", names.join(", "))
+                            };
+                        }
                         paranoia_details = v;
                     }
                     Err(_) => {
+                        outcome = HardeningOutcome::Inconclusive;
                         summary = format!(
-                            "module '{qualified}' built; LeanParanoia could not audit '{theorem_target}' (import/name resolution) — relying on build + axiom gate"
+                            "module '{qualified}' built; LeanParanoia could not audit '{theorem_target}' (import/name resolution) — INCONCLUSIVE, not clean; relying on axiom gate"
                         );
                         paranoia_details =
                             json!({"note":"no parseable verdict","stdout": stdout, "stderr": stderr});
@@ -269,40 +379,53 @@ pub fn harden(
                 }
             }
             Err(e) => {
-                summary =
-                    format!("module '{qualified}' built; LeanParanoia could not be launched: {e}");
+                outcome = HardeningOutcome::Inconclusive;
+                summary = format!(
+                    "module '{qualified}' built; LeanParanoia could not be launched: {e} — INCONCLUSIVE, not clean"
+                );
                 paranoia_details = json!({"error": e.to_string()});
             }
         }
     } else {
+        outcome = HardeningOutcome::Unavailable;
         summary = format!(
-            "module '{qualified}' built; LeanParanoia executable not present — `lake build` it under resources to enable the deep checks"
+            "module '{qualified}' built; LeanParanoia executable not present — UNAVAILABLE, not clean; `lake build` it under resources to enable the deep checks"
         );
     }
 
-    // clean = built AND (paranoia passed, or paranoia not applicable). This is
-    // additional hardening; the authoritative axiom check is the workflow gate.
-    let clean = paranoia_success.unwrap_or(true);
+    // Fail closed: only an actual parseable success verdict is clean.
+    let clean = matches!(outcome, HardeningOutcome::Passed);
 
     let details = json!({
         "qualified_name": qualified,
         "theorem_target": theorem_target,
         "workspace": ws_root,
+        "outcome": outcome,
+        "failures": failures,
         "paranoia": paranoia_details,
     });
 
+    let evidence_verdict = match outcome {
+        HardeningOutcome::Passed => "passed",
+        HardeningOutcome::Flagged => "flagged",
+        HardeningOutcome::Inconclusive => "inconclusive",
+        HardeningOutcome::Unavailable => "unavailable",
+        HardeningOutcome::BuildFailed => "build_failed",
+        HardeningOutcome::Skipped => "skipped",
+    };
     store.add_evidence(
         project_id,
         node_id,
         "lean_paranoia",
         "hardening",
-        if clean { "clean" } else { "flagged" },
+        evidence_verdict,
         details.clone(),
     )?;
 
     Ok(HardeningReport {
         ran: true,
         clean,
+        outcome,
         summary,
         details,
     })
@@ -334,5 +457,37 @@ mod tests {
         .unwrap();
         assert!(!report.ran);
         assert!(!report.clean);
+        assert_eq!(report.outcome, HardeningOutcome::Skipped);
+    }
+
+    #[test]
+    fn target_prefers_last_theorem_over_helper_lemma() {
+        let src = "lemma aux (n : Nat) : n = n := rfl\ntheorem main : True := trivial\n";
+        assert_eq!(
+            target_declaration_name(src).as_deref(),
+            Some("main"),
+            "the main result is the last theorem, not the helper lemma"
+        );
+    }
+
+    #[test]
+    fn target_falls_back_to_def_exploit() {
+        let src = "def exploit_theorem : True := trivial\n";
+        assert_eq!(
+            target_declaration_name(src).as_deref(),
+            Some("exploit_theorem")
+        );
+    }
+
+    #[test]
+    fn target_passes_through_qualified_name() {
+        let src = "theorem Foo.bar : True := trivial\n";
+        assert_eq!(target_declaration_name(src).as_deref(), Some("Foo.bar"));
+    }
+
+    #[test]
+    fn target_strips_attributes_and_modifiers() {
+        let src = "@[simp]\nprivate theorem t : True := trivial\n";
+        assert_eq!(target_declaration_name(src).as_deref(), Some("t"));
     }
 }

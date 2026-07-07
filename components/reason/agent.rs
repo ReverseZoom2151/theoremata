@@ -445,14 +445,37 @@ impl AgentLoop<'_> {
         let module = format!("N{}", node.id.replace('-', "").get(0..8).unwrap_or("node"));
         if let Ok(report) = hardening::harden(self.store, self.config, project_id, &node.id, &module, lean)
         {
+            // Record the honest outcome. Only `Flagged` is a real soundness
+            // failure: it taints the node (the `#print axioms` gate remains
+            // authoritative for the Inconclusive/Unavailable/Skipped states,
+            // so those must NOT hard-reject a formally verified node).
+            use hardening::HardeningOutcome as HO;
+            let flagged = matches!(report.outcome, HO::Flagged);
+            let verdict = match report.outcome {
+                HO::Passed => "clean",
+                HO::Flagged => "flagged",
+                HO::Inconclusive => "inconclusive",
+                HO::Unavailable => "unavailable",
+                HO::BuildFailed => "build_failed",
+                HO::Skipped => "skipped",
+            };
             self.store.add_evidence(
                 project_id,
                 &node.id,
                 "hardening",
                 "lean_paranoia",
-                if report.clean { "clean" } else { "flagged" },
+                verdict,
                 serde_json::to_value(&report)?,
             )?;
+            if flagged {
+                self.store.set_node_status(
+                    project_id,
+                    &node.id,
+                    NodeStatus::Rejected,
+                    "verifier",
+                )?;
+                *certified = certified.saturating_sub(1);
+            }
         }
         Ok(())
     }
