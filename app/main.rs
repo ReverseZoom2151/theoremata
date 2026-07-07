@@ -16,8 +16,8 @@ mod tui;
 // paths unchanged — the physical layout is by component, the namespace is flat.
 pub use graph::{db, model, scheduler};
 pub use reason::{
-    agent, chat, consolidate, critic, falsification, guard, mcts, observe, research, retry, router,
-    sampler, sampling, team, workflow,
+    agent, chat, consolidate, critic, decompose, falsification, guard, mcts, observe, research,
+    retry, router, sampler, sampling, team,
 };
 pub use verify::{hardening, lean_session};
 
@@ -29,7 +29,6 @@ use model::{EdgeKind, NodeKind, NodeStatus};
 use provider::{CommandProvider, ModelProvider, OfflineProvider};
 use std::{fs, path::PathBuf};
 use tools::{capability_report, LeanCheck, LeanParanoia, MathlibSearch, PythonCheck, Tool};
-use workflow::ResearchWorkflow;
 
 #[derive(Parser)]
 #[command(
@@ -80,9 +79,6 @@ enum Command {
         node: String,
         #[arg(value_enum)]
         status: NodeStatus,
-    },
-    Run {
-        project: String,
     },
     Chat {
         project: String,
@@ -345,15 +341,6 @@ fn main() -> Result<()> {
             store.set_node_status(&project, &node, status, "user")?;
             print_value(cli.json, &serde_json::json!({"updated":true}))?
         }
-        Command::Run { project } => print_value(
-            true,
-            &ResearchWorkflow {
-                store: &store,
-                config: &config,
-                provider: provider.as_ref(),
-            }
-            .run(&project)?,
-        )?,
         Command::Chat { project } => tui::run(&store, provider.as_ref(), &project)?,
         Command::Send { project, message } => {
             let mut on_event = |event: model::ModelStreamEvent| {

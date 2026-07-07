@@ -11,7 +11,7 @@ use crate::{
     db::Store,
     hardening,
     lean_session::LeanSession,
-    model::{ModelRequest, Node, NodeStatus},
+    model::{EdgeKind, ModelRequest, Node, NodeKind, NodeStatus, NodeTier},
     provider::ModelProvider,
     research::ResearchEngine,
     router::{self, NodeSignals, Route, ToolAvailability},
@@ -48,10 +48,25 @@ struct Formalization {
 
 impl AgentLoop<'_> {
     pub fn run(&self, project_id: &str) -> Result<AgentSummary> {
-        let _project = self.store.project(project_id)?;
+        let project = self.store.project(project_id)?;
         let run = self.store.begin_run(project_id, "autonomous_agent")?;
         let mut notes = Vec::new();
         let mut steps = Vec::new();
+        // Ensure the theorem itself is a node so it can be routed and decomposed.
+        if !self
+            .store
+            .nodes(project_id)?
+            .iter()
+            .any(|n| n.kind == NodeKind::Conjecture)
+        {
+            self.store.add_node(
+                project_id,
+                NodeKind::Conjecture,
+                "Main conjecture",
+                project.theorem.trim(),
+                "agent:seed",
+            )?;
+        }
 
         let tools = ToolAvailability {
             python: PythonCheck::new().available(),
@@ -99,6 +114,7 @@ impl AgentLoop<'_> {
         let max_attempts = self.config.max_iterations.max(1);
         let mut falsified: HashSet<String> = HashSet::new();
         let mut counterexamples: HashSet<String> = HashSet::new();
+        let mut decomposed: HashSet<String> = HashSet::new();
         let mut certified = 0usize;
         let mut loop_guard = crate::guard::LoopGuard::new(64);
         for _pass in 0..max_attempts {
@@ -110,6 +126,10 @@ impl AgentLoop<'_> {
                 let Some(node) = nodes.iter().find(|n| &n.id == node_id).cloned() else {
                     continue;
                 };
+                // A decomposed conjecture waits on its obligations; don't re-route it.
+                if decomposed.contains(&node.id) {
+                    continue;
+                }
                 let attempts = self.node_attempts(project_id, &node.id)?;
                 let signals = NodeSignals {
                     falsified: falsified.contains(&node.id),
@@ -140,6 +160,7 @@ impl AgentLoop<'_> {
                     &mut session,
                     &mut falsified,
                     &mut counterexamples,
+                    &mut decomposed,
                     &mut certified,
                 )?;
                 steps.push(json!({
@@ -211,6 +232,7 @@ impl AgentLoop<'_> {
         session: &mut Option<LeanSession>,
         falsified: &mut HashSet<String>,
         counterexamples: &mut HashSet<String>,
+        decomposed: &mut HashSet<String>,
         certified: &mut usize,
     ) -> Result<&'static str> {
         match route {
@@ -316,6 +338,37 @@ impl AgentLoop<'_> {
                 } else {
                     Ok("noop")
                 }
+            }
+            Route::Decompose => {
+                if self.config.model_command.is_none() {
+                    return Ok("noop");
+                }
+                let obligations = crate::decompose::Decomposer {
+                    store: self.store,
+                    provider: self.provider,
+                }
+                .run(project_id, run, &node.statement)?;
+                if obligations.is_empty() {
+                    return Ok("noop");
+                }
+                for (title, statement) in obligations {
+                    let child = self.store.add_node_detailed(
+                        project_id,
+                        NodeKind::Obligation,
+                        NodeTier::Implementation,
+                        Some(&node.id),
+                        &title,
+                        &statement,
+                        None,
+                        &[],
+                        "agent:decompose",
+                    )?;
+                    // The conjecture depends on each of its obligations.
+                    self.store
+                        .add_edge(project_id, &node.id, &child.id, EdgeKind::DependsOn)?;
+                }
+                decomposed.insert(node.id.clone());
+                Ok("decompose")
             }
             _ => Ok("noop"),
         }

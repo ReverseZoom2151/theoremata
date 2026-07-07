@@ -86,10 +86,10 @@ pub fn route(
         return Route::Retrieve;
     }
 
-    // 5. Informal but not yet formal → formalize (needs Lean + a model).
-    if !signals.has_formal_statement && node.formal_statement.is_none() && tools.lean && tools.model
-    {
-        return Route::Formalize;
+    // 5. High-level nodes are decomposed into obligations *before* any proof
+    //    effort: decompose the theorem, formalize the leaves.
+    if matches!(node.kind, NodeKind::Conjecture | NodeKind::Strategy) && tools.model {
+        return Route::Decompose;
     }
 
     // 6. Has a formal statement → verify it with Lean.
@@ -97,9 +97,10 @@ pub fn route(
         return Route::Verify;
     }
 
-    // 7. High-level nodes get decomposed into obligations.
-    if matches!(node.kind, NodeKind::Conjecture | NodeKind::Strategy) && tools.model {
-        return Route::Decompose;
+    // 7. Informal leaf but not yet formal → formalize (needs Lean + a model).
+    if !signals.has_formal_statement && node.formal_statement.is_none() && tools.lean && tools.model
+    {
+        return Route::Formalize;
     }
 
     // 8. Otherwise attempt a proof if we have a model, else escalate.
