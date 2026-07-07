@@ -414,6 +414,33 @@ impl Store {
         Ok(())
     }
 
+    /// Graph-of-Thoughts merge (plan §14): create a new node that depends on
+    /// several independently-proven parents — prove A and B separately, then
+    /// merge into a child that needs both. Adds the node plus a DependsOn edge
+    /// from the child to each parent (cycle-checked by `add_edge`).
+    pub fn merge_nodes(
+        &self,
+        project_id: &str,
+        kind: NodeKind,
+        title: &str,
+        statement: &str,
+        parents: &[String],
+        provenance: &str,
+    ) -> Result<Node> {
+        let node = self.add_node(project_id, kind, title, statement, provenance)?;
+        for parent in parents {
+            self.add_edge(project_id, &node.id, parent, EdgeKind::DependsOn)?;
+        }
+        self.event(
+            Some(project_id),
+            None,
+            "nodes.merged",
+            provenance,
+            serde_json::json!({"node_id": node.id, "parents": parents}),
+        )?;
+        Ok(node)
+    }
+
     /// Record how strongly an existing edge's dependency is backed
     /// (numeric_screen < prose_proof < lean_checked).
     pub fn set_edge_strength(
