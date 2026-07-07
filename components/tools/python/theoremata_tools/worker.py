@@ -167,6 +167,56 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from .star_harvester import run as star_harvest_run
 
         return star_harvest_run(request["request"])
+    if tool == "bm25_retrieve":
+        from theoremata_tools.bm25_retriever import run as bm25_run
+
+        return bm25_run(
+            root=request.get("root"),
+            imports=request.get("imports"),
+            query=request["query"],
+            limit=int(request.get("limit", 20)),
+            op=request.get("op", "retrieve"),
+            theorem_module=request.get("theorem_module"),
+            theorem_line=request.get("theorem_line"),
+            file_module=request.get("file_module"),
+        )
+    if tool == "retrieval_eval":
+        from theoremata_tools.retrieval_eval import run as retrieval_eval_run
+
+        return retrieval_eval_run(
+            examples=request.get("examples"),
+            predictions=request.get("predictions"),
+            gold=request.get("gold"),
+            ks=request.get("ks"),
+        )
+    if tool == "cascade":
+        from theoremata_tools.cascade import run as cascade_run
+
+        return cascade_run(
+            root=request.get("root"),
+            imports=request.get("imports"),
+            query=request["query"],
+            first_stage=request.get("first_stage", "bm25"),
+            first_k=int(request.get("first_k", 50)),
+            k=int(request.get("k", 10)),
+            theorem_module=request.get("theorem_module"),
+            theorem_line=request.get("theorem_line"),
+            file_module=request.get("file_module"),
+            mask=request.get("mask", True),
+            samples=int(request.get("samples", 1)),
+        )
+    if tool == "tactic_generate":
+        from theoremata_tools.tactic_server import run as tactic_run
+
+        return tactic_run(request)
+    if tool == "proof_grader":
+        from theoremata_tools.proof_grader import run as proof_grader_run
+
+        return proof_grader_run(request)
+    if tool == "curriculum":
+        from theoremata_tools.curriculum import run as curriculum_run
+
+        return curriculum_run(request)
     raise ValueError(f"unknown tool: {tool}")
 
 
