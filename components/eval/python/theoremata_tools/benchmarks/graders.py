@@ -21,9 +21,13 @@ Tracks:
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
+import subprocess
+import tempfile
+from pathlib import Path
 from typing import Any, Callable
 
 from theoremata_tools import grader as base_grader
@@ -78,6 +82,82 @@ def _comparator_path() -> str | None:
     return shutil.which("comparator")
 
 
+def _comparator_timeout() -> float:
+    try:
+        return float(os.environ.get("THEOREMATA_COMPARATOR_TIMEOUT", "120"))
+    except ValueError:
+        return 120.0
+
+
+def _run_comparator(
+    comparator: str,
+    *,
+    expected_formal: str,
+    response: str,
+    theorem_name: str,
+    whitelist: list[str],
+) -> dict[str, Any]:
+    """Run leanprover/comparator against a generated solution.
+
+    This follows FormalQualBench's contract: a trusted challenge module contains
+    the original statement/stub, a solution module contains the submitted proof,
+    and comparator checks statement preservation plus the axiom allowlist.
+
+    The comparator executable itself is external and may require LEAN_PATH /
+    lake-env setup; this function still performs a real subprocess invocation
+    and returns enough detail to diagnose environment failures.
+    """
+    with tempfile.TemporaryDirectory(prefix="theoremata-comparator-") as td:
+        root = Path(td)
+        challenge = root / "Challenge.lean"
+        solution = root / "Solution.lean"
+        config = root / "config.json"
+        challenge.write_text(expected_formal.rstrip() + "\n", encoding="utf-8")
+        solution.write_text(response.rstrip() + "\n", encoding="utf-8")
+        config.write_text(
+            json.dumps(
+                {
+                    "challenge_module": "Challenge",
+                    "solution_module": "Solution",
+                    "theorem_names": [theorem_name],
+                    "permitted_axioms": whitelist,
+                    "enable_nanoda": False,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        cmd = [comparator, str(config)]
+        if os.environ.get("THEOREMATA_COMPARATOR_LAKE_ENV") == "1":
+            lake = shutil.which("lake") or "lake"
+            cmd = [lake, "env", *cmd]
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=root,
+                text=True,
+                capture_output=True,
+                timeout=_comparator_timeout(),
+                check=False,
+            )
+            return {
+                "invoked": True,
+                "returncode": proc.returncode,
+                "ok": proc.returncode == 0,
+                "stdout": proc.stdout[-4000:],
+                "stderr": proc.stderr[-4000:],
+                "config": json.loads(config.read_text(encoding="utf-8")),
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "invoked": True,
+                "returncode": None,
+                "ok": False,
+                "error": str(exc),
+            }
+
+
 def grade_formalization(item: dict[str, Any], response: str) -> dict[str, Any]:
     expected = item.get("expected") or {}
     expected_formal = expected.get("formal_statement") or item.get("formal") or ""
@@ -86,12 +166,28 @@ def grade_formalization(item: dict[str, Any], response: str) -> dict[str, Any]:
 
     comparator = _comparator_path()
     if comparator:
-        # Comparator/landrun is Linux-only and needs a built Mathlib; we surface
-        # its availability but still fall through to the deterministic gate if we
-        # can't actually invoke it here. (Kept as a hook, per the spec recipe.)
-        detail_tool = {"comparator": comparator, "invoked": False}
-    else:
-        detail_tool = {"comparator": None, "invoked": False}
+        theorem_name = expected.get("lean_name") or "MainTheorem"
+        cmp = _run_comparator(
+            comparator,
+            expected_formal=expected_formal,
+            response=response,
+            theorem_name=theorem_name,
+            whitelist=whitelist,
+        )
+        return {
+            "is_solved": bool(response.strip()),
+            "is_correct": bool(cmp.get("ok")),
+            "detail": {
+                "track": "formalization",
+                "method": "comparator",
+                "statement_preserved": bool(cmp.get("ok")),
+                "axioms_ok": bool(cmp.get("ok")),
+                "axiom_reason": "comparator_exit_0" if cmp.get("ok") else "comparator_failed",
+                "expected_lean_name": theorem_name,
+                "comparator": comparator,
+                **cmp,
+            },
+        }
 
     preserved = _statement_preserved(expected_formal, response)
     axioms_ok, axiom_reason = _axioms_ok(response, whitelist)
@@ -106,7 +202,8 @@ def grade_formalization(item: dict[str, Any], response: str) -> dict[str, Any]:
             "axioms_ok": axioms_ok,
             "axiom_reason": axiom_reason,
             "expected_lean_name": expected.get("lean_name"),
-            **detail_tool,
+            "comparator": None,
+            "invoked": False,
         },
     }
 

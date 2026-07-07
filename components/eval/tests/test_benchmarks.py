@@ -204,6 +204,62 @@ def test_formalization_statement_preserved_no_sorry():
     assert grade(item, "theorem MainTheorem (n : Nat) : n = n := by sorry")["is_correct"] is False
 
 
+def test_formalization_invokes_comparator_when_configured(monkeypatch, tmp_path):
+    comparator = tmp_path / "fake-comparator"
+    marker = tmp_path / "called.txt"
+    comparator.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib, sys\n"
+        "cfg = json.load(open(sys.argv[1]))\n"
+        f"pathlib.Path({str(marker)!r}).write_text(cfg['theorem_names'][0])\n"
+        "raise SystemExit(0)\n",
+        encoding="utf-8",
+    )
+    comparator.chmod(0o755)
+    monkeypatch.setenv("THEOREMATA_COMPARATOR", str(comparator))
+
+    stmt = "theorem MainTheorem (n : Nat) : n = n := by sorry"
+    item = make_item(
+        id="f",
+        kind="formalization",
+        informal="",
+        formal=stmt,
+        expected={
+            "formal_statement": stmt,
+            "lean_name": "Foo.MainTheorem",
+            "axioms_whitelist": ["propext", "Quot.sound", "Classical.choice"],
+        },
+        grading={"track": "formalization", "method": "comparator_or_statement"},
+    )
+
+    res = grade(item, "theorem MainTheorem (n : Nat) : n = n := by exact rfl")
+    assert res["is_correct"] is True
+    assert res["detail"]["method"] == "comparator"
+    assert res["detail"]["invoked"] is True
+    assert marker.read_text() == "Foo.MainTheorem"
+
+
+def test_formalization_uses_comparator_failure(monkeypatch, tmp_path):
+    comparator = tmp_path / "fake-comparator"
+    comparator.write_text("#!/usr/bin/env sh\nexit 7\n", encoding="utf-8")
+    comparator.chmod(0o755)
+    monkeypatch.setenv("THEOREMATA_COMPARATOR", str(comparator))
+
+    stmt = "theorem MainTheorem (n : Nat) : n = n := by sorry"
+    item = make_item(
+        id="f",
+        kind="formalization",
+        informal="",
+        formal=stmt,
+        expected={"formal_statement": stmt, "lean_name": "Foo.MainTheorem"},
+        grading={"track": "formalization", "method": "comparator_or_statement"},
+    )
+
+    res = grade(item, "theorem MainTheorem (n : Nat) : n = n := by exact rfl")
+    assert res["is_correct"] is False
+    assert res["detail"]["returncode"] == 7
+
+
 # --------------------------------------------------------------------------- #
 # Falsification grader
 # --------------------------------------------------------------------------- #
