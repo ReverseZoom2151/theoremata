@@ -7,7 +7,7 @@ license = "MIT"
 
 [[bin]]
 name = "theoremata"
-path = "src/main.rs"
+path = "app/main.rs"
 
 [dependencies]
 anyhow = "1.0"

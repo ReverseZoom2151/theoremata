@@ -1,20 +1,22 @@
-mod agent;
-mod chat;
-mod config;
-mod critic;
-mod db;
-mod hardening;
-mod lean_session;
-mod model;
+#[path = "../components/graph/mod.rs"]
+mod graph;
+#[path = "../components/provider/mod.rs"]
 mod provider;
-mod research;
-mod retry;
-mod router;
-mod sampling;
-mod scheduler;
+#[path = "../components/tools/mod.rs"]
 mod tools;
+#[path = "../components/verify/mod.rs"]
+mod verify;
+#[path = "../components/reason/mod.rs"]
+mod reason;
+mod config;
 mod tui;
-mod workflow;
+
+// Re-export the grouped modules at the crate root so every component source
+// keeps its flat `crate::model` / `crate::workflow` / `crate::lean_session`
+// paths unchanged — the physical layout is by component, the namespace is flat.
+pub use graph::{db, model, scheduler};
+pub use reason::{agent, chat, critic, research, retry, router, sampling, workflow};
+pub use verify::{hardening, lean_session};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
