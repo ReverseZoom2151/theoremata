@@ -16,6 +16,7 @@ use crate::{
     research::ResearchEngine,
     router::{self, NodeSignals, Route, ToolAvailability},
     sampling, scheduler,
+    prover::{attempt_run, proof_job},
     tools::{LeanCheck, MathlibSearch, PythonCheck, Tool},
 };
 use anyhow::{Context, Result};
@@ -67,11 +68,13 @@ impl AgentLoop<'_> {
             )?;
         }
 
+        let model_ready = self.config.model_command.is_some();
         let tools = ToolAvailability {
             python: PythonCheck::new().available(),
             lean: LeanCheck::new(self.config).available(),
             mathlib_search: MathlibSearch::new(self.config).available(),
-            model: self.config.model_command.is_some(),
+            model: model_ready,
+            external_prover: proof_job::any_prover_available(self.config, model_ready),
         };
 
         // Phase 1 — research: seed the claim DAG.
@@ -300,7 +303,8 @@ impl AgentLoop<'_> {
                     .join("mathlib4-master/mathlib4-master");
                 let result = py.run(json!({
                     "tool":"retrieve","root":root,"imports":["Mathlib"],
-                    "query":node.title,"limit":8,"op":"retrieve"
+                    "query":node.title,"limit":8,"op":"accessible_retrieve",
+                    "theorem_module": node.lean_decls.first(),
                 }))?;
                 let lemmas = parse_lemma_names(&result.stdout);
                 if crate::guard::looks_injected(&result.stdout) {
@@ -409,7 +413,71 @@ impl AgentLoop<'_> {
                 decomposed.insert(node.id.clone());
                 Ok("decompose")
             }
+            Route::Prove => self.prove_via_prover(project_id, run, node, session, certified),
             _ => Ok("noop"),
+        }
+    }
+
+    fn prove_via_prover(
+        &self,
+        project_id: &str,
+        run: &str,
+        node: &Node,
+        session: &mut Option<LeanSession>,
+        certified: &mut usize,
+    ) -> Result<&'static str> {
+        let input = json!({
+            "statement": node.statement,
+            "theorem_name": format!("Theoremata.N{}", node.id.replace('-', "").get(0..8).unwrap_or("ode")),
+            "backend": self.config.prover_backend,
+        });
+        let record = attempt_run::start(
+            self.store,
+            self.config,
+            project_id,
+            Some(&node.id),
+            input,
+        )?;
+        let out = attempt_run::run_to_completion(
+            self.store,
+            self.config,
+            &record.id,
+            self.config.prover_max_polls,
+            Some(self.provider),
+        )?;
+        self.store.add_attempt(
+            project_id,
+            Some(&node.id),
+            Some(run),
+            "external_prover",
+            &json!({"attempt_id": record.id, "backend": self.config.prover_backend}),
+            &serde_json::to_value(&out)?,
+            out.status == crate::prover::model::AttemptRunStatus::Completed,
+        )?;
+        let Some(result) = out.proof_result else {
+            return Ok("prove_failed");
+        };
+        let Some(lean) = result.lean_code else {
+            return Ok("prove_failed");
+        };
+        self.store
+            .set_formal_statement(project_id, &node.id, &lean, "external_prover")?;
+        let theorem = extract_theorem(&lean);
+        let (compiles, axioms_clean) =
+            self.verify_source(&lean, theorem.as_deref(), session)?;
+        if compiles && axioms_clean {
+            let fresh = self.store.nodes(project_id)?.into_iter().find(|n| n.id == node.id).unwrap();
+            self.certify_k_consecutive(
+                project_id,
+                &fresh,
+                &lean,
+                theorem.as_deref(),
+                session,
+                certified,
+            )?;
+            Ok("prove")
+        } else {
+            Ok("prove_unverified")
         }
     }
 
@@ -807,9 +875,12 @@ mod tests {
     fn loop_runs_without_lean_or_python() {
         // No model_command means research/formalize are skipped, but the loop
         // must complete cleanly and route open nodes to noop.
+        std::env::set_var("THEOREMATA_ARISTOTLE_MOCK", "0");
+        std::env::set_var("THEOREMATA_ARISTOTLE_API_KEY", "test-disabled");
         let store = Store::open(Path::new(":memory:")).unwrap();
         let config = Config {
             model_command: None,
+            prover_backend: "disabled".into(),
             ..Config::default()
         };
         let project = store.create_project("p", "trivial holds").unwrap();

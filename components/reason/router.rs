@@ -29,6 +29,7 @@ pub struct ToolAvailability {
     pub lean: bool,
     pub mathlib_search: bool,
     pub model: bool,
+    pub external_prover: bool,
 }
 
 /// A compact summary of a node's history that the caller derives from the
@@ -103,8 +104,8 @@ pub fn route(
         return Route::Formalize;
     }
 
-    // 8. Otherwise attempt a proof if we have a model, else escalate.
-    if tools.model {
+    // 8. Attempt proof via external prover and/or model-backed backends.
+    if tools.external_prover || tools.model {
         Route::Prove
     } else {
         Route::Escalate
@@ -148,6 +149,7 @@ mod tests {
         lean: true,
         mathlib_search: true,
         model: true,
+        external_prover: true,
     };
 
     #[test]

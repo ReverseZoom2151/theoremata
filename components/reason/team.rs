@@ -17,6 +17,7 @@ const TOOLS: ToolAvailability = ToolAvailability {
     lean: true,
     mathlib_search: true,
     model: true,
+    external_prover: true,
 };
 
 #[derive(Debug, Clone, serde::Serialize)]
