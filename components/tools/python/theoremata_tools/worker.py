@@ -76,6 +76,11 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from .grpo import run as grpo_run
 
         return grpo_run(request["request"])
+    if tool == "leandojo":
+        from theoremata_tools.leandojo_adapter import run as leandojo_run
+
+        payload = request.get("request", request)
+        return leandojo_run(payload if isinstance(payload, dict) else request)
     if tool == "retrieve":
         return retrieval_run(
             root=request.get("root"),
@@ -83,6 +88,8 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
             query=request["query"],
             limit=int(request.get("limit", 20)),
             op=request.get("op", "retrieve"),
+            theorem_module=request.get("theorem_module"),
+            theorem_line=request.get("theorem_line"),
         )
     if tool == "mathlib_index":
         return mathlib_index_run(
@@ -145,11 +152,15 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
 
         return lemma_cache_run(request)
     if tool == "proof_telemetry":
-        from .proof_telemetry import run as proof_telemetry_run
+        from theoremata_tools.proof_telemetry import run as proof_telemetry_run
 
         return proof_telemetry_run(request)
+    if tool == "trace_normalize":
+        from theoremata_tools.trace_normalize import run as trace_normalize_run
+
+        return trace_normalize_run(request.get("request", request))
     if tool == "benchmark":
-        from .benchmarks.registry import run as benchmark_run
+        from theoremata_tools.benchmarks.registry import run as benchmark_run
 
         return benchmark_run(request["request"])
     if tool == "star_harvest":

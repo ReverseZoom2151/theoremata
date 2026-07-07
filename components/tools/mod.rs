@@ -16,15 +16,6 @@ pub trait Tool {
     fn run(&self, input: serde_json::Value) -> Result<ToolResult>;
 }
 
-fn command_exists(name: &str) -> bool {
-    Command::new("bash")
-        .args(["-lc", &format!("command -v {name}")])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
-
 /// True if `cmd <version_arg>` actually runs and exits successfully. This is the
 /// reliable availability test: it rejects the Microsoft Store `python`/`python3`
 /// stubs, which are on the Windows PATH but exit non-zero with an install prompt.
@@ -96,13 +87,26 @@ impl MathlibSearch {
                 .join("mathlib4-master/mathlib4-master/Mathlib"),
         }
     }
+
+    fn rg_command(&self) -> Option<String> {
+        resolve_command(&["rg", "ripgrep"], "--version")
+    }
+
+    fn mathlib_root(&self) -> PathBuf {
+        self.root
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.root.clone())
+    }
 }
+
 impl Tool for MathlibSearch {
     fn name(&self) -> &str {
         "mathlib_search"
     }
     fn available(&self) -> bool {
-        self.root.exists() && command_exists("rg")
+        self.root.exists()
+            && (self.rg_command().is_some() || PythonCheck::new().available())
     }
     fn run(&self, input: serde_json::Value) -> Result<ToolResult> {
         let query = input["query"]
@@ -110,17 +114,47 @@ impl Tool for MathlibSearch {
             .ok_or_else(|| anyhow!("query is required"))?;
         let limit = input["limit"].as_u64().unwrap_or(30).min(200);
         let started = Instant::now();
-        let output = Command::new("rg")
-            .args(["-n", "-i", "-m", &limit.to_string(), query])
-            .arg(&self.root)
-            .output()
-            .context("running ripgrep over Mathlib")?;
-        Ok(finish(
-            self.name(),
-            started,
-            output,
-            json!({"query":query,"root":self.root}),
-        ))
+        if let Some(rg) = self.rg_command() {
+            let output = Command::new(rg)
+                .args(["-n", "-i", "-m", &limit.to_string(), query])
+                .arg(&self.root)
+                .output()
+                .context("running ripgrep over Mathlib")?;
+            return Ok(finish(
+                self.name(),
+                started,
+                output,
+                json!({"query":query,"root":self.root,"backend":"ripgrep"}),
+            ));
+        }
+        let py = PythonCheck::new();
+        if !py.available() {
+            return Err(anyhow!(
+                "mathlib_search requires ripgrep or the Python retrieval worker"
+            ));
+        }
+        let result = py.run(json!({
+            "tool": "retrieve",
+            "root": self.mathlib_root(),
+            "imports": ["Mathlib"],
+            "query": query,
+            "limit": limit,
+            "op": "retrieve",
+        }))?;
+        Ok(ToolResult {
+            tool: self.name().into(),
+            success: result.success,
+            summary: result.summary,
+            stdout: result.stdout,
+            stderr: result.stderr,
+            duration_ms: started.elapsed().as_millis(),
+            metadata: json!({
+                "query": query,
+                "root": self.mathlib_root(),
+                "backend": "python_retrieve",
+                "worker": result.metadata,
+            }),
+        })
     }
 }
 
@@ -326,20 +360,29 @@ impl Tool for LeanParanoia {
 }
 
 pub struct Comparator;
+
+fn comparator_path() -> Option<String> {
+    if let Ok(path) = std::env::var("THEOREMATA_COMPARATOR") {
+        if std::path::Path::new(&path).exists() {
+            return Some(path);
+        }
+    }
+    resolve_command(&["comparator"], "--version")
+}
+
 impl Tool for Comparator {
     fn name(&self) -> &str {
         "comparator"
     }
     fn available(&self) -> bool {
-        command_exists("comparator") || resolve_command(&["comparator"], "--version").is_some()
+        comparator_path().is_some()
     }
     fn run(&self, input: serde_json::Value) -> Result<ToolResult> {
         let config = input["config"]
             .as_str()
             .ok_or_else(|| anyhow!("config is required"))?;
         let started = Instant::now();
-        let bin = resolve_command(&["comparator"], "--version")
-            .unwrap_or_else(|| "comparator".to_string());
+        let bin = comparator_path().unwrap_or_else(|| "comparator".to_string());
         let output = Command::new(bin).arg(config).output()?;
         Ok(finish(
             self.name(),
@@ -358,9 +401,50 @@ pub fn capability_report(config: &Config) -> serde_json::Value {
         Box::new(LeanParanoia::new(config)),
         Box::new(Comparator),
     ];
+    let lean_project = config
+        .lean_project
+        .clone()
+        .unwrap_or_else(|| config.resources.join("mathlib4-master/mathlib4-master"));
+    let corpora = [
+        ("mathlib4", lean_project.exists()),
+        ("datasets-main", config.resources.join("datasets-main").exists()),
+        ("BRIDGE-main", config.resources.join("BRIDGE-main").exists()),
+        ("QuantumLean-Bench-main", config.resources.join("QuantumLean-Bench-main").exists()),
+        ("flare-main", config.resources.join("flare-main").exists()),
+        ("IMO2025-main", config.resources.join("IMO2025-main").exists()),
+        ("aristotle_putnam25-main", config.resources.join("aristotle_putnam25-main").exists()),
+        (
+            "LeanMillenniumPrizeProblems-main",
+            config
+                .resources
+                .join("LeanMillenniumPrizeProblems-main")
+                .exists(),
+        ),
+    ];
     json!({
         "model_provider": config.model_command.as_ref().map(|_|"command").unwrap_or("offline"),
         "tools": tools.into_iter().map(|t|json!({"name":t.name(),"available":t.available()})).collect::<Vec<_>>(),
+        "prover": {
+            "backend": config.prover_backend,
+            "max_polls": config.prover_max_polls,
+            "aristotle_mock": std::env::var("THEOREMATA_ARISTOTLE_MOCK")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or_else(|_| std::env::var("THEOREMATA_ARISTOTLE_API_KEY").is_err()),
+            "aristotle_live": std::env::var("THEOREMATA_ARISTOTLE_COMMAND").is_ok(),
+            "leandojo": PathBuf::from("components/tools/python/theoremata_tools/worker.py").exists()
+                && python_command().is_some(),
+            "reprover": config.model_command.is_some()
+                && PathBuf::from("components/tools/python/theoremata_tools/worker.py").exists(),
+        },
+        "corpora": corpora.into_iter().map(|(n,p)|json!({"name":n,"present":p})).collect::<Vec<_>>(),
+        "env": {
+            "THEOREMATA_RESOURCES": std::env::var("THEOREMATA_RESOURCES").ok(),
+            "THEOREMATA_COMPARATOR": std::env::var("THEOREMATA_COMPARATOR").ok().map(|_|"set"),
+            "THEOREMATA_ARISTOTLE_COMMAND": std::env::var("THEOREMATA_ARISTOTLE_COMMAND").ok().map(|_|"set"),
+        },
+        "trust_doc": "docs/TRUST_BOUNDARIES.md",
+        "artifacts": config.artifacts,
+        "lean_project": lean_project,
         "resources": config.resources,
         "database": config.database,
     })
