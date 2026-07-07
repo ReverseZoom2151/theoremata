@@ -12,6 +12,17 @@ use crate::{
 };
 use serde_json::json;
 use std::path::Path;
+use std::sync::Mutex;
+
+/// Serializes tests that mutate the process-global `THEOREMATA_ARISTOTLE_MOCK`
+/// env var. `std::env::set_var`/`var` race across the default parallel test
+/// threads (a concurrent read can miss the flag and take the live path), so any
+/// test touching that env must hold this lock for its duration.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn test_config(dir: &Path) -> Config {
     let mut c = Config::default();
@@ -22,6 +33,7 @@ fn test_config(dir: &Path) -> Config {
 
 #[test]
 fn proof_task_submit_poll_result_mock() {
+    let _env = lock_env();
     std::env::set_var("THEOREMATA_ARISTOTLE_MOCK", "1");
     let tmp = tempfile::tempdir().unwrap();
     let config = test_config(tmp.path());
@@ -54,6 +66,7 @@ fn proof_task_submit_poll_result_mock() {
 
 #[test]
 fn attempt_run_start_to_completion_writes_artifacts() {
+    let _env = lock_env();
     std::env::set_var("THEOREMATA_ARISTOTLE_MOCK", "1");
     let tmp = tempfile::tempdir().unwrap();
     let config = test_config(tmp.path());
@@ -81,6 +94,7 @@ fn attempt_run_start_to_completion_writes_artifacts() {
 
 #[test]
 fn proof_job_cancel_is_terminal() {
+    let _env = lock_env();
     std::env::set_var("THEOREMATA_ARISTOTLE_MOCK", "1");
     let tmp = tempfile::tempdir().unwrap();
     let config = test_config(tmp.path());
