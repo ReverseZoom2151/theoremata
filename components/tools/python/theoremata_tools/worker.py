@@ -217,6 +217,22 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.curriculum import run as curriculum_run
 
         return curriculum_run(request)
+    if tool == "source_scan":
+        from theoremata_tools.formal_source_scan import run as source_scan_run
+
+        return source_scan_run(request)
+    if tool == "hammer":
+        from theoremata_tools.hammer import run as hammer_run
+
+        return hammer_run(request)
+    if tool == "rocq_session":
+        from theoremata_tools.rocq_driver import run as rocq_session_run
+
+        return rocq_session_run(request)
+    if tool == "isabelle_session":
+        from theoremata_tools.isabelle_driver import run as isabelle_session_run
+
+        return isabelle_session_run(request)
     raise ValueError(f"unknown tool: {tool}")
 
 
