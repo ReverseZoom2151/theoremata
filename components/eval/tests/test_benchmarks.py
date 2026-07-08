@@ -65,6 +65,8 @@ _CORPUS_GLOB = {
     "putnam_artifacts": "aristotle_putnam25-main",
     "formulationbench": "flare-main",
     "imo_proofbench": "DeepSeek-Math-V2-main",
+    "imo_answerbench": "IMO-Bench-main",
+    "imo_gradingbench": "IMO-Bench-main",
     "zero_to_qed": "zero-to-qed-main",
     "lean_tactics_kb": "zero-to-qed-main",
 }
@@ -94,7 +96,7 @@ def test_registry_lists_all_tracks():
         "proof_grading",
         "tactic_reference",
     }
-    assert len(ALL_NAMES) == 28
+    assert len(ALL_NAMES) == 30
 
 
 def test_load_unknown_benchmark_raises():

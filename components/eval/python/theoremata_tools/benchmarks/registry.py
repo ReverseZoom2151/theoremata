@@ -46,6 +46,8 @@ _TRACK_KIND = {
     "putnam_artifacts": ("external_artifact", "external_artifact"),
     "formulationbench": ("reformulation", "reformulation"),
     "imo_proofbench": ("proof_grading", "proof_grading"),
+    "imo_answerbench": ("nl_answer", "nl_answer"),
+    "imo_gradingbench": ("proof_grading", "proof_grading"),
     "zero_to_qed": ("formalization", "formalization"),
     "lean_tactics_kb": ("tactic_reference", "tactic_reference"),
 }

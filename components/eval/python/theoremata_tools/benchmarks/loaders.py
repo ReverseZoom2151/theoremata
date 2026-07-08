@@ -1090,6 +1090,270 @@ def load_imo_proofbench() -> list[dict[str, Any]]:
 
 
 # ===========================================================================
+# IMO-Bench — AnswerBench (verifiable-answer) + GradingBench (autograder cal.)
+# ===========================================================================
+#
+# The IMO-Bench suite (Luong et al., Google DeepMind, EMNLP 2025;
+# https://imobench.github.io) ships three tracks. IMO-ProofBench is loaded
+# above (it happens to be re-released inside DeepSeek-Math-V2). The other two —
+# IMO-AnswerBench (400 perturbed short-answer problems) and IMO-GradingBench
+# (1000 human-graded 0-7 solutions) — are loaded here from a vendored IMO-Bench
+# corpus. As with every loader these are ingested purely by glob and degrade to
+# ``[]`` when the corpus is absent. All record text is treated as untrusted.
+
+# Robustification / perturbation families used by IMO-AnswerBench (paper §2.2).
+_ANSWERBENCH_PERTURBATIONS = (
+    "paraphrase",
+    "rename",
+    "resubstitute",
+    "distractor",
+    "renumber",
+    "reformulate",
+    "original",
+)
+
+# corpus answer_type -> the grade route understood by grade_answer_match.
+_ANSWERBENCH_KIND_ROUTE = {
+    "integer": "integer",
+    "int": "integer",
+    "count": "integer",
+    "numeric": "symbolic",
+    "number": "symbolic",
+    "real": "symbolic",
+    "expression": "symbolic",
+    "algebraic": "symbolic",
+    "symbolic": "symbolic",
+    "relation": "relation",
+    "set": "set",
+    "list": "list",
+    "tuple": "list",
+    "string": "string",
+    "text": "string",
+}
+
+
+def _answerbench_answer_kind(rec: dict[str, Any], answer: str) -> str:
+    """Pick the answer-matching route for an AnswerBench record.
+
+    Honour an explicit ``answer_type``/``answer_kind`` field; otherwise infer a
+    conservative default (a bare integer grades as ``integer``, anything else as
+    ``symbolic`` so numeric/format variation still matches)."""
+    declared = str(
+        rec.get("answer_type") or rec.get("answer_kind") or rec.get("type") or ""
+    ).strip().lower()
+    if declared in _ANSWERBENCH_KIND_ROUTE:
+        return _ANSWERBENCH_KIND_ROUTE[declared]
+    stripped = (answer or "").strip().lstrip("+-")
+    if stripped.isdigit():
+        return "integer"
+    return "symbolic"
+
+
+def _norm_perturbation(value: Any) -> str | None:
+    if value is None:
+        return None
+    p = str(value).strip().lower()
+    return p or None
+
+
+def load_imo_answerbench() -> list[dict[str, Any]]:
+    """IMO-AnswerBench: 400 Olympiad short-answer problems, each expert/LLM
+    *perturbed* (paraphrase / rename / resubstitute / distractor, per the paper)
+    to defeat memorization. Every problem has a unique verifiable gold answer.
+
+    Kind = ``nl_answer``; grading method = ``answer_match`` so the robust,
+    format-resistant answer matcher (numeric / canonical-string / set-list
+    equivalence) grades it rather than the plain IneqMath symbolic path.
+    """
+    files = find_files(
+        "IMO-Bench-main/**/*answerbench*.jsonl",
+        "IMO-Bench-main/**/*answerbench*.json",
+        "IMO-Bench-main/**/*answer_bench*.jsonl",
+        "IMO-AnswerBench-main/**/*.jsonl",
+        "IMO-AnswerBench-main/**/*.json",
+        "imobench-main/**/*answerbench*.jsonl",
+        "imobench-main/**/*answerbench*.json",
+    )
+    if not files:
+        _log_counts("imo_answerbench", 0, 0, "corpus absent")
+        return []
+    items: list[dict[str, Any]] = []
+    skipped = 0
+    seen: set[str] = set()
+    for path in files:
+        for rec in _read_records(path):
+            if not isinstance(rec, dict):
+                skipped += 1
+                continue
+            problem = rec.get("problem") or rec.get("question")
+            answer = rec.get("answer")
+            if answer is None:
+                answer = rec.get("gold_answer") or rec.get("final_answer")
+            if not problem or answer is None:
+                skipped += 1
+                continue
+            rid = str(
+                rec.get("id")
+                or rec.get("problem_id")
+                or rec.get("uid")
+                or f"{path.stem}-{len(items)}"
+            )
+            uid = f"imo_answerbench:{rid}"
+            if uid in seen:
+                continue
+            seen.add(uid)
+            answer = str(answer)
+            answer_kind = _answerbench_answer_kind(rec, answer)
+            perturbation = _norm_perturbation(
+                rec.get("perturbation")
+                or rec.get("perturbation_type")
+                or rec.get("robustification")
+            )
+            items.append(
+                make_item(
+                    id=uid,
+                    kind="nl_answer",
+                    informal=str(problem),
+                    expected={
+                        "answer": answer,
+                        "answer_kind": answer_kind,
+                        "choices": rec.get("choices"),
+                        "perturbation": perturbation,
+                        "original_problem": rec.get("original_problem")
+                        or rec.get("original"),
+                        "category": rec.get("category"),
+                        "difficulty": rec.get("difficulty"),
+                    },
+                    grading={
+                        "track": "answer_match",
+                        "method": "answer_match",
+                        "answer_kind": answer_kind,
+                    },
+                    provenance={
+                        "corpus": "imo_answerbench",
+                        "perturbation": perturbation,
+                        "category": rec.get("category"),
+                        "difficulty": rec.get("difficulty"),
+                        "source": rec.get("source"),
+                        "path": rel(path),
+                    },
+                )
+            )
+    _log_counts("imo_answerbench", len(items), skipped, "perturbed short-answer")
+    return items
+
+
+# Paper 4-way rubric: Correct=7, Almost=6, Partial=1, Incorrect=0 (humans may
+# use any integer 0-7). Used to derive a gold bucket label from the human grade.
+_GRADE_CANON_POINTS: tuple[tuple[int, str], ...] = (
+    (0, "incorrect"),
+    (1, "partial"),
+    (6, "almost"),
+    (7, "correct"),
+)
+
+
+def _grade_bucket_label(value: float | None) -> str | None:
+    """Map a 0-7 grade to the nearest 4-way rubric bucket."""
+    if value is None:
+        return None
+    return min(_GRADE_CANON_POINTS, key=lambda p: abs(p[0] - value))[1]
+
+
+def load_imo_gradingbench() -> list[dict[str, Any]]:
+    """IMO-GradingBench: ~1000 (problem, proposed solution, human grade 0-7)
+    triples for training/evaluating auto-graders. Minimal-context by design
+    (problem + solution only; usually no reference solution / no guidelines).
+
+    Kind = ``proof_grading`` (grade the grader, not the proof); grading method =
+    ``grading_correlation`` so the autograder-vs-human agreement grader scores a
+    proposed grade against the gold human grade. Ties into proof_calibration.
+    """
+    files = find_files(
+        "IMO-Bench-main/**/*gradingbench*.jsonl",
+        "IMO-Bench-main/**/*gradingbench*.json",
+        "IMO-Bench-main/**/*grading_bench*.jsonl",
+        "IMO-GradingBench-main/**/*.jsonl",
+        "IMO-GradingBench-main/**/*.json",
+        "imobench-main/**/*gradingbench*.jsonl",
+        "imobench-main/**/*gradingbench*.json",
+    )
+    if not files:
+        _log_counts("imo_gradingbench", 0, 0, "corpus absent")
+        return []
+    items: list[dict[str, Any]] = []
+    skipped = 0
+    seen: set[str] = set()
+    for path in files:
+        for rec in _read_records(path):
+            if not isinstance(rec, dict):
+                skipped += 1
+                continue
+            problem = rec.get("problem") or rec.get("question")
+            solution = (
+                rec.get("solution")
+                or rec.get("proposed_solution")
+                or rec.get("candidate_solution")
+                or rec.get("proof")
+            )
+            human = _as_int(
+                rec.get("human_grade")
+                if rec.get("human_grade") is not None
+                else rec.get("human_rating")
+                if rec.get("human_rating") is not None
+                else rec.get("grade")
+            )
+            if not problem or not solution or human is None:
+                skipped += 1
+                continue
+            rid = str(
+                rec.get("id")
+                or rec.get("problem_id")
+                or rec.get("uid")
+                or f"{path.stem}-{len(items)}"
+            )
+            uid = f"imo_gradingbench:{rid}"
+            if uid in seen:
+                continue
+            seen.add(uid)
+            items.append(
+                make_item(
+                    id=uid,
+                    kind="proof_grading",
+                    informal=str(problem),
+                    formal=None,
+                    expected={
+                        "mode": "grading_bench_calibration",
+                        "proposed_solution": str(solution),
+                        # gold human grade (IMO 0-7 points scale) + rubric bucket
+                        "gold_human_rating": human,
+                        "gold_scale": "0-7",
+                        "gold_bucket": _grade_bucket_label(float(human)),
+                        # usually absent (minimal-context grading) but kept if shipped
+                        "reference_solution": rec.get("reference_solution", ""),
+                        "grading_guidelines": rec.get("grading_guidelines")
+                        or rec.get("grading guidelines", ""),
+                        "category": rec.get("category"),
+                        "source": rec.get("source"),
+                    },
+                    grading={
+                        "track": "proof_grading",
+                        "method": "grading_correlation",
+                        "category": rec.get("category"),
+                    },
+                    provenance={
+                        "corpus": "imo_gradingbench",
+                        "category": rec.get("category"),
+                        "source": rec.get("source"),
+                        "path": rel(path),
+                    },
+                )
+            )
+    _log_counts("imo_gradingbench", len(items), skipped, "human-graded solutions")
+    return items
+
+
+# ===========================================================================
 # Classic-math proof-completion bench (zero-to-qed)
 # ===========================================================================
 
@@ -1273,6 +1537,8 @@ LOADERS: dict[str, Callable[[], list[dict[str, Any]]]] = {
     "putnam_artifacts": load_putnam_artifacts,
     "formulationbench": load_formulationbench,
     "imo_proofbench": load_imo_proofbench,
+    "imo_answerbench": load_imo_answerbench,
+    "imo_gradingbench": load_imo_gradingbench,
     "zero_to_qed": load_zero_to_qed,
     "lean_tactics_kb": load_lean_tactics_kb,
 }

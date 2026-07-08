@@ -707,6 +707,222 @@ def grade_proof_grading(item: dict[str, Any], response: Any) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# IMO-AnswerBench — robust verifiable-answer matching
+# --------------------------------------------------------------------------- #
+
+# corpus answer_kind -> matcher route
+_ANSWER_MATCH_ROUTE = {
+    "integer": "integer",
+    "relation": "relation",
+    "symbolic": "symbolic",
+    "bound": "symbolic",
+    "set": "set",
+    "list": "list",
+    "string": "string",
+}
+
+
+def _unbox_answer(s: str) -> str:
+    """Strip ``$`` and unwrap a single ``\\boxed{…}``/``\\text{…}`` wrapper while
+    preserving case and operators, so the value stays sympy-parseable."""
+    s = (s or "").strip()
+    for junk in ("$", "\\left", "\\right", "\\,", "\\!"):
+        s = s.replace(junk, "")
+    s = s.strip()
+    for wrapper in (r"\\boxed\{(.*)\}$", r"\\text\{(.*)\}$", r"\\mathrm\{(.*)\}$"):
+        m = re.match(wrapper, s)
+        if m:
+            s = m.group(1).strip()
+    return s.rstrip(".").strip()
+
+
+def _canon_answer_string(s: str) -> str:
+    """Format-resistant canonical form of a scalar answer: drop ``$``/spaces,
+    unwrap a single ``\\boxed{…}``/``\\text{…}`` and outer braces, lowercase."""
+    s = (s or "").strip()
+    for junk in ("$", "\\left", "\\right", "\\,", "\\!", "\\ ", " "):
+        s = s.replace(junk, "")
+    for wrapper in (r"\\boxed\{(.*)\}$", r"\\text\{(.*)\}$", r"\\mathrm\{(.*)\}$"):
+        m = re.match(wrapper, s)
+        if m:
+            s = m.group(1)
+    return s.strip().strip("{}").rstrip(".").lower()
+
+
+def _canon_answer_set(s: str, ordered: bool) -> list[str]:
+    """Canonical form of a set/list answer: strip brackets, split on ``,``/``;``,
+    canonicalize each element; sort unless the answer is order-sensitive."""
+    inner = _canon_answer_string(s)
+    inner = inner.strip("{}[]()")
+    parts = [_canon_answer_string(p) for p in re.split(r"[,;]", inner) if p.strip()]
+    return parts if ordered else sorted(parts)
+
+
+def grade_answer_match(item: dict[str, Any], response: Any) -> dict[str, Any]:
+    """Robust answer-matching grader for the verifiable-answer track.
+
+    Extracts the final answer from ``response`` and judges semantic/format
+    equivalence to the gold answer — numeric/symbolic (0.5 == 1/2 but 6.28 !=
+    2*pi), canonical-string, or set/list equivalence — resistant to ``$``,
+    ``\\boxed{…}``, spacing and (for sets) ordering. No partial credit.
+    """
+    expected = item.get("expected") or {}
+    gold = str(expected.get("answer", ""))
+    answer_kind = expected.get("answer_kind") or item.get("grading", {}).get(
+        "answer_kind", "symbolic"
+    )
+    route = _ANSWER_MATCH_ROUTE.get(answer_kind, "symbolic")
+
+    text = response if isinstance(response, str) else str(response or "")
+    extracted = base_grader.extract_answer(text)
+    pred = extracted if extracted is not None else text.strip()
+    is_solved = bool(pred.strip())
+
+    if route in ("set", "list"):
+        ordered = route == "list"
+        gold_c = _canon_answer_set(gold, ordered)
+        pred_c = _canon_answer_set(pred, ordered)
+        is_correct = bool(gold_c) and gold_c == pred_c
+        method = f"canonical_{route}"
+    elif route == "string":
+        gold_c, pred_c = _canon_answer_string(gold), _canon_answer_string(pred)
+        is_correct = bool(gold_c) and gold_c == pred_c
+        method = "canonical_string"
+    else:  # integer / relation / symbolic
+        gold_c, pred_c = _canon_answer_string(gold), _canon_answer_string(pred)
+        if gold_c and gold_c == pred_c:
+            is_correct, method = True, "canonical_string"
+        else:
+            verdict = base_grader.grade_answer(
+                _unbox_answer(gold), _unbox_answer(pred), route
+            )
+            is_correct, method = bool(verdict["correct"]), verdict["method"]
+
+    return {
+        "is_solved": is_solved,
+        "is_correct": bool(is_correct and is_solved),
+        "detail": {
+            "track": "answer_match",
+            "method": method,
+            "answer_kind": answer_kind,
+            "gold": gold,
+            "extracted": pred,
+            "perturbation": expected.get("perturbation"),
+        },
+    }
+
+
+# --------------------------------------------------------------------------- #
+# IMO-GradingBench — autograder-vs-human agreement
+# --------------------------------------------------------------------------- #
+
+# Paper 4-way rubric: Correct=7, Almost=6, Partial=1, Incorrect=0.
+_GRADE_LABEL_POINTS = {"incorrect": 0, "partial": 1, "almost": 6, "correct": 7}
+_GRADE_CANON_POINTS: tuple[tuple[int, str], ...] = (
+    (0, "incorrect"),
+    (1, "partial"),
+    (6, "almost"),
+    (7, "correct"),
+)
+_N_OUT_OF_7 = re.compile(r"(\d+(?:\.\d+)?)\s*(?:/|out\s+of)\s*7", re.IGNORECASE)
+
+
+def _grade_bucket(value: float | None) -> str | None:
+    if value is None:
+        return None
+    return min(_GRADE_CANON_POINTS, key=lambda p: abs(p[0] - value))[1]
+
+
+def _extract_grade(response: Any) -> tuple[str | None, float | None]:
+    """Pull a (label, 0-7 numeric) grade from an autograder response.
+
+    Handles a bare number, a ``{score|grade|rating|points|label|verdict}`` dict,
+    a 4-way rubric label word, ``N out of 7``, a ``\\boxed{N}`` and a trailing
+    number — mirroring IMO-GradingBench's vanilla-prompt output formats.
+    """
+    label: str | None = None
+    val: float | None = None
+    if isinstance(response, (int, float)):
+        val = float(response)
+    elif isinstance(response, dict):
+        for k in ("grade", "score", "rating", "points"):
+            if response.get(k) is not None:
+                try:
+                    val = float(response[k])
+                    break
+                except (TypeError, ValueError):
+                    pass
+        lab = response.get("label") or response.get("verdict")
+        if lab:
+            label = str(lab).strip().lower()
+        response = response.get("text", "") if (val is None and not label) else ""
+
+    text = response if isinstance(response, str) else ""
+    low = text.lower()
+    if label is None and low:
+        hits = [(low.rfind(l), l) for l in _GRADE_LABEL_POINTS if l in low]
+        hits = [(i, l) for i, l in hits if i >= 0]
+        if hits:
+            label = max(hits)[1]
+    if val is None and low:
+        m = _N_OUT_OF_7.search(low)
+        if m:
+            val = float(m.group(1))
+        else:
+            mb = _BOXED_NUM.search(text)
+            if mb:
+                val = float(mb.group(1))
+            else:
+                nums = _ANY_NUM.findall(text)
+                if nums:
+                    val = float(nums[-1])
+    if val is None and label in _GRADE_LABEL_POINTS:
+        val = float(_GRADE_LABEL_POINTS[label])
+    return label, val
+
+
+def grade_grading_correlation(item: dict[str, Any], response: Any) -> dict[str, Any]:
+    """Autograder-calibration grader: does a proposed grade AGREE with the GOLD
+    HUMAN grade? Agreement = same 4-way rubric bucket (Correct/Almost/Partial/
+    Incorrect); also surfaces the 0-7 absolute error (the MAE signal). This is
+    the per-item unit the aggregate 4-way-accuracy / MAE metrics are built from.
+    """
+    expected = item.get("expected") or {}
+    gold_human = expected.get("gold_human_rating")
+    gold_v = None if gold_human is None else float(gold_human)
+    gold_bucket = expected.get("gold_bucket") or _grade_bucket(gold_v)
+
+    pred_label, pred_v = _extract_grade(response)
+    pred_bucket = pred_label if pred_label in _GRADE_LABEL_POINTS else _grade_bucket(
+        pred_v
+    )
+    is_solved = pred_label is not None or pred_v is not None
+    agree = (
+        is_solved
+        and gold_bucket is not None
+        and pred_bucket is not None
+        and pred_bucket == gold_bucket
+    )
+    abs_error = None if (gold_v is None or pred_v is None) else abs(pred_v - gold_v)
+    return {
+        "is_solved": is_solved,
+        "is_correct": bool(agree),
+        "detail": {
+            "track": "proof_grading",
+            "method": "grading_correlation",
+            "gold_human_rating": gold_human,
+            "gold_bucket": gold_bucket,
+            "predicted_raw": pred_v,
+            "predicted_label": pred_label,
+            "predicted_bucket": pred_bucket,
+            "bucket_agreement": bool(agree),
+            "abs_error": abs_error,
+            "scale": "0-7",
+        },
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Tactic reference (retrieval KB)
 # --------------------------------------------------------------------------- #
 
@@ -734,7 +950,14 @@ def grade_tactic_reference(item: dict[str, Any], response: Any) -> dict[str, Any
 # --------------------------------------------------------------------------- #
 
 def grade(item: dict[str, Any], response: Any, **kw: Any) -> dict[str, Any]:
-    """Grade a response against an item, routing by ``item['kind']``."""
+    """Grade a response against an item, routing by ``item['kind']`` (with a
+    grading-``method`` override for the IMO-Bench answer/grading tracks that
+    share the ``nl_answer``/``proof_grading`` kinds)."""
+    method = (item.get("grading") or {}).get("method")
+    if method == "answer_match":
+        return grade_answer_match(item, response)
+    if method == "grading_correlation":
+        return grade_grading_correlation(item, response)
     kind = item.get("kind")
     if kind == "formalization":
         return grade_formalization(item, response if isinstance(response, str) else str(response))
