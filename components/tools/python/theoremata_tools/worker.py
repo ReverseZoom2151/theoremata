@@ -265,6 +265,10 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.flywheel import run as flywheel_run
 
         return flywheel_run(request["request"])
+    if tool == "backend_select":
+        from theoremata_tools.selector import run as backend_select_run
+
+        return backend_select_run(request["request"])
     if tool == "ewc":
         from theoremata_tools.ewc import run as ewc_run
 
