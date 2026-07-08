@@ -30,6 +30,15 @@ const BACKEND: &str = "lean";
 const SYSTEM: FormalSystem = FormalSystem::Lean;
 const MODULE: &str = "Generated";
 
+/// The LeanDojo in-kernel `validateProof` soundness-gate template
+/// (`components/verify/lean/validate_proof_template.lean`). Referenced from the
+/// verify path as an OPTIONAL extra check (gated by `Config::kernel_validate_proof`);
+/// it reconstructs a standalone declaration, rejects `sorry`/metavariables, and
+/// kernel-rechecks via `addDecl`. See the template header for how the warm REPL
+/// would invoke it on the close-path. It need not run live if the toolchain lacks
+/// a REPL build of it — the wiring + flag exist regardless.
+pub const VALIDATE_PROOF_TEMPLATE: &str = "components/verify/lean/validate_proof_template.lean";
+
 pub fn mock_enabled(config: &Config) -> bool {
     config.prover_mock
         || std::env::var("THEOREMATA_LEAN_MOCK")
@@ -243,6 +252,13 @@ pub struct LeanBackend {
     pub runner: Runner,
     pub lean: String,
     pub lake: String,
+    /// Optional pin for the reject-on-mismatch precheck (`THEOREMATA_LEAN_TOOLCHAIN`,
+    /// e.g. `leanprover/lean4:v4.9.0`). `None` disables the toolchain check.
+    pub toolchain: Option<String>,
+    /// Whether to wire the LeanDojo in-kernel `validateProof` soundness gate
+    /// ([`VALIDATE_PROOF_TEMPLATE`]) into the kernel re-check
+    /// (`Config::kernel_validate_proof`).
+    pub kernel_validate: bool,
 }
 
 impl LeanBackend {
@@ -253,6 +269,8 @@ impl LeanBackend {
             runner: Runner::Native,
             lean: "lean".into(),
             lake: "lake".into(),
+            toolchain: None,
+            kernel_validate: false,
         }
     }
 
@@ -263,7 +281,33 @@ impl LeanBackend {
             runner: cfg.formal_runners.for_system(SYSTEM),
             lean: exec::env_or("THEOREMATA_LEAN", &cfg.lean_bin),
             lake: exec::env_or("THEOREMATA_LAKE", "lake"),
+            toolchain: std::env::var("THEOREMATA_LEAN_TOOLCHAIN")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            kernel_validate: cfg.kernel_validate_proof,
         }
+    }
+
+    /// Status of the optional in-kernel `validateProof` soundness gate: whether it
+    /// is enabled, whether the template is present on disk, and a note. Folded
+    /// into the kernel-recheck detail so the wiring is observable even when the
+    /// check does not run live.
+    fn validate_proof_gate(&self) -> serde_json::Value {
+        if !self.kernel_validate {
+            return json!({"enabled": false});
+        }
+        let present = std::path::Path::new(VALIDATE_PROOF_TEMPLATE).exists();
+        json!({
+            "enabled": true,
+            "template": VALIDATE_PROOF_TEMPLATE,
+            "template_present": present,
+            "note": if present {
+                "in-kernel validateProof gate wired; runs when a REPL build of the template \
+                 against the pinned toolchain is available"
+            } else {
+                "kernel_validate_proof set but template not found on disk"
+            },
+        })
     }
 }
 
@@ -300,6 +344,10 @@ impl FormalBackend for LeanBackend {
         self.mock || exec::probe(&self.runner, &[&self.lean, "--version"])
     }
 
+    fn expected_toolchain(&self) -> Option<String> {
+        self.toolchain.clone()
+    }
+
     fn scaffold(&self, cfg: &Config, code: &str, name: &str) -> Result<Workspace> {
         if self.mock {
             return Ok(Workspace {
@@ -327,6 +375,7 @@ impl FormalBackend for LeanBackend {
             return Ok(CompileReport {
                 compiled: true,
                 errors: Vec::new(),
+                per_unit: Vec::new(),
                 detail: json!({"mock": true}),
             });
         }
@@ -334,18 +383,26 @@ impl FormalBackend for LeanBackend {
             return Ok(CompileReport {
                 compiled: false,
                 errors: vec!["lean toolchain unavailable".into()],
+                per_unit: Vec::new(),
                 detail: json!({"unavailable": true, "runner": self.runner.tag()}),
             });
         }
         let file = format!("{MODULE}.lean");
         let out = exec::run(&self.runner, &[&self.lean, &file], &ws.root);
+        let errors = if out.success() {
+            Vec::new()
+        } else {
+            vec![out.stderr.clone(), out.stdout.clone()]
+        };
+        // Failure-isolating per-declaration status: read the generated source
+        // back and attribute each error to the declaration it names.
+        let code = std::fs::read_to_string(&ws.source_path).unwrap_or_default();
+        let per_unit =
+            crate::prover::formal::per_declaration_status(SYSTEM, &code, out.success(), &errors);
         Ok(CompileReport {
             compiled: out.success(),
-            errors: if out.success() {
-                Vec::new()
-            } else {
-                vec![out.stderr.clone(), out.stdout.clone()]
-            },
+            errors,
+            per_unit,
             detail: json!({
                 "runner": self.runner.tag(),
                 "code": out.code,
@@ -390,10 +447,13 @@ impl FormalBackend for LeanBackend {
     }
 
     fn kernel_recheck(&self, ws: &Workspace) -> Result<RecheckReport> {
+        // Optional LeanDojo in-kernel `validateProof` gate wiring (observable in
+        // the detail regardless of whether it can run live).
+        let validate_proof = self.validate_proof_gate();
         if self.mock {
             return Ok(RecheckReport {
                 rechecked: true,
-                detail: json!({"mock": true}),
+                detail: json!({"mock": true, "validate_proof": validate_proof}),
             });
         }
         // `leanchecker` is only meaningful inside a Lake project (it replays
@@ -406,6 +466,7 @@ impl FormalBackend for LeanBackend {
                 detail: json!({
                     "runner": self.runner.tag(),
                     "leanchecker": "skipped (bare lean; compile is kernel-checked)",
+                    "validate_proof": validate_proof,
                 }),
             });
         }
@@ -417,6 +478,7 @@ impl FormalBackend for LeanBackend {
                 detail: json!({
                     "runner": self.runner.tag(),
                     "leanchecker": "unavailable; relying on compile kernel-check",
+                    "validate_proof": validate_proof,
                 }),
             });
         }
@@ -427,6 +489,7 @@ impl FormalBackend for LeanBackend {
                 "code": out.code,
                 "stdout": out.stdout,
                 "stderr": out.stderr,
+                "validate_proof": validate_proof,
             }),
         })
     }

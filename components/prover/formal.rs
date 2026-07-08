@@ -129,13 +129,59 @@ pub struct Workspace {
     pub entry: String,
 }
 
+/// Per-declaration compile status (open-atp `_parse_per_file`): a failure in one
+/// declaration does not mask the rest, so a partially-good artifact is visible
+/// instead of collapsing to one whole-project boolean.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnitStatus {
+    /// The declared theorem/lemma/def name.
+    pub name: String,
+    /// Whether the compiler reported no error referencing this declaration.
+    pub ok: bool,
+}
+
 /// Layer 2b (build): did the source compile, and what errors if not.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompileReport {
     pub compiled: bool,
     pub errors: Vec<String>,
+    /// Failure-isolating per-declaration status (open-atp). Empty when the
+    /// backend does not break the artifact down (mock / single-unit theories),
+    /// so pre-existing serialized reports still load unchanged.
+    #[serde(default)]
+    pub per_unit: Vec<UnitStatus>,
     #[serde(default)]
     pub detail: Value,
+}
+
+/// Result of the reject-on-mismatch PRECHECK (open-atp `check_compatible`): is
+/// the project's pinned toolchain/corpus revision compatible with the backend's
+/// before any compute is spent?
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrecheckReport {
+    pub compatible: bool,
+    /// A human-readable reason when incompatible (empty when compatible).
+    pub reason: String,
+    #[serde(default)]
+    pub detail: Value,
+}
+
+impl PrecheckReport {
+    pub fn ok() -> Self {
+        Self {
+            compatible: true,
+            reason: String::new(),
+            detail: Value::Null,
+        }
+    }
+
+    pub fn reject(reason: impl Into<String>, detail: Value) -> Self {
+        Self {
+            compatible: false,
+            reason: reason.into(),
+            detail,
+        }
+    }
 }
 
 /// Layer 2a: the axioms/oracles the proof depends on, and whether that set is
@@ -179,6 +225,24 @@ pub trait FormalBackend {
     /// the toolchain is absent.
     fn available(&self) -> bool {
         true
+    }
+
+    /// The toolchain/corpus revision this backend is pinned to, when known
+    /// (Lean's `lean-toolchain` string / opam switch / Isabelle heap id). The
+    /// default is `None` (mock backends are pin-agnostic); live backends override
+    /// it so the [`precheck`](FormalBackend::precheck) can reject a mismatch.
+    fn expected_toolchain(&self) -> Option<String> {
+        None
+    }
+
+    /// Reject-on-mismatch PRECHECK (open-atp `check_compatible`), run *before* any
+    /// compute: if the project declares a pinned toolchain that differs from this
+    /// backend's, fail fast rather than deep in a build. The default compares
+    /// [`FormalProject::toolchain`] against [`expected_toolchain`](FormalBackend::expected_toolchain)
+    /// via [`precheck_compat`]; a project that declares nothing, or a backend that
+    /// pins nothing, is treated as compatible.
+    fn precheck(&self, project: Option<&crate::prover::model::FormalProject>) -> PrecheckReport {
+        precheck_compat(self.system(), project, self.expected_toolchain().as_deref())
     }
 
     /// Layer 3: build a project/workspace around `code`.
@@ -389,6 +453,100 @@ pub(crate) fn entry_name(system: FormalSystem, code: &str) -> Option<String> {
     None
 }
 
+/// Reject-on-mismatch compatibility check (open-atp `check_compatible`). Returns
+/// an incompatible report only when BOTH the project and the backend declare a
+/// pin AND they disagree (whitespace-insensitive). A missing pin on either side
+/// is treated as compatible — we never fail-closed on an *unknown* pin, only on a
+/// *known mismatch* (the cheap "do not spend compute on a doomed build" gate).
+pub fn precheck_compat(
+    system: FormalSystem,
+    project: Option<&crate::prover::model::FormalProject>,
+    expected: Option<&str>,
+) -> PrecheckReport {
+    let declared = project
+        .and_then(|p| p.toolchain.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let expected = expected.map(str::trim).filter(|s| !s.is_empty());
+    match (declared, expected) {
+        (Some(d), Some(e)) if d != e => PrecheckReport::reject(
+            format!("{system} toolchain mismatch: project pins `{d}` but backend is `{e}`"),
+            json!({"system": system.as_str(), "declared": d, "expected": e}),
+        ),
+        _ => PrecheckReport {
+            compatible: true,
+            reason: String::new(),
+            detail: json!({
+                "system": system.as_str(),
+                "declared": declared,
+                "expected": expected,
+            }),
+        },
+    }
+}
+
+/// Every declared entry (theorem/lemma/def/…) name in `code`, in source order —
+/// the multi-declaration companion to [`entry_name`], used to attribute compile
+/// errors per declaration (open-atp per-file isolation).
+pub(crate) fn all_entry_names(system: FormalSystem, code: &str) -> Vec<String> {
+    let keywords: &[&str] = match system {
+        FormalSystem::Lean => &["theorem", "lemma", "example", "def"],
+        FormalSystem::Rocq => &[
+            "Theorem",
+            "Lemma",
+            "Corollary",
+            "Proposition",
+            "Example",
+            "Fact",
+            "Remark",
+            "Definition",
+        ],
+        FormalSystem::Isabelle => &["theorem", "lemma", "corollary", "proposition"],
+    };
+    let mut out = Vec::new();
+    for raw in code.lines() {
+        let line = raw.trim_start();
+        for kw in keywords {
+            if let Some(rest) = line.strip_prefix(kw) {
+                if !rest.starts_with(|c: char| c.is_whitespace()) {
+                    continue;
+                }
+                let name: String = rest
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || matches!(c, '_' | '\'' | '.'))
+                    .collect();
+                if !name.is_empty() && !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Failure-isolating per-declaration status (open-atp `_parse_per_file`): mark a
+/// declaration failed when any compiler error message mentions its name, else
+/// passed. When the whole file compiled, every declaration is `ok`. Declarations
+/// not referenced by any error survive even if a *sibling* failed — so a
+/// partially-good artifact is visible rather than collapsing to one boolean.
+pub(crate) fn per_declaration_status(
+    system: FormalSystem,
+    code: &str,
+    compiled: bool,
+    errors: &[String],
+) -> Vec<UnitStatus> {
+    let names = all_entry_names(system, code);
+    let blob = errors.join("\n");
+    names
+        .into_iter()
+        .map(|name| {
+            let ok = compiled || !blob.contains(&name);
+            UnitStatus { name, ok }
+        })
+        .collect()
+}
+
 /// Create (and `create_dir_all`) a unique, canonicalized workspace directory for
 /// a live scaffold under the state dir (`.theoremata/formal/<system>/<uuid>`).
 /// Canonicalization yields an absolute path so WSL/Docker runners can translate
@@ -482,7 +640,17 @@ pub fn live_poll(
     let backend = backend_for(cfg, system, false);
     let code = job.task.stub.clone();
 
-    let (status, verification, message) = if !backend.available() {
+    // Reject-on-mismatch PRECHECK before spending any compute (open-atp): a
+    // project whose pinned toolchain disagrees with the backend fails fast.
+    let precheck = backend.precheck(Some(&job.task.formal_project));
+
+    let (status, verification, message) = if !precheck.compatible {
+        (
+            ProverJobStatus::Error,
+            None,
+            format!("precheck rejected: {}", precheck.reason),
+        )
+    } else if !backend.available() {
         (
             ProverJobStatus::Error,
             None,
@@ -539,6 +707,7 @@ pub fn live_poll(
             "mock": false,
             "runner": cfg.formal_runners.for_system(system).tag(),
             "poll_count": job.poll_count,
+            "precheck": precheck,
         }),
     };
 
@@ -567,4 +736,65 @@ pub fn live_poll(
         json!({"job_id": job.id, "status": status, "live": true}),
     )?;
     Ok(job)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::prover::model::FormalProject;
+
+    fn project_with_toolchain(system: FormalSystem, toolchain: Option<&str>) -> FormalProject {
+        FormalProject {
+            system,
+            root: PathBuf::from("."),
+            toolchain: toolchain.map(str::to_owned),
+            imports: Vec::new(),
+            metadata: json!({}),
+        }
+    }
+
+    #[test]
+    fn precheck_rejects_only_a_known_mismatch() {
+        let sys = FormalSystem::Lean;
+        // Both sides pinned and disagree -> reject.
+        let p = project_with_toolchain(sys, Some("leanprover/lean4:v4.9.0"));
+        let r = precheck_compat(sys, Some(&p), Some("leanprover/lean4:v4.10.0"));
+        assert!(!r.compatible);
+        assert!(r.reason.contains("mismatch"));
+
+        // Agreeing pins -> compatible.
+        let r = precheck_compat(sys, Some(&p), Some("leanprover/lean4:v4.9.0"));
+        assert!(r.compatible);
+
+        // Unknown on either side -> never fail-closed.
+        let none = project_with_toolchain(sys, None);
+        assert!(precheck_compat(sys, Some(&none), Some("leanprover/lean4:v4.9.0")).compatible);
+        assert!(precheck_compat(sys, Some(&p), None).compatible);
+        assert!(precheck_compat(sys, None, None).compatible);
+    }
+
+    #[test]
+    fn per_declaration_status_isolates_a_single_failure() {
+        let code = "theorem good : True := trivial\ntheorem bad : False := by sorry\n";
+        let errors = vec!["error: Generated.lean:2:0: unsolved goals in `bad`".to_string()];
+        let status = per_declaration_status(FormalSystem::Lean, code, false, &errors);
+        assert_eq!(status.len(), 2);
+        // `good` is untouched by the error; only `bad` is failed.
+        assert!(status.iter().any(|u| u.name == "good" && u.ok));
+        assert!(status.iter().any(|u| u.name == "bad" && !u.ok));
+    }
+
+    #[test]
+    fn per_declaration_status_all_ok_when_compiled() {
+        let code = "theorem a : True := trivial\nlemma b : True := trivial\n";
+        let status = per_declaration_status(FormalSystem::Lean, code, true, &[]);
+        assert_eq!(status.len(), 2);
+        assert!(status.iter().all(|u| u.ok));
+    }
+
+    #[test]
+    fn all_entry_names_lists_declarations_in_order() {
+        let code = "theorem foo : True := trivial\nlemma bar : True := trivial\n";
+        assert_eq!(all_entry_names(FormalSystem::Lean, code), vec!["foo", "bar"]);
+    }
 }

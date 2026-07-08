@@ -23,6 +23,14 @@ pub fn verify_lean_round_trip(
     expected_statement: &str,
 ) -> Result<VerificationReport> {
     let guard = statement_guard::guard_lean_round_trip(before_src, after_src);
+    // Statement-guard RESTORE (open-atp / Numina): when a header drifted or was
+    // deleted, compute the restored-to-snapshot source rather than only
+    // rejecting, so a caller can recover the original statement.
+    let restore = if guard.preserved {
+        None
+    } else {
+        Some(statement_guard::restore_statements(before_src, after_src))
+    };
     let py = PythonCheck::new();
     let lexical = if py.available() {
         let resp = py.run(json!({"tool": "lean_soundness", "text": after_src}))?;
@@ -66,6 +74,7 @@ pub fn verify_lean_round_trip(
             "expected_statement": expected_statement,
             "hardening_enabled": config.harden_proofs,
             "statement_guard": statement_guard::guard_report_json(&guard),
+            "statement_restore": restore,
         }),
     })
 }

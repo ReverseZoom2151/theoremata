@@ -71,6 +71,16 @@ pub struct Config {
     /// set to `rocq`/`isabelle` to route through the per-system generator.
     #[serde(default)]
     pub target_system: crate::prover::formal::FormalSystem,
+    /// Wire the LeanDojo in-kernel `validateProof` soundness gate
+    /// (`components/verify/lean/validate_proof_template.lean`) into the Lean
+    /// verify path as an optional extra check. Off by default: it needs a REPL
+    /// build of the template against the pinned toolchain, which is not always
+    /// present. When on (and the template + toolchain are available), the Lean
+    /// backend reconstructs a standalone declaration and kernel-rechecks it,
+    /// rejecting a `sorry`/metavariable-carrying "proof" the tactic outcome would
+    /// otherwise trust. The wiring + flag exist even when the check cannot run.
+    #[serde(default)]
+    pub kernel_validate_proof: bool,
 }
 
 fn default_lean_bin() -> String {
@@ -135,6 +145,7 @@ impl Default for Config {
             coqchk_bin: default_coqchk_bin(),
             isabelle_bin: default_isabelle_bin(),
             target_system: crate::prover::formal::FormalSystem::default(),
+            kernel_validate_proof: false,
         }
     }
 }

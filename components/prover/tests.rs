@@ -191,6 +191,65 @@ fn formal_system_from_str_and_display() {
 }
 
 #[test]
+fn lean_backend_precheck_rejects_toolchain_mismatch() {
+    use crate::prover::formal::backend_for;
+    use crate::prover::model::FormalProject;
+    // A Lean backend pinned to one toolchain rejects a project pinned to another
+    // BEFORE any compute (open-atp reject-on-mismatch).
+    let mut backend = lean::LeanBackend::mock();
+    backend.toolchain = Some("leanprover/lean4:v4.9.0".into());
+    let project = FormalProject {
+        system: FormalSystem::Lean,
+        root: std::path::PathBuf::from("."),
+        toolchain: Some("leanprover/lean4:v4.10.0".into()),
+        imports: Vec::new(),
+        metadata: json!({}),
+    };
+    let report = backend.precheck(Some(&project));
+    assert!(!report.compatible);
+    assert!(report.reason.contains("mismatch"));
+
+    // A mock backend with no pin (the default) is always compatible — existing
+    // behavior is unchanged.
+    let cfg = Config::default();
+    let plain = backend_for(&cfg, FormalSystem::Lean, true);
+    assert!(plain.precheck(Some(&project)).compatible);
+}
+
+#[test]
+fn lean_mock_compile_reports_per_declaration_status() {
+    use crate::prover::formal::FormalBackend;
+    let backend = lean::LeanBackend::mock();
+    let cfg = Config::default();
+    // The mock compile is a whole-file success; per_unit stays empty (single-unit
+    // semantics), and the report round-trips through serde with the new field.
+    let ws = backend
+        .scaffold(&cfg, "theorem t : True := trivial", "t")
+        .unwrap();
+    let report = backend.compile(&ws).unwrap();
+    assert!(report.compiled);
+    let json = serde_json::to_string(&report).unwrap();
+    let back: crate::prover::formal::CompileReport = serde_json::from_str(&json).unwrap();
+    assert!(back.per_unit.is_empty());
+}
+
+#[test]
+fn kernel_validate_flag_plumbs_and_template_exists() {
+    // The config flag flows into the live Lean backend, and the referenced
+    // LeanDojo template is present on disk (Task 4 wiring).
+    let mut cfg = Config::default();
+    assert!(!cfg.kernel_validate_proof, "off by default");
+    cfg.kernel_validate_proof = true;
+    let backend = lean::LeanBackend::live(&cfg);
+    assert!(backend.kernel_validate);
+    assert!(
+        std::path::Path::new(lean::VALIDATE_PROOF_TEMPLATE).exists(),
+        "validate_proof_template.lean must exist at {}",
+        lean::VALIDATE_PROOF_TEMPLATE
+    );
+}
+
+#[test]
 fn lean_project_alias_deserializes() {
     // Old serialized ProofTask used `lean_project` and had no `system` field.
     let legacy = json!({

@@ -66,6 +66,15 @@ pub struct CritiqueFinding {
     /// The itemized adversarial checks the critic attached to this finding
     /// (degenerate cases, boundary values, citation-status probes, …).
     pub adversarial_checks: Vec<String>,
+    /// DeepSeek-Math-V2 `R_meta`: whether the "verify-the-verifier" meta pass
+    /// AFFIRMED that this claimed defect actually exists. A finding only gates a
+    /// node rejection/taint when `confirmed` — an unconfirmed finding is retained
+    /// for audit but treated as a possible critic hallucination.
+    #[serde(default)]
+    pub confirmed: bool,
+    /// The meta-verifier's one-line reason for the confirm/deny decision.
+    #[serde(default)]
+    pub meta_reason: Option<String>,
 }
 
 /// A finding the meta-critic judged a false positive, kept with its reason so
@@ -84,6 +93,25 @@ pub struct CritiqueReport {
     /// False positives the meta-critic removed (kept for audit).
     pub pruned: Vec<PrunedFinding>,
     pub summary: String,
+}
+
+impl CritiqueReport {
+    /// The findings whose defect the meta-verifier CONFIRMED — the only findings
+    /// allowed to drive a node rejection/taint (DeepSeek `R_V` gate).
+    pub fn confirmed_findings(&self) -> Vec<&CritiqueFinding> {
+        self.findings.iter().filter(|f| f.confirmed).collect()
+    }
+
+    /// Whether `node_id` should be REJECTED: it carries at least one confirmed
+    /// `CriticalError`. Justification gaps (assume-and-continue) and unconfirmed
+    /// findings never reject a node on their own.
+    pub fn should_reject_node(&self, node_id: &str) -> bool {
+        self.findings.iter().any(|f| {
+            f.confirmed
+                && f.class == FindingClass::CriticalError
+                && f.node_id.as_deref() == Some(node_id)
+        })
+    }
 }
 
 pub struct Critic<'a> {
@@ -190,6 +218,8 @@ impl Critic<'_> {
                     class,
                     issue,
                     adversarial_checks,
+                    confirmed: false,
+                    meta_reason: None,
                 });
             }
         }
@@ -197,6 +227,13 @@ impl Critic<'_> {
         // Meta-critic: prune false-positive bug reports before they drive a
         // rewrite. Only real (surviving) findings are grounded onto nodes.
         let (retained, pruned) = self.meta_review(findings)?;
+
+        // Verify-the-verifier (DeepSeek-Math-V2 `R_meta`): before any surviving
+        // finding is allowed to reject/taint a node, a META pass audits whether
+        // the claimed defect ACTUALLY exists. A finding is marked `confirmed`
+        // only when the meta-check affirms it; unconfirmed findings stay for
+        // audit but do not gate node rejection.
+        let retained = self.meta_verify_findings(retained)?;
 
         // Ground each surviving finding: one that names a real node becomes
         // evidence on that node; anything else is logged as a project-level
@@ -210,6 +247,8 @@ impl Critic<'_> {
                 "class": finding.class,
                 "issue": finding.issue,
                 "adversarial_checks": finding.adversarial_checks,
+                "confirmed": finding.confirmed,
+                "meta_reason": finding.meta_reason,
             });
             match &finding.node_id {
                 Some(id) if node_ids.contains(id.as_str()) => {
@@ -338,6 +377,104 @@ impl Critic<'_> {
         }
         Ok((retained, pruned))
     }
+
+    /// Verify-the-verifier meta pass (DeepSeek-Math-V2 §2.2, `R_meta`).
+    ///
+    /// A second audit over the *surviving* findings that checks, for each one,
+    /// whether the claimed defect ACTUALLY exists and justifies its severity —
+    /// exactly the exploit the paper closes (a verifier that reports a fake issue
+    /// to look rigorous). Each finding is returned with `confirmed` set only when
+    /// the meta-check affirms the defect; unconfirmed findings are kept (never
+    /// silently dropped — that is `meta_review`'s job) but must not gate a node
+    /// rejection. Fail-safe: when the meta pass returns nothing parseable, every
+    /// finding stays UNCONFIRMED, so an unverifiable critic can never reject a
+    /// node — the anti-hallucination direction.
+    fn meta_verify_findings(&self, findings: Vec<CritiqueFinding>) -> Result<Vec<CritiqueFinding>> {
+        if findings.is_empty() {
+            return Ok(findings);
+        }
+        let indexed: Vec<serde_json::Value> = findings
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                json!({
+                    "index": i,
+                    "node_id": f.node_id,
+                    "severity": f.severity,
+                    "class": f.class,
+                    "issue": f.issue,
+                })
+            })
+            .collect();
+
+        let response = self.provider.complete(&ModelRequest {
+            role: "meta_verifier".into(),
+            task: "You are verifying a verifier (meta-verification). For EACH claimed finding \
+                   below, audit ONLY whether the described defect ACTUALLY exists in the proof \
+                   structure and whether it justifies the stated severity — do NOT introduce new \
+                   issues, and do NOT re-check parts the finding does not claim are wrong. Set \
+                   `defect_exists` true only when the claimed defect is real. A finding is \
+                   `confirmed` iff its defect exists AND (for a critical_error) the error truly \
+                   breaks the logical chain. Give a one-line reason. Be strict: a hallucinated or \
+                   overstated issue must be marked defect_exists=false so it cannot reject a valid \
+                   node."
+                .into(),
+            context: json!({ "findings": indexed }),
+            output_schema: json!({
+                "type": "object",
+                "required": ["verifications"],
+                "properties": {
+                    "verifications": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["index", "defect_exists"],
+                            "properties": {
+                                "index": {"type": "integer"},
+                                "defect_exists": {"type": "boolean"},
+                                "justifies_severity": {"type": "boolean"},
+                                "reason": {"type": "string"}
+                            }
+                        }
+                    }
+                }
+            }),
+        })?;
+
+        // index -> (confirmed, reason). Absent indices stay unconfirmed.
+        let mut verdicts: std::collections::HashMap<usize, (bool, Option<String>)> =
+            std::collections::HashMap::new();
+        if let Some(items) = response.content["verifications"].as_array() {
+            for v in items {
+                let Some(idx) = v["index"].as_u64().map(|n| n as usize) else {
+                    continue;
+                };
+                let exists = v["defect_exists"].as_bool().unwrap_or(false);
+                // `justifies_severity` defaults to true when omitted (the
+                // verifier is only asked to override it downward).
+                let justifies = v["justifies_severity"].as_bool().unwrap_or(true);
+                let reason = v["reason"].as_str().map(str::to_owned);
+                verdicts.insert(idx, (exists && justifies, reason));
+            }
+        }
+
+        let confirmed = findings
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut f)| {
+                if let Some((ok, reason)) = verdicts.remove(&i) {
+                    f.confirmed = ok;
+                    f.meta_reason = reason;
+                } else {
+                    f.confirmed = false;
+                    f.meta_reason =
+                        Some("meta-verifier returned no verdict; treated as unconfirmed".into());
+                }
+                f
+            })
+            .collect();
+        Ok(confirmed)
+    }
 }
 
 #[cfg(test)]
@@ -456,6 +593,79 @@ mod tests {
         fn name(&self) -> &str {
             "test"
         }
+    }
+
+    /// A provider whose findings all survive the false-positive prune, but whose
+    /// meta-verifier CONFIRMS the real critical error and DENIES the hallucinated
+    /// one — exercising the `R_meta` rejection gate.
+    struct MetaVerifyCritic {
+        real_node: String,
+        fake_node: String,
+    }
+    impl ModelProvider for MetaVerifyCritic {
+        fn complete(&self, request: &ModelRequest) -> Result<ModelResponse> {
+            let content = match request.role.as_str() {
+                "adversarial_verifier" => json!({
+                    "findings": [
+                        {"node_id": self.real_node, "severity": "major", "category": "gap",
+                         "class": "critical_error", "issue": "A genuine circular dependency."},
+                        {"node_id": self.fake_node, "severity": "major", "category": "gap",
+                         "class": "critical_error", "issue": "A hallucinated contradiction."}
+                    ],
+                    "summary": "Two findings."
+                }),
+                // Nothing is pruned as an outright false positive here...
+                "meta_critic" => json!({"reviews": []}),
+                // ...but the meta-verifier only CONFIRMS the real defect.
+                "meta_verifier" => json!({
+                    "verifications": [
+                        {"index": 0, "defect_exists": true, "justifies_severity": true,
+                         "reason": "the cycle is real"},
+                        {"index": 1, "defect_exists": false, "justifies_severity": false,
+                         "reason": "no such contradiction exists"}
+                    ]
+                }),
+                _ => json!({}),
+            };
+            Ok(ModelResponse {
+                content,
+                model: "test".into(),
+                provider: "test".into(),
+            })
+        }
+        fn name(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[test]
+    fn meta_verify_gates_node_rejection_on_confirmed_findings() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "t").unwrap();
+        let real = store
+            .add_node(&project.id, NodeKind::Lemma, "real", "R", "test")
+            .unwrap();
+        let fake = store
+            .add_node(&project.id, NodeKind::Lemma, "fake", "F", "test")
+            .unwrap();
+        let critic = Critic {
+            store: &store,
+            provider: &MetaVerifyCritic {
+                real_node: real.id.clone(),
+                fake_node: fake.id.clone(),
+            },
+        };
+        let report = critic.critique(&project.id).unwrap();
+        // Both findings are retained (nothing pruned as a false positive)...
+        assert_eq!(report.findings.len(), 2);
+        // ...but only the meta-confirmed one gates a rejection.
+        assert_eq!(report.confirmed_findings().len(), 1);
+        assert!(report.should_reject_node(&real.id));
+        assert!(!report.should_reject_node(&fake.id));
+        // The confirmed finding carries the meta-verifier's reason.
+        let confirmed = report.confirmed_findings();
+        assert_eq!(confirmed[0].node_id.as_deref(), Some(real.id.as_str()));
+        assert_eq!(confirmed[0].meta_reason.as_deref(), Some("the cycle is real"));
     }
 
     #[test]

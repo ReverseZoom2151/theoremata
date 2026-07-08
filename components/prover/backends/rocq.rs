@@ -314,6 +314,7 @@ impl FormalBackend for RocqBackend {
             return Ok(CompileReport {
                 compiled: true,
                 errors: Vec::new(),
+                per_unit: Vec::new(),
                 detail: json!({"mock": true}),
             });
         }
@@ -321,18 +322,24 @@ impl FormalBackend for RocqBackend {
             return Ok(CompileReport {
                 compiled: false,
                 errors: vec!["rocq toolchain unavailable".into()],
+                per_unit: Vec::new(),
                 detail: json!({"unavailable": true, "runner": self.runner.tag()}),
             });
         }
         let file = format!("{MODULE}.v");
         let out = exec::run(&self.runner, &[&self.coqc, &file], &ws.root);
+        let errors = if out.success() {
+            Vec::new()
+        } else {
+            vec![out.stderr.clone()]
+        };
+        let code = std::fs::read_to_string(&ws.source_path).unwrap_or_default();
+        let per_unit =
+            crate::prover::formal::per_declaration_status(SYSTEM, &code, out.success(), &errors);
         Ok(CompileReport {
             compiled: out.success(),
-            errors: if out.success() {
-                Vec::new()
-            } else {
-                vec![out.stderr.clone()]
-            },
+            errors,
+            per_unit,
             detail: json!({
                 "runner": self.runner.tag(),
                 "code": out.code,

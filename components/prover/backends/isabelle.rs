@@ -337,6 +337,7 @@ impl FormalBackend for IsabelleBackend {
             return Ok(CompileReport {
                 compiled: true,
                 errors: Vec::new(),
+                per_unit: Vec::new(),
                 detail: json!({"mock": true}),
             });
         }
@@ -344,17 +345,23 @@ impl FormalBackend for IsabelleBackend {
             return Ok(CompileReport {
                 compiled: false,
                 errors: vec!["isabelle toolchain unavailable".into()],
+                per_unit: Vec::new(),
                 detail: json!({"unavailable": true, "runner": self.runner.tag()}),
             });
         }
         let out = self.build(ws);
+        let errors = if out.success() {
+            Vec::new()
+        } else {
+            vec![out.stderr.clone()]
+        };
+        let code = std::fs::read_to_string(ws.root.join(&ws.source_path)).unwrap_or_default();
+        let per_unit =
+            crate::prover::formal::per_declaration_status(SYSTEM, &code, out.success(), &errors);
         Ok(CompileReport {
             compiled: out.success(),
-            errors: if out.success() {
-                Vec::new()
-            } else {
-                vec![out.stderr.clone()]
-            },
+            errors,
+            per_unit,
             detail: json!({
                 "runner": self.runner.tag(),
                 "code": out.code,
