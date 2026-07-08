@@ -233,6 +233,14 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.isabelle_driver import run as isabelle_session_run
 
         return isabelle_session_run(request)
+    if tool == "rocq_retrieve":
+        from theoremata_tools.rocq_retrieval import run as rocq_retrieve_run
+
+        return rocq_retrieve_run(request)
+    if tool == "isabelle_retrieve":
+        from theoremata_tools.isabelle_retrieval import run as isabelle_retrieve_run
+
+        return isabelle_retrieve_run(request)
     raise ValueError(f"unknown tool: {tool}")
 
 
