@@ -5,11 +5,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
 from theoremata_tools.flywheel import (  # noqa: E402
     auto_label,
+    canonical_proof,
     coerce_verification,
     dry_run,
     formal_oracle,
     label_dataset,
     majority_confirm,
+    revolution,
     run,
     to_grpo_rows,
     to_sft_rows,
@@ -156,3 +158,49 @@ def test_run_replay_oracle():
     labels = {r["problem"]: r["label"] for r in out["rows"]}
     assert labels["p1"] == 1.0
     assert labels["p2"] == 0.0  # no meta gate in replay -> trusted
+
+
+# --- one full expert-iteration revolution (offline, CPU-only) --------------
+
+def test_revolution_converts_generated_into_verified(tmp_path):
+    # N generated candidates -> K verified labeled examples, one revolution.
+    problems = [{"statement": "a = a"}, {"statement": "b + 0 = b"}, {"statement": "0 <= n"}]
+    path = str(tmp_path / "sft.jsonl")
+    out = revolution(problems, n_candidates=4, jsonl_path=path)
+
+    N = 3 * 4  # 3 problems x 4 candidates each
+    assert out["n_generated"] == N
+    assert out["n_verified"] == 3  # exactly one canonical proof per problem
+    assert abs(out["yield"] - 3 / N) < 1e-9
+
+    # every emitted row is a verified positive in the shared chat-SFT schema
+    assert len(out["sft_rows"]) == 3
+    for row in out["sft_rows"]:
+        assert [m["role"] for m in row["messages"]] == ["user", "assistant"]
+        assert row["meta"]["label"] == 1.0
+
+    # JSONL landed on disk with exactly the verified rows
+    assert out["written"] == 3
+    lines = (tmp_path / "sft.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 3
+
+
+def test_revolution_partial_yield_with_custom_generator():
+    # injectable generator seam: only 'easy' emits its known-good proof.
+    def gen(statement):
+        if statement == "hard":
+            return ["sorry", "also wrong"]
+        return [canonical_proof(statement), "sorry"]
+
+    out = revolution([{"statement": "easy"}, {"statement": "hard"}], generator=gen)
+    assert out["n_generated"] == 4
+    assert out["n_verified"] == 1  # only 'easy' had a verifiable candidate
+    assert out["sft_rows"][0]["messages"][0]["content"] == "easy"
+
+
+def test_revolution_run_op_offline():
+    out = run({"op": "revolution", "problems": [{"statement": "x = x"}], "n_candidates": 3})
+    assert out["ok"] is True
+    assert out["n_generated"] == 3
+    assert out["n_verified"] == 1
+    assert "sft_rows" not in out  # summary omits inline rows unless with_rows

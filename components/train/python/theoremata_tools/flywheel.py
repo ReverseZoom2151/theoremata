@@ -293,6 +293,147 @@ def to_grpo_rows(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Shared chat-SFT JSONL schema.
+#
+# The flywheel PRODUCES this shape (``to_sft_rows`` / ``revolution``) and
+# ``progress_sft.sft_finetune`` CONSUMES it. One JSON object per line::
+#
+#   {"messages": [{"role": "user", "content": <statement>},
+#                 {"role": "assistant", "content": <proof>}],
+#    "meta": {"label": <float>, "hard": <bool>, "provenance": {...}}}
+#
+# This is the single source of truth for the training data contract; keep the
+# producer (here) and the consumer (progress_sft) in lockstep with it.
+# ---------------------------------------------------------------------------
+SFT_SCHEMA = "theoremata.chat-sft.v1"
+
+
+# ---------------------------------------------------------------------------
+# One expert-iteration revolution (offline, CPU-only).
+#
+#   generate candidate proofs -> verify each via a pluggable oracle -> collect
+#   the verified (statement, proof) pairs -> emit SFT-ready JSONL -> report
+#   round metrics (n_generated, n_verified, yield).
+#
+# The generator and the oracle are INJECTABLE SEAMS. The defaults are a
+# deterministic mock generator and a trivial pattern oracle so the whole loop
+# runs -- and is tested -- offline with no model and no GPU. In production the
+# generator is the policy LLM and the oracle is the live Lean/Rocq/Isabelle 3+1
+# verification gate (pass ``formal=True`` with a :func:`formal_oracle`).
+# ---------------------------------------------------------------------------
+
+# A candidate generator: statement -> sequence of candidate proof strings.
+Generator = Callable[[str], Sequence[str]]
+
+
+def canonical_proof(statement: str) -> str:
+    """The single 'known-good' proof string for a statement (mock ground truth).
+    Deterministic and content-addressed by the statement text -- the pattern the
+    default oracle accepts."""
+    return f"by simp -- proves: {statement}"
+
+
+def mock_generator(statement: str, *, n: int = 4) -> list[str]:
+    """Deterministic mock proof generator -- NO model, NO GPU.
+
+    Emits ``n`` candidate proof strings for ``statement``: exactly one is the
+    canonical (known-good) proof, the rest are reproducible distractors the
+    oracle rejects. Fully deterministic given ``(statement, n)`` so the loop's
+    yield is stable across runs. This is the injectable stand-in for the policy
+    LLM's sampled completions."""
+    n = max(n, 1)
+    cands = [canonical_proof(statement)]
+    for i in range(1, n):
+        cands.append(f"sorry -- candidate {i} for: {statement}")
+    return cands[:n]
+
+
+def pattern_oracle(
+    canonical: Callable[[str], str] = canonical_proof,
+) -> VerifyOracle:
+    """A trivial pure-Python verify oracle: score ``1.0`` iff the proof matches
+    the statement's known-good pattern, else ``0.0``. Makes the flywheel testable
+    offline; the real oracle is the live formal 3+1 gate (see module docstring)."""
+
+    def _oracle(problem: str, proof: str) -> float:
+        return 1.0 if proof.strip() == canonical(problem).strip() else 0.0
+
+    return _oracle
+
+
+def revolution(
+    problems: Sequence[dict[str, Any]],
+    *,
+    generator: Optional[Generator] = None,
+    verify_oracle: Optional[VerifyOracle] = None,
+    meta_oracle: Optional[MetaOracle] = None,
+    n_candidates: int = 4,
+    n: int = 1,
+    m: int = 1,
+    k: int = 1,
+    formal: bool = False,
+    threshold: float = 1.0,
+    jsonl_path: Optional[str] = None,
+    round_index: int = 0,
+) -> dict[str, Any]:
+    """Turn ONE full expert-iteration revolution, entirely offline.
+
+    For each problem in ``problems`` (``{statement}`` -- ``problem``/``goal`` also
+    accepted), ``generator`` proposes ``n_candidates`` candidate proofs. Every
+    candidate is auto-labeled by ``verify_oracle`` via the DeepSeek recipe
+    (:func:`label_dataset`); candidates whose label is ``>= threshold`` become
+    verified SFT positives, emitted in the shared :data:`SFT_SCHEMA` chat shape
+    (optionally written to ``jsonl_path``).
+
+    With the defaults (:func:`mock_generator` + :func:`pattern_oracle`) the loop
+    is a real closed cycle that needs no model and no GPU. Returns
+    ``{ok, schema, round, n_problems, n_generated, n_verified, yield,
+    distribution, sft_rows, jsonl_path, written}``.
+    """
+    gen: Generator = generator or (lambda s: mock_generator(s, n=n_candidates))
+    oracle: VerifyOracle = verify_oracle or pattern_oracle()
+
+    items: list[dict[str, Any]] = []
+    for prob in problems:
+        statement = str(
+            prob.get("statement", prob.get("problem", prob.get("goal", "")))
+        )
+        for cand in gen(statement):
+            items.append({"problem": statement, "proof": str(cand)})
+
+    n_generated = len(items)
+    labeled = label_dataset(
+        items,
+        oracle,
+        meta_oracle=meta_oracle,
+        n=n,
+        m=m,
+        k=k,
+        formal=formal,
+    )
+    sft_rows = to_sft_rows(labeled["rows"], threshold=threshold)
+    n_verified = len(sft_rows)
+
+    written: Optional[int] = None
+    if jsonl_path is not None:
+        written = write_jsonl(sft_rows, jsonl_path)
+
+    return {
+        "ok": True,
+        "schema": SFT_SCHEMA,
+        "round": round_index,
+        "n_problems": len(problems),
+        "n_generated": n_generated,
+        "n_verified": n_verified,
+        "yield": (n_verified / n_generated) if n_generated else 0.0,
+        "distribution": labeled["distribution"],
+        "sft_rows": sft_rows,
+        "jsonl_path": jsonl_path,
+        "written": written,
+    }
+
+
 def dry_run(
     items: Sequence[dict[str, Any]],
     verify_oracle: VerifyOracle,
@@ -370,6 +511,23 @@ def run(request: dict[str, Any]) -> dict[str, Any]:
             result = dict(result)
             result["grpo_rows"] = to_grpo_rows(result["rows"])
         return result
+    if op == "revolution":
+        # Offline mock loop: the default generator + pattern oracle cannot cross
+        # the JSON boundary, so this replays the deterministic mock seams.
+        res = revolution(
+            request.get("problems", request.get("items", [])),
+            n_candidates=int(request.get("n_candidates", 4)),
+            n=int(request.get("n", 1)),
+            m=int(request.get("m", 1)),
+            k=int(request.get("k", 1)),
+            formal=bool(request.get("formal", False)),
+            threshold=float(request.get("threshold", 1.0)),
+            jsonl_path=request.get("jsonl_path"),
+            round_index=int(request.get("round", 0)),
+        )
+        if not request.get("with_rows"):
+            res = {kk: vv for kk, vv in res.items() if kk != "sft_rows"}
+        return res
     raise ValueError(f"unknown op: {op}")
 
 
