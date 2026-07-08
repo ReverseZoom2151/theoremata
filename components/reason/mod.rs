@@ -12,10 +12,11 @@ pub use orchestration::{
     agent, blueprint_run, certification, chat, consolidate, observe, research, team,
 };
 pub use search::{
-    driver, fitness, mcts, minimize, proof_pool, progress, sampler, sampling, subsumption,
-    tactic_outcome, ttc,
+    driver, fitness, goal_cache, mcts, minimize, proof_pool, progress, sampler, sampling,
+    subsumption, tactic_outcome, ttc,
 };
 pub use proving::{
-    blueprint, decompose, falsification, formal_generate, library, portfolio, retry, router, sketch,
+    blueprint, decompose, evolve_sketch, falsification, formal_generate, library, optimize,
+    portfolio, retry, router, sketch,
 };
 pub use critique::{critic, guard, memory, plan_history, taint};
