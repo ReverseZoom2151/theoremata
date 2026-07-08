@@ -273,6 +273,10 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.selector import run as backend_select_run
 
         return backend_select_run(request["request"])
+    if tool == "lean_corpus":
+        from theoremata_tools.lean_corpus import run as lean_corpus_run
+
+        return lean_corpus_run(request["request"])
     if tool == "ewc":
         from theoremata_tools.ewc import run as ewc_run
 
