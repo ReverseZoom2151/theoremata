@@ -17,6 +17,40 @@ use crate::{model::ModelRequest, provider::ModelProvider};
 use anyhow::Result;
 use serde_json::json;
 
+/// Which selection rule the graph driver ([`crate::search::driver`]) uses to
+/// choose the next node to descend into.
+///
+/// Only consumed by the MCGS driver; the closure-driven [`search`] here always
+/// uses plain PUCT. Default is [`SelectionMode::Puct`] so existing behaviour is
+/// unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionMode {
+    /// Classic PUCT: pick the single child with the highest
+    /// `Q + progress_weight·value + c·P·√N_parent/(1+N_child)`.
+    Puct,
+    /// Aristotle-style AND/OR minimax (plan: `docs/paper-mining/aristotle.md`).
+    /// Pick the highest-**UCB** *action* (an OR choice over tactics), then among
+    /// that action's resulting subgoals descend into the **hardest** = lowest-**LCB**
+    /// child (the AND child most likely to sink the whole action).
+    AndOrMinimax,
+}
+
+/// Where a node's action priors come from in the MCGS driver.
+///
+/// Only consumed by the driver. Default [`PriorMode::Progress`] keeps the fixed
+/// per-step progress/prior heuristic, so existing behaviour is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PriorMode {
+    /// Use the prior each [`crate::search::driver::TacticStep`] carries (the
+    /// progress/heuristic weight the expander assigned).
+    Progress,
+    /// Aristotle's *empirical sampled-action distribution*: sample the expander
+    /// `N` times and set each action's prior to the frequency with which it was
+    /// drawn (explicitly **not** sequence logprobs). The `usize` is the sample
+    /// count `N`.
+    EmpiricalSampled(usize),
+}
+
 /// Search budget and PUCT tuning.
 #[derive(Debug, Clone, Copy)]
 pub struct SearchConfig {
@@ -34,6 +68,11 @@ pub struct SearchConfig {
     /// closure returns `0` for every state — so plain [`search`] is unaffected
     /// regardless of this value.
     pub progress_weight: f64,
+    /// Selection rule for the MCGS driver. Default [`SelectionMode::Puct`].
+    pub selection: SelectionMode,
+    /// Where the MCGS driver draws action priors from. Default
+    /// [`PriorMode::Progress`].
+    pub prior_mode: PriorMode,
 }
 
 impl Default for SearchConfig {
@@ -44,6 +83,8 @@ impl Default for SearchConfig {
             expand_k: 4,
             max_depth: 12,
             progress_weight: crate::progress::PROGRESS_PRIOR_WEIGHT,
+            selection: SelectionMode::Puct,
+            prior_mode: PriorMode::Progress,
         }
     }
 }

@@ -25,7 +25,7 @@
 //! its per-goal budget (width/rollouts); with no controller attached it uses the
 //! fixed [`SearchConfig`] budget, exactly like [`crate::search::mcts`].
 
-use super::mcts::SearchConfig;
+use super::mcts::{PriorMode, SearchConfig, SelectionMode};
 use super::ttc::TtcController;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -119,6 +119,12 @@ pub struct DriverResult {
     pub dedup_hits: usize,
     /// `(tactic, visit_count)` for every root child — the distilled policy target.
     pub visit_counts: Vec<(String, usize)>,
+    /// Whether the goal's **negation** was closed before the goal itself — i.e.
+    /// the search found a *disproof* and the goal is false. Only ever `true` when
+    /// negation-augmented search is enabled via
+    /// [`ProofSearchDriver::with_negator`]; always `false` otherwise. A `refuted`
+    /// result is never also `solved`.
+    pub refuted: bool,
 }
 
 /// One node in the search DAG. Values live on the node (shared across all parents
@@ -131,6 +137,88 @@ struct DagNode<S> {
     value_sum: f64,
     edges: Vec<Edge>,
     expanded: bool,
+}
+
+impl<S> DagNode<S> {
+    /// Mean backed-up reward `Q` (`0` when unvisited).
+    fn mean(&self) -> f64 {
+        if self.visits > 0 {
+            self.value_sum / self.visits as f64
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Upper/lower confidence bounds for a child: `mean ± c·√(ln N_parent / N_child)`.
+/// An unvisited child has an infinitely wide interval (`+∞` UCB / `-∞` LCB), so it
+/// is both the most optimistic action and the hardest subgoal until explored.
+fn ucb_lcb(mean: f64, child_visits: usize, parent_visits: usize, c: f64) -> (f64, f64) {
+    if child_visits == 0 {
+        return (f64::INFINITY, f64::NEG_INFINITY);
+    }
+    let radius = c * ((parent_visits.max(1) as f64).ln().max(0.0) / child_visits as f64).sqrt();
+    (mean + radius, mean - radius)
+}
+
+/// AND/OR minimax child selection (Aristotle, `docs/paper-mining/aristotle.md`).
+///
+/// Edges are grouped by tactic text into *actions* (an action's several edges are
+/// its AND-children = the subgoals it produced). Pick the action whose best child
+/// has the highest **UCB** (the optimistic OR choice over tactics), then within
+/// that action descend into the child with the lowest **LCB** — the hardest
+/// subgoal, the one most likely to block the whole action. Deterministic: ties
+/// keep the first edge in encounter order.
+fn and_or_select_child<S>(
+    edges: &[Edge],
+    nodes: &[DagNode<S>],
+    parent_visits: usize,
+    c: f64,
+) -> Option<usize> {
+    if edges.is_empty() {
+        return None;
+    }
+    // Group edges by tactic, preserving first-seen order for determinism.
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut group_of: Vec<(String, usize)> = Vec::new();
+    for e in edges {
+        if let Some((_, gi)) = group_of.iter().find(|(t, _)| *t == e.tactic) {
+            groups[*gi].push(e.child);
+        } else {
+            group_of.push((e.tactic.clone(), groups.len()));
+            groups.push(vec![e.child]);
+        }
+    }
+
+    // Highest-UCB action (OR): an action's optimism is its best child's UCB.
+    let mut best_group: Option<&Vec<usize>> = None;
+    let mut best_ucb = f64::NEG_INFINITY;
+    for children in &groups {
+        let mut group_ucb = f64::NEG_INFINITY;
+        for &ci in children {
+            let (ucb, _) = ucb_lcb(nodes[ci].mean(), nodes[ci].visits, parent_visits, c);
+            if ucb > group_ucb {
+                group_ucb = ucb;
+            }
+        }
+        if group_ucb > best_ucb {
+            best_ucb = group_ucb;
+            best_group = Some(children);
+        }
+    }
+
+    // Hardest subgoal (AND): lowest LCB within the chosen action.
+    let children = best_group?;
+    let mut best_child = None;
+    let mut best_lcb = f64::INFINITY;
+    for &ci in children {
+        let (_, lcb) = ucb_lcb(nodes[ci].mean(), nodes[ci].visits, parent_visits, c);
+        if lcb < best_lcb {
+            best_lcb = lcb;
+            best_child = Some(ci);
+        }
+    }
+    best_child
 }
 
 /// A directed edge: a tactic application from a parent node to a (possibly
@@ -148,6 +236,11 @@ pub struct ProofSearchDriver<E: TacticExpander> {
     cfg: SearchConfig,
     ttc: Option<TtcController>,
     seed: u64,
+    /// Optional negation seam: given a goal state, produce the state whose
+    /// closure *disproves* the goal (the logical negation). When present, the
+    /// driver runs negation-augmented search — a disproof competes for the same
+    /// budget and, if it closes first, the search returns `refuted`.
+    negator: Option<Box<dyn Fn(&E::State) -> Option<E::State>>>,
 }
 
 impl<E: TacticExpander> ProofSearchDriver<E> {
@@ -159,6 +252,7 @@ impl<E: TacticExpander> ProofSearchDriver<E> {
             cfg: SearchConfig::default(),
             ttc: None,
             seed: 0,
+            negator: None,
         }
     }
 
@@ -180,6 +274,23 @@ impl<E: TacticExpander> ProofSearchDriver<E> {
     /// instead of using the fixed [`SearchConfig`] budget.
     pub fn with_ttc(mut self, ttc: TtcController) -> Self {
         self.ttc = Some(ttc);
+        self
+    }
+
+    /// Enable **negation-augmented search** (Aristotle's falsify-inside-the-budget).
+    ///
+    /// `negate(goal)` returns the state whose closure *disproves* `goal` (its
+    /// logical negation), or `None` if the goal cannot be negated. With this set,
+    /// every non-negation node in the DAG is augmented with an extra edge to its
+    /// negation, so a disproof competes for the *same* search budget as the proof.
+    /// If a negation node closes first, the search stops early and the
+    /// [`DriverResult`] is `refuted` (and never `solved`). The seam is injectable
+    /// so a real backend (negate the Lean goal) or a mock plugs into the same API.
+    pub fn with_negator<F>(mut self, negate: F) -> Self
+    where
+        F: Fn(&E::State) -> Option<E::State> + 'static,
+    {
+        self.negator = Some(Box::new(negate));
         self
     }
 
@@ -211,6 +322,9 @@ impl<E: TacticExpander> ProofSearchDriver<E> {
 
         let mut nodes: Vec<DagNode<E::State>> = Vec::new();
         let mut table: HashMap<String, usize> = HashMap::new();
+        // Parallel to `nodes`: is this node on the *disproof* (negation) side?
+        // A closed disproof node means the goal is refuted, not solved.
+        let mut is_neg: Vec<bool> = Vec::new();
 
         let root_key = root.dedup_key();
         let root_closed = root.is_closed();
@@ -224,9 +338,11 @@ impl<E: TacticExpander> ProofSearchDriver<E> {
             edges: Vec::new(),
             expanded: false,
         });
+        is_neg.push(false);
         table.insert(root_key, 0);
 
         let mut solved = root_closed;
+        let mut refuted = false;
         let mut dedup_hits = 0usize;
         let mut edges_created = 0usize;
         let mut iterations = 0usize;
@@ -234,7 +350,7 @@ impl<E: TacticExpander> ProofSearchDriver<E> {
         let base_seed = self.seed;
 
         for _ in 0..iter_budget.max(1) {
-            if solved {
+            if solved || refuted {
                 break;
             }
             iterations += 1;
@@ -252,25 +368,36 @@ impl<E: TacticExpander> ProofSearchDriver<E> {
                 && !nodes[current].edges.is_empty()
                 && depth < max_depth
             {
-                let n_parent = (nodes[current].visits.max(1) as f64).sqrt();
-                let mut best_child: Option<usize> = None;
-                let mut best_score = f64::NEG_INFINITY;
-                for e in &nodes[current].edges {
-                    let c = &nodes[e.child];
-                    let q = if c.visits > 0 {
-                        c.value_sum / c.visits as f64
-                    } else {
-                        0.0
-                    };
-                    let u =
-                        self.cfg.exploration * e.prior * n_parent / (1.0 + c.visits as f64);
-                    // LeanProgress-style value prior, identical to mcts.rs.
-                    let score = q + self.cfg.progress_weight * c.progress + u;
-                    if score > best_score {
-                        best_score = score;
-                        best_child = Some(e.child);
+                let best_child = match self.cfg.selection {
+                    SelectionMode::AndOrMinimax => and_or_select_child(
+                        &nodes[current].edges,
+                        &nodes,
+                        nodes[current].visits,
+                        self.cfg.exploration,
+                    ),
+                    SelectionMode::Puct => {
+                        let n_parent = (nodes[current].visits.max(1) as f64).sqrt();
+                        let mut chosen: Option<usize> = None;
+                        let mut best_score = f64::NEG_INFINITY;
+                        for e in &nodes[current].edges {
+                            let c = &nodes[e.child];
+                            let q = if c.visits > 0 {
+                                c.value_sum / c.visits as f64
+                            } else {
+                                0.0
+                            };
+                            let u = self.cfg.exploration * e.prior * n_parent
+                                / (1.0 + c.visits as f64);
+                            // LeanProgress-style value prior, identical to mcts.rs.
+                            let score = q + self.cfg.progress_weight * c.progress + u;
+                            if score > best_score {
+                                best_score = score;
+                                chosen = Some(e.child);
+                            }
+                        }
+                        chosen
                     }
-                }
+                };
                 let next = match best_child {
                     Some(n) => n,
                     None => break,
@@ -294,14 +421,31 @@ impl<E: TacticExpander> ProofSearchDriver<E> {
                 1.0
             } else {
                 if !nodes[current].expanded {
-                    let seed = mix_seed(base_seed, &nodes[current].state.dedup_key());
-                    let candidates = self.expander.expand(&nodes[current].state, seed);
+                    let cur_is_neg = is_neg[current];
+                    // Candidate priors: either the progress/heuristic weight each
+                    // step carries (default) or Aristotle's empirical sampled-action
+                    // distribution (frequency of each action across N samples).
+                    let candidates = match self.cfg.prior_mode {
+                        PriorMode::Progress => {
+                            let seed = mix_seed(base_seed, &nodes[current].state.dedup_key());
+                            self.expander.expand(&nodes[current].state, seed)
+                        }
+                        PriorMode::EmpiricalSampled(n) => Self::empirical_candidates(
+                            &mut self.expander,
+                            base_seed,
+                            &nodes[current].state,
+                            n.max(1),
+                        ),
+                    };
                     let mut edges = Vec::new();
                     for step in candidates.into_iter().take(expand_k) {
                         let key = step.next.dedup_key();
                         let child = if let Some(&idx) = table.get(&key) {
                             // Transposition: two paths converge onto one node.
                             dedup_hits += 1;
+                            if cur_is_neg {
+                                is_neg[idx] = true;
+                            }
                             idx
                         } else {
                             if nodes.len() >= node_cap {
@@ -321,6 +465,8 @@ impl<E: TacticExpander> ProofSearchDriver<E> {
                                 edges: Vec::new(),
                                 expanded: false,
                             });
+                            // A subgoal inherits the disproof-side flag of its parent.
+                            is_neg.push(cur_is_neg);
                             table.insert(key, idx);
                             idx
                         };
@@ -331,6 +477,49 @@ impl<E: TacticExpander> ProofSearchDriver<E> {
                         });
                         edges_created += 1;
                     }
+
+                    // Negation augmentation: give every proof-side state an extra
+                    // edge to its logical negation so a disproof competes for the
+                    // same budget. Never negate a disproof node (no double negation).
+                    if !cur_is_neg {
+                        if let Some(neg_state) =
+                            self.negator.as_ref().and_then(|f| f(&nodes[current].state))
+                        {
+                            let key = neg_state.dedup_key();
+                            let child = if let Some(&idx) = table.get(&key) {
+                                dedup_hits += 1;
+                                is_neg[idx] = true;
+                                Some(idx)
+                            } else if nodes.len() >= node_cap {
+                                None
+                            } else {
+                                let closed = neg_state.is_closed();
+                                let progress = neg_state.progress();
+                                let idx = nodes.len();
+                                nodes.push(DagNode {
+                                    state: neg_state,
+                                    closed,
+                                    progress,
+                                    visits: 0,
+                                    value_sum: 0.0,
+                                    edges: Vec::new(),
+                                    expanded: false,
+                                });
+                                is_neg.push(true);
+                                table.insert(key, idx);
+                                Some(idx)
+                            };
+                            if let Some(child) = child {
+                                edges.push(Edge {
+                                    tactic: "¬goal (disproof)".into(),
+                                    prior: 1.0,
+                                    child,
+                                });
+                                edges_created += 1;
+                            }
+                        }
+                    }
+
                     nodes[current].edges = edges;
                     nodes[current].expanded = true;
                 }
@@ -339,7 +528,13 @@ impl<E: TacticExpander> ProofSearchDriver<E> {
             };
 
             if leaf_reward >= 1.0 {
-                solved = true;
+                // A closed leaf on the disproof side means the goal is refuted;
+                // on the proof side it means solved.
+                if is_neg[current] {
+                    refuted = true;
+                } else {
+                    solved = true;
+                }
             }
 
             // 4. Backpropagation along the traversed path.
@@ -354,6 +549,11 @@ impl<E: TacticExpander> ProofSearchDriver<E> {
         let mut best_tactic = None;
         let mut best_visits = 0usize;
         for e in &nodes[0].edges {
+            // The injected disproof edge is not a proof tactic — keep it out of the
+            // distilled proof policy / robust-child choice.
+            if is_neg[e.child] {
+                continue;
+            }
             let visits = nodes[e.child].visits;
             visit_counts.push((e.tactic.clone(), visits));
             if visits >= best_visits {
@@ -371,7 +571,49 @@ impl<E: TacticExpander> ProofSearchDriver<E> {
             edges_created,
             dedup_hits,
             visit_counts,
+            refuted,
         }
+    }
+
+    /// Aristotle's empirical sampled-action prior: sample the expander `n` times
+    /// (each with a distinct, deterministically-derived seed) and set each
+    /// action's prior to the frequency with which it was drawn — **not** a fixed
+    /// heuristic weight. Actions keep first-seen order (deterministic), and priors
+    /// sum to `1`. The representative `next` state is taken from the first sample
+    /// that produced the action.
+    fn empirical_candidates(
+        expander: &mut E,
+        base_seed: u64,
+        state: &E::State,
+        n: usize,
+    ) -> Vec<TacticStep<E::State>> {
+        let base_key = state.dedup_key();
+        let mut order: Vec<String> = Vec::new();
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        let mut rep: HashMap<String, TacticStep<E::State>> = HashMap::new();
+        for i in 0..n {
+            let seed = mix_seed(base_seed, &format!("{base_key}#emp#{i}"));
+            for step in expander.expand(state, seed) {
+                let t = step.tactic.clone();
+                if !counts.contains_key(&t) {
+                    order.push(t.clone());
+                    rep.insert(t.clone(), step);
+                }
+                *counts.entry(t).or_insert(0) += 1;
+            }
+        }
+        let total: usize = counts.values().sum();
+        let mut out = Vec::new();
+        if total == 0 {
+            return out;
+        }
+        for t in order {
+            let count = counts[&t];
+            let mut step = rep.remove(&t).expect("representative step for sampled action");
+            step.prior = count as f64 / total as f64;
+            out.push(step);
+        }
+        out
     }
 
     /// Greedy simulation: follow the highest-prior candidate until a closed state
@@ -647,5 +889,189 @@ mod tests {
         let result = starved.run(MockGoal::open("A"));
         assert!(!result.solved, "an exhausted budget must starve the search");
         assert!(result.iterations <= 1);
+    }
+
+    // ---- Feature 1: negation-augmented search (falsify inside the budget) ----
+
+    #[test]
+    fn negation_that_closes_returns_refuted() {
+        // The goal "G" itself never closes (no proving edges). Its negation "¬G"
+        // closes in one step. With a negator wired in, the disproof competes for
+        // the same budget and the search returns `refuted` (goal is false), never
+        // `solved`.
+        let expander = TableExpander::new()
+            // The negated goal proves: ¬G -> closed.
+            .edge("not:G", "close", 1.0, MockGoal::closed("false-witness"));
+        let mut driver = ProofSearchDriver::new(expander)
+            .with_seed(5)
+            .with_negator(|g: &MockGoal| Some(MockGoal::open(&format!("not:{}", g.key))));
+        let result = driver.run(MockGoal::open("G"));
+        assert!(result.refuted, "the disproof should close and refute the goal");
+        assert!(!result.solved, "a refuted goal must never also be solved");
+    }
+
+    #[test]
+    fn unclosable_negation_leaves_proving_unaffected() {
+        // The goal "p2" proves normally (p2 -> p1 -> p0 closed). Its negation
+        // never closes (no edges out of any "not:*"). Enabling the negator must
+        // not disturb the proof: the goal is solved, not refuted.
+        let expander = TableExpander::new()
+            .edge("p2", "close", 1.0, MockGoal::open("p1"))
+            .edge("p1", "close", 1.0, MockGoal::closed("p0"));
+        let mut driver = ProofSearchDriver::new(expander)
+            .with_seed(9)
+            .with_negator(|g: &MockGoal| Some(MockGoal::open(&format!("not:{}", g.key))));
+        let result = driver.run(MockGoal::open("p2"));
+        assert!(result.solved, "an unclosable negation must not block proving");
+        assert!(!result.refuted);
+        assert_eq!(result.best_tactic.as_deref(), Some("close"));
+    }
+
+    #[test]
+    fn no_negator_never_refutes() {
+        // Without a negator the search behaves exactly as before: refuted stays
+        // false even for an unprovable goal.
+        let expander = TableExpander::new().edge("q", "stuck", 1.0, MockGoal::open("q"));
+        let mut driver = ProofSearchDriver::new(expander).with_seed(1).with_config(SearchConfig {
+            max_nodes: 20,
+            ..SearchConfig::default()
+        });
+        let result = driver.run(MockGoal::open("q"));
+        assert!(!result.refuted);
+        assert!(!result.solved);
+    }
+
+    // ---- Feature 2: AND/OR minimax selection ----
+
+    /// Build a leaf DagNode with crafted statistics for selection tests.
+    fn stat_node(key: &str, visits: usize, value_sum: f64) -> DagNode<MockGoal> {
+        DagNode {
+            state: MockGoal::open(key),
+            closed: false,
+            progress: 0.0,
+            visits,
+            value_sum,
+            edges: Vec::new(),
+            expanded: false,
+        }
+    }
+
+    #[test]
+    fn and_or_selection_picks_highest_ucb_action_then_lowest_lcb_child() {
+        // Nodes (index = position): two actions.
+        //  action "A": children 1 (mean 0.9, high) and 2 (mean 0.2, hard).
+        //  action "B": children 3 (mean 0.5) and 4 (mean 0.5).
+        // Same visit count so bounds differ only by mean. Action A has the highest
+        // UCB (via child 1's high mean), so it is chosen; within A the lowest-LCB
+        // (hardest) child is 2.
+        let nodes = vec![
+            stat_node("root", 100, 0.0),        // 0: parent (visits used as N_parent)
+            stat_node("a-easy", 10, 9.0),       // 1: mean 0.9
+            stat_node("a-hard", 10, 2.0),       // 2: mean 0.2
+            stat_node("b1", 10, 5.0),           // 3: mean 0.5
+            stat_node("b2", 10, 5.0),           // 4: mean 0.5
+        ];
+        let edges = vec![
+            Edge { tactic: "A".into(), prior: 1.0, child: 1 },
+            Edge { tactic: "A".into(), prior: 1.0, child: 2 },
+            Edge { tactic: "B".into(), prior: 1.0, child: 3 },
+            Edge { tactic: "B".into(), prior: 1.0, child: 4 },
+        ];
+        let chosen = and_or_select_child(&edges, &nodes, nodes[0].visits, 1.41);
+        assert_eq!(chosen, Some(2), "must descend into action A's hardest child");
+    }
+
+    #[test]
+    fn and_or_bounds_order_correctly() {
+        // A higher-mean child has a higher UCB and a higher LCB than a lower-mean
+        // child at equal visits — the confidence interval just shifts with the mean.
+        let (hi_u, hi_l) = ucb_lcb(0.8, 10, 100, 1.41);
+        let (lo_u, lo_l) = ucb_lcb(0.2, 10, 100, 1.41);
+        assert!(hi_u > lo_u);
+        assert!(hi_l > lo_l);
+        // Unvisited children have an unbounded interval.
+        let (u0, l0) = ucb_lcb(0.0, 0, 100, 1.41);
+        assert!(u0.is_infinite() && u0 > 0.0);
+        assert!(l0.is_infinite() && l0 < 0.0);
+    }
+
+    #[test]
+    fn and_or_minimax_mode_still_solves() {
+        // The new selection mode is a drop-in: a solvable chain still solves.
+        let expander = TableExpander::new()
+            .edge("m2", "close", 1.0, MockGoal::open("m1"))
+            .edge("m1", "close", 1.0, MockGoal::closed("m0"));
+        let mut driver = ProofSearchDriver::new(expander).with_seed(2).with_config(SearchConfig {
+            selection: SelectionMode::AndOrMinimax,
+            ..SearchConfig::default()
+        });
+        let result = driver.run(MockGoal::open("m2"));
+        assert!(result.solved);
+    }
+
+    // ---- Feature 3: empirical sampled-action PUCT prior ----
+
+    /// A seed-sensitive expander: action "a" is always sampled; action "b" is only
+    /// sampled when the seed is divisible by 3. Over many samples "a" is drawn far
+    /// more often than "b", so its empirical prior must be higher.
+    struct SampledExpander;
+    impl TacticExpander for SampledExpander {
+        type State = MockGoal;
+        fn expand(&mut self, state: &MockGoal, seed: u64) -> Vec<TacticStep<MockGoal>> {
+            if state.key != "root" {
+                return Vec::new();
+            }
+            let mut steps = vec![TacticStep::new("a", 0.5, MockGoal::open("sa"))];
+            if seed % 3 == 0 {
+                steps.push(TacticStep::new("b", 0.5, MockGoal::open("sb")));
+            }
+            steps
+        }
+    }
+
+    #[test]
+    fn empirical_prior_reflects_sample_frequency_and_normalizes() {
+        let mut expander = SampledExpander;
+        let steps = ProofSearchDriver::<SampledExpander>::empirical_candidates(
+            &mut expander,
+            123,
+            &MockGoal::open("root"),
+            120,
+        );
+        // Both actions appear.
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].tactic, "a");
+        assert_eq!(steps[1].tactic, "b");
+        // "a" (always sampled) has a strictly higher empirical prior than "b".
+        assert!(
+            steps[0].prior > steps[1].prior,
+            "more-sampled action must get the higher prior ({} vs {})",
+            steps[0].prior,
+            steps[1].prior
+        );
+        // Priors normalize to 1.
+        let sum: f64 = steps.iter().map(|s| s.prior).sum();
+        assert!((sum - 1.0).abs() < 1e-9, "priors must sum to 1 (got {sum})");
+    }
+
+    #[test]
+    fn empirical_prior_mode_is_deterministic_and_solves() {
+        // Two runs with the same seed under the empirical prior mode agree, and a
+        // solvable chain still solves.
+        let build = || {
+            TableExpander::new()
+                .edge("e2", "close", 1.0, MockGoal::open("e1"))
+                .edge("e1", "close", 1.0, MockGoal::closed("e0"))
+        };
+        let cfg = SearchConfig {
+            prior_mode: PriorMode::EmpiricalSampled(8),
+            ..SearchConfig::default()
+        };
+        let mut d1 = ProofSearchDriver::new(build()).with_seed(4).with_config(cfg);
+        let mut d2 = ProofSearchDriver::new(build()).with_seed(4).with_config(cfg);
+        let r1 = d1.run(MockGoal::open("e2"));
+        let r2 = d2.run(MockGoal::open("e2"));
+        assert!(r1.solved);
+        assert_eq!(r1.visit_counts, r2.visit_counts);
     }
 }
