@@ -637,6 +637,99 @@ def grade_reformulation(item: dict[str, Any], response: Any) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# Proof grading / evaluator calibration (IMO-ProofBench)
+# --------------------------------------------------------------------------- #
+
+_BOXED_NUM = re.compile(r"\\boxed\{\s*([0-9]*\.?[0-9]+)\s*\}")
+_ANY_NUM = re.compile(r"-?[0-9]*\.?[0-9]+")
+
+
+def _extract_score(response: Any) -> float | None:
+    """Pull a numeric grade from a grader response (boxed first, else last num)."""
+    if isinstance(response, (int, float)):
+        return float(response)
+    if isinstance(response, dict):
+        for k in ("score", "grade", "rating"):
+            if response.get(k) is not None:
+                try:
+                    return float(response[k])
+                except (TypeError, ValueError):
+                    pass
+        response = response.get("text", "")
+    text = response if isinstance(response, str) else str(response or "")
+    m = _BOXED_NUM.search(text)
+    if m:
+        return float(m.group(1))
+    nums = _ANY_NUM.findall(text)
+    return float(nums[-1]) if nums else None
+
+
+def grade_proof_grading(item: dict[str, Any], response: Any) -> dict[str, Any]:
+    """Evaluator-calibration grader: how close is a proposed grade to the GOLD
+    HUMAN grade? ``response`` is a grader's score (boxed number / dict / float),
+    on either the 0-7 IMO scale or a normalized 0-1 scale. Correct iff the
+    normalized grade lands within tolerance of the normalized human rating.
+    """
+    expected = item.get("expected") or {}
+    gold_human = expected.get("gold_human_rating")
+    tol = 0.15
+    pred_raw = _extract_score(response)
+
+    def _norm(v: float | None) -> float | None:
+        if v is None:
+            return None
+        return v / 7.0 if v > 1.0 else float(v)
+
+    gold_n = _norm(None if gold_human is None else float(gold_human))
+    pred_n = _norm(pred_raw)
+    is_solved = pred_raw is not None
+    is_correct = (
+        is_solved
+        and gold_n is not None
+        and pred_n is not None
+        and abs(pred_n - gold_n) <= tol
+    )
+    return {
+        "is_solved": is_solved,
+        "is_correct": bool(is_correct),
+        "detail": {
+            "track": "proof_grading",
+            "method": "grade_calibration",
+            "gold_human_rating": gold_human,
+            "gold_normalized": gold_n,
+            "predicted_raw": pred_raw,
+            "predicted_normalized": pred_n,
+            "model_auto_rating": expected.get("model_auto_rating"),
+            "abs_error": None if (gold_n is None or pred_n is None) else abs(pred_n - gold_n),
+            "tolerance": tol,
+        },
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Tactic reference (retrieval KB)
+# --------------------------------------------------------------------------- #
+
+def grade_tactic_reference(item: dict[str, Any], response: Any) -> dict[str, Any]:
+    """A tactic-KB entry is a reference, not a task. Grade a response as a
+    lightweight retrieval check: does it name the reference tactic?"""
+    expected = item.get("expected") or {}
+    tactic = str(expected.get("tactic") or "")
+    text = response if isinstance(response, str) else str(response or "")
+    hit = bool(tactic) and tactic.lower() in text.lower()
+    return {
+        "is_solved": bool(text.strip()),
+        "is_correct": hit,
+        "detail": {
+            "track": "tactic_reference",
+            "method": "retrieval_reference",
+            "tactic": tactic,
+            "matched": hit,
+        },
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Dispatch by track
 # --------------------------------------------------------------------------- #
 
@@ -662,4 +755,8 @@ def grade(item: dict[str, Any], response: Any, **kw: Any) -> dict[str, Any]:
         return grade_external_artifact(item, response)
     if kind == "reformulation":
         return grade_reformulation(item, response)
+    if kind == "proof_grading":
+        return grade_proof_grading(item, response)
+    if kind == "tactic_reference":
+        return grade_tactic_reference(item, response)
     raise ValueError(f"cannot grade item of kind {kind!r}")

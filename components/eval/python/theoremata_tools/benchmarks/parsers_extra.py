@@ -5,7 +5,7 @@ import re
 from typing import Any
 
 _THEOREM_HEADER = re.compile(
-    r"(?m)^\s*(theorem|lemma|def)\s+([A-Za-z0-9_.«»]+)\s+([^:]*:\s*[^:=]+)",
+    r"(?m)^\s*(theorem|lemma|def)\s+([A-Za-z0-9_.«»']+)\s+([^:]*:\s*[^:=]+)",
 )
 _PROVENANCE_UUID = re.compile(
     r"(?i)request\s*(?:id|uuid)\s*[:=]\s*([0-9a-f-]{36})",

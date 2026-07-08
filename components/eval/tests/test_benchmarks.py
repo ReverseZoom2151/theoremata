@@ -64,6 +64,9 @@ _CORPUS_GLOB = {
     "imo2025": "IMO2025-main",
     "putnam_artifacts": "aristotle_putnam25-main",
     "formulationbench": "flare-main",
+    "imo_proofbench": "DeepSeek-Math-V2-main",
+    "zero_to_qed": "zero-to-qed-main",
+    "lean_tactics_kb": "zero-to-qed-main",
 }
 
 # corpora that exist but ship no structured problems (PDF-only data cards)
@@ -88,8 +91,10 @@ def test_registry_lists_all_tracks():
         "statement_target",
         "external_artifact",
         "reformulation",
+        "proof_grading",
+        "tactic_reference",
     }
-    assert len(ALL_NAMES) == 25
+    assert len(ALL_NAMES) == 28
 
 
 def test_load_unknown_benchmark_raises():
@@ -528,3 +533,192 @@ def test_quantumlean_grader_is_honest_no_statement_preservation(monkeypatch, tmp
     assert res["detail"]["method"] == "typecheck_only"
     assert res["detail"]["auto_gradable"] is False
     assert res["is_solved"] is True
+
+
+# --------------------------------------------------------------------------- #
+# IMO-ProofBench loader — gold+model grade pairs (evaluator calibration)
+# --------------------------------------------------------------------------- #
+
+_PROOFBENCH_ROW = {
+    "solution": "By taking x=0 ...",
+    "grading guidelines": "(Partial) 1. Guessed the solution correctly",
+    "level": "IMO-easy",
+    "source": "(Modified) IMO 2019, P1",
+    "question": "Determine all functions f such that ...",
+    "problem_idx": "PB-Basic-001",
+    "type": "Algebra",
+    "model_prediction": {
+        "proof": "Let P(x,y) denote the statement ...",
+        "average_automatic_rating": 1.0,
+        "human_rating": 7,
+    },
+}
+
+
+def _write_proofbench(root: Path, split: str, rows: list[dict]) -> None:
+    d = root / "DeepSeek-Math-V2-main" / "DeepSeek-Math-V2-main" / "outputs"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"IMO-ProofBench-{split}.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in rows), encoding="utf-8"
+    )
+
+
+def test_imo_proofbench_exposes_gold_and_prediction(monkeypatch, tmp_path):
+    _write_proofbench(tmp_path, "Basic", [_PROOFBENCH_ROW])
+    monkeypatch.setenv("THEOREMATA_RESOURCES", str(tmp_path))
+    items = load_benchmark("imo_proofbench")
+    assert len(items) == 1
+    it = items[0]
+    assert it["id"] == "imo_proofbench:PB-Basic-001"
+    assert it["kind"] == "proof_grading"
+    exp = it["expected"]
+    # gold human grade + model grade pair (the calibration signal)
+    assert exp["gold_human_rating"] == 7
+    assert exp["model_auto_rating"] == 1.0
+    assert exp["reference_solution"].startswith("By taking")
+    assert exp["grading_guidelines"].startswith("(Partial)")
+    assert exp["prediction_proof"].startswith("Let P(x,y)")
+    assert it["grading"]["split"] == "Basic"
+
+
+def test_imo_proofbench_calibration_grader(monkeypatch, tmp_path):
+    _write_proofbench(tmp_path, "Basic", [_PROOFBENCH_ROW])
+    monkeypatch.setenv("THEOREMATA_RESOURCES", str(tmp_path))
+    it = load_benchmark("imo_proofbench")[0]
+    # a grader that also says 7/7 agrees with the human → correct
+    assert grade(it, r"Final grade: \boxed{7}")["is_correct"] is True
+    # a grader that says 0 is far from the human 7 → incorrect
+    assert grade(it, r"Final grade: \boxed{0}")["is_correct"] is False
+    # normalized 0-1 scale is accepted too (1.0 ~ 7/7)
+    assert grade(it, {"score": 1.0})["is_correct"] is True
+
+
+def test_imo_proofbench_end_to_end_if_present():
+    if not _corpus_present("imo_proofbench"):
+        pytest.skip("IMO-ProofBench corpus absent")
+    items = load_benchmark("imo_proofbench")
+    assert len(items) == 60  # 30 Basic + 30 Advanced
+    # every item exposes a gold human grade + the model's proof under evaluation
+    assert all(it["expected"]["prediction_proof"] for it in items)
+    assert all(it["expected"]["gold_human_rating"] is not None for it in items)
+    assert {it["grading"]["split"] for it in items} == {"Basic", "Advanced"}
+
+
+# --------------------------------------------------------------------------- #
+# zero-to-qed loader — classic-proof completion bench (manual vs automation)
+# --------------------------------------------------------------------------- #
+
+def _write_zero_to_qed(root: Path, stem: str, src: str) -> None:
+    d = root / "zero-to-qed-main" / "zero-to-qed-main" / "src" / "ZeroToQED" / "Proofs"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{stem}.lean").write_text(src, encoding="utf-8")
+
+
+def test_zero_to_qed_loads_manual_vs_automation_pair(monkeypatch, tmp_path):
+    _write_zero_to_qed(
+        tmp_path,
+        "InfinitudePrimes",
+        "namespace ZeroToQED.Proofs\n"
+        "theorem InfinitudeOfPrimes : ∀ n, ∃ p > n, Nat.Prime p := by\n  sorry\n"
+        "end ZeroToQED.Proofs\n",
+    )
+    _write_zero_to_qed(
+        tmp_path,
+        "InfinitudePrimesGrind",
+        "namespace ZeroToQED.Proofs.Grind\n"
+        "theorem InfinitudeOfPrimes : ∀ n, ∃ p > n, IsPrime p := by\n  grind\n"
+        "end ZeroToQED.Proofs.Grind\n",
+    )
+    monkeypatch.setenv("THEOREMATA_RESOURCES", str(tmp_path))
+    items = load_benchmark("zero_to_qed")
+    assert len(items) == 2
+    by_strategy = {it["expected"]["strategy"]: it for it in items}
+    assert set(by_strategy) == {"manual", "automation"}
+    # the manual/automation pair shares a theorem_key
+    assert by_strategy["manual"]["expected"]["theorem_key"] == "InfinitudePrimes"
+    assert by_strategy["automation"]["expected"]["theorem_key"] == "InfinitudePrimes"
+    for it in items:
+        assert it["kind"] == "formalization"
+        assert it["grading"]["task"] == "proof_completion"
+        assert "InfinitudeOfPrimes" in it["expected"]["reference_proof"]
+
+
+def test_zero_to_qed_end_to_end_if_present():
+    if not _corpus_present("zero_to_qed"):
+        pytest.skip("zero-to-qed corpus absent")
+    items = load_benchmark("zero_to_qed")
+    assert len(items) > 0
+    keys = {it["expected"]["theorem_key"] for it in items}
+    # the InfinitudePrimes manual-vs-grind pair is present and paired
+    strategies = {
+        it["expected"]["strategy"]
+        for it in items
+        if it["expected"]["theorem_key"] == "InfinitudePrimes"
+    }
+    assert strategies == {"manual", "automation"}
+    assert "Sqrt2Irrational" in keys
+
+
+# --------------------------------------------------------------------------- #
+# Lean tactics KB loader — structured {tactic, purpose, example}
+# --------------------------------------------------------------------------- #
+
+_TACTICS_MD = """# Tactics Reference
+
+## Table of Contents
+
+- [`omega`](#omega) - Solve linear arithmetic over Nat and Int
+- [`simp`](#simp) - Apply simplification lemmas
+- [`push Not`](#push-not) - Push negations inward
+
+## Section
+
+### omega
+
+The **`omega`** tactic decides linear arithmetic over integers and naturals.
+
+```lean
+example (n : Nat) : n + 0 = n := by omega
+```
+
+### simp
+
+The `simp` tactic applies simplification lemmas to the goal.
+
+```lean
+example : 1 + 1 = 2 := by simp
+```
+"""
+
+
+def _write_tactics_kb(root: Path, md: str) -> None:
+    d = root / "zero-to-qed-main" / "zero-to-qed-main" / "docs" / "src"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "appendix_c_tactics.md").write_text(md, encoding="utf-8")
+
+
+def test_lean_tactics_kb_parses_structured_entries(monkeypatch, tmp_path):
+    _write_tactics_kb(tmp_path, _TACTICS_MD)
+    monkeypatch.setenv("THEOREMATA_RESOURCES", str(tmp_path))
+    items = load_benchmark("lean_tactics_kb")
+    assert len(items) == 3
+    by_tactic = {it["expected"]["tactic"]: it for it in items}
+    assert set(by_tactic) == {"omega", "simp", "push Not"}
+    omega = by_tactic["omega"]
+    assert omega["kind"] == "tactic_reference"
+    assert omega["expected"]["purpose"] == "Solve linear arithmetic over Nat and Int"
+    assert "linear arithmetic" in omega["expected"]["description"]
+    assert "by omega" in omega["expected"]["example"]
+    # retrieval-style grader matches when the tactic is named
+    assert grade(omega, "use the omega tactic here")["is_correct"] is True
+    assert grade(omega, "use ring instead")["is_correct"] is False
+
+
+def test_lean_tactics_kb_end_to_end_if_present():
+    if not _corpus_present("lean_tactics_kb"):
+        pytest.skip("zero-to-qed tactics appendix absent")
+    items = load_benchmark("lean_tactics_kb")
+    assert len(items) > 30  # the appendix documents ~60-80 tactics
+    tactics = {it["expected"]["tactic"] for it in items}
+    assert {"omega", "simp", "aesop", "ring"} <= tactics
+    assert all(it["expected"]["purpose"] for it in items)

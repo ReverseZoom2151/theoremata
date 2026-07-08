@@ -993,6 +993,258 @@ def load_goldbach_collatz() -> list[dict[str, Any]]:
     return [item]
 
 
+# ===========================================================================
+# Proof-grading / evaluator-calibration track (IMO-ProofBench)
+# ===========================================================================
+
+def _as_int(v: Any) -> int | None:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_float(v: Any) -> float | None:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def load_imo_proofbench() -> list[dict[str, Any]]:
+    """IMO-ProofBench (DeepSeek-Math-V2 release): 60 olympiad problems
+    (Basic + Advanced) shipping a reference solution, human grading guidelines,
+    a model proof, a **gold human rating** (0-7 IMO scale) and the model's own
+    **automatic rating** (0-1).
+
+    Ground truth = reference solution + grading guidelines; the (gold human
+    grade, model grade) pair makes this double as an EVALUATOR-CALIBRATION set
+    for the proof_calibration layer (does an automated grader agree with the
+    human?). Kind = ``proof_grading`` (grade the grader, not the proof).
+    """
+    files = find_files(
+        "DeepSeek-Math-V2-main/**/outputs/IMO-ProofBench-*.jsonl",
+    )
+    if not files:
+        _log_counts("imo_proofbench", 0, 0, "corpus absent")
+        return []
+    items: list[dict[str, Any]] = []
+    skipped = 0
+    seen: set[str] = set()
+    for path in files:
+        # "IMO-ProofBench-Basic.jsonl" -> "Basic"
+        split = path.stem.replace("IMO-ProofBench-", "") or path.stem
+        for rec in _read_records(path):
+            pid = rec.get("problem_idx") or rec.get("id")
+            question = rec.get("question") or rec.get("problem")
+            if not pid or not question:
+                skipped += 1
+                continue
+            uid = f"imo_proofbench:{pid}"
+            if uid in seen:
+                continue
+            seen.add(uid)
+            pred = rec.get("model_prediction")
+            pred = pred if isinstance(pred, dict) else {}
+            human_rating = _as_int(pred.get("human_rating"))
+            auto_rating = _as_float(pred.get("average_automatic_rating"))
+            items.append(
+                make_item(
+                    id=uid,
+                    kind="proof_grading",
+                    informal=str(question),
+                    formal=None,
+                    expected={
+                        "mode": "proof_grading_calibration",
+                        "reference_solution": rec.get("solution", ""),
+                        "grading_guidelines": rec.get("grading guidelines", ""),
+                        # gold human grade (IMO 0-7 points scale)
+                        "gold_human_rating": human_rating,
+                        "gold_scale": "0-7",
+                        # the proof under evaluation + the model's own grade
+                        "prediction_proof": pred.get("proof", ""),
+                        "model_auto_rating": auto_rating,
+                        "model_scale": "0-1",
+                        "level": rec.get("level"),
+                        "problem_type": rec.get("type"),
+                        "source": rec.get("source"),
+                    },
+                    grading={
+                        "track": "proof_grading",
+                        "method": "grade_calibration",
+                        "split": split,
+                    },
+                    provenance={
+                        "corpus": "imo_proofbench",
+                        "problem_idx": pid,
+                        "split": split,
+                        "level": rec.get("level"),
+                        "type": rec.get("type"),
+                        "source": rec.get("source"),
+                        "path": rel(path),
+                    },
+                )
+            )
+    _log_counts("imo_proofbench", len(items), skipped, "gold+model grade pairs")
+    return items
+
+
+# ===========================================================================
+# Classic-math proof-completion bench (zero-to-qed)
+# ===========================================================================
+
+def load_zero_to_qed() -> list[dict[str, Any]]:
+    """Curated classic-math proofs from zero-to-qed (√2 irrational, infinitude
+    of primes, pigeonhole, binomial theorem, Euclid's lemma, …) as a Lean
+    formalization / proof-completion bench.
+
+    Each ``Proofs/*.lean`` file → one item whose gold is the reference proof
+    (full source). The manual-vs-automation pair (``InfinitudePrimes`` vs
+    ``InfinitudePrimesGrind``) is preserved via a shared ``theorem_key`` and a
+    ``strategy`` tag (manual | automation).
+    """
+    files = find_files("zero-to-qed-main/**/src/ZeroToQED/Proofs/*.lean")
+    if not files:
+        _log_counts("zero_to_qed", 0, 0, "corpus absent")
+        return []
+    items: list[dict[str, Any]] = []
+    skipped = 0
+    for path in sorted(files):
+        src = path.read_text(encoding="utf-8", errors="replace")
+        headers = extract_lean_headers(src)
+        if not headers:
+            skipped += 1
+            continue
+        primary = headers[-1]  # the file's headline theorem (last decl)
+        stem = path.stem
+        is_grind = stem.lower().endswith("grind")
+        theorem_key = stem[:-5] if is_grind else stem
+        strategy = "automation" if is_grind else "manual"
+        uid = f"zero_to_qed:{stem}"
+        items.append(
+            make_item(
+                id=uid,
+                kind="formalization",
+                informal=extract_problem_comment(src) or theorem_key,
+                formal=primary["signature"],
+                expected={
+                    "formal_statement": primary["signature"],
+                    "lean_name": primary["name"],
+                    "reference_proof": src,
+                    "headers": headers,
+                    "theorem_key": theorem_key,
+                    "strategy": strategy,
+                    "axioms_whitelist": list(AXIOMS_WHITELIST),
+                },
+                grading={
+                    "track": "formalization",
+                    "method": "comparator_or_statement",
+                    "task": "proof_completion",
+                    "strategy": strategy,
+                },
+                provenance={
+                    "corpus": "zero_to_qed",
+                    "lean_name": primary["name"],
+                    "theorem_key": theorem_key,
+                    "strategy": strategy,
+                    "n_headers": len(headers),
+                    "path": rel(path),
+                },
+            )
+        )
+    _log_counts("zero_to_qed", len(items), skipped, "classic-proof bench")
+    return items
+
+
+# ===========================================================================
+# Lean tactics knowledge base (zero-to-qed appendix_c_tactics.md)
+# ===========================================================================
+
+import re as _re  # local alias; keep module imports tidy
+
+_TACTICS_TOC = _re.compile(
+    r"^- \[`([^`]+)`\]\(#([^)]+)\)\s*-\s*(.*)$", _re.MULTILINE
+)
+
+
+def _parse_tactics_sections(md: str) -> dict[str, dict[str, str]]:
+    """Map the first token of each ``### heading`` to its description + example."""
+    sections: dict[str, dict[str, str]] = {}
+    parts = _re.split(r"^### (.+)$", md, flags=_re.MULTILINE)
+    # parts = [pre, heading1, body1, heading2, body2, ...]
+    for i in range(1, len(parts), 2):
+        heading = parts[i].strip()
+        body = parts[i + 1] if i + 1 < len(parts) else ""
+        key = heading.split()[0].lower() if heading.split() else heading.lower()
+        # first prose paragraph (skip blank lines)
+        desc = ""
+        for para in _re.split(r"\n\s*\n", body):
+            p = para.strip()
+            if p and not p.startswith(("<figure", "```", "!", "|")):
+                desc = _re.sub(r"\s+", " ", p)
+                break
+        m = _re.search(r"```lean\s*([\s\S]*?)```", body)
+        example = m.group(1).strip() if m else ""
+        sections.setdefault(key, {"description": desc, "example": example})
+    return sections
+
+
+def load_lean_tactics_kb() -> list[dict[str, Any]]:
+    """Parse ``appendix_c_tactics.md`` (~60-80 Lean 4 / Mathlib tactics) into a
+    structured tactic reference usable as a retrieval / knowledge-base corpus.
+
+    Each entry: ``{tactic, purpose, example, description}``. The canonical tactic
+    list + one-line purpose come from the document's table of contents; the
+    longer description + a worked ``lean`` example are pulled from each tactic's
+    section where present.
+    """
+    files = find_files("zero-to-qed-main/**/docs/src/appendix_c_tactics.md")
+    if not files:
+        _log_counts("lean_tactics_kb", 0, 0, "corpus absent")
+        return []
+    items: list[dict[str, Any]] = []
+    skipped = 0
+    seen: set[str] = set()
+    for path in files:
+        md = path.read_text(encoding="utf-8", errors="replace")
+        sections = _parse_tactics_sections(md)
+        for tactic, anchor, purpose in _TACTICS_TOC.findall(md):
+            tactic = tactic.strip()
+            key = tactic.split()[0].lower() if tactic.split() else tactic.lower()
+            uid = f"lean_tactic:{tactic}"
+            if not tactic or uid in seen:
+                skipped += 1
+                continue
+            seen.add(uid)
+            sec = sections.get(key, {})
+            items.append(
+                make_item(
+                    id=uid,
+                    kind="tactic_reference",
+                    informal=purpose.strip(),
+                    formal=None,
+                    expected={
+                        "tactic": tactic,
+                        "purpose": purpose.strip(),
+                        "description": sec.get("description", ""),
+                        "example": sec.get("example", ""),
+                        "anchor": anchor,
+                    },
+                    grading={
+                        "track": "tactic_reference",
+                        "method": "retrieval_reference",
+                    },
+                    provenance={
+                        "corpus": "lean_tactics_kb",
+                        "tactic": tactic,
+                        "path": rel(path),
+                    },
+                )
+            )
+    _log_counts("lean_tactics_kb", len(items), skipped, "tactic KB entries")
+    return items
+
+
 # Registry name -> loader callable.
 LOADERS: dict[str, Callable[[], list[dict[str, Any]]]] = {
     "formalqualbench": load_formalqualbench,
@@ -1020,4 +1272,7 @@ LOADERS: dict[str, Callable[[], list[dict[str, Any]]]] = {
     "imo2025": load_imo2025,
     "putnam_artifacts": load_putnam_artifacts,
     "formulationbench": load_formulationbench,
+    "imo_proofbench": load_imo_proofbench,
+    "zero_to_qed": load_zero_to_qed,
+    "lean_tactics_kb": load_lean_tactics_kb,
 }

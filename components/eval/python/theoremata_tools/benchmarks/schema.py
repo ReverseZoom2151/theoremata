@@ -35,6 +35,11 @@ KINDS = (
     # QuantumLean ships model outputs + a human 0-2 rubric, NOT a gold formal
     # proof — graded typecheck-only (no statement-preservation is possible).
     "scientific_formalization",
+    # IMO-ProofBench: an NL proof + a gold human grade + a model grade — an
+    # EVALUATOR-CALIBRATION item (grade the grader, not the proof).
+    "proof_grading",
+    # A structured Lean/Mathlib tactic reference entry (retrieval / KB corpus).
+    "tactic_reference",
 )
 
 # The canonical Lean "consistency" axiom trio. Anything else (notably sorryAx)
