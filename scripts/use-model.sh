@@ -8,5 +8,5 @@
 #
 # Run the CLI from the repo root (the command globs components/*/python).
 # Unset THEOREMATA_MODEL_COMMAND (or use THEOREMATA_MODEL_MOCK=1) to go back offline.
-export THEOREMATA_MODEL_COMMAND='/c/Python312/python -E -c "import sys,glob,os;[sys.path.insert(0,os.path.abspath(p)) for p in glob.glob('"'"'components/*/python'"'"')];from theoremata_tools.model_provider import main;main()"'
+export THEOREMATA_MODEL_COMMAND='${THEOREMATA_PYTHON:-python} -E -c "import sys,glob,os;[sys.path.insert(0,os.path.abspath(p)) for p in glob.glob('"'"'components/*/python'"'"')];from theoremata_tools.model_provider import main;main()"'
 echo "THEOREMATA_MODEL_COMMAND set. Now export THEOREMATA_MODEL=<litellm-id> and your provider API key, then run the CLI from the repo root."

@@ -82,7 +82,7 @@ _IS_WINDOWS = os.name == "nt"
 # keeps a literal ``$HOME`` so it resolves per-user inside the login shell.
 _WSL_DISTRO = os.environ.get("THEOREMATA_WSL_DISTRO", "Ubuntu")
 _ISABELLE_WSL_PATH = os.environ.get(
-    "THEOREMATA_ISABELLE_WSL_PATH", "$HOME/Isabelle2025-2/bin/isabelle"
+    "THEOREMATA_ISABELLE_WSL_PATH", "isabelle"
 )
 # Prefix marking a ``_command_for`` result that must be run through WSL.
 _WSL_PREFIX = "wsl:"
@@ -190,7 +190,9 @@ def _command_for(system: str) -> Optional[str]:
         native = shutil.which("isabelle")
         if native:
             return native
-        if _wsl_probe(f'test -x "{_ISABELLE_WSL_PATH}"'):
+        # `command -v` does a PATH lookup, so a bare `isabelle` (default) resolves
+        # via the login shell's ~/.profile; an absolute-path override works too.
+        if _wsl_probe(f'command -v "{_ISABELLE_WSL_PATH}" >/dev/null 2>&1'):
             return _WSL_PREFIX + _ISABELLE_WSL_PATH
         return None
     if system == "rocq":
@@ -239,7 +241,9 @@ def _wsl_bash(script_body: str, wall_timeout: int) -> "tuple[int, str]":
             fh.write(script_body)
         try:
             proc = subprocess.run(
-                ["wsl.exe", "-d", _WSL_DISTRO, "--", "bash", _win_to_wsl_path(spath)],
+                # `-l` (login) sources ~/.profile so toolchains added to PATH
+                # there (e.g. an Isabelle bundle) resolve without a hardcoded path.
+                ["wsl.exe", "-d", _WSL_DISTRO, "--", "bash", "-l", _win_to_wsl_path(spath)],
                 capture_output=True,
                 text=True,
                 timeout=wall_timeout,

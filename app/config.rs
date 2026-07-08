@@ -86,7 +86,9 @@ fn default_coqchk_bin() -> String {
 }
 
 fn default_isabelle_bin() -> String {
-    "~/Isabelle2025-2/bin/isabelle".into()
+    // Generic default: `isabelle` on PATH. Point at a specific bundle via the
+    // `THEOREMATA_ISABELLE` env var or `isabelle_bin` in the local config.
+    "isabelle".into()
 }
 
 fn default_k_consecutive_clean() -> u32 {
