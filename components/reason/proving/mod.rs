@@ -3,5 +3,6 @@ pub mod formal_generate;
 pub mod portfolio;
 pub mod router;
 pub mod retry;
+pub mod sketch;
 pub mod falsification;
 pub mod blueprint;
