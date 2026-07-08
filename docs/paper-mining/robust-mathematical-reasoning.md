@@ -1,0 +1,73 @@
+# Paper Mining: Towards Robust Mathematical Reasoning (IMO-Bench)
+
+- **Source**: Luong, Hwang, Nguyen, et al. (Google DeepMind), EMNLP 2025, pages 35407–35431.
+- **Artifacts**: https://imobench.github.io
+- **What kind of paper**: This is a Google DeepMind **evaluation / benchmark + LLM-autograder** paper, not a training-method or formal-verification paper. It is the benchmarking counterpart to their "Gemini Deep Think achieves IMO 2025 gold" announcement (Luong & Lockhart, 2025). Robustness here means *resistance to memorization and answer-guessing* (perturbed problems + full-proof grading), NOT adversarial-robustness in the ML sense and NOT formal (Lean/Rocq) verification.
+
+## Core contribution
+
+The paper introduces **IMO-Bench**, a three-benchmark suite at International Mathematical Olympiad difficulty that shifts evaluation away from final-answer matching toward robust, proof-level reasoning: IMO-AnswerBench (400 short-answer problems), IMO-ProofBench (60 proof-writing problems with grading rubrics), and IMO-GradingBench (1000 human-graded proofs for training/evaluating auto-graders). It also delivers two LLM-based auto-graders (AnswerAutoGrader and ProofAutoGrader, both built on Gemini 2.5 Pro) that correlate near-perfectly / strongly with human experts. These benchmarks served as the "north-star metrics" behind the Gemini Deep Think IMO-2025 gold result.
+
+## Key techniques / architecture
+
+The system is a benchmark suite plus a pair of prompt-based LLM graders. There is no training method disclosed; the value is in the evaluation methodology and the robustness/grading design.
+
+- **Robustification (anti-memorization).** Every short-answer problem is drawn from real Olympiad contests, then *perturbed by experts or LLMs* to defeat memorization: paraphrasing, renaming geometric objects/points, algebraic substitution (e.g. `x=a+b−c` triangle-side reparametrization), changing numerical values, adding distractor functions/variables, and reformulating the objective. Robustification consistently drops model accuracy (gap up to 11.2% for o4-mini; ~+1.8 to +3.5% on originals across models — Table 9). This is the concrete "robust" mechanism: perturbation-based, like MATH-Perturb / Putnam-AXIOM / functional-MATH, but at IMO level.
+- **Answer-format normalization.** Short answers are engineered to be unique and non-trivial: reformulate "characterize all m" into "compute this sum/count" so the answer is a single hard-to-guess number (e.g. 1012, 1009, 4151879777); avoid yes/no existence answers (which are guessable) by asking for the smallest n instead; force "in degrees" for geometry; simplify answers to reduce ambiguity.
+- **AnswerAutoGrader.** A single Gemini 2.5 Pro prompt acts as a deterministic autograder: extract the final answer from a solution and judge *semantic/mathematical equivalence* to a golden answer (algebraic, numerical, set/list equivalence), NOT the reasoning. No partial credit. Output is a `\boxed{Correct/Incorrect}` after `<thinking>` chain-of-thought. This replaces brittle SymPy-only checking (as in FrontierMath) and tolerates format variation.
+- **ProofAutoGrader.** A Gemini 2.5 Pro prompt graded on the IMO 0–7 scale. It is given four inputs: **problem statement, ground-truth reference solution, problem-specific grading guidelines, and the candidate solution**. It runs a structured process: analyze references → step-by-step verification (explicitly warned to catch solutions that "pretend to be correct") → assess progress → score. Output `<points>N out of 7</points>`.
+- **Grading rubric (proof).** IMO 7-point scale collapsed to four ratings mapped to points: **Correct=7, Almost=6, Partial=1, Incorrect=0**. Human experts may use any integer 0–7. Rationale: real Olympiad grading is polarizing (mostly 5–7 or 0–2), so scores are consistent across graders.
+- **Evaluation methodology / what makes it "robust".** (1) Problems are perturbed so memorization doesn't help. (2) Proof problems give credit only for *correct reasoning steps*, not the final answer — directly attacking the "right answer, flawed proof" and "answer guessing" failure modes documented in the appendix (models assuming linearity without justification, guessing polynomial forms, missing invariants). (3) All *primary* results use expert human grading; auto-graders are validated against humans before being recommended as proxies. (4) A separate benchmark (IMO-GradingBench) evaluates the models' *own* ability to grade/verify proofs — i.e. self-verification as a measurable skill.
+
+## Results / benchmarks
+
+- **IMO-AnswerBench (400 problems, AnswerAutoGrader).** Gemini Deep Think (IMO Gold) **80.0%** overall (Algebra 85 / Combinatorics 69 / Geometry 88 / Number Theory 78). Beats best non-Gemini (Grok 4, 73.1%) by 6.9% and best open-weight (DeepSeek R1, 60.8%) by 19.2%. Other frontier: Grok 4 73.1, Gemini 2.5 Deep Think 71.8, Gemini 2.5 Pro 68.2, o4-mini 67.9, GPT-5 65.6, o3 61.1, Qwen3-235B 53.8, Kimi-K2 45.8, Claude Sonnet 4 23.0, Claude Opus 4 22.3. Combinatorics is the weakest category for essentially all models. (8-run averages; Deep Think single-run.)
+- **AnswerAutoGrader vs human** (Gemini 2.5 Pro + o3 solutions): 98.9% accuracy on the correct class; confusion matrix 274/1 and 8/517 (Table 5) — near-perfect format-level grading.
+- **IMO-ProofBench (human expert grades).** Basic (30) / Advanced (30). Gemini Deep Think (IMO Gold): **Basic 89.0%, Advanced 65.7%**. Advanced beats best non-Gemini (Grok 4 heavy 23.3%) by **42.4%**; best open-weight only 7.1%. Advanced breakdown for IMO Gold: Novel 61.1%, robustified-IMO-2024 76.2%, USAMO-2025 69.0%. **Overfitting signal**: Grok 4 heavy scores 76.2% on USAMO-2025 but only 11.1% on Novel; o3 52.4% vs 15.1%; Gemini-2.5-Pro-agentic 52.4% vs 17.5% — IMO Gold is far more uniform, evidencing genuine (not memorized) reasoning.
+- **ProofAutoGrader vs human.** Pearson **0.96 (basic), 0.93 (advanced)** over 14 public models; **0.87** over 170 internal models. Per-solution confusion (840 solutions) shows most errors between Incorrect↔Partial. Known failure modes: overestimates scores, misses high-level/"specious" logical errors (A≥B, A≥C ⇒ B≥C), overly punitive on unconventional-but-correct proofs (marks a human-6/7 novel solution as 0 because its stated lemma was technically false).
+- **IMO-GradingBench (1000, minimal context: problem+solution only, no reference, no guidelines).** Metrics: 4-way Accuracy and MAE. Best accuracy o3 **54.0%**; best MAE Gemini Deep Think (IMO Gold) **18.4%** (golden/best-possible MAE is 3.9%, not 0, due to the 7/6/1/0 mapping). Low scores show per-instance minimal-context grading is much harder than aggregated ProofAutoGrader ranking.
+
+## Novel vs SOTA-2026
+
+- First IMO-level suite combining **perturbed short-answer + natural-language full-proof grading + proof-grading-as-a-task** in one release. Prior robustness benches (SVAMP, Lila, functional-MATH, Putnam-AXIOM, MATH-Perturb) perturb but stay final-answer; OlympiadBench/Omni-MATH/HLE are answer-centric; MiniF2F is formal. IMO-Bench is natural-language proof-centric at IMO-hard level with 3 fully-novel IMO sets.
+- Novel is the **empirical validation that LLM auto-graders (Gemini 2.5 Pro) reach near-human answer grading (98.9%) and strongly-correlated proof grading (0.93–0.96)**, plus honest documentation of where the proof grader still fails.
+- Not novel as *technique*: the graders are prompt-engineered LLM judges, not trained reward models; robustification is an established idea scaled up. No new model, training loss, RL, or verifier architecture is disclosed.
+
+## Adopt-relevance to Theoremata
+
+- **Falsify-before-prove gate** — real gap this paper illuminates, not directly solves. The appendix catalogs exactly the failure modes our gate exists to catch: unjustified assumptions (assume-linear, assume-polynomial-degree), final-answer guessing without proof, and missing invariants. IMO-ProofBench's "credit only for correct reasoning steps" is the *evaluation-side* analog of falsify-before-prove. **Adopt**: use their robustified problems + common-mistake taxonomy (B.4) as a *targeted regression set* to confirm our falsify gate actually rejects "right answer, wrong proof" cases that final-answer graders wave through.
+- **3+1 verification gate** — mostly complementary, one real gap. Our gate is formal (Lean/Rocq/Isabelle compile) + a soft check. This paper is entirely *informal natural-language* grading and explicitly contrasts itself with LEAN (footnote 6). Where it helps us: the **+1 soft/LLM check** in our gate is essentially their ProofAutoGrader. Their honest failure analysis (misses specious logic like A≥B∧A≥C⇒B≥C; over-punishes novel-but-correct lemmas) is a direct warning for our soft gate — do NOT let the LLM check override or veto a passed formal check, and treat its "reject" as advisory. Their finding that **giving the grader a reference solution + problem-specific guidelines** lifts correlation from ~0.87 (minimal context) to 0.93–0.96 is a concrete, adoptable improvement to our soft-check prompt: feed it a reference/lemma-cache hit and known rubric, not just the bare goal.
+- **Expert-iteration flywheel** — strong endorsement + a north-star lesson. The paper states these benchmarks were the "north-star metrics" that drove Deep Think to gold, and they graded **170 internal models** on ProofBench during that journey. For our flywheel: (1) a *robust, non-gameable* eval that resists answer-guessing is a precondition for a healthy flywheel — otherwise expert iteration optimizes toward memorization/guessing; (2) an automatic proof-grader with 0.87–0.96 human correlation is good enough to be the *reward signal* / ranking metric across many candidate systems, exactly what a flywheel needs to iterate fast without human-in-the-loop every round.
+- **Proof-grading** — we should adopt their grader design essentially wholesale for our informal/self-check layer. The 4-way rubric (Correct/Almost/Partial/Incorrect → 7/6/1/0), the structured "verify every step, beware solutions that pretend to be correct" prompt, and the MAE metric with a non-zero golden floor are all directly reusable. **Gap we already cover**: our proof-DAG + formal splice gives us step-level ground truth they lack (they warn their grader misses high-level logical errors — our DAG makes each step machine-checkable, which is strictly stronger). So: use their informal grader for *ranking/triage of unformalized candidates*, keep our formal gate as the *authority*.
+- **What we already do vs gap**: We already do formal verification (stronger than their informal grader) and step-level DAG checking. The real gaps are (a) an anti-memorization *robustification* pass on any natural-language benchmarks/problems we ingest, and (b) using a reference-solution-conditioned LLM grader as an advisory reward signal in the flywheel and in our +1 soft gate.
+
+## Verbatim-worthy details
+
+**Benchmarks (Table 1)**
+- IMO-AnswerBench — size **400**, task "Get the right answer". 4 categories × 100 (Algebra, Combinatorics, Geometry, Number Theory), 4 difficulty tiers: pre-IMO, IMO-Easy (P1/P4), IMO-Medium (P2/P5), IMO-Hard (P3/P6).
+- IMO-ProofBench — size **60**, task "Write a rigorous proof". 30 basic (pre-IMO→IMO-Medium) + 30 advanced (up to IMO-Hard). Advanced = 18 novel (by IMO medalists) + 6 robustified IMO-2024 + 6 USAMO-2025; contains 5 complete IMO sets, 3 novel.
+- IMO-GradingBench — size **1000**, task "Grade a proof". Each = problem + proposed solution + human grade (0–7), balanced ~equally across 4 categories.
+
+**Grading rubric (Table 3)**: Correct=7 (fully correct, rigorous, complete), Almost=6 (minor errors), Partial=1 (mostly incorrect, some relevant results), Incorrect=0. Human experts may assign any integer 0–7.
+
+**Graders / models**
+- Both auto-graders built on **Gemini 2.5 Pro** (public).
+- AnswerAutoGrader: extract-then-equivalence, no partial credit, `<thinking>…</thinking>` then `\boxed{Correct|Incorrect}`. Handles algebraic / numerical / set-list equivalence. (Full prompt Appendix A.5.)
+- ProofAutoGrader: inputs = problem + ground-truth solution + specific grading guidelines + proposed solution; 0–7 rubric where guidelines override general rubric for partial credit; output `<points>N out of 7</points>` (parsed from first block). Warned to catch solutions that "pretend to be correct." (Full prompt Appendix B.5.)
+- IMO-GradingBench "vanilla" prompt: problem+solution only, output last word ∈ {incorrect, partial, almost, correct}; python extracts label, fallback LLM extractor prompt (Appendix C.3/C.4).
+
+**Key numbers**
+- IMO Gold: AnswerBench 80.0%; ProofBench Basic 89.0%, Advanced 65.7% (Novel 61.1, IMO-2024 76.2, USAMO-2025 69.0).
+- Margins: +6.9% (answer, vs Grok 4), +19.2% (answer, vs DeepSeek R1 open-weight), +42.4% (advanced proof, vs Grok 4 heavy).
+- AnswerAutoGrader vs human: 98.9% on correct class.
+- ProofAutoGrader Pearson: 0.96 basic / 0.93 advanced (14 models); 0.87 (170 internal models); 840-solution confusion matrix.
+- IMO-GradingBench: o3 acc 54.0%; IMO-Gold MAE 18.4%; golden-MAE floor 3.9%.
+- ProofBench 0–7 grading rationale: most solutions score 5–7 or 0–2 (polarizing), yielding cross-grader consistency (cf. Evan Chen 2023 rubric guidance).
+
+**Models evaluated (14 public)**: Claude Opus 4, Claude Sonnet 4, DeepSeek V3, DeepSeek R1, Kimi-K2-Instruct, Qwen3-235B-A22B, o3, o4-mini (high), GPT-5, Gemini 2.5 Pro, Gemini 2.5 Deep Think, Gemini Deep Think (IMO Gold), Gemini 2.5 Pro + Huang&Yang agentic framework, Grok 4 / Grok 4 heavy.
+
+**Huang & Yang (2025) agentic baseline (B.3)** — an inference-time self-verify loop worth noting for our MCTS/portfolio design: per model call thinking budget 32K tokens; a pipeline = up to 30 iterations of self-verification + bug-fixing; solution returned after **5 consecutive passing self-verifications**; pipeline exits if **10 consecutive verifications fail**; **100 parallel pipelines**, stop when any returns a solution (failed to solve 2 advanced problems). Open-sourced at github.com/lyang36/IMO25.
+
+**Robustification techniques (§2.2, A.4)**: paraphrase; rename objects/points; algebraic substitution/reparametrization; change numerical values; add distractor functions/variables; reformulate objective (e.g. "find all k" → "count even d with even #solutions"); force unique non-trivial numeric answers; convert yes/no existence → smallest-n; force degrees in geometry; simplify answers.
+
+**Limitations stated**: (1) auto-graders are imperfect proxies — definitive results still need costly human experts; (2) future data contamination — public release means problems will be scraped into training sets, risking benchmark decay.
