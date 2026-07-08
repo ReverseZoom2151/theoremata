@@ -18,7 +18,8 @@ mod verify;
 // paths unchanged — the physical layout is by component, the namespace is flat.
 pub use graph::{db, model, scheduler};
 pub use reason::{
-    agent, blueprint, certification, chat, consolidate, critic, decompose, driver, falsification,
+    agent, blueprint, blueprint_run, certification, chat, consolidate, critic, decompose, driver,
+    falsification,
     formal_generate, guard, mcts, memory, observe, plan_history, portfolio, progress, proof_pool,
     research, retry, router, sampler, sampling, sketch, taint, team, ttc,
 };
@@ -223,6 +224,17 @@ enum Command {
     BlueprintImport {
         project: String,
         file: PathBuf,
+    },
+    /// Drive a whole leanblueprint `content.tex` end-to-end: topo-order its
+    /// `\uses` DAG and prove each item via the sketch + certification path,
+    /// proving dependencies before dependents.
+    BlueprintRun {
+        project: String,
+        file: PathBuf,
+        /// Restrict each hole's portfolio to a comma-separated subset
+        /// (e.g. `--systems lean,rocq`); defaults to all three.
+        #[arg(long)]
+        systems: Option<String>,
     },
     /// Referential-integrity gate: check every blueprint `\lean{}` decl resolves.
     Checkdecls {
@@ -712,6 +724,40 @@ fn main() -> Result<()> {
         Command::BlueprintImport { project, file } => {
             let tex = std::fs::read_to_string(&file)?;
             print_value(true, &blueprint::import(&store, &project, &tex)?)?
+        }
+        Command::BlueprintRun {
+            project,
+            file,
+            systems,
+        } => {
+            store.project(&project)?;
+            let systems: Vec<prover::formal::FormalSystem> = match &systems {
+                Some(s) => s
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::parse)
+                    .collect::<Result<_>>()?,
+                None => Vec::new(),
+            };
+            let tex = std::fs::read_to_string(&file)?;
+            let run = blueprint_run::BlueprintRun::from_tex(&tex)?;
+            let generator = sketch::WholeStatementGenerator;
+            let hole_prover = sketch::PortfolioHoleProver {
+                store: &store,
+                config: &config,
+                provider: provider.as_ref(),
+                systems,
+            };
+            let adapter = blueprint_run::SketchObligationProver {
+                store: &store,
+                project_id: &project,
+                generator: &generator,
+                prover: &hole_prover,
+                provider: provider.as_ref(),
+                gate_enabled: certification::gate_enabled(),
+            };
+            print_value(true, &run.drive(&adapter)?)?
         }
         Command::Checkdecls {
             workspace,

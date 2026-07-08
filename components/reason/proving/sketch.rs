@@ -110,6 +110,22 @@ pub trait SketchGenerator {
     fn generate(&self, statement: &str) -> Result<InformalSketch>;
 }
 
+/// The degenerate production generator: emit a one-step sketch whose single hole
+/// IS the whole statement. With no model-driven decomposition available, a
+/// sketch run gracefully degrades to "prove the statement directly" — the hole
+/// is then discharged by whatever `HoleProver` is wired (e.g. the portfolio).
+/// This is the honest default until a model-backed multi-step generator lands.
+pub struct WholeStatementGenerator;
+
+impl SketchGenerator for WholeStatementGenerator {
+    fn generate(&self, statement: &str) -> Result<InformalSketch> {
+        Ok(InformalSketch::new(
+            statement,
+            vec![SketchStep::hole("goal", "Prove the statement directly.", statement)],
+        ))
+    }
+}
+
 /// The context handed to the per-hole prover: which sketch step, which DAG node,
 /// and the subgoal to discharge.
 #[derive(Debug, Clone)]

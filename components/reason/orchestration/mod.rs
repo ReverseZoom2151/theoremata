@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod blueprint_run;
 pub mod certification;
 pub mod research;
 pub mod consolidate;
