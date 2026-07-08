@@ -18,9 +18,9 @@ mod verify;
 // paths unchanged — the physical layout is by component, the namespace is flat.
 pub use graph::{db, model, scheduler};
 pub use reason::{
-    agent, blueprint, chat, consolidate, critic, decompose, falsification, formal_generate, guard,
-    mcts, observe, plan_history, portfolio, progress, proof_pool, research, retry, router, sampler,
-    sampling, taint, team,
+    agent, blueprint, certification, chat, consolidate, critic, decompose, driver, falsification,
+    formal_generate, guard, mcts, observe, plan_history, portfolio, progress, proof_pool, research,
+    retry, router, sampler, sampling, sketch, taint, team, ttc,
 };
 pub use prover::{aristotle, attempt_run, exec, formal, isabelle, lean, proof_job, rocq};
 pub use verify::{hardening, lean_session};
