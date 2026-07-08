@@ -13,4 +13,4 @@ pub use search::{driver, mcts, proof_pool, progress, sampler, sampling, ttc};
 pub use proving::{
     blueprint, decompose, falsification, formal_generate, portfolio, retry, router, sketch,
 };
-pub use critique::{critic, guard, plan_history, taint};
+pub use critique::{critic, guard, memory, plan_history, taint};
