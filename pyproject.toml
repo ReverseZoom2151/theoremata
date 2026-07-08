@@ -7,6 +7,18 @@ dependencies = ["sympy>=1.13", "litellm>=1.0"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+# Optional accelerators. Every one is a soft, runtime-gated import: the workers
+# fall back to deterministic stdlib paths when a package is absent, so these are
+# never required to run or test the harness.
+retrieval = ["rank-bm25>=0.2"]
+train = ["torch>=2.0", "transformers>=4.40", "trl>=0.9", "scikit-learn>=1.3"]
+all = [
+    "rank-bm25>=0.2",
+    "torch>=2.0",
+    "transformers>=4.40",
+    "trl>=0.9",
+    "scikit-learn>=1.3",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["components"]
