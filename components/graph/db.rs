@@ -135,6 +135,42 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_proof_jobs_project ON proof_jobs(project_id);
             CREATE INDEX IF NOT EXISTS idx_attempt_runs_project ON attempt_runs(project_id);
+            -- Growing verified-lemma library (LEGO-Prover pattern): three logical
+            -- stores. `library_lemmas` are admitted, verifier-passed skills;
+            -- `library_requests` are conjectured open sub-goals (retrieval queries
+            -- + the evolver worklist); `library_problems` are target statements
+            -- that bias evolution.
+            CREATE TABLE IF NOT EXISTS library_lemmas (
+              id TEXT PRIMARY KEY,
+              project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+              statement TEXT NOT NULL,
+              proof TEXT NOT NULL,
+              provenance TEXT NOT NULL,
+              embedding_key TEXT NOT NULL,
+              update_count INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS library_requests (
+              id TEXT PRIMARY KEY,
+              project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+              subgoal TEXT NOT NULL,
+              provenance TEXT NOT NULL,
+              solved INTEGER NOT NULL DEFAULT 0,
+              update_count INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS library_problems (
+              id TEXT PRIMARY KEY,
+              project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+              statement TEXT NOT NULL,
+              provenance TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_library_lemmas_project ON library_lemmas(project_id);
+            CREATE INDEX IF NOT EXISTS idx_library_requests_project ON library_requests(project_id);
+            CREATE INDEX IF NOT EXISTS idx_library_problems_project ON library_problems(project_id);
             "#,
         )?;
         // Idempotent column additions so databases created before these fields
@@ -1398,6 +1434,222 @@ impl Store {
         let rows = st.query_map([project_id], lemma_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
+
+    // --- Growing verified-lemma library (LEGO-Prover) ---------------------
+    //
+    // Persistence for the three logical stores behind
+    // `reason::proving::library::LemmaLibrary`. All admission / dedup / ranking
+    // *policy* lives in that module; these methods are pure CRUD over the
+    // `library_lemmas` / `library_requests` / `library_problems` tables.
+
+    /// Insert an admitted skill into the lemma store. `embedding_key` is a
+    /// deterministic fingerprint of the statement supplied by the caller (the
+    /// library computes it); `update_count` starts at 0.
+    pub fn add_library_lemma(
+        &self,
+        project_id: &str,
+        statement: &str,
+        proof: &str,
+        provenance: &str,
+        embedding_key: &str,
+    ) -> Result<LibraryLemma> {
+        self.project(project_id)?;
+        let now = Utc::now();
+        let lemma = LibraryLemma {
+            id: Uuid::new_v4().to_string(),
+            project_id: project_id.to_owned(),
+            statement: statement.to_owned(),
+            proof: proof.to_owned(),
+            provenance: provenance.to_owned(),
+            embedding_key: embedding_key.to_owned(),
+            update_count: 0,
+            created_at: now,
+            updated_at: now,
+        };
+        self.conn.execute(
+            "INSERT INTO library_lemmas(id,project_id,statement,proof,provenance,embedding_key,\
+             update_count,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,0,?7,?7)",
+            params![
+                lemma.id,
+                project_id,
+                statement,
+                proof,
+                provenance,
+                embedding_key,
+                now.to_rfc3339()
+            ],
+        )?;
+        self.event(
+            Some(project_id),
+            None,
+            "library.lemma_admitted",
+            "library",
+            json!({"lemma_id": lemma.id}),
+        )?;
+        Ok(lemma)
+    }
+
+    /// All admitted library lemmas for a project, in insertion order.
+    pub fn library_lemmas(&self, project_id: &str) -> Result<Vec<LibraryLemma>> {
+        let mut st = self.conn.prepare(
+            "SELECT id,project_id,statement,proof,provenance,embedding_key,update_count,\
+             created_at,updated_at FROM library_lemmas WHERE project_id=?1 \
+             ORDER BY created_at, id",
+        )?;
+        let rows = st.query_map([project_id], library_lemma_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The least-`update_count` lemma (the evolver scheduler pick). Ties broken
+    /// by oldest-created then id, so the choice is deterministic.
+    pub fn next_library_lemma_to_evolve(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<LibraryLemma>> {
+        self.conn
+            .query_row(
+                "SELECT id,project_id,statement,proof,provenance,embedding_key,update_count,\
+                 created_at,updated_at FROM library_lemmas WHERE project_id=?1 \
+                 ORDER BY update_count ASC, created_at ASC, id ASC LIMIT 1",
+                [project_id],
+                library_lemma_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Increment a lemma's `update_count` (it has just been worked on).
+    pub fn bump_library_lemma_update(&self, project_id: &str, id: &str) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE library_lemmas SET update_count=update_count+1,updated_at=?1 \
+             WHERE id=?2 AND project_id=?3",
+            params![Utc::now().to_rfc3339(), id, project_id],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!("library lemma not found: {id}"));
+        }
+        Ok(())
+    }
+
+    /// Enqueue an open sub-goal (from a sketch hole) into the request store.
+    pub fn add_library_request(
+        &self,
+        project_id: &str,
+        subgoal: &str,
+        provenance: &str,
+    ) -> Result<LibraryRequest> {
+        self.project(project_id)?;
+        let now = Utc::now();
+        let req = LibraryRequest {
+            id: Uuid::new_v4().to_string(),
+            project_id: project_id.to_owned(),
+            subgoal: subgoal.to_owned(),
+            provenance: provenance.to_owned(),
+            solved: false,
+            update_count: 0,
+            created_at: now,
+            updated_at: now,
+        };
+        self.conn.execute(
+            "INSERT INTO library_requests(id,project_id,subgoal,provenance,solved,update_count,\
+             created_at,updated_at) VALUES (?1,?2,?3,?4,0,0,?5,?5)",
+            params![req.id, project_id, subgoal, provenance, now.to_rfc3339()],
+        )?;
+        self.event(
+            Some(project_id),
+            None,
+            "library.request_enqueued",
+            "library",
+            json!({"request_id": req.id}),
+        )?;
+        Ok(req)
+    }
+
+    /// All requests for a project, in insertion order.
+    pub fn library_requests(&self, project_id: &str) -> Result<Vec<LibraryRequest>> {
+        let mut st = self.conn.prepare(
+            "SELECT id,project_id,subgoal,provenance,solved,update_count,created_at,updated_at \
+             FROM library_requests WHERE project_id=?1 ORDER BY created_at, id",
+        )?;
+        let rows = st.query_map([project_id], library_request_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The oldest still-open request (least `update_count`, then oldest-created).
+    pub fn oldest_open_library_request(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<LibraryRequest>> {
+        self.conn
+            .query_row(
+                "SELECT id,project_id,subgoal,provenance,solved,update_count,created_at,updated_at \
+                 FROM library_requests WHERE project_id=?1 AND solved=0 \
+                 ORDER BY update_count ASC, created_at ASC, id ASC LIMIT 1",
+                [project_id],
+                library_request_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Mark a request solved (a lemma discharging it was admitted).
+    pub fn mark_library_request_solved(&self, project_id: &str, id: &str) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE library_requests SET solved=1,updated_at=?1 WHERE id=?2 AND project_id=?3",
+            params![Utc::now().to_rfc3339(), id, project_id],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!("library request not found: {id}"));
+        }
+        Ok(())
+    }
+
+    /// Increment a request's `update_count` (it has just been worked on).
+    pub fn bump_library_request_update(&self, project_id: &str, id: &str) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE library_requests SET update_count=update_count+1,updated_at=?1 \
+             WHERE id=?2 AND project_id=?3",
+            params![Utc::now().to_rfc3339(), id, project_id],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!("library request not found: {id}"));
+        }
+        Ok(())
+    }
+
+    /// Record a target statement that biases evolution (the problem store).
+    pub fn add_library_problem(
+        &self,
+        project_id: &str,
+        statement: &str,
+        provenance: &str,
+    ) -> Result<LibraryProblem> {
+        self.project(project_id)?;
+        let now = Utc::now();
+        let problem = LibraryProblem {
+            id: Uuid::new_v4().to_string(),
+            project_id: project_id.to_owned(),
+            statement: statement.to_owned(),
+            provenance: provenance.to_owned(),
+            created_at: now,
+        };
+        self.conn.execute(
+            "INSERT INTO library_problems(id,project_id,statement,provenance,created_at) \
+             VALUES (?1,?2,?3,?4,?5)",
+            params![problem.id, project_id, statement, provenance, now.to_rfc3339()],
+        )?;
+        Ok(problem)
+    }
+
+    /// All target problems for a project, in insertion order.
+    pub fn library_problems(&self, project_id: &str) -> Result<Vec<LibraryProblem>> {
+        let mut st = self.conn.prepare(
+            "SELECT id,project_id,statement,provenance,created_at FROM library_problems \
+             WHERE project_id=?1 ORDER BY created_at, id",
+        )?;
+        let rows = st.query_map([project_id], library_problem_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
 }
 
 fn dt(s: String) -> rusqlite::Result<DateTime<Utc>> {
@@ -1525,6 +1777,85 @@ fn lemma_row(r: &Row) -> rusqlite::Result<Lemma> {
         source_node_id: r.get(4)?,
         taint: r.get::<_, i64>(5)? != 0,
         created_at: dt(r.get(6)?)?,
+    })
+}
+
+/// An admitted skill in the growing verified-lemma library. Distinct from the
+/// legacy graph-extraction [`crate::model::Lemma`]: this is the LEGO-Prover
+/// "lemma store" record — a verified `(statement, proof)` with its provenance,
+/// a deterministic `embedding_key`, and an `update_count` used by the evolver
+/// scheduler.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LibraryLemma {
+    pub id: String,
+    pub project_id: String,
+    pub statement: String,
+    pub proof: String,
+    pub provenance: String,
+    pub embedding_key: String,
+    pub update_count: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A conjectured open sub-goal in the library "request store" — doubles as a
+/// retrieval query and an item on the evolver worklist.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LibraryRequest {
+    pub id: String,
+    pub project_id: String,
+    pub subgoal: String,
+    pub provenance: String,
+    pub solved: bool,
+    pub update_count: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A target statement in the library "problem store" that biases evolution.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LibraryProblem {
+    pub id: String,
+    pub project_id: String,
+    pub statement: String,
+    pub provenance: String,
+    pub created_at: DateTime<Utc>,
+}
+
+fn library_lemma_row(r: &Row) -> rusqlite::Result<LibraryLemma> {
+    Ok(LibraryLemma {
+        id: r.get(0)?,
+        project_id: r.get(1)?,
+        statement: r.get(2)?,
+        proof: r.get(3)?,
+        provenance: r.get(4)?,
+        embedding_key: r.get(5)?,
+        update_count: r.get(6)?,
+        created_at: dt(r.get(7)?)?,
+        updated_at: dt(r.get(8)?)?,
+    })
+}
+
+fn library_request_row(r: &Row) -> rusqlite::Result<LibraryRequest> {
+    Ok(LibraryRequest {
+        id: r.get(0)?,
+        project_id: r.get(1)?,
+        subgoal: r.get(2)?,
+        provenance: r.get(3)?,
+        solved: r.get::<_, i64>(4)? != 0,
+        update_count: r.get(5)?,
+        created_at: dt(r.get(6)?)?,
+        updated_at: dt(r.get(7)?)?,
+    })
+}
+
+fn library_problem_row(r: &Row) -> rusqlite::Result<LibraryProblem> {
+    Ok(LibraryProblem {
+        id: r.get(0)?,
+        project_id: r.get(1)?,
+        statement: r.get(2)?,
+        provenance: r.get(3)?,
+        created_at: dt(r.get(4)?)?,
     })
 }
 

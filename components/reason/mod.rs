@@ -11,8 +11,11 @@ pub mod search;
 pub use orchestration::{
     agent, blueprint_run, certification, chat, consolidate, observe, research, team,
 };
-pub use search::{driver, mcts, proof_pool, progress, sampler, sampling, ttc};
+pub use search::{
+    driver, fitness, mcts, minimize, proof_pool, progress, sampler, sampling, subsumption,
+    tactic_outcome, ttc,
+};
 pub use proving::{
-    blueprint, decompose, falsification, formal_generate, portfolio, retry, router, sketch,
+    blueprint, decompose, falsification, formal_generate, library, portfolio, retry, router, sketch,
 };
 pub use critique::{critic, guard, memory, plan_history, taint};

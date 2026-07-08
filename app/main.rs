@@ -19,9 +19,9 @@ mod verify;
 pub use graph::{db, model, scheduler};
 pub use reason::{
     agent, blueprint, blueprint_run, certification, chat, consolidate, critic, decompose, driver,
-    falsification,
-    formal_generate, guard, mcts, memory, observe, plan_history, portfolio, progress, proof_pool,
-    research, retry, router, sampler, sampling, sketch, taint, team, ttc,
+    falsification, fitness, formal_generate, guard, library, mcts, memory, minimize, observe,
+    plan_history, portfolio, progress, proof_pool, research, retry, router, sampler, sampling,
+    sketch, subsumption, tactic_outcome, taint, team, ttc,
 };
 pub use prover::{aristotle, attempt_run, exec, formal, isabelle, lean, proof_job, rocq};
 pub use verify::{hardening, lean_session};

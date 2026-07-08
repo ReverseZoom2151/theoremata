@@ -6,3 +6,4 @@ pub mod retry;
 pub mod sketch;
 pub mod falsification;
 pub mod blueprint;
+pub mod library;
