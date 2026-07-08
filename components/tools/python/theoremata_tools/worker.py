@@ -293,6 +293,10 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.lifelong_curriculum import run as train_curriculum_run
 
         return train_curriculum_run(request["request"])
+    if tool == "difficulty":
+        from theoremata_tools.difficulty import run as difficulty_run
+
+        return difficulty_run(request["request"])
     raise ValueError(f"unknown tool: {tool}")
 
 
