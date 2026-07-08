@@ -237,6 +237,52 @@ def verifier_reward(
     return float(r_format) * r_score * float(r_meta)
 
 
+def _clip01(x: float) -> float:
+    """Clamp a scalar into ``[0, 1]`` (rewards/agreements/meta terms are ratios)."""
+    return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
+
+
+def graded_verifier_reward(
+    format_ok: Any,
+    score_agreement: Any,
+    meta_confirmed: Any,
+) -> float:
+    """DeepSeek-Math-V2 graded verifier reward, primitive form
+    ``R_V = R_format . R_score . R_meta`` (Eq. 2-3).
+
+    Unlike the higher-level :func:`verifier_reward` (which *derives* ``R_score``
+    from a predicted/gold score pair), this takes the three factors directly:
+
+    * ``format_ok`` -- ``R_format in {0, 1}`` (verifier output well-formed). Any
+      truthy value snaps to ``1.0``; falsy/zero to ``0.0``.
+    * ``score_agreement`` -- ``R_score in [0, 1]``: how well the verifier's rubric
+      score agrees with the label (e.g. :func:`faithfulness_reward`).
+    * ``meta_confirmed`` -- ``R_meta in [0, 1]``: did a second (meta) pass confirm
+      the verifier's flagged issues.
+
+    Returns ``0.0`` whenever the format gate fails (the paper's cheap exact gate
+    that everything multiplies against); otherwise the product of the three
+    terms. This is the SOFT, graded reward that rides on top of the formal
+    3+1 gate -- never a replacement for it.
+    """
+    r_format = 1.0 if format_ok else 0.0
+    return r_format * _clip01(float(score_agreement)) * _clip01(float(meta_confirmed))
+
+
+def graded_generator_reward(
+    format_ok: Any,
+    score_agreement: Any,
+    meta_confirmed: Any,
+) -> float:
+    """Combined generator reward in the graded product form
+    ``R = R_format . R_score . R_meta`` (per the task spec). Shares the exact
+    multiplicative shape of :func:`graded_verifier_reward`; kept as a distinct
+    entry point so callers can wire the generator- and verifier-side soft rewards
+    independently. For the richer ``alpha.R_Y + beta.R_Z`` blend from the paper's
+    Eq. 4-6 use :func:`generator_self_verify_reward`."""
+    return graded_verifier_reward(format_ok, score_agreement, meta_confirmed)
+
+
 def generator_self_verify_reward(
     r_y: Any,
     predicted_score: Any,

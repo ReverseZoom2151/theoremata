@@ -35,6 +35,7 @@ Offline / dry-run only: no model, no GPU. Tests drive it with mock oracles.
 from __future__ import annotations
 
 import json
+import math
 import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Sequence
@@ -97,6 +98,37 @@ def majority_confirm(votes: Sequence[Any]) -> bool:
     An empty vote list is *not* confirmed."""
     bools = [_coerce_bool(v) for v in votes]
     return bools.count(True) > bools.count(False)
+
+
+def majority_meta_confirm(passes: Sequence[Any]) -> float:
+    """Auto-label one proof from ``N`` verifier passes by *verification-compute
+    scaling* (DeepSeek-Math-V2 s2.5): the confirmed label flips away from the
+    default ``1.0`` only when **>= ceil(N/2)** of the passes agree that the proof
+    has an issue (score < 1.0). When that majority threshold is met the label is
+    the **lowest** issue score reported (fatal beats minor-gap); otherwise the
+    proof is confirmed correct (``1.0``).
+
+    Each element of ``passes`` may be a float, a dict, or a :class:`Verification`
+    (see :func:`coerce_verification`). An empty list is trivially ``1.0``. This is
+    a SOFT auto-label from the trained/graded verifier -- the formal 3+1 gate
+    remains the ground-truth oracle."""
+    verifs = [coerce_verification(p) for p in passes]
+    n = len(verifs)
+    if n == 0:
+        return 1.0
+    need = math.ceil(n / 2)
+    issue_scores = [v.score for v in verifs if v.issues()]
+    if len(issue_scores) >= need:
+        return min(issue_scores)
+    return 1.0
+
+
+def _meta_agreement(passes: Sequence[Verification], label: float) -> float:
+    """Fraction of passes whose score matches the confirmed ``label`` (the meta
+    ``R_meta`` term: how consistently the compute-scaled passes back the label)."""
+    if not passes:
+        return 0.0
+    return sum(1 for v in passes if v.score == label) / len(passes)
 
 
 def formal_oracle(verdict_fn: Callable[[str, str], Any]) -> VerifyOracle:
@@ -434,6 +466,114 @@ def revolution(
     }
 
 
+def graded_revolution(
+    problems: Sequence[dict[str, Any]],
+    *,
+    generator: Optional[Generator] = None,
+    verify_oracle: Optional[VerifyOracle] = None,
+    graded_verifier: Optional[VerifyOracle] = None,
+    n_candidates: int = 4,
+    n: int = 1,
+    m: int = 1,
+    k: int = 1,
+    formal: bool = False,
+    threshold: float = 1.0,
+    n_graded: int = 4,
+    r_format: float = 1.0,
+    jsonl_path: Optional[str] = None,
+    round_index: int = 0,
+) -> dict[str, Any]:
+    """A :func:`revolution` variant that scales *verification compute* to
+    auto-label the HARD proofs the ground-truth oracle did not verify.
+
+    The ground-truth path is unchanged: ``verify_oracle`` (the formal 3+1 gate)
+    hard-labels every candidate and candidates with label ``>= threshold`` become
+    verified SFT positives (identical to :func:`revolution`). ON TOP of that, each
+    candidate the ground-truth oracle did NOT verify is run through the
+    trained/graded ``graded_verifier`` ``n_graded`` times; :func:`majority_meta_confirm`
+    turns those passes into a SOFT auto-label, and a graded soft reward
+    ``R = R_format . R_score . R_meta`` (:func:`reward.graded_verifier_reward`) is
+    attached. These soft labels never enter the hard SFT set -- the formal gate
+    stays the sole ground-truth oracle; the graded verifier is a soft reward.
+
+    ``graded_verifier`` defaults to ``verify_oracle`` (so with no soft verifier the
+    hard proofs simply re-confirm as flawed). Returns the :func:`revolution` fields
+    plus ``n_auto_labeled`` and ``auto_labeled`` (each row
+    ``{problem, proof, soft_label, confirmed, reward, provenance}``).
+    """
+    from theoremata_tools.reward import faithfulness_reward, graded_verifier_reward
+
+    gen: Generator = generator or (lambda s: mock_generator(s, n=n_candidates))
+    gt_oracle: VerifyOracle = verify_oracle or pattern_oracle()
+    soft_oracle: VerifyOracle = graded_verifier or gt_oracle
+
+    items: list[dict[str, Any]] = []
+    for prob in problems:
+        statement = str(
+            prob.get("statement", prob.get("problem", prob.get("goal", "")))
+        )
+        for cand in gen(statement):
+            items.append({"problem": statement, "proof": str(cand)})
+
+    n_generated = len(items)
+    labeled = label_dataset(items, gt_oracle, n=n, m=m, k=k, formal=formal)
+    sft_rows = to_sft_rows(labeled["rows"], threshold=threshold)
+    n_verified = len(sft_rows)
+
+    auto_labeled: list[dict[str, Any]] = []
+    for row in labeled["rows"]:
+        if float(row["label"]) >= threshold:
+            continue  # already a hard-verified positive; nothing to auto-label
+        passes = [
+            coerce_verification(soft_oracle(row["problem"], row["proof"]))
+            for _ in range(max(n_graded, 1))
+        ]
+        soft_label = majority_meta_confirm(passes)
+        r_meta = _meta_agreement(passes, soft_label)
+        agreements = [faithfulness_reward(v.score, soft_label) or 0.0 for v in passes]
+        r_score = sum(agreements) / len(agreements) if agreements else 0.0
+        reward = graded_verifier_reward(r_format, r_score, r_meta)
+        need = math.ceil(len(passes) / 2)
+        confirmed = sum(1 for v in passes if v.score == soft_label) >= need
+        auto_labeled.append(
+            {
+                "problem": row["problem"],
+                "proof": row["proof"],
+                "soft_label": soft_label,
+                "confirmed": confirmed,
+                "reward": reward,
+                "provenance": {
+                    "oracle": "graded_soft",
+                    "n_graded": n_graded,
+                    "scores": [v.score for v in passes],
+                    "r_score": r_score,
+                    "r_meta": r_meta,
+                    "note": "soft auto-label; formal gate remains ground truth",
+                },
+            }
+        )
+
+    written: Optional[int] = None
+    if jsonl_path is not None:
+        written = write_jsonl(sft_rows, jsonl_path)
+
+    return {
+        "ok": True,
+        "schema": SFT_SCHEMA,
+        "round": round_index,
+        "n_problems": len(problems),
+        "n_generated": n_generated,
+        "n_verified": n_verified,
+        "n_auto_labeled": len(auto_labeled),
+        "yield": (n_verified / n_generated) if n_generated else 0.0,
+        "distribution": labeled["distribution"],
+        "sft_rows": sft_rows,
+        "auto_labeled": auto_labeled,
+        "jsonl_path": jsonl_path,
+        "written": written,
+    }
+
+
 def dry_run(
     items: Sequence[dict[str, Any]],
     verify_oracle: VerifyOracle,
@@ -522,6 +662,24 @@ def run(request: dict[str, Any]) -> dict[str, Any]:
             k=int(request.get("k", 1)),
             formal=bool(request.get("formal", False)),
             threshold=float(request.get("threshold", 1.0)),
+            jsonl_path=request.get("jsonl_path"),
+            round_index=int(request.get("round", 0)),
+        )
+        if not request.get("with_rows"):
+            res = {kk: vv for kk, vv in res.items() if kk != "sft_rows"}
+        return res
+    if op == "graded_revolution":
+        # Offline mock loop: defaults (mock_generator + pattern_oracle) cannot
+        # cross the JSON boundary, so this replays the deterministic mock seams.
+        res = graded_revolution(
+            request.get("problems", request.get("items", [])),
+            n_candidates=int(request.get("n_candidates", 4)),
+            n=int(request.get("n", 1)),
+            m=int(request.get("m", 1)),
+            k=int(request.get("k", 1)),
+            formal=bool(request.get("formal", False)),
+            threshold=float(request.get("threshold", 1.0)),
+            n_graded=int(request.get("n_graded", 4)),
             jsonl_path=request.get("jsonl_path"),
             round_index=int(request.get("round", 0)),
         )
