@@ -171,6 +171,20 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_library_lemmas_project ON library_lemmas(project_id);
             CREATE INDEX IF NOT EXISTS idx_library_requests_project ON library_requests(project_id);
             CREATE INDEX IF NOT EXISTS idx_library_problems_project ON library_problems(project_id);
+            -- Global persistent goal cache (AlphaProof "Nexus"): a canonical-goal
+            -- keyed proof cache so proven sub-goals are reused ACROSS searches and
+            -- runs, not just within one search's transposition table. All keying /
+            -- subsumption policy lives in `reason::search::goal_cache::GoalCache`;
+            -- this table is pure CRUD.
+            CREATE TABLE IF NOT EXISTS goal_cache (
+              id TEXT PRIMARY KEY,
+              project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+              canonical_key TEXT NOT NULL,
+              goal TEXT NOT NULL,
+              proof TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_goal_cache_project_key ON goal_cache(project_id, canonical_key);
             "#,
         )?;
         // Idempotent column additions so databases created before these fields
@@ -1650,6 +1664,92 @@ impl Store {
         let rows = st.query_map([project_id], library_problem_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
+
+    // --- Global persistent goal cache (AlphaProof "Nexus") -----------------
+    //
+    // Persistence for `reason::search::goal_cache::GoalCache`. All
+    // canonicalization / subsumption *policy* lives in that module; these
+    // methods are pure CRUD over the `goal_cache` table.
+
+    /// Insert a cached proof keyed by its caller-supplied `canonical_key` (the
+    /// canonical form of `goal`). Does not deduplicate — the `GoalCache` policy
+    /// checks [`Store::goal_cache_by_key`] first to stay idempotent on a key.
+    pub fn add_goal_cache_entry(
+        &self,
+        project_id: &str,
+        canonical_key: &str,
+        goal: &str,
+        proof: &str,
+    ) -> Result<GoalCacheEntry> {
+        self.project(project_id)?;
+        let now = Utc::now();
+        let entry = GoalCacheEntry {
+            id: Uuid::new_v4().to_string(),
+            project_id: project_id.to_owned(),
+            canonical_key: canonical_key.to_owned(),
+            goal: goal.to_owned(),
+            proof: proof.to_owned(),
+            created_at: now,
+        };
+        self.conn.execute(
+            "INSERT INTO goal_cache(id,project_id,canonical_key,goal,proof,created_at) \
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                entry.id,
+                project_id,
+                canonical_key,
+                goal,
+                proof,
+                now.to_rfc3339()
+            ],
+        )?;
+        self.event(
+            Some(project_id),
+            None,
+            "goal_cache.stored",
+            "goal_cache",
+            json!({"entry_id": entry.id}),
+        )?;
+        Ok(entry)
+    }
+
+    /// The cached entry for a canonical key, if any (the exact-hit lookup).
+    pub fn goal_cache_by_key(
+        &self,
+        project_id: &str,
+        canonical_key: &str,
+    ) -> Result<Option<GoalCacheEntry>> {
+        self.conn
+            .query_row(
+                "SELECT id,project_id,canonical_key,goal,proof,created_at FROM goal_cache \
+                 WHERE project_id=?1 AND canonical_key=?2 ORDER BY created_at, id LIMIT 1",
+                params![project_id, canonical_key],
+                goal_cache_entry_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// All cached entries for a project, in insertion order (the subsumption
+    /// scan iterates these).
+    pub fn goal_cache_entries(&self, project_id: &str) -> Result<Vec<GoalCacheEntry>> {
+        let mut st = self.conn.prepare(
+            "SELECT id,project_id,canonical_key,goal,proof,created_at FROM goal_cache \
+             WHERE project_id=?1 ORDER BY created_at, id",
+        )?;
+        let rows = st.query_map([project_id], goal_cache_entry_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Number of cached entries for a project.
+    pub fn count_goal_cache(&self, project_id: &str) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM goal_cache WHERE project_id=?1",
+            [project_id],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
 }
 
 fn dt(s: String) -> rusqlite::Result<DateTime<Utc>> {
@@ -1856,6 +1956,32 @@ fn library_problem_row(r: &Row) -> rusqlite::Result<LibraryProblem> {
         statement: r.get(2)?,
         provenance: r.get(3)?,
         created_at: dt(r.get(4)?)?,
+    })
+}
+
+/// A cached proof in the global persistent goal cache (AlphaProof "Nexus"): a
+/// verified `(goal, proof)` keyed by the goal's canonical form so that proven
+/// sub-goals are reused across searches and runs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GoalCacheEntry {
+    pub id: String,
+    pub project_id: String,
+    /// The canonical key of `goal` (supplied by `GoalCache`).
+    pub canonical_key: String,
+    /// The original goal text as stored (used for subsumption checks).
+    pub goal: String,
+    pub proof: String,
+    pub created_at: DateTime<Utc>,
+}
+
+fn goal_cache_entry_row(r: &Row) -> rusqlite::Result<GoalCacheEntry> {
+    Ok(GoalCacheEntry {
+        id: r.get(0)?,
+        project_id: r.get(1)?,
+        canonical_key: r.get(2)?,
+        goal: r.get(3)?,
+        proof: r.get(4)?,
+        created_at: dt(r.get(5)?)?,
     })
 }
 
