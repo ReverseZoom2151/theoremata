@@ -5,3 +5,7 @@ pub mod sampler;
 pub mod sampling;
 pub mod progress;
 pub mod ttc;
+pub mod subsumption;
+pub mod fitness;
+pub mod minimize;
+pub mod tactic_outcome;
