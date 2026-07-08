@@ -520,11 +520,28 @@ def load_bridge178() -> list[dict[str, Any]]:
             if uid in seen:
                 continue
             seen.add(uid)
-            signatures = []
+            # Real dataset key is `function_signature` (singular string); keep
+            # `signatures`/`signature` as back-compat fallbacks.
+            signatures: list[str] = []
+            arguments: list[str] = []
+            argument_types: list[str] = []
+            function_name = None
             if isinstance(lean_meta, dict):
-                signatures = lean_meta.get("signatures") or lean_meta.get("signature") or []
-                if isinstance(signatures, str):
-                    signatures = [signatures]
+                sig = (
+                    lean_meta.get("function_signature")
+                    or lean_meta.get("signatures")
+                    or lean_meta.get("signature")
+                    or []
+                )
+                if isinstance(sig, str):
+                    signatures = [sig]
+                elif isinstance(sig, list):
+                    signatures = [s for s in sig if s]
+                arguments = lean_meta.get("arguments") or []
+                argument_types = lean_meta.get("argument_types") or []
+                function_name = lean_meta.get("function_name")
+            # `tests.inputs` are named-kwarg dicts (keyed by arg name); an oracle
+            # runner must bind by name via `arguments`, not by position.
             items.append(
                 make_item(
                     id=uid,
@@ -533,10 +550,15 @@ def load_bridge178() -> list[dict[str, Any]]:
                     formal=None,
                     expected={
                         "lean_signatures": signatures,
+                        "function_name": function_name,
+                        "arguments": arguments,
+                        "argument_types": argument_types,
                         "oracle_tests": {
                             "inputs": tests.get("inputs") or tests.get("input"),
                             "expected_outputs": tests.get("expected_outputs")
                             or tests.get("outputs"),
+                            "bind": "kwargs",
+                            "arguments": arguments,
                         },
                         "python": rec.get("python"),
                         "prompt_variants": ["direct", "functional", "theorem", "proof"],
@@ -598,22 +620,42 @@ def _load_quantumlean(domain: str | None = None) -> list[dict[str, Any]]:
             if uid in seen:
                 continue
             seen.add(uid)
-            formal = rec.get("solution_formal")
+            # `solution_formal`/`solution_informal` are DICTS keyed by model name
+            # (e.g. "gpt5.4_response") — model outputs, NOT a gold reference. There
+            # is no gold formal proof anywhere in the corpus, so we do NOT stringify
+            # them into `formal`; the problem statement is the item and the human
+            # 0-2 `manual_eval` rubric is the intended scoring channel.
+            formal_responses = rec.get("solution_formal")
+            informal_responses = rec.get("solution_informal")
+            formal_responses = (
+                formal_responses if isinstance(formal_responses, dict) else {}
+            )
+            informal_responses = (
+                informal_responses if isinstance(informal_responses, dict) else {}
+            )
+            response_model_keys = sorted(
+                set(formal_responses) | set(informal_responses)
+            )
             items.append(
                 make_item(
                     id=uid,
-                    kind="formalization",
+                    kind="scientific_formalization",
                     informal=str(problem),
-                    formal=str(formal) if formal else None,
+                    formal=None,  # no gold formal proof exists in this corpus
                     expected={
-                        "solution_informal": rec.get("solution_informal"),
-                        "response_keys": ["response_key"],
+                        "mode": "typecheck_only",
+                        "gold_present": False,
+                        "problem": str(problem),
+                        "model_responses_formal": formal_responses,
+                        "model_responses_informal": informal_responses,
+                        "response_model_keys": response_model_keys,
                         "manual_eval": rec.get("manual_eval"),
+                        "type": rec.get("type"),
                         "axioms_whitelist": list(AXIOMS_WHITELIST),
                     },
                     grading={
                         "track": "formalization",
-                        "method": "comparator_or_statement",
+                        "method": "typecheck_only",
                         "task": "scientific_formalization",
                         "domain": dom,
                         "type": rec.get("type"),

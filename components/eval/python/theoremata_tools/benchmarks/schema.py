@@ -32,6 +32,9 @@ KINDS = (
     "statement_target",
     "external_artifact",
     "reformulation",
+    # QuantumLean ships model outputs + a human 0-2 rubric, NOT a gold formal
+    # proof — graded typecheck-only (no statement-preservation is possible).
+    "scientific_formalization",
 )
 
 # The canonical Lean "consistency" axiom trio. Anything else (notably sorryAx)

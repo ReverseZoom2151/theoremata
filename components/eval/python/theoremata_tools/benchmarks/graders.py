@@ -506,6 +506,49 @@ def grade_verified_programming(item: dict[str, Any], response: Any) -> dict[str,
 
 
 # --------------------------------------------------------------------------- #
+# Scientific formalization (QuantumLean) — typecheck-only, NO gold
+# --------------------------------------------------------------------------- #
+
+def grade_scientific_formalization(item: dict[str, Any], response: Any) -> dict[str, Any]:
+    """QuantumLean has NO gold formal proof — only model outputs plus a human
+    0-2 ``manual_eval`` rubric. Statement-preservation is therefore impossible
+    and would be a fabricated pass. We grade honestly: engagement (a Lean snippet
+    was produced) + a structural axiom/``sorry`` gate as a *necessary* condition,
+    and surface the human rubric. Correctness is NOT auto-determinable without a
+    live Lean typecheck against a gold reference that does not exist, so
+    ``is_correct`` stays ``False`` (undetermined) with an explicit note.
+    """
+    expected = item.get("expected") or {}
+    lean = _extract_lean_text(response)
+    axioms_ok, axiom_detail = _axioms_ok(
+        lean, list(expected.get("axioms_whitelist") or AXIOMS_WHITELIST)
+    )
+    is_solved = bool(lean.strip())
+    return {
+        "is_solved": is_solved,
+        # No gold + no live typecheck => not auto-verifiable. Honest: never claim
+        # correctness from statement-preservation (there is no statement to preserve).
+        "is_correct": False,
+        "detail": {
+            "track": "formalization",
+            "method": "typecheck_only",
+            "auto_gradable": False,
+            "gold_present": bool(expected.get("gold_present", False)),
+            "axioms_ok": axioms_ok,
+            "axiom_detail": axiom_detail,
+            "structural_gate_only": True,
+            "manual_eval": expected.get("manual_eval"),
+            "response_model_keys": expected.get("response_model_keys"),
+            "note": (
+                "QuantumLean ships no gold formal proof; correctness requires a "
+                "live Lean typecheck and/or the human 0-2 manual_eval rubric. "
+                "No statement-preservation grade is possible."
+            ),
+        },
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Statement target (Millennium)
 # --------------------------------------------------------------------------- #
 
@@ -611,6 +654,8 @@ def grade(item: dict[str, Any], response: Any, **kw: Any) -> dict[str, Any]:
         return grade_falsification(item, response)
     if kind == "verified_programming":
         return grade_verified_programming(item, response)
+    if kind == "scientific_formalization":
+        return grade_scientific_formalization(item, response)
     if kind == "statement_target":
         return grade_statement_target(item, response)
     if kind == "external_artifact":

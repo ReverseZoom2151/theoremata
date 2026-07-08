@@ -398,3 +398,133 @@ def test_proof_completion_smoke_runner(monkeypatch, tmp_path):
     )
     assert via_registry["op"] == "proof_completion"
     assert via_registry["correct"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# BRIDGE-178 loader — reads `function_signature` (bug fix regression lock)
+# --------------------------------------------------------------------------- #
+
+_BRIDGE_RECORD = {
+    "task_id": "t1",
+    "dataset_id": "bridge178",
+    "title_or_source_id": "weekly-contest-381-minimum-number-of-pushes",
+    "difficulty": "easy",
+    "tags": ["algorithms"],
+    "problem_statement": "Return the minimum number of pushes.",
+    "python": {
+        "function_name": "minimumPushes",
+        "function_signature": "def minimumPushes(word: str) -> int:\n    pass",
+    },
+    "lean": {
+        "function_name": "minimumPushes",
+        "function_signature": "def minimumPushes (word : String) : Int",
+        "arguments": ["word"],
+        "argument_types": ["String"],
+    },
+    "tests": {
+        "inputs": [{"word": "abcde"}, {"word": "b"}],
+        "expected_outputs": [5, 1],
+    },
+}
+
+
+def _write_bridge(root: Path, records: list[dict]) -> None:
+    d = root / "BRIDGE-main" / "BRIDGE-main" / "datasets"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "bridge178.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in records), encoding="utf-8"
+    )
+
+
+def test_bridge178_loads_function_signature(monkeypatch, tmp_path):
+    _write_bridge(tmp_path, [_BRIDGE_RECORD])
+    monkeypatch.setenv("THEOREMATA_RESOURCES", str(tmp_path))
+    items = load_benchmark("bridge178")
+    assert len(items) == 1
+    it = items[0]
+    assert it["kind"] == "verified_programming"
+    # the bug: signatures used to load [] because the key was wrong
+    assert it["expected"]["lean_signatures"] == ["def minimumPushes (word : String) : Int"]
+    assert it["expected"]["function_name"] == "minimumPushes"
+    assert it["expected"]["arguments"] == ["word"]
+    assert it["expected"]["argument_types"] == ["String"]
+    # named-kwarg oracle inputs bind by argument name
+    oracle = it["expected"]["oracle_tests"]
+    assert oracle["bind"] == "kwargs"
+    assert oracle["inputs"][0] == {"word": "abcde"}
+    # and grading is now actually correctable (non-empty signatures)
+    good = (
+        "```lean\ndef minimumPushes (word : String) : Int := 0\n```"
+    )
+    res = grade(it, good)
+    assert res["detail"]["signatures_ok"] is True
+    assert res["is_correct"] is True
+
+
+def test_bridge178_grade_correctable_on_real_corpus_if_present():
+    if not _corpus_present("bridge178"):
+        pytest.skip("BRIDGE corpus absent")
+    items = load_benchmark("bridge178")
+    assert len(items) > 0
+    # every item now carries a non-empty Lean signature (was always [] pre-fix)
+    assert all(it["expected"]["lean_signatures"] for it in items)
+
+
+# --------------------------------------------------------------------------- #
+# QuantumLean loader — no fabricated formal-gold grade (bug fix regression lock)
+# --------------------------------------------------------------------------- #
+
+_QL_RECORD = {
+    "id": "5.73_0001",
+    "source": "MIT OpenCourseWare, 5.73",
+    "domain": "quantum_physics",
+    "type": "proof-based",
+    "problem": "Show that the operator is Hermitian.",
+    "metadata": {},
+    "citations": [],
+    "solution_informal": {"gpt5.4_response": "Because the eigenvalues are real ..."},
+    "solution_formal": {"gpt5.4_response": "import Mathlib\ntheorem foo : True := by trivial"},
+    "manual_eval": {
+        "scale": "0-2",
+        "gold_present": False,
+        "rubric": {"2": "Correct.", "1": "Partial.", "0": "Wrong."},
+        "responses": {"solution_formal.gpt5.4_response": {"score": 1, "correct": False}},
+    },
+}
+
+
+def _write_quantumlean(root: Path, records: list[dict]) -> None:
+    d = root / "QuantumLean-Bench-main" / "QuantumLean" / "BenchmarkData" / "Physics"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "mitocw_5.73.json").write_text(json.dumps(records), encoding="utf-8")
+
+
+def test_quantumlean_does_not_stringify_model_dict(monkeypatch, tmp_path):
+    _write_quantumlean(tmp_path, [_QL_RECORD])
+    monkeypatch.setenv("THEOREMATA_RESOURCES", str(tmp_path))
+    items = load_benchmark("quantumlean")
+    assert len(items) == 1
+    it = items[0]
+    assert it["kind"] == "scientific_formalization"
+    # the bug: `formal` used to be the repr of a {model: lean} dict
+    assert it["formal"] is None
+    assert "gpt5.4_response" not in str(it["formal"])
+    exp = it["expected"]
+    assert exp["gold_present"] is False
+    assert exp["response_model_keys"] == ["gpt5.4_response"]
+    assert exp["model_responses_formal"]["gpt5.4_response"].startswith("import Mathlib")
+    assert exp["manual_eval"]["scale"] == "0-2"
+    assert it["grading"]["method"] == "typecheck_only"
+
+
+def test_quantumlean_grader_is_honest_no_statement_preservation(monkeypatch, tmp_path):
+    _write_quantumlean(tmp_path, [_QL_RECORD])
+    monkeypatch.setenv("THEOREMATA_RESOURCES", str(tmp_path))
+    it = load_benchmark("quantumlean")[0]
+    # Even echoing back a model's "solution" must NOT yield a fabricated pass:
+    # there is no gold statement to preserve.
+    res = grade(it, "import Mathlib\ntheorem foo : True := by trivial")
+    assert res["is_correct"] is False
+    assert res["detail"]["method"] == "typecheck_only"
+    assert res["detail"]["auto_gradable"] is False
+    assert res["is_solved"] is True
