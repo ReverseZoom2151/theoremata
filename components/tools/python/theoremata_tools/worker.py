@@ -241,6 +241,42 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.isabelle_retrieval import run as isabelle_retrieve_run
 
         return isabelle_retrieve_run(request)
+    if tool == "proof_calibration":
+        from theoremata_tools.proof_calibration import run as proof_calibration_run
+
+        return proof_calibration_run(request)
+    if tool == "aristotle_mcp":
+        from theoremata_tools.aristotle_mcp_client import run as aristotle_mcp_run
+
+        return aristotle_mcp_run(request)
+    if tool == "formal_lint":
+        from theoremata_tools.formal_lint import run as formal_lint_run
+
+        return formal_lint_run(request)
+    if tool == "lp_geometry":
+        from theoremata_tools.lp_geometry import run as lp_geometry_run
+
+        return lp_geometry_run(request)
+    if tool == "flywheel":
+        from theoremata_tools.flywheel import run as flywheel_run
+
+        return flywheel_run(request["request"])
+    if tool == "ewc":
+        from theoremata_tools.ewc import run as ewc_run
+
+        return ewc_run(request["request"])
+    if tool == "progress_sft":
+        from theoremata_tools.progress_sft import run as progress_sft_run
+
+        return progress_sft_run(request["request"])
+    if tool == "retriever_train":
+        from theoremata_tools.retriever_train import run as retriever_train_run
+
+        return retriever_train_run(request["request"])
+    if tool == "train_curriculum":
+        from theoremata_tools.lifelong_curriculum import run as train_curriculum_run
+
+        return train_curriculum_run(request["request"])
     raise ValueError(f"unknown tool: {tool}")
 
 
