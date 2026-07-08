@@ -110,3 +110,67 @@ def test_dry_run_every_row_has_positive():
     assert out["batch_size"] == 2
     assert out["all_rows_have_positive"] is True
     assert all(s >= 1.0 for s in out["positives_per_row"])
+
+
+# --- dense-index scaffold: hash fallback (always available, no torch) -------
+
+def test_dense_index_hash_fallback_ranks_sanely():
+    from theoremata_tools.retriever_train import build_index, query_index
+
+    premises = [
+        {"name": "Nat.add_comm", "module": "Mathlib.Nat.Basic"},
+        {"name": "Nat.mul_comm", "module": "Mathlib.Nat.Basic"},
+        {"name": "List.append_nil", "module": "Mathlib.List.Basic"},
+    ]
+    index = build_index(premises, dim=64, backend="hash")
+    assert index["backend"] == "hash"
+    assert index["projection"] is None
+    assert len(index["vectors"]) == 3
+
+    res = query_index(index, "add commutative nat", k=2)
+    assert res[0]["name"] == "Nat.add_comm"  # best lexical/embedding overlap
+    assert len(res) == 2
+    assert res[0]["score"] >= res[1]["score"]  # sorted descending
+
+
+def test_dense_index_persist_roundtrip(tmp_path):
+    from theoremata_tools.retriever_train import (
+        build_index,
+        load_index,
+        query_index,
+        save_index,
+    )
+
+    premises = [
+        {"name": "Nat.add_comm", "module": "Mathlib.Nat.Basic"},
+        {"name": "List.append_nil", "module": "Mathlib.List.Basic"},
+    ]
+    index = build_index(premises, dim=32, backend="hash")
+    path = str(tmp_path / "index.json")
+    save_index(index, path)
+
+    loaded = load_index(path)
+    assert loaded["dim"] == 32
+    assert loaded["backend"] == "hash"
+    assert query_index(loaded, "nat add", k=1)[0]["name"] == "Nat.add_comm"
+
+
+def test_dense_index_torch_optional():
+    import importlib.util
+
+    import pytest
+
+    if importlib.util.find_spec("torch") is None:
+        pytest.skip("torch not installed")
+
+    from theoremata_tools.retriever_train import build_index, query_index
+
+    premises = [
+        {"name": "Nat.add_comm", "module": "Mathlib.Nat.Basic"},
+        {"name": "List.append_nil", "module": "Mathlib.List.Basic"},
+    ]
+    index = build_index(premises, dim=32, backend="torch")
+    assert index["backend"] == "torch"
+    assert index["projection"] is not None  # fitted, JSON-serializable matrix
+    res = query_index(index, "nat add", k=1)
+    assert res and res[0]["name"] in {"Nat.add_comm", "List.append_nil"}

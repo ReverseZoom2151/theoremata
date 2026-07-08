@@ -21,8 +21,11 @@ DeepSpeed stage-2, ``gradient_clip_val 1.0``.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import random
+import re
 import sys
 from typing import Any, Optional, Sequence
 
@@ -163,6 +166,185 @@ def dry_run(
     }
 
 
+# ---------------------------------------------------------------------------
+# Dense retrieval index (offline scaffold).
+#
+#   build_corpus -> embed -> nearest-neighbour query, with JSON persist/load.
+#
+# Two honestly-gated embedding backends produce the SAME index/query contract:
+#
+# * ``hash`` (default fallback) -- a dependency-free signed hashing-trick
+#   embedding. No torch, no GPU, deterministic; always available.
+# * ``torch`` (optional) -- runs one REAL training step to fit a linear
+#   projection over the hashed features. The fitted matrix is stored as plain
+#   nested lists, so the persisted index is JSON-serializable and can be QUERIED
+#   with no torch at all. GPU/torch is used only to *build* the projection.
+#
+# ``backend="auto"`` picks ``torch`` when importable, else ``hash``. The choice
+# is always reported in the index's ``backend`` field so it is never silent.
+# ---------------------------------------------------------------------------
+
+_TOKEN_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+")
+
+
+def _tokenize(text: str) -> list[str]:
+    """Split an identifier / query into lowercased word pieces
+    (``Nat.add_comm`` -> ``[nat, add, comm]``)."""
+    out: list[str] = []
+    for part in re.split(r"[^A-Za-z0-9]+", text or ""):
+        out.extend(m.group(0).lower() for m in _TOKEN_RE.finditer(part))
+    return out
+
+
+def premise_text(premise: dict[str, Any]) -> str:
+    """The text a premise is embedded from: explicit ``text`` if present, else
+    ``name`` + ``module``."""
+    if premise.get("text"):
+        return str(premise["text"])
+    return f"{premise.get('name', '')} {premise.get('module', '')}".strip()
+
+
+def _hash_features(text: str, dim: int) -> list[float]:
+    """Deterministic signed hashing-trick features (UNnormalized). Uses
+    ``hashlib`` (not the salted builtin ``hash``) so vectors are stable across
+    processes and platforms."""
+    vec = [0.0] * dim
+    for tok in _tokenize(text):
+        h = int(hashlib.md5(tok.encode("utf-8")).hexdigest(), 16)
+        vec[h % dim] += 1.0 if (h >> 7) & 1 else -1.0
+    return vec
+
+
+def _matvec(matrix: Sequence[Sequence[float]], vec: Sequence[float]) -> list[float]:
+    return [sum(row[j] * vec[j] for j in range(len(vec))) for row in matrix]
+
+
+def _normalize(vec: Sequence[float]) -> list[float]:
+    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+    return [v / norm for v in vec]
+
+
+def _embed(text: str, dim: int, projection: Optional[Sequence[Sequence[float]]]) -> list[float]:
+    """Hash features -> optional learned projection -> L2 normalize."""
+    feats = _hash_features(text, dim)
+    if projection is not None:
+        feats = _matvec(projection, feats)
+    return _normalize(feats)
+
+
+def build_corpus(premises: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalize premise records into ``{name, module, kind, text}`` corpus rows."""
+    return [
+        {
+            "name": p.get("name", ""),
+            "module": p.get("module"),
+            "kind": p.get("kind"),
+            "text": premise_text(p),
+        }
+        for p in premises
+    ]
+
+
+def _detect_index_backend() -> str:
+    try:
+        import torch  # noqa: F401
+    except Exception:  # noqa: BLE001 - any import failure => hash fallback
+        return "hash"
+    return "torch"
+
+
+def _train_projection(texts: Sequence[str], dim: int, seed: int) -> list[list[float]]:
+    """Run ONE real torch training step to fit a ``dim x dim`` linear projection
+    over the hashed features (self-supervised reconstruction warm start).
+    Torch-only; returns a plain nested-list matrix so the index stays
+    JSON-serializable and queryable without torch."""
+    import torch
+
+    torch.manual_seed(int(seed))
+    feats = torch.tensor(
+        [_hash_features(t, dim) for t in texts] or [[0.0] * dim], dtype=torch.float32
+    )
+    proj = torch.nn.Linear(dim, dim, bias=False)
+    optim = torch.optim.Adam(proj.parameters(), lr=1e-2)
+    loss = torch.nn.functional.mse_loss(proj(feats), feats)
+    loss.backward()
+    optim.step()
+    return proj.weight.detach().tolist()
+
+
+def build_index(
+    premises: Sequence[dict[str, Any]],
+    *,
+    dim: int = 64,
+    backend: str = "auto",
+    seed: int = 3407,
+) -> dict[str, Any]:
+    """Build a dense retrieval index over ``premises``.
+
+    ``backend="auto"`` uses the torch projection path when torch imports, else the
+    dependency-free ``hash`` fallback. Both produce L2-normalized vectors and a
+    :func:`query_index`-ready structure; the torch path additionally stores the
+    fitted ``projection`` matrix so queries need no torch.
+
+    Returns ``{backend, dim, projection, records, vectors}``.
+    """
+    if backend == "auto":
+        backend = _detect_index_backend()
+    corpus = build_corpus(premises)
+    projection: Optional[list[list[float]]] = None
+    if backend == "torch":
+        projection = _train_projection([r["text"] for r in corpus], dim, seed)
+    vectors = [_embed(r["text"], dim, projection) for r in corpus]
+    return {
+        "backend": backend,
+        "dim": dim,
+        "projection": projection,
+        "records": corpus,
+        "vectors": vectors,
+    }
+
+
+def query_index(index: dict[str, Any], query: str, k: int = 5) -> list[dict[str, Any]]:
+    """Return the top-``k`` premises for ``query`` by cosine similarity (vectors
+    are pre-normalized, so cosine == dot product)."""
+    dim = int(index["dim"])
+    projection = index.get("projection")
+    qv = _embed(query, dim, projection)
+    vectors = index["vectors"]
+    scored = sorted(
+        (
+            (sum(qv[j] * v[j] for j in range(dim)), i)
+            for i, v in enumerate(vectors)
+        ),
+        key=lambda t: (-t[0], t[1]),
+    )
+    out: list[dict[str, Any]] = []
+    for s, i in scored[: max(0, k)]:
+        rec = index["records"][i]
+        out.append(
+            {
+                "name": rec.get("name"),
+                "module": rec.get("module"),
+                "kind": rec.get("kind"),
+                "score": round(float(s), 6),
+            }
+        )
+    return out
+
+
+def save_index(index: dict[str, Any], path: str) -> str:
+    """Persist an index as JSON; returns the path written."""
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(index, fh, ensure_ascii=False)
+    return path
+
+
+def load_index(path: str) -> dict[str, Any]:
+    """Load an index previously written by :func:`save_index`."""
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
 def run(request: dict[str, Any]) -> dict[str, Any]:
     op = request.get("op", "config")
     if op == "config":
@@ -182,6 +364,19 @@ def run(request: dict[str, Any]) -> dict[str, Any]:
         return build_label_matrix(request["batch_positives"], request["batch_negatives"])
     if op == "dry_run":
         return dry_run(request.get("examples", []), request.get("config"))
+    if op == "build_index":
+        return build_index(
+            request.get("premises", []),
+            dim=int(request.get("dim", 64)),
+            backend=request.get("backend", "auto"),
+            seed=int(request.get("seed", 3407)),
+        )
+    if op == "query_index":
+        return {
+            "results": query_index(
+                request["index"], request.get("query", ""), int(request.get("k", 5))
+            )
+        }
     raise ValueError(f"unknown op: {op}")
 
 
