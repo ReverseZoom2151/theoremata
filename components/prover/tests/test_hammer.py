@@ -310,3 +310,48 @@ def test_live_sledgehammer_reconstructs_trivial_goal():
     assert out["kernel_checked"] is True
     tactic = out["reconstructed_tactic"]
     assert tactic and re.search(r"\bby\b", tactic), tactic
+
+
+# --------------------------------------------------------------------------- #
+# LIVE CoqHammer (rocq): runs only when the CoqHammer plugin actually compiles
+# (probed under `eval "$(opam env)"` on this box; else skipped). Asserts a
+# kernel-checked `sauto` reconstruction comes back live for a trivial goal.
+# --------------------------------------------------------------------------- #
+def _coqhammer_live_available() -> bool:
+    """True iff a rocq command exists and its CoqHammer pure-tier probe compiles."""
+    command = hammer._command_for("rocq")
+    return bool(command) and hammer._coqhammer_plugin_available(command, False)
+
+
+@pytest.mark.skipif(
+    not _coqhammer_live_available(),
+    reason="CoqHammer (Rocq) not available on this machine",
+)
+def test_live_coqhammer_reconstructs_trivial_goal():
+    out = hammer.run_hammer("rocq", "1 + 1 = 2", mode="real", timeout=30)
+    assert out["ok"] is True
+    assert out["mode"] == "live"
+    assert out["success"] is True
+    assert out["kernel_checked"] is True
+    assert out["tier"] == "pure"
+    assert out["provers_tried"] == []
+    tactic = out["reconstructed_tactic"]
+    assert tactic and "sauto" in tactic, tactic
+
+
+@pytest.mark.skipif(
+    not _coqhammer_live_available(),
+    reason="CoqHammer (Rocq) not available on this machine",
+)
+def test_live_coqhammer_full_tier_uses_atps():
+    out = hammer.run_hammer(
+        "rocq", "1 + 1 = 2", mode="real", timeout=30, context={"tier": "full"}
+    )
+    assert out["ok"] is True
+    assert out["mode"] == "live"
+    assert out["success"] is True
+    assert out["kernel_checked"] is True
+    assert out["tier"] == "full"
+    assert out["tool"] == "coqhammer:hammer"
+    assert out["provers_tried"]  # eprover/z3 fired for premise selection
+    assert out["reconstructed_tactic"]  # a valid reconstruction script

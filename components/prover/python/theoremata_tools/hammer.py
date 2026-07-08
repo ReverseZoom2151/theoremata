@@ -106,6 +106,15 @@ _SYSTEM_ALIASES = {
 # Default prover batteries (the ATP/SMT solvers a real invocation would fire).
 _ISABELLE_PROVERS = ["e", "vampire", "cvc5", "z3"]
 _ROCQ_ATP_PROVERS = ["vampire", "eprover", "z3", "cvc4"]
+# ATPs actually installed alongside CoqHammer on this box (apt eprover + z3); the
+# full-tier `hammer` dispatches premise selection to these.
+_ROCQ_LIVE_ATP_PROVERS = ["eprover", "z3"]
+
+# On this Windows box CoqHammer lives inside the opam switch: only
+# ``eval "$(opam env)"`` puts Rocq 9.1.1 + the Hammer plugin on PATH (a bare
+# ``coqc`` is the apt 8.18 build, which lacks the plugin). Every WSL coqc
+# invocation for the rocq backend must therefore be prefixed with this line.
+_OPAM_ENV_PREFIX = 'eval "$(opam env)"\n'
 
 # Substrings that mark a goal as (deterministically) unprovable in mock mode.
 # Kept conservative on purpose: arithmetic-shaped markers like "1 = 2" would
@@ -617,6 +626,10 @@ def _coqhammer_plugin_available(command: str, full: bool) -> bool:
     ``Hammer`` module -> ``hammer`` + ATPs). We compile a one-line probe ``.v``
     that just ``Require``s the module(s); a non-zero ``coqc`` exit means the
     plugin is absent (``opam install coq-hammer[-tactics]`` needed).
+
+    The plugin lives in the opam switch (Rocq 9.1.1), so the WSL probe compiles
+    under ``eval "$(opam env)"`` -- a bare ``coqc`` is the apt 8.18 build without
+    the Hammer plugin and would always fail the ``Require``.
     """
     require = (
         "From Hammer Require Import Hammer Tactics."
@@ -631,7 +644,7 @@ def _coqhammer_plugin_available(command: str, full: bool) -> bool:
             if command.startswith(_WSL_PREFIX):
                 coqc = command[len(_WSL_PREFIX):]
                 rc, _out = _wsl_bash(
-                    f'{coqc} "{_win_to_wsl_path(vfile)}"\n', 90
+                    f'{_OPAM_ENV_PREFIX}{coqc} "{_win_to_wsl_path(vfile)}"\n', 90
                 )
                 return rc == 0
             proc = subprocess.run(
@@ -646,6 +659,44 @@ def _coqhammer_plugin_available(command: str, full: bool) -> bool:
         return False
 
 
+def _compile_rocq(command: str, vtext: str, wall_timeout: int) -> "tuple[int, str]":
+    """Compile a ``.v`` with ``coqc`` and return ``(returncode, output)``.
+
+    On Windows the real ``coqc`` (Rocq 9.1.1 + Hammer plugin) lives in the opam
+    switch inside WSL, so we prefix the script with ``eval "$(opam env)"`` and
+    run through ``wsl.exe`` on the file's ``/mnt`` path (coqc reads/writes there
+    fine). Native (Linux/PATH) invocation runs the binary directly; since
+    ``_run_subprocess`` hides the exit code we treat any ``error`` in the output
+    as a non-zero exit (kernel/plugin failure).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        vfile = os.path.join(tmp, "Generated.v")
+        with open(vfile, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(vtext)
+        if command.startswith(_WSL_PREFIX):
+            coqc = command[len(_WSL_PREFIX):]
+            return _wsl_bash(
+                f'{_OPAM_ENV_PREFIX}{coqc} "{_win_to_wsl_path(vfile)}"\n',
+                wall_timeout,
+            )
+        out = _run_subprocess([command, vfile], "", wall_timeout)
+        return (1 if "error" in out.lower() else 0), out
+
+
+def _parse_coqhammer_reconstruction(out: str) -> Optional[str]:
+    """Pull the reconstruction tactic out of ``hammer``'s output.
+
+    ``hammer`` prints e.g. ``Replace the hammer tactic with: sfirstorder`` (or
+    ``hauto use: ...`` / ``sauto ...``). We take the rest of that line and strip
+    a trailing period/whitespace. Returns ``None`` if no such line is present.
+    """
+    match = re.search(r"Replace the hammer tactic with:\s*(.+)", out)
+    if not match:
+        return None
+    cand = match.group(1).strip().rstrip(".").strip()
+    return cand or None
+
+
 def _real_rocq(
     goal_or_state: Any,
     context: dict[str, Any],
@@ -654,12 +705,23 @@ def _real_rocq(
 ) -> dict[str, Any]:
     """Drive CoqHammer headlessly (pure ``sauto`` tier vs full ``hammer`` tier).
 
-    Live call: compile a ``.v`` with ``From Hammer Require Import Hammer
-    Tactics.`` and either the pure-tier ``sauto``/``best`` (no ATP) or the
-    full-tier ``hammer`` (fires Vampire/E/Z3/cvc4, prints a reconstruction
-    tactic to substitute). On this box CoqHammer is **not** installed, so the
-    plugin probe fails and we raise ``HammerUnavailable`` (-> graceful mock
-    fallback) with a note that ``opam install coq-hammer`` is required.
+    Live call (under ``eval "$(opam env)"`` on this box): compile a ``.v`` and
+    check ``coqc`` exits 0 -- a success is a real, kernel-checked Rocq proof.
+
+    * **pure tier** (default): ``From Hammer Require Import Tactics.`` +
+      ``Goal <g>. Proof. sauto. Qed.`` -- pure CIC search, no external ATPs.
+      ``reconstructed_tactic`` is ``sauto`` (or ``best``), ``provers_tried`` is
+      empty.
+    * **full tier** (``context["tier"] == "full"``): ``From Hammer Require
+      Import Hammer Tactics.`` + ``Proof. hammer. Qed.`` -- ``hammer`` fires the
+      installed ATPs (eprover/z3) for premise selection and prints a
+      deterministic reconstruction (``Replace the hammer tactic with: ...``)
+      that we parse and return. If the line can't be parsed we fall back to a
+      ``sauto`` full-compile as the reconstruction. Either way the returned
+      tactic was verified by ``coqc`` (kernel-checked).
+
+    Raises ``HammerUnavailable`` (-> graceful mock fallback) if the CoqHammer
+    plugin probe fails (``opam install coq-hammer[-tactics]`` needed).
     """
     command = _command_for("rocq")
     if not command:
@@ -672,51 +734,77 @@ def _real_rocq(
             f"CoqHammer not installed for the {tier} tier "
             f"(run `opam install {pkg}`)"
         )
-    provers = list(context.get("provers") or (_ROCQ_ATP_PROVERS if full else []))
-    tactic_cmd = "hammer" if full else ("best" if context.get("best") else "sauto")
     goal = _goal_text(goal_or_state)
-    require = (
-        "From Hammer Require Import Hammer Tactics."
-        if full
-        else "From Hammer Require Import Tactics."
-    )
+
+    if not full:
+        # Pure tier: self-contained sauto/best compile, no external ATPs.
+        tactic_cmd = "best" if context.get("best") else "sauto"
+        vtext = (
+            "From Hammer Require Import Tactics.\n"
+            f"Goal {goal}.\nProof. {tactic_cmd}. Qed.\n"
+        )
+        rc, out = _compile_rocq(command, vtext, timeout + 60)
+        success = rc == 0
+        return _result(
+            system="rocq",
+            tool="coqhammer:sauto",
+            success=success,
+            reconstructed_tactic=tactic_cmd if success else None,
+            provers_tried=list(context.get("provers") or []),
+            message=(
+                f"CoqHammer (pure tier): `{tactic_cmd}` closed the goal "
+                "(kernel-checked, no ATP)."
+                if success
+                else "CoqHammer (pure tier): `sauto`/`best` did not close the goal."
+            ),
+            mode="live",
+            requested_mode=requested_mode,
+            tier="pure",
+        )
+
+    # Full tier: `hammer` dispatches to ATPs then prints a reconstruction tactic.
+    provers = list(context.get("provers") or _ROCQ_LIVE_ATP_PROVERS)
     vtext = (
-        f"{require}\n"
-        + (f"Set Hammer ATPLimit {timeout}.\n" if full else "")
-        + f"Lemma goal : {goal}.\nProof. {tactic_cmd}. Qed.\n"
+        "From Hammer Require Import Hammer Tactics.\n"
+        f"Set Hammer ATPLimit {timeout}.\n"
+        f"Goal {goal}.\nProof. hammer. Qed.\n"
     )
-    with tempfile.TemporaryDirectory() as tmp:
-        vfile = os.path.join(tmp, "Generated.v")
-        with open(vfile, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(vtext)
-        if command.startswith(_WSL_PREFIX):
-            coqc = command[len(_WSL_PREFIX):]
-            _rc, out = _wsl_bash(
-                f'{coqc} "{_win_to_wsl_path(vfile)}"\n', timeout + 60
-            )
-        else:
-            out = _run_subprocess([command, vfile], "", timeout + 60)
-    # `hammer` prints e.g. "Replace the hammer tactic with: hauto use: ...".
-    match = re.search(
-        r"(?:Replace the hammer tactic with:?\s*)?((?:s?auto|hauto|qauto|best)"
-        r"[^\n.]*)",
-        out,
-    )
-    reconstructed = match.group(1).strip() if match else (
-        tactic_cmd if not full else None
-    )
-    success = reconstructed is not None and "error" not in out.lower()
+    rc, out = _compile_rocq(command, vtext, timeout + 60)
+    if rc != 0:
+        return _result(
+            system="rocq",
+            tool="coqhammer:hammer",
+            success=False,
+            reconstructed_tactic=None,
+            provers_tried=provers,
+            message="CoqHammer (full tier): `hammer` found no proof / kernel error.",
+            mode="live",
+            requested_mode=requested_mode,
+            tier="full",
+        )
+    # `hammer` succeeded (kernel-checked). Prefer the printed reconstruction; if
+    # unparseable, fall back to a sauto full-compile as the deterministic tactic.
+    reconstructed = _parse_coqhammer_reconstruction(out)
+    if reconstructed is None:
+        sauto_text = (
+            "From Hammer Require Import Tactics.\n"
+            f"Goal {goal}.\nProof. sauto. Qed.\n"
+        )
+        s_rc, _s_out = _compile_rocq(command, sauto_text, timeout + 60)
+        reconstructed = "sauto" if s_rc == 0 else "hammer"
     return _result(
         system="rocq",
-        tool="coqhammer:hammer" if full else "coqhammer:sauto",
-        success=success,
-        reconstructed_tactic=reconstructed if success else None,
+        tool="coqhammer:hammer",
+        success=True,
+        reconstructed_tactic=reconstructed,
         provers_tried=provers,
-        message="CoqHammer: reconstruction accepted." if success else
-        "CoqHammer: no reconstruction / kernel error.",
+        message=(
+            f"CoqHammer (full tier): `hammer` closed the goal via ATPs; replace "
+            f"with `{reconstructed}` (kernel-checked)."
+        ),
         mode="live",
         requested_mode=requested_mode,
-        tier=tier,
+        tier="full",
     )
 
 
