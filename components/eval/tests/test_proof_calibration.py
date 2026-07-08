@@ -14,6 +14,7 @@ from theoremata_tools.proof_calibration import (  # noqa: E402
     pearson,
     rmse,
     run,
+    score_marking_scheme_grader,
     spearman,
     verify_solve_gap,
     within_tolerance,
@@ -171,3 +172,50 @@ def test_run_dispatch_calibrate_and_disagreement():
     assert out["count"] == 3.0
     out2 = run({"op": "verify_solve_gap", "verify_scores": [1.0, 1.0], "solve_scores": [0.0, 1.0]})
     assert math.isclose(out2["gap"], 0.5)
+
+
+# --------------------------------------------------------------------------- #
+# PROOFGRADER calibration: full metric set + marking-scheme grader scoring
+# --------------------------------------------------------------------------- #
+
+def test_calibrate_reports_all_paper_metrics_hand_computed():
+    # PROOFGRADER's headline metric set: MAE, RMSE, Bias, WTA<=1, Kendall-tau_b,
+    # Pearson, Spearman.
+    pred = [2.0, 4.0, 6.0]
+    gold = [1.0, 5.0, 6.0]
+    r = calibrate(pred and [(p, g) for p, g in zip(pred, gold)])
+    for key in (
+        "mae", "rmse", "bias", "within_tolerance", "within_1_point",
+        "kendall", "pearson", "spearman",
+    ):
+        assert key in r
+    # diffs +1, -1, 0 -> MAE 2/3, RMSE sqrt(2/3), Bias 0, all within 1 point.
+    assert math.isclose(r["mae"], 2.0 / 3.0)
+    assert math.isclose(r["rmse"], math.sqrt(2.0 / 3.0))
+    assert math.isclose(r["bias"], 0.0)
+    assert r["within_1_point"] == 1.0
+
+
+def test_score_marking_scheme_grader_vs_gold():
+    pred = [7, 1, 4]   # grader's 0-7 grades
+    gold = [7, 0, 5]   # expert labels
+    r = score_marking_scheme_grader(pred, gold, scale=7)
+    assert r["scale"] == 7
+    # diffs 0, +1, -1 -> MAE 2/3, Bias 0, all within 1 point (WTA<=1 == 1.0).
+    assert math.isclose(r["mae"], 2.0 / 3.0)
+    assert math.isclose(r["bias"], 0.0)
+    assert r["within_1_point"] == 1.0
+    assert "kendall" in r and "pearson" in r and "spearman" in r
+
+
+def test_run_dispatch_score_marking_scheme_grader():
+    out = run(
+        {
+            "op": "score_marking_scheme_grader",
+            "pred_grades": [7, 1, 4],
+            "gold_grades": [7, 0, 5],
+            "scale": 7,
+        }
+    )
+    assert out["scale"] == 7
+    assert out["within_1_point"] == 1.0

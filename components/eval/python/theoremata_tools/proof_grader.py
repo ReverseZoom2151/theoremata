@@ -186,6 +186,22 @@ def geometric_mean(scores: list[float]) -> float:
     return prod ** (1.0 / len(vals))
 
 
+def _median(values: list[float]) -> float:
+    """Median of ``values`` (average of the two middle values for even counts).
+
+    Used for PROOFGRADER's median-of-N ensembling: robust to a single outlier
+    grader sample. NaN for an empty list.
+    """
+    vals = sorted(float(v) for v in values)
+    n = len(vals)
+    if n == 0:
+        return float("nan")
+    mid = n // 2
+    if n % 2 == 1:
+        return vals[mid]
+    return (vals[mid - 1] + vals[mid]) / 2.0
+
+
 def aggregate_scores(scores: list[float], method: str = "arithmetic") -> float:
     """Aggregate dimension/step scores by ``"arithmetic"`` or ``"geometric"``."""
     if method == "geometric":
@@ -604,6 +620,438 @@ def grade_proof_item(
 
 
 # --------------------------------------------------------------------------- #
+# Marking-scheme-conditioned grading (PROOFGRADER / IMO-Bench)
+# --------------------------------------------------------------------------- #
+#
+# The PROOFGRADER paper (Ma et al., ICLR 2026) and IMO-Bench (Luong et al.,
+# EMNLP 2025) show the same thing: grading a natural-language proof from
+# ``(problem, proof)`` alone (a NONE-context config) systematically *over-scores*
+# weak proofs (~1.7 pts) and mis-rates "sophisticated but wrong" arguments. The
+# fix — conditioning the grader on (a) a reference solution and (b) a
+# problem-specific *marking scheme* generated from that reference — lifts human
+# correlation from ~0.87 to 0.93-0.96 and MAE to ~0.926. This module ports that:
+#
+#   1. :func:`generate_marking_scheme` — from a reference solution, produce a
+#      structured scheme (checkpoints / zero-credit items / deductions), via an
+#      injectable model callable, with a deterministic template fallback offline.
+#   2. :func:`grade_with_marking_scheme` — grade a candidate against that scheme
+#      on the IMO 0-7 fine-grained scale, using the reference + scheme as
+#      *advisory* context, then **median-of-N ensemble** (default N=5) for
+#      variance reduction (PROOFGRADER = O3 + REF+MS + median-of-5).
+#
+# IMPORTANT — this is a SOFT/ADVISORY signal. Both papers warn the NL grader
+# misses specious logic and over-punishes novel-but-correct lemmas, so its grade
+# (and any "reject") is a ranking/triage number, NOT a soundness certificate. It
+# must NEVER veto a passed FORMAL check: the formal 3+1 gate is ground truth.
+
+#: Marking-scheme = the three USEMO/Evan-Chen sections (checkpoints, zero-credit,
+#: deductions). A ``model`` maps ``(problem, reference) -> scheme dict``.
+SchemeModel = Callable[[str, str], dict[str, Any]]
+
+#: A scheme-conditioned grader maps
+#: ``(problem, candidate, scheme, reference[, sample]) -> {score, assessment,
+#: errors}`` with ``score`` an int on the 0-``max_points`` scale. ``sample`` is
+#: the ensemble index (lets a stochastic grader vary per run).
+SchemeGrader = Callable[..., dict[str, Any]]
+
+#: The IMO fine-grained scale ceiling (Putnam 0-10 normalised to 0-7).
+IMO_SCALE_MAX = 7
+
+#: 4-band mapping of a 0-7 grade (PROOFBENCH / IMO-Bench): incorrect / partial /
+#: nearly-complete / fully-correct.
+def score_band(score: int, scale_max: int = IMO_SCALE_MAX) -> str:
+    """Map an integer 0-``scale_max`` grade onto the PROOFBENCH 4-band label."""
+    try:
+        s = int(score)
+    except Exception:  # noqa: BLE001
+        return "unknown"
+    top = int(scale_max)
+    if s <= 0:
+        return "incorrect"
+    if s >= top:
+        return "fully-correct"
+    if s <= top // 2:
+        return "partial"
+    return "nearly-complete"
+
+
+# Standard zero-credit items + deductions (paper's default marking-scheme spine).
+_ZERO_CREDIT_DEFAULTS = (
+    "restating the problem or its hypotheses without making progress",
+    "asserting the conclusion, or an unproved conjecture / unjustified WLOG",
+    "merely naming a theorem without correctly applying it",
+    "a dead-end approach that yields no usable partial result",
+)
+_DEDUCTION_DEFAULTS = (
+    {"penalty": 1, "condition": "a minor gap or an under-justified routine step"},
+    {"penalty": 2, "condition": "a significant but non-fatal logical gap"},
+    {"cap": 3, "condition": "the main idea is only asserted, not actually proved"},
+)
+
+# Content-word stop list for the deterministic checkpoint-coverage heuristic.
+_SCHEME_STOP = frozenset(
+    {
+        "the", "and", "for", "with", "that", "this", "then", "from", "have",
+        "has", "are", "was", "were", "will", "which", "such", "some", "into",
+        "there", "their", "them", "they", "here", "hence", "thus", "since",
+        "where", "when", "what", "each", "every", "all", "any", "let", "show",
+        "prove", "proof", "case", "cases", "step", "steps", "therefore", "so",
+        "we", "it", "is", "of", "to", "in", "a", "an", "be", "by", "as",
+    }
+)
+
+
+def _clip(text: str, limit: int = 160) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _template_marking_scheme(
+    problem: str, reference: str, max_points: int = IMO_SCALE_MAX
+) -> dict[str, Any]:
+    """Deterministic offline marking scheme derived from the reference solution.
+
+    Splits the reference into steps, gives the *main idea* (heuristically the
+    longest step) ``>=4`` of the ``max_points`` (paper: >=4 pts to the main idea,
+    <=3 to routine work), and up to three routine 1-pt checkpoints. Checkpoint
+    points never sum above ``max_points``.
+    """
+    steps = split_steps(reference or "")
+    checkpoints: list[dict[str, Any]] = []
+    if not steps:
+        checkpoints.append(
+            {
+                "points": int(max_points),
+                "description": "a complete, rigorous, self-contained correct proof",
+                "tag": "additive",
+                "chain": 0,
+                "role": "main-idea",
+            }
+        )
+    else:
+        main_idx = max(range(len(steps)), key=lambda i: len(steps[i]))
+        main_pts = min(int(max_points), 4)
+        routine_budget = max(0, int(max_points) - main_pts)
+        routine_seen = 0
+        for i, s in enumerate(steps):
+            if i == main_idx:
+                checkpoints.append(
+                    {
+                        "points": main_pts,
+                        "description": _clip(s),
+                        "tag": "additive",
+                        "chain": 0,
+                        "role": "main-idea",
+                    }
+                )
+            elif routine_seen < routine_budget:
+                routine_seen += 1
+                checkpoints.append(
+                    {
+                        "points": 1,
+                        "description": _clip(s),
+                        "tag": "additive",
+                        "chain": 0,
+                        "role": "routine",
+                    }
+                )
+    return {
+        "max_points": int(max_points),
+        "checkpoints": checkpoints,
+        "zero_credit": list(_ZERO_CREDIT_DEFAULTS),
+        "deductions": [dict(d) for d in _DEDUCTION_DEFAULTS],
+        "source": "template",
+    }
+
+
+def _normalize_scheme(raw: Any, max_points: int = IMO_SCALE_MAX) -> dict[str, Any]:
+    """Coerce an arbitrary (model-produced) object onto our scheme structure."""
+    raw = raw if isinstance(raw, dict) else {}
+    mp = raw.get("max_points", max_points)
+    try:
+        mp = int(mp)
+    except Exception:  # noqa: BLE001
+        mp = int(max_points)
+    checkpoints: list[dict[str, Any]] = []
+    for cp in raw.get("checkpoints") or []:
+        if not isinstance(cp, dict):
+            continue
+        desc = str(cp.get("description", "")).strip()
+        if not desc:
+            continue
+        try:
+            pts = int(cp.get("points", 0))
+        except Exception:  # noqa: BLE001
+            pts = 0
+        checkpoints.append(
+            {
+                "points": pts,
+                "description": desc,
+                "tag": str(cp.get("tag", "additive")),
+                "chain": int(cp.get("chain", 0)) if str(cp.get("chain", 0)).lstrip("-").isdigit() else 0,
+                "role": str(cp.get("role", "")),
+            }
+        )
+    zero = [str(z) for z in (raw.get("zero_credit") or []) if str(z).strip()]
+    deductions = [d for d in (raw.get("deductions") or []) if isinstance(d, dict)]
+    return {
+        "max_points": mp,
+        "checkpoints": checkpoints,
+        "zero_credit": zero or list(_ZERO_CREDIT_DEFAULTS),
+        "deductions": deductions or [dict(d) for d in _DEDUCTION_DEFAULTS],
+        "source": str(raw.get("source", "model")),
+    }
+
+
+_SCHEME_GEN_SCHEMA = {
+    "type": "object",
+    "required": ["checkpoints", "zero_credit", "deductions", "max_points"],
+    "properties": {
+        "max_points": {"type": "integer"},
+        "checkpoints": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["points", "description"],
+                "properties": {
+                    "points": {"type": "integer"},
+                    "description": {"type": "string"},
+                    "tag": {"type": "string"},
+                },
+            },
+        },
+        "zero_credit": {"type": "array", "items": {"type": "string"}},
+        "deductions": {"type": "array", "items": {"type": "object"}},
+    },
+}
+
+
+def _default_scheme_model(problem: str, reference: str) -> dict[str, Any]:
+    """Provider-backed marking-scheme generator (mock-capable, offline-safe).
+
+    Uses :func:`theoremata_tools.model_provider.generate`; deterministic under
+    ``THEOREMATA_MODEL_MOCK=1``. If the provider is unavailable or returns a
+    scheme without usable checkpoints, raises so the caller falls back to the
+    deterministic template.
+    """
+    from theoremata_tools.model_provider import generate
+
+    request = {
+        "role": "marking_scheme_author",
+        "task": (
+            "You are an olympiad head grader. From the problem and its REFERENCE "
+            "solution, write a problem-specific marking scheme on a 0-7 scale in "
+            "three sections: (1) checkpoints — at most 7 points total, >=4 to the "
+            "main idea and <=3 to routine work; (2) zero_credit — items that earn "
+            "nothing (restatements, unproved conjectures, dead ends); (3) "
+            "deductions — flat penalties or caps, applying only the single "
+            "largest and never below 0."
+        ),
+        "context": {"problem": problem, "reference_solution": reference},
+        "output_schema": _SCHEME_GEN_SCHEMA,
+    }
+    content, model = generate(request)
+    scheme = _normalize_scheme(content)
+    if not scheme["checkpoints"]:
+        raise ValueError("provider returned a scheme with no checkpoints")
+    scheme["source"] = f"model:{model}"
+    return scheme
+
+
+def generate_marking_scheme(
+    problem: str,
+    reference: str,
+    *,
+    model: SchemeModel | None = None,
+    max_points: int = IMO_SCALE_MAX,
+) -> dict[str, Any]:
+    """Generate a per-problem marking scheme from a reference solution.
+
+    Tries ``model`` (or the default provider-backed generator) first; on any
+    failure or a checkpoint-less result, falls back to the deterministic
+    :func:`_template_marking_scheme` so this is fully offline/deterministic.
+
+    Returns a scheme ``{max_points, checkpoints: [{points, description, tag,
+    chain, role}], zero_credit: [...], deductions: [{penalty|cap, condition}],
+    source}``.
+    """
+    problem = str(problem or "")
+    reference = str(reference or "")
+    fn = model or _default_scheme_model
+    try:
+        scheme = _normalize_scheme(fn(problem, reference) or {}, max_points)
+        if scheme["checkpoints"]:
+            return scheme
+    except Exception:  # noqa: BLE001 — any failure => deterministic fallback
+        pass
+    return _template_marking_scheme(problem, reference, max_points)
+
+
+def _covers(cand_low: str, description: str) -> bool:
+    """Heuristic: does the candidate address a checkpoint (content-word overlap)?
+
+    Used only by the deterministic fallback grader; a real LLM grader maps
+    alternative approaches to equivalent checkpoints, which keyword overlap
+    cannot. Returns True when >=50% of the checkpoint's distinctive content
+    words appear in the candidate.
+    """
+    words = {
+        w
+        for w in re.findall(r"[a-z0-9]+", description.lower())
+        if len(w) >= 4 and w not in _SCHEME_STOP
+    }
+    if not words:
+        return True
+    hits = sum(1 for w in words if w in cand_low)
+    return hits / len(words) >= 0.5
+
+
+def _default_scheme_grader(
+    problem: str,
+    candidate: str,
+    scheme: dict[str, Any],
+    reference: str,
+    sample: int = 0,
+) -> dict[str, Any]:
+    """Deterministic offline scheme-conditioned grader on the 0-``max_points`` scale.
+
+    Awards each checkpoint's points when the candidate covers it, caps the sum at
+    ``max_points``, then scales by the mean step-quality (so hand-waved coverage
+    earns less than a justified one). This is intentionally conservative — it is
+    the *scheme-conditioned* baseline that, per the paper, no-context grading
+    over-scores relative to. ``sample`` is unused here (deterministic).
+    """
+    max_points = int(scheme.get("max_points", IMO_SCALE_MAX))
+    cand_low = (candidate or "").lower()
+    steps = split_steps(candidate or "")
+    classified = [classify_step(s) for s in steps]
+    quality = (
+        arithmetic_mean([_STATUS_QUALITY.get(c["status"], 0.0) for c in classified])
+        if classified
+        else 0.0
+    )
+    covered = 0
+    unmet: list[str] = []
+    for cp in scheme.get("checkpoints", []):
+        try:
+            pts = int(cp.get("points", 0))
+        except Exception:  # noqa: BLE001
+            pts = 0
+        if _covers(cand_low, str(cp.get("description", ""))):
+            covered += pts
+        else:
+            unmet.append(str(cp.get("description", "")))
+    covered = min(covered, max_points)
+    score = int(max(0, min(max_points, round(covered * quality))))
+    errors = [c["reason"] for c in classified if c["status"] in FLAW_STATUSES]
+    return {
+        "score": score,
+        "assessment": (
+            f"covered {covered}/{max_points} checkpoint points at mean "
+            f"step-quality {quality:.2f}"
+        ),
+        "errors": errors,
+        "unmet_checkpoints": unmet,
+    }
+
+
+def _call_scheme_grader(
+    gfn: SchemeGrader,
+    problem: str,
+    candidate: str,
+    scheme: dict[str, Any],
+    reference: str,
+    sample: int,
+) -> dict[str, Any]:
+    """Invoke a scheme grader, tolerating graders that omit the ``sample`` arg."""
+    try:
+        return gfn(problem, candidate, scheme, reference, sample) or {}
+    except TypeError:
+        return gfn(problem, candidate, scheme, reference) or {}
+
+
+def grade_with_marking_scheme(
+    problem: str,
+    candidate: str,
+    *,
+    reference: str,
+    scheme: dict[str, Any] | None = None,
+    grader: SchemeGrader | None = None,
+    model: SchemeModel | None = None,
+    n_samples: int = 5,
+    max_points: int = IMO_SCALE_MAX,
+) -> dict[str, Any]:
+    """Marking-scheme-conditioned, ensembled 0-7 grade for a candidate proof.
+
+    Generates (or accepts) a per-problem marking scheme from ``reference``, then
+    grades ``candidate`` against it ``n_samples`` times and takes the **median**
+    (PROOFGRADER's variance-reducing median-of-5). The reference solution and the
+    scheme are *advisory* context, not a rigid checklist.
+
+    Returns ``{grade, score, median_score, band, scale, n_samples,
+    sample_scores, samples: [{score, assessment, errors, ...}], marking_scheme,
+    advisory, note}``.
+
+    The ``grade`` is a SOFT/ADVISORY natural-language signal. It must NEVER veto
+    a passed FORMAL check — the formal 3+1 gate is ground truth.
+    """
+    problem = str(problem or "")
+    candidate = str(candidate or "")
+    reference = str(reference or "")
+    if scheme is None:
+        scheme = generate_marking_scheme(
+            problem, reference, model=model, max_points=max_points
+        )
+    else:
+        scheme = _normalize_scheme(scheme, max_points)
+    mp = int(scheme.get("max_points", max_points))
+
+    gfn = grader or _default_scheme_grader
+    n = max(1, int(n_samples))
+    samples: list[dict[str, Any]] = []
+    for i in range(n):
+        try:
+            raw = _call_scheme_grader(gfn, problem, candidate, scheme, reference, i)
+        except Exception as exc:  # noqa: BLE001
+            raw = {"score": 0, "assessment": f"grader_error:{exc}", "errors": [str(exc)]}
+        try:
+            s = int(round(float(raw.get("score", 0))))
+        except Exception:  # noqa: BLE001
+            s = 0
+        s = max(0, min(mp, s))
+        entry = {
+            "score": s,
+            "assessment": str(raw.get("assessment", "")),
+            "errors": list(raw.get("errors") or []),
+        }
+        if "unmet_checkpoints" in raw:
+            entry["unmet_checkpoints"] = list(raw.get("unmet_checkpoints") or [])
+        samples.append(entry)
+
+    scores = [x["score"] for x in samples]
+    median = _median(scores)
+    grade = int(round(median))
+    return {
+        "op": "grade_with_marking_scheme",
+        "grade": grade,
+        "score": grade,
+        "median_score": median,
+        "band": score_band(grade, mp),
+        "scale": mp,
+        "n_samples": n,
+        "sample_scores": scores,
+        "samples": samples,
+        "marking_scheme": scheme,
+        "advisory": True,
+        "note": (
+            "Soft/advisory natural-language signal (median-of-N, scheme- and "
+            "reference-conditioned). It must NEVER veto a passed FORMAL check — "
+            "the formal 3+1 gate is ground truth."
+        ),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # JSON dispatch (worker hook) + CLI
 # --------------------------------------------------------------------------- #
 
@@ -625,6 +1073,24 @@ def run(request: dict[str, Any]) -> dict[str, Any]:
             request.get("response", ""),
             mode=request.get("mode", "step_wise"),
             use_llm=bool(request.get("use_llm", False)),
+        )
+    if op == "generate_marking_scheme":
+        return {
+            "op": "generate_marking_scheme",
+            "marking_scheme": generate_marking_scheme(
+                request.get("problem", ""),
+                request.get("reference", ""),
+                max_points=int(request.get("max_points", IMO_SCALE_MAX)),
+            ),
+        }
+    if op == "grade_with_marking_scheme":
+        return grade_with_marking_scheme(
+            request.get("problem", ""),
+            request.get("candidate", request.get("proof", "")),
+            reference=request.get("reference", ""),
+            scheme=request.get("scheme"),
+            n_samples=int(request.get("n_samples", 5)),
+            max_points=int(request.get("max_points", IMO_SCALE_MAX)),
         )
     if op == "split_steps":
         return {"op": "split_steps", "steps": split_steps(request.get("proof", ""))}

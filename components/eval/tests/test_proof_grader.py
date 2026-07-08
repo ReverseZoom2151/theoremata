@@ -14,12 +14,15 @@ from theoremata_tools.proof_grader import (  # noqa: E402
     aggregate_scores,
     arithmetic_mean,
     classify_step,
+    generate_marking_scheme,
     geometric_mean,
     grade_proof,
     grade_proof_item,
+    grade_with_marking_scheme,
     has_lgtm,
     is_refusal,
     run,
+    score_band,
     split_steps,
 )
 
@@ -244,3 +247,148 @@ def test_ordinal_scale_partial_credit_band():
     res = grade_proof(proof, scale=7, aggregate="arithmetic")
     assert res["taxonomy_counts"][COMPUTATION_ERROR] == 1
     assert 0 < res["ordinal_score"] < 7
+
+
+# --------------------------------------------------------------------------- #
+# Marking-scheme-conditioned grading (PROOFGRADER / IMO-Bench)
+# --------------------------------------------------------------------------- #
+
+# A reference solution with distinct content words per step (main idea = the
+# longest "Factor ..." step).
+REFERENCE = """Assume n is even, so write n = 2k for some integer k.
+Substitute to get n squared equals 4k squared.
+Factor 4k squared as 2 times 2k squared, which exhibits a factor of two.
+Therefore n squared is even, completing the argument."""
+
+# Strong candidate: mirrors the reference, every step justified.
+STRONG_CANDIDATE = """Assume n is even, so write n = 2k for an integer k.
+Substitute to obtain n squared equals 4k squared.
+Factor 4k squared as 2 times 2k squared, exhibiting a factor of two.
+Therefore n squared is even."""
+
+# Weak candidate: asserts the key step ("obviously"), covers almost no checkpoint.
+WEAK_CANDIDATE = """Assume n is even.
+Obviously n squared is even for all such n.
+Therefore the claim is proved."""
+
+PROBLEM = "Prove that if n is even then n^2 is even."
+
+
+def _offline_model(problem, reference):
+    """Force the deterministic template scheme (no provider/network)."""
+    raise RuntimeError("offline: use template fallback")
+
+
+def test_marking_scheme_from_reference_is_structured():
+    scheme = generate_marking_scheme(PROBLEM, REFERENCE, model=_offline_model)
+    assert scheme["source"] == "template"
+    assert scheme["max_points"] == 7
+    cps = scheme["checkpoints"]
+    assert cps, "expected non-empty checkpoints"
+    # Every checkpoint is structured: integer points + a description string.
+    for cp in cps:
+        assert isinstance(cp["points"], int)
+        assert isinstance(cp["description"], str) and cp["description"]
+    # Points never exceed the scale, and the main idea earns >= 4 (paper rule).
+    assert sum(cp["points"] for cp in cps) <= 7
+    assert max(cp["points"] for cp in cps) >= 4
+    # The other two sections are present and non-empty.
+    assert scheme["zero_credit"]
+    assert scheme["deductions"]
+
+
+def test_marking_scheme_injected_model_is_used():
+    custom = {
+        "max_points": 7,
+        "checkpoints": [
+            {"points": 5, "description": "core pigeonhole argument"},
+            {"points": 2, "description": "boundary case handled"},
+        ],
+        "zero_credit": ["restating the claim"],
+        "deductions": [{"penalty": 1, "condition": "minor gap"}],
+    }
+    scheme = generate_marking_scheme(PROBLEM, REFERENCE, model=lambda p, r: custom)
+    assert [cp["points"] for cp in scheme["checkpoints"]] == [5, 2]
+    assert scheme["source"] == "model"
+
+
+def test_scheme_grading_orders_strong_above_weak_on_0_7():
+    strong = grade_with_marking_scheme(
+        PROBLEM, STRONG_CANDIDATE, reference=REFERENCE, model=_offline_model
+    )
+    weak = grade_with_marking_scheme(
+        PROBLEM, WEAK_CANDIDATE, reference=REFERENCE, model=_offline_model
+    )
+    assert 0 <= weak["grade"] <= 7 and 0 <= strong["grade"] <= 7
+    assert strong["grade"] > weak["grade"]
+    assert strong["scale"] == 7
+    # Bands: strong reaches the top, weak stays in the lower half.
+    assert strong["band"] == "fully-correct"
+    assert weak["band"] in {"incorrect", "partial"}
+
+
+def test_median_of_5_is_robust_to_one_outlier():
+    def outlier_grader(problem, candidate, scheme, reference, sample):
+        # Four samples say 3, one hallucinates a 7.
+        return {"score": 7 if sample == 4 else 3, "assessment": f"s{sample}"}
+
+    res = grade_with_marking_scheme(
+        PROBLEM,
+        WEAK_CANDIDATE,
+        reference=REFERENCE,
+        model=_offline_model,
+        grader=outlier_grader,
+        n_samples=5,
+    )
+    assert res["n_samples"] == 5
+    assert sorted(res["sample_scores"]) == [3, 3, 3, 3, 7]
+    assert res["grade"] == 3  # median unmoved by the single outlier
+
+
+def test_no_context_over_scores_weak_relative_to_scheme():
+    """The paper's ~1.7pt finding: no-context grading over-scores a weak proof
+    relative to scheme-conditioned grading (assert direction, not magnitude)."""
+    no_context = grade_proof(WEAK_CANDIDATE, scale=7)["ordinal_score"]
+    scheme_conditioned = grade_with_marking_scheme(
+        PROBLEM, WEAK_CANDIDATE, reference=REFERENCE, model=_offline_model
+    )["grade"]
+    assert no_context > scheme_conditioned
+
+
+def test_scheme_grade_is_advisory_never_vetoes_formal():
+    res = grade_with_marking_scheme(
+        PROBLEM, WEAK_CANDIDATE, reference=REFERENCE, model=_offline_model
+    )
+    assert res["advisory"] is True
+    assert "formal" in res["note"].lower()
+    assert "never veto" in res["note"].lower()
+
+
+def test_score_band_mapping():
+    assert score_band(0) == "incorrect"
+    assert score_band(2) == "partial"
+    assert score_band(5) == "nearly-complete"
+    assert score_band(7) == "fully-correct"
+
+
+def test_run_marking_scheme_ops(monkeypatch):
+    monkeypatch.setenv("THEOREMATA_MODEL_MOCK", "1")
+    gen = run({"op": "generate_marking_scheme", "problem": PROBLEM, "reference": REFERENCE})
+    assert gen["op"] == "generate_marking_scheme"
+    assert gen["marking_scheme"]["checkpoints"]
+    # Grade with an explicit scheme so the op is fully offline/deterministic.
+    scheme = generate_marking_scheme(PROBLEM, REFERENCE, model=_offline_model)
+    graded = run(
+        {
+            "op": "grade_with_marking_scheme",
+            "problem": PROBLEM,
+            "candidate": STRONG_CANDIDATE,
+            "reference": REFERENCE,
+            "scheme": scheme,
+            "n_samples": 5,
+        }
+    )
+    assert graded["op"] == "grade_with_marking_scheme"
+    assert 0 <= graded["grade"] <= 7
+    assert graded["n_samples"] == 5
+    assert graded["advisory"] is True

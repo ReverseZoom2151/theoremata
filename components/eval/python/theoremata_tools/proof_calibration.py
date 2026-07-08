@@ -445,6 +445,9 @@ def calibrate(
         "comparable_pairs": order["comparable_pairs"],
         "correct_pairs": order["correct_pairs"],
         "within_tolerance": within_tolerance(preds, golds, tolerance),
+        # PROOFGRADER's WTA<=1 ("within-1-point agreement"); alias at the default
+        # tolerance so the paper's headline metric is always reported by name.
+        "within_1_point": within_tolerance(preds, golds, 1.0),
         "tolerance": tolerance,
         "min_diff": min(diffs) if diffs else float("nan"),
         "max_diff": max(diffs) if diffs else float("nan"),
@@ -458,6 +461,49 @@ def calibrate(
             seed=seed,
             tolerance=tolerance,
         )
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# Marking-scheme grader scoring
+# --------------------------------------------------------------------------- #
+
+def score_marking_scheme_grader(
+    pred_grades: Sequence[float],
+    gold_grades: Sequence[float],
+    *,
+    scale: int = 7,
+    tolerance: float = 1.0,
+    bootstrap: bool = False,
+    num_bootstrap: int = 1000,
+    ci_level: float = 0.95,
+    seed: int = 13,
+) -> dict[str, Any]:
+    """Score the 0-7 marking-scheme grader against an expert-graded gold array.
+
+    ``pred_grades`` are the grader's integer 0-``scale`` grades (e.g. the
+    ``grade``/``median_score`` from
+    :func:`theoremata_tools.proof_grader.grade_with_marking_scheme`) and
+    ``gold_grades`` the aligned expert labels. Returns the full
+    :func:`calibrate` metric dict — MAE, RMSE, bias, within-1-point (WTA<=1),
+    Kendall-tau_b, Pearson, Spearman, order-preservation — plus ``scale`` and
+    ``within_1_point`` (the paper's headline evaluator metric, human ceiling
+    ~87.5%).
+    """
+    pairs = list(zip(pred_grades, gold_grades))
+    result = calibrate(
+        pairs,
+        tolerance=tolerance,
+        bootstrap=bootstrap,
+        num_bootstrap=num_bootstrap,
+        ci_level=ci_level,
+        seed=seed,
+    )
+    result["scale"] = int(scale)
+    # within_1_point is already emitted by calibrate; keep it explicit here too.
+    result["within_1_point"] = within_tolerance(
+        [float(p) for p in pred_grades], [float(g) for g in gold_grades], 1.0
+    )
     return result
 
 
@@ -488,6 +534,17 @@ def run(request: dict[str, Any]) -> dict[str, Any]:
             ci_level=float(request.get("ci_level", 0.95)),
             seed=int(request.get("seed", 13)),
             tolerance=float(request.get("tolerance", 1.0)),
+        )
+    if op == "score_marking_scheme_grader":
+        return score_marking_scheme_grader(
+            request.get("pred_grades", []),
+            request.get("gold_grades", []),
+            scale=int(request.get("scale", 7)),
+            tolerance=float(request.get("tolerance", 1.0)),
+            bootstrap=bool(request.get("bootstrap", False)),
+            num_bootstrap=int(request.get("num_bootstrap", 1000)),
+            ci_level=float(request.get("ci_level", 0.95)),
+            seed=int(request.get("seed", 13)),
         )
     if op == "disagreement":
         return evaluator_disagreement(request.get("evaluator_scores", []))
