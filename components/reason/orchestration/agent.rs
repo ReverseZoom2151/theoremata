@@ -35,9 +35,27 @@ pub struct AgentSummary {
     pub run_id: String,
     pub steps: Vec<Value>,
     pub certified: usize,
+    /// Aletheia abstentions: nodes the certification gate DECLINED on low
+    /// confidence rather than certifying or failing. Excluded from conditional
+    /// accuracy so an abstention is not scored as a wrong answer. `0` unless the
+    /// abstention threshold env-seam is set (default behaviour is unchanged).
+    pub abstained: usize,
     pub critique_findings: usize,
     pub state: String,
     pub notes: Vec<String>,
+}
+
+/// Optional env seam for the Aletheia abstention threshold. Absent (or
+/// unparseable) means abstention is OFF — the agent keeps its exact prior
+/// certify-or-fail behaviour. A value in `(0, 1]` makes the certify gate DECLINE
+/// (abstain) on any uncertified node whose confidence is below it, instead of
+/// scoring it as a failure. Deterministic: read once per certify call, no
+/// wall-clock/rand.
+pub fn abstain_threshold() -> Option<f64> {
+    std::env::var("THEOREMATA_ABSTAIN_THRESHOLD")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|t| *t > 0.0)
 }
 
 struct Formalization {
@@ -118,6 +136,7 @@ impl AgentLoop<'_> {
         let mut counterexamples: HashSet<String> = HashSet::new();
         let mut decomposed: HashSet<String> = HashSet::new();
         let mut certified = 0usize;
+        let mut abstained = 0usize;
         let mut loop_guard = crate::guard::LoopGuard::new(64);
         for _pass in 0..max_attempts {
             let nodes = self.store.nodes(project_id)?;
@@ -165,6 +184,7 @@ impl AgentLoop<'_> {
                     &mut counterexamples,
                     &mut decomposed,
                     &mut certified,
+                    &mut abstained,
                 )?;
                 steps.push(json!({
                     "node":node.id,"title":node.title,"route":route,
@@ -210,6 +230,7 @@ impl AgentLoop<'_> {
             run_id: run,
             steps,
             certified,
+            abstained,
             critique_findings,
             state: state.into(),
             notes,
@@ -237,6 +258,7 @@ impl AgentLoop<'_> {
         counterexamples: &mut HashSet<String>,
         decomposed: &mut HashSet<String>,
         certified: &mut usize,
+        abstained: &mut usize,
     ) -> Result<&'static str> {
         match route {
             Route::Falsify => {
@@ -340,7 +362,9 @@ impl AgentLoop<'_> {
                 )?;
                 Ok("retrieve")
             }
-            Route::Formalize => self.formalize(project_id, run, node, session, certified),
+            Route::Formalize => {
+                self.formalize(project_id, run, node, session, certified, abstained)
+            }
             Route::Verify => {
                 if let Some(formal) = &node.formal_statement {
                     let theorem = extract_theorem(formal);
@@ -366,6 +390,7 @@ impl AgentLoop<'_> {
                             theorem.as_deref(),
                             session,
                             certified,
+                            abstained,
                         )?;
                     }
                     Ok("verify")
@@ -413,7 +438,9 @@ impl AgentLoop<'_> {
                 decomposed.insert(node.id.clone());
                 Ok("decompose")
             }
-            Route::Prove => self.prove_via_prover(project_id, run, node, session, certified),
+            Route::Prove => {
+                self.prove_via_prover(project_id, run, node, session, certified, abstained)
+            }
             _ => Ok("noop"),
         }
     }
@@ -425,6 +452,7 @@ impl AgentLoop<'_> {
         node: &Node,
         session: &mut Option<LeanSession>,
         certified: &mut usize,
+        abstained: &mut usize,
     ) -> Result<&'static str> {
         // Non-Lean targets go through the per-system generator + live backend
         // (Coq/Isar are produced and verified natively, not via the Lean path).
@@ -498,6 +526,7 @@ impl AgentLoop<'_> {
                 theorem.as_deref(),
                 session,
                 certified,
+                abstained,
             )?;
             Ok("prove")
         } else {
@@ -512,6 +541,7 @@ impl AgentLoop<'_> {
         node: &Node,
         session: &mut Option<LeanSession>,
         certified: &mut usize,
+        abstained: &mut usize,
     ) -> Result<&'static str> {
         // Non-Lean targets are formalized+proved through the per-system generator
         // (system-native Coq/Isar) rather than the Lean-only best-of-N below.
@@ -562,6 +592,7 @@ impl AgentLoop<'_> {
                 theorem.as_deref(),
                 session,
                 certified,
+                abstained,
             )?;
         }
         Ok("formalize")
@@ -636,6 +667,7 @@ impl AgentLoop<'_> {
         theorem: Option<&str>,
         session: &mut Option<LeanSession>,
         certified: &mut usize,
+        abstained: &mut usize,
     ) -> Result<bool> {
         let k = self.config.k_consecutive_clean;
         let gate = k_consecutive_clean(k, k.max(1), |_round| {
@@ -674,16 +706,45 @@ impl AgentLoop<'_> {
             provider: self.provider,
             enabled: super::certification::gate_enabled(),
         };
-        let outcome = meta_gate.evaluate(
-            project_id,
-            &node.id,
-            lean,
-            verifier_score,
-            verifier_score,
-            gate.certified,
-        )?;
+        // Aletheia abstention (item #2): when the abstention threshold env-seam is
+        // set, an uncertified low-confidence node ABSTAINS (declines) rather than
+        // being scored as a failure. Default (no threshold) keeps the exact prior
+        // certify-or-fail behaviour.
+        let outcome = match abstain_threshold() {
+            Some(threshold) => meta_gate.evaluate_with_abstention(
+                project_id,
+                &node.id,
+                lean,
+                verifier_score,
+                verifier_score,
+                gate.certified,
+                threshold,
+            )?,
+            None => meta_gate.evaluate(
+                project_id,
+                &node.id,
+                lean,
+                verifier_score,
+                verifier_score,
+                gate.certified,
+            )?,
+        };
         if outcome.certified {
             self.certify(project_id, node, lean, certified)?;
+        } else if outcome.abstained {
+            // A first-class terminal state distinct from failure: record it and
+            // leave the node uncertified (never marked Rejected/Failed).
+            *abstained += 1;
+            self.store.event(
+                Some(project_id),
+                None,
+                "certify.abstained",
+                "certification_gate",
+                json!({
+                    "node": node.id,
+                    "reason": outcome.abstain_reason,
+                }),
+            )?;
         }
         Ok(outcome.certified)
     }
