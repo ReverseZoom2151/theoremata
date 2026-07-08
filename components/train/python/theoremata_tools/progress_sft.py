@@ -25,8 +25,11 @@ dataset + config end-to-end without importing a trainer.
 from __future__ import annotations
 
 import json
+import math
 import sys
 from typing import Any, Iterable
+
+from .flywheel import SFT_SCHEMA  # single source of truth for the chat-SFT shape
 
 NO_GOALS = "no goals"
 
@@ -164,6 +167,189 @@ def dry_run(traces: Iterable[dict[str, Any]], config: dict[str, Any] | None = No
     }
 
 
+# ---------------------------------------------------------------------------
+# Chat-SFT: one honest, tiny fine-tune step over the flywheel's JSONL output.
+#
+# This consumes the shared :data:`flywheel.SFT_SCHEMA` chat rows (produced by
+# ``flywheel.to_sft_rows`` / ``flywheel.revolution``) and runs ONE step of SFT.
+# If torch + transformers import, a REAL single gradient step of a tiny,
+# randomly-initialised, char-level GPT-2 runs entirely offline (no weights are
+# downloaded). Otherwise a clearly-labelled dry-run reports dataset and
+# loss-shaped metrics WITHOUT touching any weights -- honest about being
+# not-a-real-train. This is distinct from the LeanProgress recipe above.
+# ---------------------------------------------------------------------------
+
+
+def sft_config(**overrides: Any) -> dict[str, Any]:
+    """Tiny chat-SFT config for ONE honest step (distinct from the LeanProgress
+    ``progress_config``). CPU-friendly; the torch path builds a random-init model
+    so nothing is downloaded. ``overrides`` replace any key."""
+    config: dict[str, Any] = {
+        "model": "gpt2-tiny(random-init, char-level, offline)",
+        "schema": SFT_SCHEMA,
+        "max_length": 256,
+        "learning_rate": 5e-5,
+        "max_steps": 1,
+        "batch_size": 1,
+        "grad_clip": 1.0,
+        "seed": 0,
+    }
+    config.update(overrides)
+    return config
+
+
+def read_sft_jsonl(path: str) -> list[dict[str, Any]]:
+    """Read a chat-SFT JSONL file (:data:`flywheel.SFT_SCHEMA`) into rows."""
+    rows: list[dict[str, Any]] = []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def _chat_example_text(row: dict[str, Any]) -> str:
+    """Flatten one chat-SFT row into a single training string. Tolerates the flat
+    ``{prompt, completion}`` shape too, so harvester rows also feed in."""
+    msgs = row.get("messages")
+    if isinstance(msgs, list):
+        return "\n".join(
+            f"{m.get('role', '')}: {m.get('content', '')}" for m in msgs
+        )
+    return f"{row.get('prompt', '')}{row.get('completion', '')}"
+
+
+def _torch_transformers_available() -> bool:
+    try:
+        import torch  # noqa: F401
+        import transformers  # noqa: F401
+    except Exception:  # noqa: BLE001 - any import failure => offline dry-run
+        return False
+    return True
+
+
+def _sft_dry_run(texts: list[str], config: dict[str, Any]) -> dict[str, Any]:
+    """Deterministic offline dry-run: count tokens / build examples / report
+    loss-shaped metrics. Clearly labelled NOT a real train -- no weights move."""
+    n = len(texts)
+    token_counts = [len(t.split()) for t in texts]
+    total_tokens = sum(token_counts)
+    vocab: set[str] = set()
+    for t in texts:
+        vocab.update(t.split())
+    V = max(len(vocab), 1)
+    # A loss-shaped REFERENCE, not a trained loss: the cross-entropy (nats) of a
+    # uniform next-token guess over the observed vocabulary -- the analytic
+    # baseline a real trainer would start near and then reduce.
+    uniform_baseline_loss = round(math.log(V), 6)
+    return {
+        "ok": True,
+        "trained": False,
+        "backend": "dry_run",
+        "reason": "torch+transformers unavailable",
+        "note": "NOT a real train: metrics are analytic, no weights updated",
+        "schema": SFT_SCHEMA,
+        "num_examples": n,
+        "num_tokens": total_tokens,
+        "avg_tokens": round(total_tokens / n, 3) if n else 0.0,
+        "vocab_size": V,
+        "steps": 0,
+        "uniform_baseline_loss": uniform_baseline_loss,
+        "config": {"model": config.get("model"), "max_steps": config.get("max_steps")},
+    }
+
+
+def _sft_finetune_torch(texts: list[str], config: dict[str, Any]) -> dict[str, Any]:
+    """One REAL SFT step, offline: a random-init char-level GPT-2 (built from a
+    config, so nothing is downloaded) does a single forward/backward/optimizer
+    step over the flattened examples. Returns the observed training loss."""
+    import torch
+    from transformers import GPT2Config, GPT2LMHeadModel
+
+    if not texts:
+        return {
+            "ok": True,
+            "trained": False,
+            "backend": "torch",
+            "reason": "empty dataset",
+            "steps": 0,
+        }
+
+    torch.manual_seed(int(config.get("seed", 0)))
+    # Char-level vocab built from the data => no pretrained download (offline).
+    chars = sorted({c for t in texts for c in t})
+    stoi = {c: i + 1 for i, c in enumerate(chars)}  # id 0 reserved for pad
+    vocab_size = len(stoi) + 1
+    max_len = int(config.get("max_length", 256))
+
+    batch = [[stoi[c] for c in t][:max_len] or [0] for t in texts]
+    width = max(len(ids) for ids in batch)
+    input_ids = torch.zeros(len(batch), width, dtype=torch.long)
+    for i, ids in enumerate(batch):
+        input_ids[i, : len(ids)] = torch.tensor(ids, dtype=torch.long)
+
+    model_cfg = GPT2Config(
+        vocab_size=vocab_size,
+        n_positions=max(width, 8),
+        n_ctx=max(width, 8),
+        n_embd=32,
+        n_layer=2,
+        n_head=2,
+    )
+    model = GPT2LMHeadModel(model_cfg)
+    model.train()
+    optim = torch.optim.AdamW(
+        model.parameters(), lr=float(config.get("learning_rate", 5e-5))
+    )
+
+    labels = input_ids.clone()
+    labels[labels == 0] = -100  # ignore pad positions in the LM loss
+
+    out = model(input_ids=input_ids, labels=labels)
+    loss0 = float(out.loss.detach())
+    out.loss.backward()
+    torch.nn.utils.clip_grad_norm_(
+        model.parameters(), float(config.get("grad_clip", 1.0))
+    )
+    optim.step()
+
+    return {
+        "ok": True,
+        "trained": True,
+        "backend": "torch",
+        "schema": SFT_SCHEMA,
+        "num_examples": len(texts),
+        "vocab_size": vocab_size,
+        "steps": 1,
+        "loss": round(loss0, 6),
+        "config": {"model": "gpt2-tiny(random-init, char-level, offline)", "max_length": max_len},
+    }
+
+
+def sft_finetune(
+    data: str | Iterable[dict[str, Any]],
+    config: dict[str, Any] | None = None,
+    *,
+    backend: str = "auto",
+) -> dict[str, Any]:
+    """Run ONE honest, tiny SFT step over the flywheel's chat-SFT output.
+
+    ``data`` is a path to a JSONL file (``flywheel.to_sft_rows`` /
+    ``flywheel.revolution`` output) or an in-memory list of chat-SFT rows.
+    ``backend`` is ``"auto"`` (real torch step if available, else dry-run),
+    ``"torch"``, or ``"dry_run"``. Everything runs offline with no GPU.
+    """
+    config = config or sft_config()
+    rows = read_sft_jsonl(data) if isinstance(data, str) else list(data)
+    texts = [_chat_example_text(r) for r in rows]
+    if backend == "auto":
+        backend = "torch" if _torch_transformers_available() else "dry_run"
+    if backend == "torch":
+        return _sft_finetune_torch(texts, config)
+    return _sft_dry_run(texts, config)
+
+
 def write_jsonl(rows: Iterable[dict[str, Any]], path: str) -> int:
     count = 0
     with open(path, "w", encoding="utf-8") as fh:
@@ -184,6 +370,14 @@ def run(request: dict[str, Any]) -> dict[str, Any]:
         return progress_config(**request.get("overrides", {}))
     if op == "dry_run":
         return dry_run(request.get("traces", []), request.get("config"))
+    if op == "sft":
+        return sft_finetune(
+            request.get("path", request.get("rows", [])),
+            request.get("config"),
+            backend=request.get("backend", "auto"),
+        )
+    if op == "sft_config":
+        return sft_config(**request.get("overrides", {}))
     raise ValueError(f"unknown op: {op}")
 
 

@@ -86,3 +86,40 @@ def test_dry_run_validates_completions():
     assert out["ok"] is True and out["dry_run"] is True
     assert out["num_rows"] == 2
     assert out["target"] == "relative"
+
+
+# --- chat-SFT: one honest step consuming the flywheel's JSONL --------------
+
+def test_sft_finetune_dry_run_offline():
+    from theoremata_tools.progress_sft import sft_finetune
+
+    rows = [
+        {"messages": [{"role": "user", "content": "a = a"},
+                      {"role": "assistant", "content": "by simp"}]},
+        {"messages": [{"role": "user", "content": "b = b"},
+                      {"role": "assistant", "content": "by rfl"}]},
+    ]
+    out = sft_finetune(rows, backend="dry_run")
+    assert out["ok"] is True
+    assert out["trained"] is False  # honestly labelled not-a-real-train
+    assert out["num_examples"] == 2
+    assert out["num_tokens"] > 0
+    assert out["uniform_baseline_loss"] >= 0.0
+
+
+def test_flywheel_jsonl_is_valid_sft_input(tmp_path):
+    # #1's output is a valid #3 input: shared JSONL schema, end-to-end offline.
+    from theoremata_tools.flywheel import revolution
+    from theoremata_tools.progress_sft import read_sft_jsonl, sft_finetune
+
+    path = str(tmp_path / "sft.jsonl")
+    rev = revolution([{"statement": "p"}, {"statement": "q"}], jsonl_path=path)
+    assert rev["written"] == 2
+
+    rows = read_sft_jsonl(path)
+    assert all("messages" in r for r in rows)
+
+    out = sft_finetune(path, backend="dry_run")
+    assert out["num_examples"] == 2
+    assert out["trained"] is False
+    assert out["schema"] == rev["schema"]
