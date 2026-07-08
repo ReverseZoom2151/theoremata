@@ -265,6 +265,10 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.geometry_synth import run as geometry_synth_run
 
         return geometry_synth_run(request)
+    if tool == "geometry_algebraic":
+        from theoremata_tools.geometry_algebraic import run as geometry_algebraic_run
+
+        return geometry_algebraic_run(request)
     if tool == "flywheel":
         from theoremata_tools.flywheel import run as flywheel_run
 
