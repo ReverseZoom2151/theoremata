@@ -658,10 +658,34 @@ impl AgentLoop<'_> {
                 "longest_streak": gate.longest_streak,
             }),
         )?;
-        if gate.certified {
+        // Scored proof-pool + critic meta-verification gate (item #1). The
+        // candidate is inserted into the persisted pool regardless of the streak
+        // outcome (so the pool is populated during a run); certification then
+        // additionally requires the pool's all-pass verdict AND that the critic's
+        // meta-verification did not CONFIRM a critical finding on this node. A
+        // full clean streak maps to verifier_score 1.0 (the all-pass value).
+        let verifier_score = if k == 0 {
+            1.0
+        } else {
+            (gate.longest_streak as f64 / k as f64).min(1.0)
+        };
+        let meta_gate = super::certification::PoolMetaGate {
+            store: self.store,
+            provider: self.provider,
+            enabled: super::certification::gate_enabled(),
+        };
+        let outcome = meta_gate.evaluate(
+            project_id,
+            &node.id,
+            lean,
+            verifier_score,
+            verifier_score,
+            gate.certified,
+        )?;
+        if outcome.certified {
             self.certify(project_id, node, lean, certified)?;
         }
-        Ok(gate.certified)
+        Ok(outcome.certified)
     }
 
     fn certify(

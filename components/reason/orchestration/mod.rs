@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod certification;
 pub mod research;
 pub mod consolidate;
 pub mod observe;
