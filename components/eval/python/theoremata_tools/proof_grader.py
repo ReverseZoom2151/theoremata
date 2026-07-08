@@ -33,6 +33,7 @@ gate in :mod:`theoremata_tools.benchmarks.graders`.
 from __future__ import annotations
 
 import json
+import math
 import re
 import sys
 from typing import Any, Callable
@@ -91,6 +92,114 @@ _GAP_PATTERNS = (
     "hence the result",  # asserting a conclusion with nothing before it
     "and we are done",
 )
+
+
+# --------------------------------------------------------------------------- #
+# Rubric upgrades (from TheoremExplainAgent — geometric mean, banned-reasoning
+# anti-refusal guard, <LGTM> convergence sentinel, anchored multi-dimension
+# rubric) + ProofGrader's 0-N ordinal scale.
+# --------------------------------------------------------------------------- #
+
+#: Clean-judgment sentinel. If a judge emits this, the proof is accepted and the
+#: retry/critique loop short-circuits (TEA ``<LGTM>`` contract).
+LGTM_SENTINEL = "<LGTM>"
+
+#: Judge cop-out phrases. A judgment containing any of these is a *refusal*, not
+#: a grade: it is rejected so a non-answer can't poison the verdict / a retry
+#: loop (TEA ``banned_reasonings.txt``, matched case-insensitively).
+BANNED_REASONINGS = (
+    "evaluation cannot",
+    "can't assist",
+    "cannot assist",
+    "can't provide",
+    "cannot provide",
+    "can't evaluate",
+    "cannot evaluate",
+    "cannot be evaluated",
+    "cannot be rated",
+    "cannot be completed",
+    "cannot be assessed",
+    "cannot be scored",
+    "cannot be conducted",
+    "unable to evaluate",
+    "unable to provide the evaluation",
+    "do not have the capability",
+    "do not have the ability",
+    "as an ai",
+    "i cannot",
+)
+
+#: Anchored multi-dimension rubric (1-5 each, 1 = completely fails … 5 = fully
+#: meets or exceeds). Dimensions map to proof quality, per the TEA methodology.
+RUBRIC_DIMENSIONS = (
+    "statement_fidelity",  # proves the actual statement, not a weaker one
+    "proof_correctness",   # every step is valid
+    "gap_freeness",        # no unjustified leaps / missing cases
+    "rigor",               # formal-check-ready, no hand-waving
+    "minimality",          # no spurious / circular detours
+)
+
+#: Per-status quality in [0,1] used when aggregating with the geometric mean, so
+#: a single severe flaw drags the whole score down instead of averaging out.
+_STATUS_QUALITY = {
+    CORRECT: 1.0,
+    UNJUSTIFIED_STEP: 0.5,
+    LOGICAL_GAP: 0.3,
+    COMPUTATION_ERROR: 0.1,
+}
+
+
+def is_refusal(text: Any) -> bool:
+    """True if ``text`` is a judge refusal/punt (contains a banned reasoning)."""
+    if text is None:
+        return False
+    low = str(text).lower()
+    return any(bad in low for bad in BANNED_REASONINGS)
+
+
+def has_lgtm(text: Any) -> bool:
+    """True if ``text`` carries the ``<LGTM>`` clean-judgment sentinel."""
+    return text is not None and LGTM_SENTINEL.lower() in str(text).lower()
+
+
+def arithmetic_mean(scores: list[float]) -> float:
+    """Plain mean of non-None scores (0.0 if empty)."""
+    vals = [float(s) for s in scores if s is not None]
+    return sum(vals) / len(vals) if vals else 0.0
+
+
+def geometric_mean(scores: list[float]) -> float:
+    """Geometric mean of non-None scores (0.0 if empty).
+
+    Product-based, so a single near-zero dimension tanks the aggregate — the
+    imbalance-punishing aggregation from TEA's ``calculate_geometric_mean``.
+    Negative inputs are invalid for a geometric mean and yield 0.0.
+    """
+    vals = [float(s) for s in scores if s is not None]
+    if not vals:
+        return 0.0
+    prod = 1.0
+    for v in vals:
+        if v < 0:
+            return 0.0
+        prod *= v
+    return prod ** (1.0 / len(vals))
+
+
+def aggregate_scores(scores: list[float], method: str = "arithmetic") -> float:
+    """Aggregate dimension/step scores by ``"arithmetic"`` or ``"geometric"``."""
+    if method == "geometric":
+        return geometric_mean(scores)
+    if method == "arithmetic":
+        return arithmetic_mean(scores)
+    raise ValueError(f"unknown aggregation method: {method!r}")
+
+
+def _to_ordinal(fraction: float, scale_max: int) -> int:
+    """Map a [0,1] quality fraction onto an integer 0..scale_max ordinal band."""
+    if fraction != fraction:  # NaN
+        return 0
+    return int(max(0, min(scale_max, round(fraction * scale_max))))
 
 
 # --------------------------------------------------------------------------- #
@@ -306,6 +415,19 @@ def _worst_status(per_step: list[dict[str, Any]]) -> str:
 # Public entry point
 # --------------------------------------------------------------------------- #
 
+def _judge_text(result: dict[str, Any]) -> str:
+    """Flatten a judge result to text for sentinel / refusal scanning."""
+    parts = [
+        str(result.get(k, ""))
+        for k in ("raw", "text", "content", "verdict", "reason", "notes")
+    ]
+    try:
+        parts.append(json.dumps(result, default=str))
+    except Exception:  # noqa: BLE001
+        pass
+    return " ".join(p for p in parts if p)
+
+
 def grade_proof(
     proof: str | None = None,
     *,
@@ -314,6 +436,8 @@ def grade_proof(
     use_llm: bool = False,
     judge: ProofJudge | None = None,
     problem: str = "",
+    aggregate: str = "arithmetic",
+    scale: int | None = None,
 ) -> dict[str, Any]:
     """Grade a proof with a rubric + structured error taxonomy.
 
@@ -334,18 +458,27 @@ def grade_proof(
         deterministic path.
     problem:
         Optional problem statement passed to the LLM judge for context.
+    aggregate:
+        Step-wise score aggregation: ``"arithmetic"`` (default; fraction of
+        correct steps) or ``"geometric"`` (per-step quality geometric mean, so a
+        single severe flaw tanks the score — TEA geometric-mean aggregation).
+    scale:
+        When an int ``N`` (e.g. ``7`` for ProofGrader's 0-7 rubric), also emit an
+        integer ``ordinal_score`` in ``[0, N]`` derived from the quality
+        fraction, alongside the existing binary/float ``score``.
 
     Returns
     -------
     ``{score, verdict, mode, path, per_step: [{step, status, reason}],
-       taxonomy_counts, flaw_count, n_steps}``.
+       taxonomy_counts, flaw_count, n_steps}`` (+ ``ordinal_score``/``scale`` when
+       ``scale`` is set, and ``lgtm``/``judge_refused`` flags on the LLM path).
     """
     if mode not in {"step_wise", "holistic"}:
         raise ValueError(f"unknown mode: {mode!r}")
 
     step_list = _coerce_steps(proof, steps)
     if not step_list:
-        return {
+        empty = {
             "score": None,
             "verdict": "empty",
             "mode": mode,
@@ -355,15 +488,39 @@ def grade_proof(
             "flaw_count": 0,
             "n_steps": 0,
         }
+        if scale is not None:
+            empty["ordinal_score"] = None
+            empty["scale"] = int(scale)
+        return empty
 
     path = "deterministic"
     per_step: list[dict[str, Any]] = []
+    lgtm = False
+    judge_refused = False
 
     if use_llm:
         jfn = judge or _default_llm_judge
         result = jfn(problem, step_list) or {}
+        text = _judge_text(result)
         raw_steps = result.get("per_step") or []
-        if raw_steps:
+        # Anti-refusal guard: a punting judge is a non-answer, not a grade —
+        # drop it and fall back to determinism rather than trusting it.
+        if is_refusal(text):
+            judge_refused = True
+            raw_steps = []
+        # <LGTM> convergence sentinel: a clean judgment with no flagged steps
+        # short-circuits to acceptance.
+        elif has_lgtm(text) and not any(
+            isinstance(s, dict) and str(s.get("status")).lower() in FLAW_STATUSES
+            for s in raw_steps
+        ):
+            lgtm = True
+            per_step = [
+                {"step": s, "status": CORRECT, "reason": "judge returned <LGTM>"}
+                for s in step_list
+            ]
+            path = "llm_judge"
+        if not per_step and raw_steps:
             per_step = _normalize_judge_steps(step_list, raw_steps)
             path = "llm_judge"
 
@@ -374,28 +531,42 @@ def grade_proof(
 
     counts = _taxonomy_counts(per_step)
     flaw_count = sum(counts[s] for s in FLAW_STATUSES)
+    quality = [_STATUS_QUALITY.get(s["status"], 0.0) for s in per_step]
 
     if mode == "holistic":
         worst = _worst_status(per_step)
         score = 1.0 if worst == CORRECT else 0.0
         verdict = CORRECT if worst == CORRECT else "flawed"
         holistic = {"overall_status": worst}
+        quality_fraction = score
     else:  # step_wise
-        score = _score(per_step)
+        if aggregate == "geometric":
+            score = round(aggregate_scores(quality, "geometric"), 6)
+        else:
+            score = _score(per_step)
         verdict = CORRECT if flaw_count == 0 else "flawed"
         holistic = {}
+        quality_fraction = round(aggregate_scores(quality, aggregate), 6)
 
-    return {
+    out = {
         "score": score,
         "verdict": verdict,
         "mode": mode,
         "path": path,
+        "aggregate": aggregate,
         "per_step": per_step,
         "taxonomy_counts": counts,
         "flaw_count": flaw_count,
         "n_steps": len(step_list),
         **holistic,
     }
+    if use_llm:
+        out["lgtm"] = lgtm
+        out["judge_refused"] = judge_refused
+    if scale is not None:
+        out["scale"] = int(scale)
+        out["ordinal_score"] = _to_ordinal(quality_fraction, int(scale))
+    return out
 
 
 def grade_proof_item(
@@ -445,6 +616,8 @@ def run(request: dict[str, Any]) -> dict[str, Any]:
             mode=request.get("mode", "step_wise"),
             use_llm=bool(request.get("use_llm", False)),
             problem=request.get("problem", ""),
+            aggregate=request.get("aggregate", "arithmetic"),
+            scale=request.get("scale"),
         )
     if op == "grade_proof_item":
         return grade_proof_item(

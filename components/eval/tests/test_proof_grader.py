@@ -4,13 +4,21 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import math  # noqa: E402
+
 from theoremata_tools.proof_grader import (  # noqa: E402
     CORRECT,
     COMPUTATION_ERROR,
+    LOGICAL_GAP,
     UNJUSTIFIED_STEP,
+    aggregate_scores,
+    arithmetic_mean,
     classify_step,
+    geometric_mean,
     grade_proof,
     grade_proof_item,
+    has_lgtm,
+    is_refusal,
     run,
     split_steps,
 )
@@ -148,3 +156,91 @@ def test_run_dispatch():
     assert out["verdict"] == "flawed"
     out2 = run({"op": "classify_step", "step": "Obviously true."})
     assert out2["status"] == UNJUSTIFIED_STEP
+
+
+# --------------------------------------------------------------------------- #
+# Rubric upgrades: geometric mean, banned-reasonings, <LGTM>, ordinal scale
+# --------------------------------------------------------------------------- #
+
+def test_geometric_mean_punishes_a_weak_dimension_vs_arithmetic():
+    # One near-failing dimension among strong ones.
+    dims = [1.0, 1.0, 1.0, 0.1]
+    a = aggregate_scores(dims, "arithmetic")
+    g = aggregate_scores(dims, "geometric")
+    assert math.isclose(a, 0.775)          # (1+1+1+0.1)/4
+    assert g < a                            # geometric drags the aggregate down
+    assert math.isclose(g, (0.1) ** 0.25)  # product^(1/4) = 0.1^0.25
+    # Balanced input: the two aggregations agree.
+    assert math.isclose(arithmetic_mean([0.5, 0.5]), geometric_mean([0.5, 0.5]))
+
+
+def test_geometric_mean_edge_cases():
+    assert geometric_mean([]) == 0.0
+    assert geometric_mean([2.0, None, 8.0]) == 4.0  # sqrt(16), None skipped
+    assert geometric_mean([-1.0, 2.0]) == 0.0       # negative invalid -> 0.0
+
+
+def test_grade_proof_geometric_aggregation_lower_than_arithmetic():
+    # A proof with one computation error (quality 0.1) among correct steps.
+    proof = "We have a = b by hypothesis.\nThen 2 + 2 = 5 as computed.\nHence done by algebra."
+    arith = grade_proof(proof, aggregate="arithmetic")
+    geo = grade_proof(proof, aggregate="geometric")
+    assert geo["score"] < arith["score"]
+    assert geo["aggregate"] == "geometric"
+
+
+def test_banned_reasoning_is_rejected_and_falls_back():
+    def refusing_judge(problem, steps):
+        return {"per_step": [], "verdict": "I cannot evaluate this proof."}
+
+    res = grade_proof(UNJUSTIFIED_PROOF, use_llm=True, judge=refusing_judge)
+    assert res["judge_refused"] is True
+    assert res["path"] == "deterministic"   # refusal dropped, determinism used
+    assert res["verdict"] == "flawed"
+
+
+def test_is_refusal_helper():
+    assert is_refusal("Sorry, I cannot provide the evaluation.")
+    assert is_refusal("As an AI, I am unable to evaluate.")
+    assert not is_refusal("Step 2 is unjustified.")
+
+
+def test_lgtm_sentinel_short_circuits_to_accept():
+    def lgtm_judge(problem, steps):
+        return {"per_step": [], "verdict": "<LGTM>"}
+
+    res = grade_proof(CLEAN_PROOF, use_llm=True, judge=lgtm_judge)
+    assert res["lgtm"] is True
+    assert res["verdict"] == CORRECT
+    assert res["score"] == 1.0
+    assert all(s["status"] == CORRECT for s in res["per_step"])
+    assert has_lgtm("all good <LGTM>")
+
+
+def test_lgtm_ignored_when_judge_also_flags_a_flaw():
+    def mixed_judge(problem, steps):
+        per = [{"status": CORRECT, "reason": "ok"} for _ in steps]
+        per[0] = {"status": LOGICAL_GAP, "reason": "gap"}
+        return {"per_step": per, "verdict": "<LGTM> but see step 1"}
+
+    res = grade_proof(CLEAN_PROOF, use_llm=True, judge=mixed_judge)
+    assert res["lgtm"] is False
+    assert res["verdict"] == "flawed"
+
+
+def test_ordinal_scale_0_to_7():
+    clean = grade_proof(CLEAN_PROOF, scale=7)
+    assert clean["scale"] == 7
+    assert clean["ordinal_score"] == 7  # all steps correct -> top band
+    flawed = grade_proof(UNJUSTIFIED_PROOF, scale=7)
+    assert 0 <= flawed["ordinal_score"] < 7
+    empty = grade_proof("", scale=7)
+    assert empty["ordinal_score"] is None
+
+
+def test_ordinal_scale_partial_credit_band():
+    # 3 of 4 steps correct (one computation error) -> mid ordinal, not 0 or max.
+    proof = "a = b holds.\n2 + 2 = 5 is wrong.\nc = d holds.\ne = f holds."
+    res = grade_proof(proof, scale=7, aggregate="arithmetic")
+    assert res["taxonomy_counts"][COMPUTATION_ERROR] == 1
+    assert 0 < res["ordinal_score"] < 7
