@@ -30,6 +30,23 @@ from typing import Any, Callable, Optional, Sequence
 # DeepMath weighting: accuracy 1.0, tool-use shaping 0.1.
 TOOL_USE_WEIGHT = 0.1
 
+# DeepSeek-Math-V2 generator self-verify blend (Eq. 5-6): proof-correctness stays
+# dominant (alpha) but honest self-evaluation is non-trivially rewarded (beta).
+ALPHA_SELF_EVAL = 0.76
+BETA_SELF_EVAL = 0.24
+
+# The valid DeepSeek score set {complete, minor-gap, fatal}.
+SCORE_SET = (0.0, 0.5, 1.0)
+
+# Default marker phrases whose presence constitutes a passing format reward
+# (DeepSeek-Math-V2 App. A.2/A.1). Any ONE present -> format-ok; callers may
+# pass their own markers.
+_DEFAULT_MARKERS = (
+    "based on my evaluation, the final overall score should be:",
+    "here is my evaluation of the solution:",
+    "\\boxed{",
+)
+
 # A verdict is either a structured dict {compiled, axioms_ok} or a bare bool.
 Verdict = Any
 GoldParser = Callable[[Any], Optional[Any]]
@@ -153,6 +170,96 @@ def make_reward_fn(*, tool_weight: float = TOOL_USE_WEIGHT) -> Callable[[dict[st
         return reward(sample, tool_weight=tool_weight)
 
     return _fn
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek-Math-V2: faithful-verifier + meta-verify + generator self-verify
+# ---------------------------------------------------------------------------
+#
+# These add a *scored* reward path alongside the binary verifier-driven reward
+# above, addressing the LeanDojo-v2 "GRPO reward is a 1.0 stub" gap with real
+# shaping. Scores s live in {0, 0.5, 1} (fatal / minor-gap / complete). Our
+# formal Lean/Rocq/Isabelle gate is a *stronger* score source than an NL
+# self-verifier: a clean compile+axiom+kernel verdict pins the gold score to 1.0
+# (or 0.0 on failure) with no self-report to be faithful about.
+
+
+def format_reward(text: Any, markers: Sequence[str] = _DEFAULT_MARKERS) -> float:
+    """DeepSeek ``R_format``: ``1.0`` when the output carries a required marker
+    phrase (case-insensitive substring), else ``0.0``. Cheap, exact gate that
+    the score/meta rewards multiply against (a malformed output earns nothing)."""
+    if not text:
+        return 0.0
+    low = str(text).lower()
+    return 1.0 if any(m.lower() in low for m in markers) else 0.0
+
+
+def snap_score(score: Any) -> Optional[float]:
+    """Snap an arbitrary numeric score to the nearest value in {0, 0.5, 1}.
+    Returns ``None`` for a missing/non-numeric score."""
+    if score is None or isinstance(score, bool):
+        return None
+    try:
+        s = float(score)
+    except (TypeError, ValueError):
+        return None
+    return min(SCORE_SET, key=lambda t: abs(t - s))
+
+
+def faithfulness_reward(predicted_score: Any, gold_score: Any) -> Optional[float]:
+    """DeepSeek ``R_score = 1 - |s' - s|`` (Eq. 1): how close a *predicted* score
+    ``s'`` is to the gold score ``s``. Both are snapped to {0, 0.5, 1}; the
+    result lies in ``[0, 1]`` (1.0 = exact agreement). ``None`` if either score
+    is missing. This is verifier faithfulness -- reward the verifier for
+    scoring like the ground truth, not for any fixed verdict."""
+    s_pred = snap_score(predicted_score)
+    s_gold = snap_score(gold_score)
+    if s_pred is None or s_gold is None:
+        return None
+    return 1.0 - abs(s_pred - s_gold)
+
+
+def verifier_reward(
+    predicted_score: Any,
+    gold_score: Any,
+    *,
+    r_format: float = 1.0,
+    r_meta: float = 1.0,
+) -> Optional[float]:
+    """DeepSeek enhanced-verifier reward ``R_V = R_format . R_score . R_meta``
+    (Eq. 2-3). ``r_meta`` in ``[0, 1]`` is the meta-verifier multiplier: it
+    discounts a score whose *analysis* the meta-verifier could not confirm
+    (attacks the "hallucinate fake issues yet score correctly" exploit).
+    Returns ``None`` when there is no gold/predicted score to compare."""
+    r_score = faithfulness_reward(predicted_score, gold_score)
+    if r_score is None:
+        return None
+    return float(r_format) * r_score * float(r_meta)
+
+
+def generator_self_verify_reward(
+    r_y: Any,
+    predicted_score: Any,
+    gold_score: Any,
+    *,
+    r_format: float = 1.0,
+    r_meta: float = 1.0,
+    alpha: float = ALPHA_SELF_EVAL,
+    beta: float = BETA_SELF_EVAL,
+) -> Optional[float]:
+    """DeepSeek generator reward ``R = R_format . (alpha.R_Y + beta.R_Z)``
+    (Eq. 4-6), where ``R_Z = R_score(s', s) . R_meta(Z)`` rewards the generator
+    for a *faithful* self-evaluation (not for claiming correctness). ``r_y`` is
+    the proof-correctness reward (e.g. the verifier's/formal gate's score of the
+    proof itself). Defaults ``alpha=0.76, beta=0.24`` keep correctness dominant
+    while making honest self-assessment non-trivial. ``None`` if the self-score
+    cannot be scored against gold."""
+    r_z = faithfulness_reward(predicted_score, gold_score)
+    if r_z is None:
+        return None
+    r_z = r_z * float(r_meta)
+    r_y_val = 0.0 if r_y is None else float(r_y)
+    return float(r_format) * (float(alpha) * r_y_val + float(beta) * r_z)
 
 
 # ---------------------------------------------------------------------------

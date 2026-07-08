@@ -1,0 +1,387 @@
+"""Auto-labeling flywheel: zero-human hard labels for proof-correctness data.
+
+Ports DeepSeek-Math-V2's self-improving data engine
+(``docs/resource-mining/new/DeepSeek-Math-V2.md`` s2.5, PDF p.6). Given generated
+proofs, it runs each proof through ``n`` verifications and, for the ones that
+report an issue, ``m`` meta-verifications; a majority of confirming
+meta-assessments validates an analysis. The proof is labeled with the **lowest
+score confirmed by >= k valid analyses**, else labeled ``1.0``. In DeepSeek's
+last two RL iterations this fully replaced human annotation.
+
+Pluggable ORACLE
+----------------
+The verifier is a *pluggable oracle* -- any callable ``(problem, proof) -> score``
+(a float, a ``{"score","analysis","reports_issue"}`` dict, or a
+:class:`Verification`). Two oracle families matter:
+
+* **NL self-verifier** -- an LLM that emits ``{issue-summary, score in {0,.5,1}}``.
+  It can *lie* (score a flawed proof while hallucinating fake issues), so its
+  analyses must pass the meta-verifier before they count.
+* **Formal oracle (STRONGER)** -- our Lean/Rocq/Isabelle ``verify`` (compile +
+  ``#print axioms`` closure + kernel typecheck + soundness scan). A clean verdict
+  is a **hard label 1.0**, a failure a **hard label 0.0**, with *no self-report to
+  be faithful about and no meta-verification needed*. Pass ``formal=True`` (or a
+  :func:`formal_oracle`-wrapped verdict fn) to take this path. This is a strictly
+  stronger hard-label source than DeepSeek's all-LLM verifier for the
+  autoformalizable subset -- exactly the hybrid the mining report recommends.
+
+Output is a labeled dataset with full provenance, convertible to SFT rows
+(label-1 proofs become positive ``messages`` targets) or GRPO rows
+(``{gold, proof, label, verdict}``) that feed the faithful-verifier reward in
+``reward.py``.
+
+Offline / dry-run only: no model, no GPU. Tests drive it with mock oracles.
+"""
+from __future__ import annotations
+
+import json
+import sys
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional, Sequence
+
+# valid DeepSeek scores: fatal / minor-gap / complete
+SCORE_SET = (0.0, 0.5, 1.0)
+
+
+@dataclass
+class Verification:
+    """One verifier pass over a proof."""
+
+    score: float
+    analysis: str = ""
+    reports_issue: Optional[bool] = None  # None -> derived from score < 1.0
+
+    def issues(self) -> bool:
+        if self.reports_issue is not None:
+            return bool(self.reports_issue)
+        return self.score < 1.0
+
+
+# A verify oracle: (problem, proof) -> score | dict | Verification
+VerifyOracle = Callable[[str, str], Any]
+# A meta oracle: (problem, proof, verification) -> bool | {"valid": bool}
+MetaOracle = Callable[[str, str, Verification], Any]
+
+
+def _snap(score: Any) -> float:
+    """Snap an arbitrary numeric to the nearest value in {0, 0.5, 1}."""
+    try:
+        s = float(score)
+    except (TypeError, ValueError):
+        return 1.0
+    return min(SCORE_SET, key=lambda t: abs(t - s))
+
+
+def coerce_verification(x: Any) -> Verification:
+    """Accept a float, a dict, or a :class:`Verification`; normalize the score
+    into {0, 0.5, 1}."""
+    if isinstance(x, Verification):
+        return Verification(_snap(x.score), x.analysis, x.reports_issue)
+    if isinstance(x, dict):
+        return Verification(
+            _snap(x.get("score", 1.0)),
+            str(x.get("analysis", "")),
+            x.get("reports_issue"),
+        )
+    return Verification(_snap(x))
+
+
+def _coerce_bool(x: Any) -> bool:
+    if isinstance(x, dict):
+        return bool(x.get("valid", x.get("confirmed", x.get("ok"))))
+    return bool(x)
+
+
+def majority_confirm(votes: Sequence[Any]) -> bool:
+    """A DeepSeek meta majority: strictly more confirming than denying votes.
+    An empty vote list is *not* confirmed."""
+    bools = [_coerce_bool(v) for v in votes]
+    return bools.count(True) > bools.count(False)
+
+
+def formal_oracle(verdict_fn: Callable[[str, str], Any]) -> VerifyOracle:
+    """Wrap a formal verdict function ``(problem, proof) -> verdict`` into a
+    verify oracle emitting a *hard* score. ``verdict`` may be a bool or a
+    ``{compiled, axioms_ok}`` dict; a clean pass -> 1.0, anything else -> 0.0."""
+
+    def _oracle(problem: str, proof: str) -> Verification:
+        v = verdict_fn(problem, proof)
+        if isinstance(v, dict):
+            ok = bool(v.get("compiled")) and bool(v.get("axioms_ok", True))
+        else:
+            ok = bool(v)
+        return Verification(1.0 if ok else 0.0, analysis="formal-gate", reports_issue=not ok)
+
+    return _oracle
+
+
+def auto_label(
+    problem: str,
+    proof: str,
+    verify_oracle: VerifyOracle,
+    *,
+    meta_oracle: Optional[MetaOracle] = None,
+    n: int = 4,
+    m: int = 3,
+    k: int = 1,
+    formal: bool = False,
+) -> dict[str, Any]:
+    """Auto-label one proof (DeepSeek recipe).
+
+    * ``formal=True``: run the oracle once; its score is a HARD label (formal
+      ground truth). No meta-verification.
+    * otherwise: run ``verify_oracle`` ``n`` times. For each verification that
+      reports an issue, run ``meta_oracle`` ``m`` times and keep the analysis
+      only if a majority confirms it (a *valid analysis*). If there are ``>= k``
+      valid analyses, label the proof with the **lowest** valid score; else
+      label ``1.0``.
+
+    Returns ``{label, hard, confirmed, provenance}`` with the full audit trail.
+    """
+    if formal:
+        v = coerce_verification(verify_oracle(problem, proof))
+        return {
+            "label": v.score,
+            "hard": True,
+            "confirmed": True,
+            "provenance": {
+                "oracle": "formal",
+                "n_verify": 1,
+                "scores": [v.score],
+                "valid_analyses": 0,
+                "note": "formal gate: clean verdict == hard label",
+            },
+        }
+
+    verifications = [coerce_verification(verify_oracle(problem, proof)) for _ in range(max(n, 0))]
+    scores = [v.score for v in verifications]
+    valid_scores: list[float] = []
+    meta_log: list[dict[str, Any]] = []
+    for v in verifications:
+        if not v.issues():
+            continue
+        if meta_oracle is None:
+            valid = True
+            votes: list[bool] = []
+        else:
+            votes = [_coerce_bool(meta_oracle(problem, proof, v)) for _ in range(max(m, 0))]
+            valid = majority_confirm(votes)
+        meta_log.append({"score": v.score, "valid": valid, "votes": votes})
+        if valid:
+            valid_scores.append(v.score)
+
+    if len(valid_scores) >= max(k, 1):
+        label = min(valid_scores)
+        confirmed = True
+    else:
+        label = 1.0
+        confirmed = False
+
+    return {
+        "label": label,
+        "hard": False,
+        "confirmed": confirmed,
+        "provenance": {
+            "oracle": "nl_verifier",
+            "n_verify": n,
+            "m_meta": m,
+            "k": k,
+            "scores": scores,
+            "valid_analyses": len(valid_scores),
+            "meta": meta_log,
+        },
+    }
+
+
+def label_dataset(
+    items: Sequence[dict[str, Any]],
+    verify_oracle: VerifyOracle,
+    *,
+    meta_oracle: Optional[MetaOracle] = None,
+    n: int = 4,
+    m: int = 3,
+    k: int = 1,
+    formal: bool = False,
+) -> dict[str, Any]:
+    """Auto-label a batch of ``{problem, proof}`` items.
+
+    Returns ``{ok, labeled, hard, confirmed, distribution, rows}`` where each row
+    is ``{problem, proof, label, hard, confirmed, provenance}``. ``distribution``
+    tallies rows per score in {0, 0.5, 1}.
+    """
+    rows: list[dict[str, Any]] = []
+    distribution = {0.0: 0, 0.5: 0, 1.0: 0}
+    hard = 0
+    confirmed = 0
+    for item in items:
+        problem = str(item.get("problem", item.get("goal", "")))
+        proof = str(item.get("proof", ""))
+        res = auto_label(
+            problem,
+            proof,
+            verify_oracle,
+            meta_oracle=meta_oracle,
+            n=n,
+            m=m,
+            k=k,
+            formal=formal,
+        )
+        distribution[res["label"]] = distribution.get(res["label"], 0) + 1
+        hard += 1 if res["hard"] else 0
+        confirmed += 1 if res["confirmed"] else 0
+        rows.append(
+            {
+                "problem": problem,
+                "proof": proof,
+                "label": res["label"],
+                "hard": res["hard"],
+                "confirmed": res["confirmed"],
+                "provenance": res["provenance"],
+            }
+        )
+    return {
+        "ok": True,
+        "labeled": len(rows),
+        "hard": hard,
+        "confirmed": confirmed,
+        "distribution": {str(kk): vv for kk, vv in distribution.items()},
+        "rows": rows,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Dataset conversion (SFT / GRPO-ready, with provenance)
+# ---------------------------------------------------------------------------
+
+def to_sft_rows(rows: Sequence[dict[str, Any]], *, threshold: float = 1.0) -> list[dict[str, Any]]:
+    """Emit chat-SFT rows for proofs whose auto-label is ``>= threshold`` (only
+    fully-confirmed correct proofs by default). Positives only -- the flywheel
+    does not teach the model on flawed proofs."""
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        if float(r["label"]) >= threshold:
+            out.append(
+                {
+                    "messages": [
+                        {"role": "user", "content": r["problem"]},
+                        {"role": "assistant", "content": r["proof"]},
+                    ],
+                    "meta": {"label": r["label"], "hard": r["hard"], "provenance": r["provenance"]},
+                }
+            )
+    return out
+
+
+def to_grpo_rows(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Emit GRPO rows ``{gold, proof, label, gold_score, verdict}``. ``verdict``
+    maps a hard label onto the binary ``{compiled, axioms_ok}`` verdict the
+    existing reward consumes (pass iff label == 1.0); ``gold_score`` feeds the
+    new faithful-verifier reward directly."""
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        label = float(r["label"])
+        out.append(
+            {
+                "gold": r["problem"],
+                "proof": r["proof"],
+                "label": label,
+                "gold_score": label,
+                "verdict": {"compiled": label >= 1.0, "axioms_ok": True},
+                "provenance": r["provenance"],
+            }
+        )
+    return out
+
+
+def dry_run(
+    items: Sequence[dict[str, Any]],
+    verify_oracle: VerifyOracle,
+    *,
+    meta_oracle: Optional[MetaOracle] = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Validate the flywheel end-to-end offline: label the batch, then confirm
+    both conversions produce well-formed rows. No GPU, no trainer."""
+    result = label_dataset(items, verify_oracle, meta_oracle=meta_oracle, **kwargs)
+    sft = to_sft_rows(result["rows"])
+    grpo = to_grpo_rows(result["rows"])
+    return {
+        "ok": True,
+        "dry_run": True,
+        "labeled": result["labeled"],
+        "hard": result["hard"],
+        "confirmed": result["confirmed"],
+        "distribution": result["distribution"],
+        "sft_rows": len(sft),
+        "grpo_rows": len(grpo),
+    }
+
+
+def write_jsonl(rows, path: str) -> int:
+    count = 0
+    with open(path, "w", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write(json.dumps(row, ensure_ascii=False))
+            fh.write("\n")
+            count += 1
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Worker dispatch. NOTE: a real oracle cannot cross the JSON boundary, so the
+# JSON ``run`` supports only the "already produced verifications" mode: each
+# item carries ``verifications: [score,...]`` (and optional ``meta`` votes),
+# and a table oracle replays them. For live oracles call the Python API.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _ReplayOracle:
+    """Replays pre-computed verifications per problem id (for JSON/offline use)."""
+
+    table: dict[str, list[Any]]
+    _cursor: dict[str, int] = field(default_factory=dict)
+
+    def __call__(self, problem: str, proof: str) -> Any:
+        seq = self.table.get(problem, [1.0])
+        i = self._cursor.get(problem, 0)
+        val = seq[min(i, len(seq) - 1)]
+        self._cursor[problem] = i + 1
+        return val
+
+
+def run(request: dict[str, Any]) -> dict[str, Any]:
+    op = request.get("op", "label")
+    items = request.get("items", [])
+    # Build a replay oracle from each item's inlined verifications.
+    table = {str(it.get("problem", it.get("goal", ""))): it.get("verifications", [1.0]) for it in items}
+    oracle = _ReplayOracle(table)
+    kwargs = {
+        "n": int(request.get("n", 4)),
+        "m": int(request.get("m", 3)),
+        "k": int(request.get("k", 1)),
+        "formal": bool(request.get("formal", False)),
+    }
+    if op in ("label", "dry_run"):
+        result = (dry_run if op == "dry_run" else label_dataset)(items, oracle, **kwargs)
+        if op == "label" and request.get("emit") == "sft":
+            result = dict(result)
+            result["sft_rows"] = to_sft_rows(result["rows"])
+        elif op == "label" and request.get("emit") == "grpo":
+            result = dict(result)
+            result["grpo_rows"] = to_grpo_rows(result["rows"])
+        return result
+    raise ValueError(f"unknown op: {op}")
+
+
+def main() -> None:
+    if len(sys.argv) >= 2:
+        with open(sys.argv[1], encoding="utf-8") as fh:
+            request = json.load(fh)
+    else:
+        request = json.load(sys.stdin)
+    print(json.dumps(run(request), indent=2, default=str))
+    raise SystemExit(0)
+
+
+if __name__ == "__main__":
+    main()
