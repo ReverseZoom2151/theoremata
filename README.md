@@ -162,7 +162,10 @@ The Rust core carries 250 tests and the Python workers 876. Both suites pass.
 <div align="center">
 <img src="https://cdn.simpleicons.org/rust/000000" height="34" alt="Rust">&nbsp;&nbsp;&nbsp;&nbsp;
 <img src="https://cdn.simpleicons.org/python/3776AB" height="34" alt="Python">&nbsp;&nbsp;&nbsp;&nbsp;
+<img src="assets/logos/lean.png" height="34" alt="Lean 4">&nbsp;&nbsp;&nbsp;&nbsp;
+<img src="assets/logos/rocq.svg" height="26" alt="Rocq (Coq)">&nbsp;&nbsp;&nbsp;&nbsp;
 <img src="https://cdn.simpleicons.org/sqlite/003B57" height="30" alt="SQLite">&nbsp;&nbsp;&nbsp;&nbsp;
+<img src="assets/logos/ratatui.svg" height="32" alt="ratatui">&nbsp;&nbsp;&nbsp;&nbsp;
 <img src="https://cdn.simpleicons.org/docker/2496ED" height="30" alt="Docker">&nbsp;&nbsp;&nbsp;&nbsp;
 <img src="https://cdn.simpleicons.org/ubuntu/E95420" height="30" alt="WSL / Ubuntu">&nbsp;&nbsp;&nbsp;&nbsp;
 <img src="https://cdn.simpleicons.org/sympy/3B5526" height="30" alt="SymPy">&nbsp;&nbsp;&nbsp;&nbsp;
@@ -181,10 +184,10 @@ external blocks a build or a run.
 |-|-------------|------|-------------------|
 | <img src="https://cdn.simpleicons.org/rust/000000" height="16"> | [Rust](https://www.rust-lang.org) 2021 | Core binary: proof-DAG, orchestration, verification gate | Required (`cargo`) |
 | <img src="https://cdn.simpleicons.org/sqlite/003B57" height="16"> | [SQLite](https://www.sqlite.org) via [`rusqlite`](https://docs.rs/rusqlite) | The proof-DAG store (WAL) | Bundled, nothing to install |
-| | [`clap`](https://docs.rs/clap), [`ratatui`](https://ratatui.rs), [`crossterm`](https://docs.rs/crossterm) | CLI and interactive TUI | `cargo` |
+| <img src="assets/logos/ratatui.svg" height="16"> | [`clap`](https://docs.rs/clap), [`ratatui`](https://ratatui.rs), [`crossterm`](https://docs.rs/crossterm) | CLI and interactive TUI | `cargo` |
 | <img src="https://cdn.simpleicons.org/python/3776AB" height="16"> | [Python](https://www.python.org) 3.11+ | Deterministic workers (falsify, retrieval, grading, training) | Required for the tool layer (`pip install -e .`) |
-| <img src="https://img.shields.io/badge/Lean-4-4B0082?style=flat-square" height="16"> | [Lean 4](https://lean-lang.org) with [Mathlib](https://github.com/leanprover-community/mathlib4) | Formal backend and premise corpus | Detected at runtime, optional |
-| <img src="https://img.shields.io/badge/Rocq-Coq-D4A017?style=flat-square" height="16"> | [Rocq (Coq)](https://rocq-prover.org) | Formal backend | Detected at runtime, optional |
+| <img src="assets/logos/lean.png" height="18"> | [Lean 4](https://lean-lang.org) with [Mathlib](https://github.com/leanprover-community/mathlib4) | Formal backend and premise corpus | Detected at runtime, optional |
+| <img src="assets/logos/rocq.svg" height="14"> | [Rocq (Coq)](https://rocq-prover.org) | Formal backend | Detected at runtime, optional |
 | <img src="https://img.shields.io/badge/Isabelle-HOL-990000?style=flat-square" height="16"> | [Isabelle/HOL](https://isabelle.in.tum.de) | Formal backend | Detected at runtime, optional |
 | | Sledgehammer, [CoqHammer](https://coqhammer.github.io), [aesop](https://github.com/leanprover-community/aesop) | Hammers: find a tactic, verify it through the gate | Ships with its prover, optional |
 | <img src="https://cdn.simpleicons.org/docker/2496ED" height="16"> <img src="https://cdn.simpleicons.org/ubuntu/E95420" height="16"> | Docker and WSL | Runners: run any backend native, in WSL, or in a container | Config (`formal_runners`), optional |
@@ -335,4 +338,6 @@ idea is traced to its source in
 use here are documented paper by paper.
 
 The project's own code is under the MIT licence. Vendored resources and the formal
-proof assistants keep their own licences.
+proof assistants keep their own licences. The Lean, Rocq, and ratatui logos in
+`assets/logos/` are the property of their respective projects and are used here to
+identify and link those projects.
