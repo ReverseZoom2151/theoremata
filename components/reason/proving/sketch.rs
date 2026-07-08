@@ -133,6 +133,13 @@ pub struct HoleContext {
     pub step_id: String,
     pub node_id: String,
     pub subgoal: String,
+    /// Chain-of-states feedback (ImProver pattern): the EXACT ground-truth local
+    /// goal state at this hole, as dumped by the prover on a prior failed attempt.
+    /// `None` on the first dispatch (and whenever no state could be extracted) —
+    /// the prover then reasons from the subgoal/error alone, exactly as before.
+    /// A retry threads the last known goal state in here so the prover reasons
+    /// over the real intermediate state rather than only the error text.
+    pub goal_state: Option<String>,
 }
 
 /// A closed hole: the proof text that discharges the subgoal.
@@ -145,6 +152,42 @@ pub struct HoleProof {
 /// `Ok(Some(proof))` = closed; `Ok(None)` = the hole remains open (unproven).
 pub trait HoleProver {
     fn prove(&self, ctx: &HoleContext) -> Result<Option<HoleProof>>;
+
+    /// The last failed attempt text for `ctx` — a failed proof term or the raw
+    /// verifier error — used to drive goal-state extraction on a retry. Defaults
+    /// to `None`: a prover that reports nothing here degrades the goal-state
+    /// retry to today's error-only behaviour (the extractor is handed an empty
+    /// attempt and typically returns `None`).
+    fn last_attempt(&self, _ctx: &HoleContext) -> Option<String> {
+        None
+    }
+}
+
+/// Extracts the EXACT local goal state at a hole (ImProver "chain-of-states"):
+/// given the subgoal and a failed `attempt`, the production impl asks the
+/// Lean/prover to DUMP its ground-truth intermediate state so a retry can reason
+/// over the real state, not just the error text. Injected as a trait so the
+/// pipeline stays deterministic under test.
+pub trait GoalStateExtractor {
+    /// Dump the local goal state for `subgoal` given the failed `attempt`.
+    /// `None` when no state can be extracted — the retry then degrades to
+    /// today's error-only behaviour, unchanged.
+    fn extract(&self, subgoal: &str, attempt: &str) -> Option<String>;
+}
+
+/// The production goal-state extractor: live extraction dumps the prover's state
+/// via a real Lean/prover invocation, which is LIVE-GATED and not wired into this
+/// build. It returns `None`, so threading it through is a safe no-op until the
+/// live extractor lands — the flow degrades to error-only retries. Documented
+/// stub; the mock in tests exercises the populated path.
+pub struct StubGoalStateExtractor;
+
+impl GoalStateExtractor for StubGoalStateExtractor {
+    fn extract(&self, _subgoal: &str, _attempt: &str) -> Option<String> {
+        // Live-gated: would shell out to `lean --run`/the prover to print the
+        // goal state. Intentionally inert here.
+        None
+    }
 }
 
 /// The result of dispatching one hole to the prover.
@@ -155,6 +198,9 @@ pub struct HoleResult {
     pub subgoal: String,
     pub closed: bool,
     pub proof: Option<String>,
+    /// The last goal state threaded into this hole's (retried) context, if any.
+    /// `None` when no retry ran or no state could be extracted.
+    pub goal_state: Option<String>,
 }
 
 /// The outcome of running a sketch: the sub-DAG root, every hole's result, and —
@@ -194,8 +240,52 @@ impl<G: SketchGenerator, P: HoleProver> SketchPipeline<'_, G, P> {
     }
 
     /// Run a pre-built sketch: materialise the sub-DAG, dispatch every hole, and
-    /// splice on full closure (refuse otherwise).
+    /// splice on full closure (refuse otherwise). No goal-state retry — a hole
+    /// that fails to close stays open, exactly as before.
     pub fn run_sketch(&self, project_id: &str, sketch: &InformalSketch) -> Result<SketchAssembly> {
+        self.run_sketch_inner(project_id, sketch, None, 0)
+    }
+
+    /// Chain-of-states variant of [`SketchPipeline::run`]: generate a sketch, then
+    /// run it with goal-state feedback. When a hole fails to close, the injected
+    /// [`GoalStateExtractor`] dumps the ground-truth local goal state, which is
+    /// threaded into the hole context for up to `max_retries` re-dispatches so the
+    /// prover reasons over the real intermediate state, not just the error text.
+    /// If extraction returns `None`, the flow degrades to the error-only
+    /// behaviour of [`SketchPipeline::run`], unchanged.
+    pub fn run_with_goal_states(
+        &self,
+        project_id: &str,
+        statement: &str,
+        extractor: &dyn GoalStateExtractor,
+        max_retries: u32,
+    ) -> Result<SketchAssembly> {
+        let sketch = self.generator.generate(statement)?;
+        self.run_sketch_with_goal_states(project_id, &sketch, extractor, max_retries)
+    }
+
+    /// Chain-of-states variant of [`SketchPipeline::run_sketch`]. See
+    /// [`SketchPipeline::run_with_goal_states`].
+    pub fn run_sketch_with_goal_states(
+        &self,
+        project_id: &str,
+        sketch: &InformalSketch,
+        extractor: &dyn GoalStateExtractor,
+        max_retries: u32,
+    ) -> Result<SketchAssembly> {
+        self.run_sketch_inner(project_id, sketch, Some(extractor), max_retries)
+    }
+
+    /// The shared sketch driver. `extractor`/`max_retries` are `None`/`0` for the
+    /// legacy path (byte-for-byte prior behaviour) and populated for the
+    /// chain-of-states path.
+    fn run_sketch_inner(
+        &self,
+        project_id: &str,
+        sketch: &InformalSketch,
+        extractor: Option<&dyn GoalStateExtractor>,
+        max_retries: u32,
+    ) -> Result<SketchAssembly> {
         // 1. Root node representing the informal sketch.
         let root = self.store.add_node_detailed(
             project_id,
@@ -255,12 +345,42 @@ impl<G: SketchGenerator, P: HoleProver> SketchPipeline<'_, G, P> {
         for step in sketch.holes() {
             let node_id = node_for_step[&step.id].clone();
             let subgoal = step.hole.as_ref().unwrap().subgoal.clone();
-            let ctx = HoleContext {
+            let mut ctx = HoleContext {
                 step_id: step.id.clone(),
                 node_id: node_id.clone(),
                 subgoal: subgoal.clone(),
+                goal_state: None,
             };
-            let proved = self.prover.prove(&ctx)?;
+            let mut proved = self.prover.prove(&ctx)?;
+
+            // Chain-of-states retry: while the hole is open and a retry budget
+            // remains, dump the ground-truth goal state from the last failed
+            // attempt and thread it into the context before re-dispatching. If no
+            // state can be extracted the loop stops immediately — degrading to the
+            // error-only behaviour of the legacy path.
+            if let Some(extractor) = extractor {
+                let mut retries_left = max_retries;
+                while proved.is_none() && retries_left > 0 {
+                    let attempt = self.prover.last_attempt(&ctx).unwrap_or_default();
+                    let Some(state) = extractor.extract(&subgoal, &attempt) else {
+                        break;
+                    };
+                    ctx.goal_state = Some(state.clone());
+                    // Record the recovered goal state as auditable evidence.
+                    self.store.add_evidence(
+                        project_id,
+                        &node_id,
+                        "sketch_hole_goal_state",
+                        "goal_state_extractor",
+                        "extracted",
+                        json!({ "step_id": step.id, "goal_state": state }),
+                    )?;
+                    retries_left -= 1;
+                    proved = self.prover.prove(&ctx)?;
+                }
+            }
+
+            let goal_state = ctx.goal_state.clone();
             match &proved {
                 Some(HoleProof { proof }) => {
                     self.store
@@ -304,6 +424,7 @@ impl<G: SketchGenerator, P: HoleProver> SketchPipeline<'_, G, P> {
                 subgoal,
                 closed: proved.is_some(),
                 proof: proved.map(|p| p.proof),
+                goal_state,
             });
         }
 
@@ -559,5 +680,133 @@ mod tests {
         };
         pipeline.run(&project.id, "t").unwrap();
         assert_eq!(prover.seen.into_inner(), vec!["s1".to_string(), "s2".to_string()]);
+    }
+
+    /// A generator with a single hole (keeps the goal-state tests focused).
+    struct OneHoleGenerator;
+    impl SketchGenerator for OneHoleGenerator {
+        fn generate(&self, statement: &str) -> Result<InformalSketch> {
+            Ok(InformalSketch::new(
+                statement,
+                vec![SketchStep::hole("h1", "discharge the goal", "goal : P 0")],
+            ))
+        }
+    }
+
+    /// A prover that CANNOT close a hole from the error alone (first attempt fails
+    /// with `goal_state == None`), but succeeds once the ground-truth goal state
+    /// has been threaded in. It records every `goal_state` it observed so the test
+    /// can assert the extractor's state reached the retry context.
+    struct GoalStateDependentProver {
+        seen_states: RefCell<Vec<Option<String>>>,
+    }
+    impl HoleProver for GoalStateDependentProver {
+        fn prove(&self, ctx: &HoleContext) -> Result<Option<HoleProof>> {
+            self.seen_states.borrow_mut().push(ctx.goal_state.clone());
+            match &ctx.goal_state {
+                Some(state) => Ok(Some(HoleProof {
+                    proof: format!("-- closed using state: {state}\nby simp"),
+                })),
+                None => Ok(None),
+            }
+        }
+        fn last_attempt(&self, _ctx: &HoleContext) -> Option<String> {
+            Some("by simp -- failed: unsolved goals".into())
+        }
+    }
+
+    /// A mock extractor that dumps a canned goal state (production would shell out
+    /// to the prover). Asserts it is handed the failed attempt text.
+    struct MockGoalStateExtractor {
+        state: String,
+    }
+    impl GoalStateExtractor for MockGoalStateExtractor {
+        fn extract(&self, _subgoal: &str, attempt: &str) -> Option<String> {
+            assert!(!attempt.is_empty(), "the failed attempt is threaded to the extractor");
+            Some(self.state.clone())
+        }
+    }
+
+    #[test]
+    fn mock_extractors_goal_state_is_surfaced_into_the_retry_context() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "P 0").unwrap();
+        let prover = GoalStateDependentProver {
+            seen_states: RefCell::new(Vec::new()),
+        };
+        let pipeline = SketchPipeline {
+            store: &store,
+            generator: &OneHoleGenerator,
+            prover: &prover,
+        };
+        let extractor = MockGoalStateExtractor {
+            state: "⊢ P 0".into(),
+        };
+        let assembly = pipeline
+            .run_with_goal_states(&project.id, "P 0", &extractor, 2)
+            .unwrap();
+
+        // The retry closed the hole and assembled the proof.
+        assert!(assembly.is_assembled());
+        assert_eq!(assembly.hole_results.len(), 1);
+        let hole = &assembly.hole_results[0];
+        assert!(hole.closed);
+        // The EXACT extracted goal state was surfaced into the hole result...
+        assert_eq!(hole.goal_state.as_deref(), Some("⊢ P 0"));
+        // ...and into the retry context the prover actually saw (first attempt
+        // None, second attempt carries the extractor's state).
+        let seen = prover.seen_states.into_inner();
+        assert_eq!(seen, vec![None, Some("⊢ P 0".to_string())]);
+    }
+
+    #[test]
+    fn extraction_none_degrades_to_error_only_behaviour_unchanged() {
+        // An extractor that never yields a state: the hole must stay open exactly
+        // as it does on the legacy (no-goal-state) path — no retry closes it.
+        struct EmptyExtractor;
+        impl GoalStateExtractor for EmptyExtractor {
+            fn extract(&self, _subgoal: &str, _attempt: &str) -> Option<String> {
+                None
+            }
+        }
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "P 0").unwrap();
+        let prover = GoalStateDependentProver {
+            seen_states: RefCell::new(Vec::new()),
+        };
+        let pipeline = SketchPipeline {
+            store: &store,
+            generator: &OneHoleGenerator,
+            prover: &prover,
+        };
+        let assembly = pipeline
+            .run_with_goal_states(&project.id, "P 0", &EmptyExtractor, 3)
+            .unwrap();
+
+        // No state extracted ⇒ no retry succeeds ⇒ the hole is refused, identical
+        // to the legacy error-only flow.
+        assert!(!assembly.is_assembled());
+        assert_eq!(assembly.open_holes, vec!["h1".to_string()]);
+        assert_eq!(assembly.hole_results[0].goal_state, None);
+        // The prover was dispatched exactly once (no goal-state retry fired).
+        assert_eq!(prover.seen_states.into_inner(), vec![None]);
+    }
+
+    #[test]
+    fn legacy_run_sketch_never_retries_with_goal_state() {
+        // The stable `run` path must behave as before: one dispatch, hole open.
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "P 0").unwrap();
+        let prover = GoalStateDependentProver {
+            seen_states: RefCell::new(Vec::new()),
+        };
+        let pipeline = SketchPipeline {
+            store: &store,
+            generator: &OneHoleGenerator,
+            prover: &prover,
+        };
+        let assembly = pipeline.run(&project.id, "P 0").unwrap();
+        assert!(!assembly.is_assembled());
+        assert_eq!(prover.seen_states.into_inner(), vec![None]);
     }
 }
