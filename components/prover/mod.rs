@@ -6,6 +6,7 @@ pub mod formal;
 pub mod model;
 pub mod proof_job;
 pub mod attempt_run;
+pub mod axiom_audit;
 
 // Re-export every leaf module flat at the component root so existing paths
 // (`prover::aristotle`, hence `crate::prover::aristotle`, and sibling

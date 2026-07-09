@@ -28,7 +28,7 @@ pub use reason::{
     taint, team, ttc,
 };
 pub use prover::{
-    aristotle, attempt_run, exec, formal, goal_state, isabelle, lean, proof_job, rocq,
+    aristotle, attempt_run, axiom_audit, exec, formal, goal_state, isabelle, lean, proof_job, rocq,
 };
 pub use verify::{hardening, lean_session};
 

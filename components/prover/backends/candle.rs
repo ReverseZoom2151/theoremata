@@ -222,21 +222,11 @@ impl FormalBackend for CandleBackend {
         if let Some(report) = crate::prover::formal::worker_source_scan(SYSTEM, code) {
             return Ok(report);
         }
-        // HOL Light escape hatches the proven kernel cannot see because they
-        // sidestep it entirely: `mk_thm` fabricates a `thm` with no proof, and
-        // `new_axiom` widens the fixed axiom base by fiat.
-        let low = code.to_lowercase();
-        let patterns = ["mk_thm", "new_axiom"];
-        let findings: Vec<String> = patterns
-            .iter()
-            .filter(|p| low.contains(**p))
-            .map(|p| (*p).to_string())
-            .collect();
-        Ok(ScanReport {
-            clean: findings.is_empty(),
-            findings,
-            detail: json!({"system": SYSTEM.as_str(), "fallback": true}),
-        })
+        // Authoritative HOL Light auditor: flags the escape hatches the proven
+        // kernel cannot see because they sidestep it (`mk_thm` fabricates a `thm`,
+        // `new_axiom` widens the fixed base) plus unsound definitional extensions
+        // and INST/INST_TYPE capture. See `crate::prover::axiom_audit`.
+        Ok(crate::prover::axiom_audit::audit_hol_light(code, &SYSTEM.axiom_whitelist()).into_scan_report())
     }
 }
 
