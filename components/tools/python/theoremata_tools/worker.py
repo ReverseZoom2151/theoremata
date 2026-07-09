@@ -56,6 +56,10 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         return stages_run(request)
     if tool == "feasibility":
         return feasibility(request["constraints"])
+    if tool == "triviality":
+        from theoremata_tools.triviality import run as triviality_run
+
+        return triviality_run(request)
     if tool == "asymptotic_feasibility":
         return asymptotic_feasibility(request["constraints"])
     if tool == "prove_asymptotic":
