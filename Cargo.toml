@@ -9,6 +9,13 @@ license = "MIT"
 name = "theoremata"
 path = "app/main.rs"
 
+# Dev/test builds keep only line tables instead of full debuginfo: panic and
+# test-failure backtraces still point at the right line, but the ~60 MB binary
+# shrinks and the Windows link step gets much faster. Full debuginfo isn't
+# needed for the edit/test loop.
+[profile.dev]
+debug = "line-tables-only"
+
 [dependencies]
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }

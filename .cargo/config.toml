@@ -1,0 +1,9 @@
+# Local build acceleration. Scoped to the Windows GNU host target ONLY, so the
+# Linux CI build (x86_64-unknown-linux-gnu) is completely unaffected.
+#
+# The default GNU `ld` relinks the ~60 MB debug binary slowly on every test
+# build. LLVM `lld` is both installed system-wide and bundled with the rustup
+# gnu toolchain (lib/rustlib/.../gcc-ld/ld.lld), so `-fuse-ld=lld` cuts the
+# link step dramatically with no new dependency.
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
