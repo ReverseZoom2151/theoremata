@@ -50,5 +50,14 @@ content was treated as untrusted data.
 5. **Abstention / falsify-inside-search** — Aletheia (abstain as terminal state),
    Aristotle (augment each state with the goal's negation). Reliability lever.
 
+## Also in this folder
+
+- `deepmind-articles.md` — mining of five DeepMind math-AI blog articles
+  (AlphaProof/AlphaGeometry 2, AlphaGeometry, FunSearch, AlphaTensor, AI-guided
+  pure mathematics). Articles 1/2/4 validate and mirror what we built (DD+AR,
+  traceback synthetic data, MCGS, flywheel); **FunSearch (program search)** and
+  **conjecture-discovery** are the two genuinely-new capabilities absent from the
+  codebase.
+
 See the parent `docs/resource-mining/` for the repo-level (code) mining. The
 prioritized cross-source adopt list lives in the session synthesis.
