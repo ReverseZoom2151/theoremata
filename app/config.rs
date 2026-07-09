@@ -66,6 +66,10 @@ pub struct Config {
     /// Binary for the live Isabelle build. Env: `THEOREMATA_ISABELLE`.
     #[serde(default = "default_isabelle_bin")]
     pub isabelle_bin: String,
+    /// Binary for the live Candle (verified HOL Light on CakeML) gate
+    /// (`candle <file>.ml`). Env: `THEOREMATA_CANDLE`.
+    #[serde(default = "default_candle_bin")]
+    pub candle_bin: String,
     /// Which formal system the agent targets when generating proofs for
     /// `Route::Prove`/`Route::Formalize`. Defaults to Lean (existing behavior);
     /// set to `rocq`/`isabelle` to route through the per-system generator.
@@ -155,6 +159,12 @@ fn default_isabelle_bin() -> String {
     "isabelle".into()
 }
 
+fn default_candle_bin() -> String {
+    // Generic default: `candle` on PATH. Point at a specific build via the
+    // `THEOREMATA_CANDLE` env var or `candle_bin` in the local config.
+    "candle".into()
+}
+
 fn default_k_consecutive_clean() -> u32 {
     3
 }
@@ -198,6 +208,7 @@ impl Default for Config {
             coqc_bin: default_coqc_bin(),
             coqchk_bin: default_coqchk_bin(),
             isabelle_bin: default_isabelle_bin(),
+            candle_bin: default_candle_bin(),
             target_system: crate::prover::formal::FormalSystem::default(),
             kernel_validate_proof: false,
             validate_statements: default_validate_statements(),

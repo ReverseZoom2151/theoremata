@@ -191,6 +191,9 @@ pub fn assemble_proof(system: FormalSystem, goal: &str, tactic: &str) -> String 
             format!("Theorem t : {goal}.\nProof.\n  {body}.\nQed.\n")
         }
         FormalSystem::Lean => format!("theorem t : {goal} := by\n  {tactic}\n"),
+        // Candle/HOL Light: an OCaml let-binding whose body is a `prove` call
+        // combining the goal term with the tactic script.
+        FormalSystem::Candle => format!("let t = prove(`{goal}`,\n  {tactic});;\n"),
     }
 }
 
@@ -233,6 +236,7 @@ fn role_for(system: FormalSystem) -> &'static str {
         FormalSystem::Lean => "lean_proof_generator",
         FormalSystem::Rocq => "rocq_proof_generator",
         FormalSystem::Isabelle => "isabelle_proof_generator",
+        FormalSystem::Candle => "candle_proof_generator",
     }
 }
 
@@ -242,6 +246,7 @@ fn task_for(system: FormalSystem, statement: &str) -> String {
         FormalSystem::Lean => ("Lean 4", "sorry, admit, or unsafe axioms"),
         FormalSystem::Rocq => ("Coq (Rocq)", "admit, Admitted, or bare Axiom"),
         FormalSystem::Isabelle => ("Isabelle/Isar", "sorry, oops, or an oracle"),
+        FormalSystem::Candle => ("HOL Light (Candle)", "mk_thm or new_axiom"),
     };
     format!(
         "Write a complete, self-contained {lang} proof of: {statement}. \
@@ -262,6 +267,8 @@ fn stub_for(system: FormalSystem) -> String {
         FormalSystem::Isabelle => "theory Scratch\n  imports Main\nbegin\n\n\
              theorem generated: \"True\"\n  by simp\n\nend\n"
             .into(),
+        // A trivially-true HOL Light theorem: `TRUTH : thm = |- T`.
+        FormalSystem::Candle => "let generated = TRUTH;;\n".into(),
     }
 }
 

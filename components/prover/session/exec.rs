@@ -74,6 +74,10 @@ pub struct FormalRunners {
     pub rocq: Runner,
     #[serde(default = "runner_wsl_ubuntu")]
     pub isabelle: Runner,
+    /// Candle (verified HOL Light on CakeML). Defaults to WSL Ubuntu, where the
+    /// HOL4/PolyML/CakeML toolchain that builds `candle` lives on this machine.
+    #[serde(default = "runner_wsl_ubuntu")]
+    pub candle: Runner,
 }
 
 fn runner_native() -> Runner {
@@ -92,6 +96,7 @@ impl Default for FormalRunners {
             lean: runner_native(),
             rocq: runner_wsl_ubuntu(),
             isabelle: runner_wsl_ubuntu(),
+            candle: runner_wsl_ubuntu(),
         }
     }
 }
@@ -103,6 +108,7 @@ impl FormalRunners {
             FormalSystem::Lean => &self.lean,
             FormalSystem::Rocq => &self.rocq,
             FormalSystem::Isabelle => &self.isabelle,
+            FormalSystem::Candle => &self.candle,
         };
         base.resolved()
     }

@@ -32,13 +32,19 @@ use std::{
 };
 
 /// Which formal system a proof object belongs to. Serialized `snake_case`
-/// (`lean` / `rocq` / `isabelle`) to match the `backend` string dispatch.
+/// (`lean` / `rocq` / `isabelle` / `candle`) to match the `backend` string
+/// dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FormalSystem {
     Lean,
     Rocq,
     Isabelle,
+    /// Candle — the verified HOL Light kernel running on CakeML. Its kernel
+    /// soundness is machine-PROVEN (in HOL4, down to the CakeML-compiled binary),
+    /// so its layer-3 kernel re-check carries a stronger guarantee than the
+    /// smaller-trusted-checker approach of `leanchecker`/`coqchk`.
+    Candle,
 }
 
 impl Default for FormalSystem {
@@ -54,6 +60,7 @@ impl FormalSystem {
             FormalSystem::Lean => "lean",
             FormalSystem::Rocq => "rocq",
             FormalSystem::Isabelle => "isabelle",
+            FormalSystem::Candle => "candle",
         }
     }
 
@@ -66,6 +73,11 @@ impl FormalSystem {
     ///   `Closed under the global context` (represented here as the single
     ///   sentinel token the audit checks for).
     /// * Isabelle — the empty oracle set (`Thm_Deps.all_oracles = []`).
+    /// * Candle — HOL Light's tiny, fixed axiom base: the three mathematical
+    ///   axioms `ETA_AX`, `SELECT_AX` (choice), and `INFINITY_AX`. The
+    ///   definitional principles (`new_definition` / `new_basic_definition` /
+    ///   `new_type_definition`) are conservative and add nothing to this base;
+    ///   any OTHER axiom (i.e. a `new_axiom` call) fails the audit.
     pub fn axiom_whitelist(self) -> Vec<String> {
         match self {
             FormalSystem::Lean => vec![
@@ -75,6 +87,9 @@ impl FormalSystem {
             ],
             FormalSystem::Rocq => vec!["Closed under the global context".into()],
             FormalSystem::Isabelle => Vec::new(),
+            FormalSystem::Candle => {
+                vec!["ETA_AX".into(), "SELECT_AX".into(), "INFINITY_AX".into()]
+            }
         }
     }
 
@@ -84,6 +99,8 @@ impl FormalSystem {
             FormalSystem::Lean => ".lean",
             FormalSystem::Rocq => ".v",
             FormalSystem::Isabelle => ".thy",
+            // HOL Light proofs are OCaml scripts executed by the Candle kernel.
+            FormalSystem::Candle => ".ml",
         }
     }
 
@@ -93,6 +110,8 @@ impl FormalSystem {
             FormalSystem::Lean => vec!["Mathlib".into()],
             FormalSystem::Rocq => vec!["Stdlib".into(), "mathcomp.ssreflect.ssreflect".into()],
             FormalSystem::Isabelle => vec!["Main".into()],
+            // HOL Light's standard prelude (loaded by the Candle image).
+            FormalSystem::Candle => vec!["hol_light".into()],
         }
     }
 }
@@ -111,6 +130,9 @@ impl FromStr for FormalSystem {
             "lean" | "lean4" => Ok(FormalSystem::Lean),
             "rocq" | "coq" => Ok(FormalSystem::Rocq),
             "isabelle" | "isabelle/hol" | "hol" => Ok(FormalSystem::Isabelle),
+            // `hol` is already claimed by Isabelle above, so Candle takes the
+            // explicit tags only.
+            "candle" | "hol_light" | "hol-light" | "hollight" => Ok(FormalSystem::Candle),
             other => Err(anyhow::anyhow!("unknown formal system: {other}")),
         }
     }
@@ -429,6 +451,8 @@ pub(crate) fn entry_name(system: FormalSystem, code: &str) -> Option<String> {
             "Definition",
         ],
         FormalSystem::Isabelle => &["theorem", "lemma", "corollary", "proposition"],
+        // HOL Light theorems are OCaml let-bindings: `let FOO = prove(...)`.
+        FormalSystem::Candle => &["let"],
     };
     for raw in code.lines() {
         let line = raw.trim_start();
@@ -502,6 +526,8 @@ pub(crate) fn all_entry_names(system: FormalSystem, code: &str) -> Vec<String> {
             "Definition",
         ],
         FormalSystem::Isabelle => &["theorem", "lemma", "corollary", "proposition"],
+        // HOL Light theorems are OCaml let-bindings: `let FOO = prove(...)`.
+        FormalSystem::Candle => &["let"],
     };
     let mut out = Vec::new();
     for raw in code.lines() {
@@ -612,6 +638,12 @@ pub fn backend_for(cfg: &Config, system: FormalSystem, mock: bool) -> Box<dyn Fo
         }
         (FormalSystem::Isabelle, false) => {
             Box::new(crate::prover::isabelle::IsabelleBackend::live(cfg))
+        }
+        (FormalSystem::Candle, true) => {
+            Box::new(crate::prover::backends::candle::CandleBackend::mock())
+        }
+        (FormalSystem::Candle, false) => {
+            Box::new(crate::prover::backends::candle::CandleBackend::live(cfg))
         }
     }
 }
@@ -796,5 +828,36 @@ mod tests {
     fn all_entry_names_lists_declarations_in_order() {
         let code = "theorem foo : True := trivial\nlemma bar : True := trivial\n";
         assert_eq!(all_entry_names(FormalSystem::Lean, code), vec!["foo", "bar"]);
+    }
+
+    #[test]
+    fn candle_parses_and_round_trips() {
+        use std::str::FromStr;
+        // Both accepted tags parse to Candle; `hol` stays claimed by Isabelle.
+        assert_eq!(FormalSystem::from_str("candle").unwrap(), FormalSystem::Candle);
+        assert_eq!(
+            FormalSystem::from_str("hol_light").unwrap(),
+            FormalSystem::Candle
+        );
+        assert_eq!(FormalSystem::from_str("hol").unwrap(), FormalSystem::Isabelle);
+        // as_str / Display round-trip.
+        assert_eq!(FormalSystem::Candle.as_str(), "candle");
+        assert_eq!(FormalSystem::Candle.to_string(), "candle");
+        assert_eq!(
+            FormalSystem::from_str(FormalSystem::Candle.as_str()).unwrap(),
+            FormalSystem::Candle
+        );
+        // Source extension + a non-empty, fixed axiom base.
+        assert_eq!(FormalSystem::Candle.source_extension(), ".ml");
+        assert_eq!(FormalSystem::Candle.axiom_whitelist().len(), 3);
+    }
+
+    #[test]
+    fn backend_for_candle_returns_candle_backend() {
+        let cfg = Config::default();
+        let backend = backend_for(&cfg, FormalSystem::Candle, true);
+        assert_eq!(backend.system(), FormalSystem::Candle);
+        // The mock backend is always available, mirroring the siblings.
+        assert!(backend.available());
     }
 }
