@@ -184,10 +184,17 @@ the 2026 SOTA research pass:
 - Frontier: Aristotle & Seed-Prover reached **IMO 2025 gold** (AlphaProof was
   silver); Formal-Conjectures benchmark for verified discovery.
 
+- **#4 Cross-tree knowledge sharing (AG2 SKEST) → built as `search/skest.rs`**:
+  an ensemble of heterogeneous, deterministically round-robin-interleaved
+  best-first trees sharing one in-memory `SharedFacts` pool (sound cached-general-
+  side-only subsumption reuse), so a subgoal one tree closes is reusable by
+  siblings mid-run. Control test: sharing solves with fewer expansions. 8 tests.
+
 ### Still remaining from these articles
-- **#4 Cross-tree knowledge sharing in MCGS (AG2 SKEST)** — [ADJUSTMENT] general
-  MCGS version still unbuilt (geometry DDAR2 `clone()` is a local partial).
-- Deferred-by-necessity: trained weights / AlphaGeometry-scale data (GPU+model),
-  a live real-model run, and Test-Time RL's actual training loop.
+- **Nothing buildable-now remains.** All four adopt-list items (#1 FunSearch/
+  AlphaEvolve, #2 conjecture-discovery, #3 discovery-game, #4 SKEST) are built,
+  plus the planning build (blueprint generation + refinement).
+- Deferred-by-necessity only: trained weights / AlphaGeometry-scale data
+  (GPU+model), a live real-model run, and Test-Time RL's actual training loop.
 
 See [[theoremata-paper-mining]] and the parent `docs/paper-mining/README.md`.
