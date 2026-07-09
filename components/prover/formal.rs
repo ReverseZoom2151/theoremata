@@ -114,6 +114,89 @@ impl FormalSystem {
             FormalSystem::Candle => vec!["hol_light".into()],
         }
     }
+
+    /// Citable trusted-base facts about the foundation each backend rests on,
+    /// used for honest documentation and backend selection. The three capability
+    /// flags and the primitive-notion counts follow Freek Wiedijk, "Is ZF a
+    /// hack? Comparing the complexity of some (formalist interpretations of)
+    /// foundational systems for mathematics" (J. Applied Logic, 2006), whose
+    /// Automath encodings (`zfc-etc/*.aut`) give a per-foundation primitive-
+    /// notion inventory. `primitive_notions` is `Some(_)` only where our
+    /// backend's foundation appears *directly* in that study; `None` where the
+    /// backend rests on a relative/descendant of a studied system.
+    pub fn foundation_profile(self) -> FoundationProfile {
+        match self {
+            // Lean 4 — Calculus of Inductive Constructions. Not studied directly;
+            // a descendant of CoC/ECC. Classical logic and choice are opt-in
+            // axioms (see `axiom_whitelist`), available but not default.
+            FormalSystem::Lean => FoundationProfile {
+                foundation: "Calculus of Inductive Constructions (type theory)",
+                classical: true,
+                choice: true,
+                all_math: true,
+                primitive_notions: None,
+                note: "descendant of CoC/ECC (Wiedijk 2006); classical logic + \
+                       choice are opt-in axioms, not the default logic",
+            },
+            // Rocq — CIC as well, but intuitionistic and choice-free by default
+            // (`Classical`/choice must be imported explicitly).
+            FormalSystem::Rocq => FoundationProfile {
+                foundation: "Calculus of Inductive Constructions (type theory)",
+                classical: false,
+                choice: false,
+                all_math: true,
+                primitive_notions: None,
+                note: "descendant of CoC/ECC (Wiedijk 2006); intuitionistic and \
+                       choice-free by default",
+            },
+            // Isabelle/HOL — Church higher-order logic (same lineage as HOL
+            // Light). Wiedijk studied the Pure *meta-logic* (minimal, not
+            // all-math) separately, so no direct primitive-notion count for the
+            // full object logic.
+            FormalSystem::Isabelle => FoundationProfile {
+                foundation: "Isabelle/HOL (Church higher-order logic)",
+                classical: true,
+                choice: true,
+                all_math: true,
+                primitive_notions: None,
+                note: "Church HOL, same lineage as HOL Light; Wiedijk 2006 \
+                       studied the minimal Pure meta-logic (not all-math) apart \
+                       from the full object logic",
+            },
+            // Candle — HOL Light exactly, the `holl.aut` context in the study:
+            // 25 primitive notions, the simplest *serious* foundation by concept
+            // count; the three axioms match our `axiom_whitelist`.
+            FormalSystem::Candle => FoundationProfile {
+                foundation: "HOL Light (Church higher-order logic)",
+                classical: true,
+                choice: true,
+                all_math: true,
+                primitive_notions: Some(25),
+                note: "Wiedijk 2006 `holl.aut`: 25 primitive notions, the \
+                       simplest serious foundation by concept count; axioms \
+                       ETA_AX / SELECT_AX / INFINITY_AX (= our axiom_whitelist)",
+            },
+        }
+    }
+}
+
+/// Citable trusted-base profile for a [`FormalSystem`]'s underlying foundation.
+/// See [`FormalSystem::foundation_profile`] for provenance (Wiedijk 2006).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FoundationProfile {
+    /// Human-readable name of the underlying foundation.
+    pub foundation: &'static str,
+    /// Logic is classical by default (vs. intuitionistic).
+    pub classical: bool,
+    /// The axiom of choice is available by default.
+    pub choice: bool,
+    /// Rich enough to encode "all of mathematics" (Wiedijk's "all math" column).
+    pub all_math: bool,
+    /// Primitive-notion count from Wiedijk 2006 where the foundation is studied
+    /// directly; `None` for a relative/descendant of a studied system.
+    pub primitive_notions: Option<u32>,
+    /// Short provenance / caveat note.
+    pub note: &'static str,
 }
 
 impl fmt::Display for FormalSystem {
@@ -859,5 +942,34 @@ mod tests {
         assert_eq!(backend.system(), FormalSystem::Candle);
         // The mock backend is always available, mirroring the siblings.
         assert!(backend.available());
+    }
+
+    #[test]
+    fn foundation_profiles_carry_citable_facts() {
+        // Candle = HOL Light exactly: the study's `holl.aut` context, 25
+        // primitive notions, classical + choice + all-math. The only backend
+        // whose foundation Wiedijk 2006 studies directly, so the only one with a
+        // concrete primitive-notion count.
+        let candle = FormalSystem::Candle.foundation_profile();
+        assert_eq!(candle.primitive_notions, Some(25));
+        assert!(candle.classical && candle.choice && candle.all_math);
+        assert_eq!(
+            FormalSystem::Isabelle.foundation_profile().primitive_notions,
+            None
+        );
+        assert_eq!(FormalSystem::Lean.foundation_profile().primitive_notions, None);
+        // Every foundation we target can encode all of mathematics...
+        for sys in [
+            FormalSystem::Lean,
+            FormalSystem::Rocq,
+            FormalSystem::Isabelle,
+            FormalSystem::Candle,
+        ] {
+            assert!(sys.foundation_profile().all_math, "{sys} should be all-math");
+        }
+        // ...but Rocq is intuitionistic + choice-free by default, unlike the
+        // HOL-family backends.
+        let rocq = FormalSystem::Rocq.foundation_profile();
+        assert!(!rocq.classical && !rocq.choice);
     }
 }
