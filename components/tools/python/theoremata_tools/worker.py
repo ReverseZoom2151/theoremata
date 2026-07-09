@@ -167,6 +167,10 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.cert_nullstellensatz import run as cert_nullstellensatz_run
 
         return cert_nullstellensatz_run(request)
+    if tool == "cert_wz":
+        from theoremata_tools.cert_wz import run as cert_wz_run
+
+        return cert_wz_run(request)
     if tool == "lemma_cache":
         from .lemma_cache import run as lemma_cache_run
 
