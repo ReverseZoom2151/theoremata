@@ -13,11 +13,11 @@ pub use orchestration::{
     statement_validation, team,
 };
 pub use search::{
-    driver, fitness, goal_cache, mcts, minimize, proof_pool, progress, sampler, sampling,
-    subsumption, tactic_outcome, ttc,
+    driver, fitness, goal_cache, inverse_method, mcts, minimize, proof_pool, progress, sampler,
+    sampling, subsumption, tactic_outcome, ttc,
 };
 pub use proving::{
-    blueprint, decompose, evolve_sketch, falsification, formal_generate, formalize_portfolio,
-    library, mathlib_export, optimize, portfolio, repair, retry, router, sketch,
+    blueprint, decompose, definition_synthesis, evolve_sketch, falsification, formal_generate,
+    formalize_portfolio, library, mathlib_export, optimize, portfolio, repair, retry, router, sketch,
 };
 pub use critique::{critic, guard, memory, plan_history, taint};

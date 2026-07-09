@@ -1,3 +1,4 @@
+mod api;
 mod config;
 #[path = "../components/prover/mod.rs"]
 mod prover;
@@ -18,13 +19,16 @@ mod verify;
 // paths unchanged — the physical layout is by component, the namespace is flat.
 pub use graph::{db, model, scheduler};
 pub use reason::{
-    agent, blueprint, blueprint_run, certification, chat, consolidate, critic, decompose, driver,
-    evolve_sketch, falsification, fitness, formal_generate, formalize_portfolio, goal_cache, guard,
-    library, mathlib_export, mcts, memory, method_transfer, minimize, observe, optimize,
-    plan_history, portfolio, progress, proof_pool, repair, research, retry, router, sampler,
-    sampling, sketch, statement_validation, subsumption, tactic_outcome, taint, team, ttc,
+    agent, blueprint, blueprint_run, certification, chat, consolidate, critic, decompose,
+    definition_synthesis, driver, evolve_sketch, falsification, fitness, formal_generate,
+    formalize_portfolio, goal_cache, guard, inverse_method, library, mathlib_export, mcts, memory,
+    method_transfer, minimize, observe, optimize, plan_history, portfolio, progress, proof_pool,
+    repair, research, retry, router, sampler, sampling, sketch, statement_validation, subsumption,
+    tactic_outcome, taint, team, ttc,
 };
-pub use prover::{aristotle, attempt_run, exec, formal, isabelle, lean, proof_job, rocq};
+pub use prover::{
+    aristotle, attempt_run, exec, formal, goal_state, isabelle, lean, proof_job, rocq,
+};
 pub use verify::{hardening, lean_session};
 
 use anyhow::Result;
@@ -214,6 +218,11 @@ enum Command {
     /// Call any Python worker tool with a raw JSON request (e.g.
     /// `{"tool":"benchmark","request":{"op":"list"}}`).
     Tool {
+        request: String,
+    },
+    /// Stable, versioned JSON API for editor/MCP clients (e.g.
+    /// `{"op":"list_projects"}`). See `api::ApiRequest` for the schema.
+    Api {
         request: String,
     },
     /// Export a project's proof-DAG to a leanblueprint `content.tex` + `lean_decls`.
@@ -699,6 +708,7 @@ fn main() -> Result<()> {
             let request: serde_json::Value = serde_json::from_str(&request)?;
             print_value(true, &PythonCheck::new().run(request)?)?
         }
+        Command::Api { request } => println!("{}", api::handle_json(&store, &request)),
         Command::BlueprintExport { project, out_dir } => {
             let export = blueprint::export(&store, &project)?;
             std::fs::create_dir_all(&out_dir)?;
