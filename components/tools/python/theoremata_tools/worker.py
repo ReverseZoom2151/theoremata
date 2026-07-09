@@ -163,6 +163,10 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.cert_flyspeck_lp import run as cert_flyspeck_lp_run
 
         return cert_flyspeck_lp_run(request)
+    if tool == "cert_nullstellensatz":
+        from theoremata_tools.cert_nullstellensatz import run as cert_nullstellensatz_run
+
+        return cert_nullstellensatz_run(request)
     if tool == "lemma_cache":
         from .lemma_cache import run as lemma_cache_run
 
