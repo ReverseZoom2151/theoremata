@@ -301,6 +301,10 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.geometry_ddar import run as geometry_ddar_run
 
         return geometry_ddar_run(request)
+    if tool == "geometry_ddar2":
+        from theoremata_tools.geometry_ddar2 import run as geometry_ddar2_run
+
+        return geometry_ddar2_run(request)
     if tool == "flywheel":
         from theoremata_tools.flywheel import run as flywheel_run
 
