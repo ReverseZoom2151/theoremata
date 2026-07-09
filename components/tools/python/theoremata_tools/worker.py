@@ -289,6 +289,10 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.geometry_synth import run as geometry_synth_run
 
         return geometry_synth_run(request)
+    if tool == "geometry_synth2":
+        from theoremata_tools.geometry_synth2 import run as geometry_synth2_run
+
+        return geometry_synth2_run(request)
     if tool == "geometry_algebraic":
         from theoremata_tools.geometry_algebraic import run as geometry_algebraic_run
 
