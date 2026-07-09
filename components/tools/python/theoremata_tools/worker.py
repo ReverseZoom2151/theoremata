@@ -179,6 +179,10 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.cert_sos import run as cert_sos_run
 
         return cert_sos_run(request)
+    if tool == "cert_taylor_model":
+        from theoremata_tools.cert_taylor_model import run as cert_taylor_model_run
+
+        return cert_taylor_model_run(request)
     if tool == "lemma_cache":
         from .lemma_cache import run as lemma_cache_run
 
