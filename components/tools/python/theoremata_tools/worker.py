@@ -217,6 +217,10 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.proof_grader import run as proof_grader_run
 
         return proof_grader_run(request)
+    if tool == "exposition":
+        from theoremata_tools.exposition import run as exposition_run
+
+        return exposition_run(request)
     if tool == "curriculum":
         from theoremata_tools.curriculum import run as curriculum_run
 
