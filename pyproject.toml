@@ -20,5 +20,15 @@ all = [
     "scikit-learn>=1.3",
 ]
 
+# The importable code is the PEP-420 namespace package `theoremata_tools`, split
+# across `components/*/python/theoremata_tools/`, and is resolved from the source
+# tree by the root `conftest.py` (which puts each `components/*/python` on
+# sys.path) — it is NOT built into a single wheel. So `pip install -e .` installs
+# only this project's DEPENDENCIES; declare no packages/modules to build, which
+# also stops setuptools from trying to auto-discover the top-level `app/`,
+# `assets/`, `components/` dirs (the "Multiple top-level packages" error).
+[tool.setuptools]
+py-modules = []
+
 [tool.pytest.ini_options]
 testpaths = ["components"]
