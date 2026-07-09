@@ -155,6 +155,10 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from .linprog_cert import evaluate as linprog_cert_evaluate
 
         return linprog_cert_evaluate(request)
+    if tool == "cert_log":
+        from theoremata_tools.cert_log import run as cert_log_run
+
+        return cert_log_run(request)
     if tool == "lemma_cache":
         from .lemma_cache import run as lemma_cache_run
 
