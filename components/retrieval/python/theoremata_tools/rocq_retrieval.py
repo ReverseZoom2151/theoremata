@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import functools
 import json
+import ntpath
 import os
 import re
 import shutil
@@ -111,9 +112,14 @@ _GLOB_KIND = {
 # WSL / native coqc plumbing.
 # --------------------------------------------------------------------------- #
 def _win_to_wsl_path(path: str) -> str:
-    """Translate a Windows path (``C:\\a\\b``) to its WSL form (``/mnt/c/a/b``)."""
-    ap = os.path.abspath(path)
-    drive, rest = os.path.splitdrive(ap)
+    """Translate a Windows path (``C:\\a\\b``) to its WSL form (``/mnt/c/a/b``).
+
+    Parses as a Windows path via ``ntpath`` regardless of host OS, so the
+    translation is deterministic on Linux CI too (``os.path`` is ``posixpath``
+    there and would treat ``C:\\...`` as a relative path).
+    """
+    ap = ntpath.abspath(path)
+    drive, rest = ntpath.splitdrive(ap)
     rest = rest.replace("\\", "/")
     if drive and len(drive) >= 2 and drive[1] == ":":
         return f"/mnt/{drive[0].lower()}{rest}"

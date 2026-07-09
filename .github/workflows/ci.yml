@@ -70,9 +70,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
-      # Non-blocking: the Python workers are auxiliary to the Rust core, and some
-      # tests are gated on optional/live dependencies (torch, network provers)
-      # that are not installed here. Report the result without failing the build.
+      # The suite passes without the optional ML stack: tests needing torch /
+      # transformers / sklearn / numpy self-skip via importorskip when absent.
+      # This step now genuinely gates the build.
       - name: pytest components
-        continue-on-error: true
         run: python -m pytest components
