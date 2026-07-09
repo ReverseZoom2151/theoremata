@@ -9,3 +9,4 @@ pub mod blueprint;
 pub mod library;
 pub mod evolve_sketch;
 pub mod optimize;
+pub mod repair;
