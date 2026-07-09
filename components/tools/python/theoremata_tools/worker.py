@@ -293,6 +293,10 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.geometry_algebraic import run as geometry_algebraic_run
 
         return geometry_algebraic_run(request)
+    if tool == "geometry_ddar":
+        from theoremata_tools.geometry_ddar import run as geometry_ddar_run
+
+        return geometry_ddar_run(request)
     if tool == "flywheel":
         from theoremata_tools.flywheel import run as flywheel_run
 
