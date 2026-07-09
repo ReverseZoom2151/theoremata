@@ -21,7 +21,11 @@
 //! evidence on that node, so the critique becomes durable, auditable graph
 //! state. Pruned false positives are logged (never silently dropped).
 
-use crate::{db::Store, model::ModelRequest, provider::ModelProvider};
+use crate::{
+    db::Store,
+    model::{ModelRequest, Node, NodeStatus},
+    provider::ModelProvider,
+};
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::json;
@@ -112,6 +116,190 @@ impl CritiqueReport {
                 && f.node_id.as_deref() == Some(node_id)
         })
     }
+}
+
+/// Category tag carried on the advisory finding emitted by
+/// [`short_proof_for_hard_target`]. A stable string so downstream consumers can
+/// filter for it.
+pub const SUSPICIOUS_SHORT_PROOF_CATEGORY: &str = "suspicious-short-proof";
+
+/// Tuning for the "suspiciously short proof for a hard target" heuristic
+/// (maxwells-daemon: *if you expect a problem to be hard and the proof is very
+/// short, you've probably missed something* — usually a mis-stated statement or
+/// a trivial witness). A node ESTIMATED hard yet certified by a TRIVIALLY SHORT
+/// proof earns an ADVISORY finding. It never rejects a node — a passed formal
+/// check is ground truth — it only warns that the STATEMENT may be wrong.
+#[derive(Debug, Clone, Copy)]
+pub struct ShortProofCfg {
+    /// A node whose difficulty estimate (in `[0, 1]`, `1.0` = hardest — the
+    /// convention used by the TTC controller) is `>=` this is a "hard target".
+    pub hard_threshold: f64,
+    /// A proof whose size (see [`proof_size`]: non-comment tactic-step count) is
+    /// `<=` this is "trivially short".
+    pub trivial_len: usize,
+}
+
+impl Default for ShortProofCfg {
+    fn default() -> Self {
+        ShortProofCfg {
+            hard_threshold: 0.7,
+            trivial_len: 2,
+        }
+    }
+}
+
+/// Documented proof-"size" metric: the number of **non-comment tactic steps**.
+///
+/// The proof text is normalised deterministically (no wall-clock/rand):
+/// 1. block comments are removed — Lean `/- … -/` and Rocq/Isabelle `(* … *)`
+///    (an unterminated block drops the remainder);
+/// 2. per line, a Lean/Haskell `--` line comment is stripped to end-of-line;
+/// 3. the tactic separators newline, `;`, and the Lean combinator `<;>` are all
+///    normalised to newlines;
+/// 4. the count is the number of remaining non-blank segments.
+///
+/// A term-mode one-liner (`… := trivial`) has size `1`; a multi-tactic `by`
+/// block scales with its steps. Comment-only lines contribute nothing.
+pub fn proof_size(proof: &str) -> usize {
+    let no_block = strip_block_comments(proof);
+    let mut normalized = String::new();
+    for line in no_block.lines() {
+        // Drop a Lean/Haskell `--` line comment (Rocq uses `(* *)`, handled
+        // above), keeping only the code before it.
+        let code = match line.split_once("--") {
+            Some((before, _)) => before,
+            None => line,
+        };
+        normalized.push_str(code);
+        normalized.push('\n');
+    }
+    normalized
+        .replace("<;>", "\n")
+        .replace(';', "\n")
+        .lines()
+        .filter(|seg| !seg.trim().is_empty())
+        .count()
+}
+
+/// Remove every `/- … -/` and `(* … *)` block comment span.
+fn strip_block_comments(text: &str) -> String {
+    let once = remove_spans(text, "/-", "-/");
+    remove_spans(&once, "(*", "*)")
+}
+
+/// Delete every `open`…`close` span (an unterminated `open` drops the rest).
+fn remove_spans(text: &str, open: &str, close: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(i) = rest.find(open) {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + open.len()..];
+        match after.find(close) {
+            Some(j) => rest = &after[j + close.len()..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The maxwells-daemon heuristic as a pure function: when a target is estimated
+/// HARD (`difficulty >= cfg.hard_threshold`) yet its certified proof is
+/// TRIVIALLY SHORT (`proof_size(proof) <= cfg.trivial_len`), return an ADVISORY
+/// [`CritiqueFinding`] flagging that the statement may be trivially satisfiable
+/// or mis-formalized. Returns `None` otherwise.
+///
+/// The finding is deliberately a [`FindingClass::JustificationGap`] with
+/// `confirmed: false`, so it can NEVER drive [`CritiqueReport::should_reject_node`]
+/// (which rejects only on a confirmed critical error): a proof that passed the
+/// formal check is ground truth and is never overturned — this only warns.
+///
+/// An empty/whitespace proof yields size `0` and returns `None` (no proof text
+/// to judge, rather than a false alarm on missing data). The returned finding
+/// has `node_id: None`; the caller sets it when grounding to a specific node.
+pub fn short_proof_for_hard_target(
+    difficulty: f64,
+    proof: &str,
+    cfg: &ShortProofCfg,
+) -> Option<CritiqueFinding> {
+    if difficulty < cfg.hard_threshold {
+        return None;
+    }
+    let size = proof_size(proof);
+    if size == 0 || size > cfg.trivial_len {
+        return None;
+    }
+    Some(CritiqueFinding {
+        node_id: None,
+        severity: "advisory".to_owned(),
+        category: SUSPICIOUS_SHORT_PROOF_CATEGORY.to_owned(),
+        class: FindingClass::JustificationGap,
+        issue: format!(
+            "This target is estimated HARD (difficulty {difficulty:.2} >= {:.2}) yet was \
+             certified by a very short proof ({size} tactic step(s) <= {}). A hard result with a \
+             trivial proof is a classic smell: the statement may be trivially satisfiable, \
+             vacuous, or mis-formalized (a trivial witness, a weakened conclusion, or a \
+             contradictory hypothesis). ADVISORY ONLY — the formal check is ground truth and is \
+             NOT overturned; review the STATEMENT for a formalization error.",
+            cfg.hard_threshold, cfg.trivial_len
+        ),
+        adversarial_checks: vec![
+            "Re-read the formal statement: does it capture the intended claim, or only a trivial \
+             special case?"
+                .to_owned(),
+            "Check for a vacuous/contradictory hypothesis — an unsatisfiable premise makes any \
+             conclusion trivially provable."
+                .to_owned(),
+            "Check for a trivial witness or degenerate instance that satisfies the statement \
+             without its intended content."
+                .to_owned(),
+            "Confirm the quantifiers and the direction of the claim were not weakened during \
+             formalization."
+                .to_owned(),
+        ],
+        confirmed: false,
+        meta_reason: None,
+    })
+}
+
+/// Estimate a node's difficulty in `[0, 1]` from the signals present on the node
+/// itself (the graph stores no numeric difficulty). We read the `strategy_hint`:
+/// a hint flagging the work as hard/deep/open maps to a high difficulty,
+/// mirroring `guard::model_tier`'s existing "hard" escalation. With no signal we
+/// return a neutral `0.5` — below the default `hard_threshold`, so an
+/// un-annotated node never triggers the advisory.
+fn estimate_node_difficulty(node: &Node) -> f64 {
+    match node.strategy_hint.as_deref() {
+        Some(hint) => {
+            let h = hint.to_ascii_lowercase();
+            const HARD_MARKERS: [&str; 7] = [
+                "hard",
+                "difficult",
+                "deep",
+                "open problem",
+                "nontrivial",
+                "non-trivial",
+                "major",
+            ];
+            if HARD_MARKERS.iter().any(|m| h.contains(m)) {
+                0.9
+            } else {
+                0.5
+            }
+        }
+        None => 0.5,
+    }
+}
+
+/// A node is CERTIFIED (its formal check passed) when its proof is complete
+/// (`proof_done`) or it is marked `FormallyVerified`. Only certified nodes are
+/// eligible for the short-proof advisory — the heuristic is about a *passed*
+/// check whose brevity is suspicious.
+fn node_is_certified(node: &Node) -> bool {
+    node.proof_done || node.status == NodeStatus::FormallyVerified
 }
 
 pub struct Critic<'a> {
@@ -234,6 +422,29 @@ impl Critic<'_> {
         // only when the meta-check affirms it; unconfirmed findings stay for
         // audit but do not gate node rejection.
         let retained = self.meta_verify_findings(retained)?;
+
+        // maxwells-daemon advisory: a target ESTIMATED HARD that was certified by
+        // a TRIVIALLY SHORT proof is a smell (usually a mis-stated statement or a
+        // trivial witness). Derived deterministically from graph state (no model
+        // call) and appended AFTER the meta passes, so it is never pruned/gated.
+        // It is ADVISORY — a justification gap with `confirmed: false` — so it can
+        // NEVER reject a node: a passed formal check remains ground truth.
+        let mut retained = retained;
+        let short_cfg = ShortProofCfg::default();
+        for node in &graph.nodes {
+            if !node_is_certified(node) {
+                continue;
+            }
+            let Some(proof) = node.formal_statement.as_deref() else {
+                continue;
+            };
+            if let Some(mut finding) =
+                short_proof_for_hard_target(estimate_node_difficulty(node), proof, &short_cfg)
+            {
+                finding.node_id = Some(node.id.clone());
+                retained.push(finding);
+            }
+        }
 
         // Ground each surviving finding: one that names a real node becomes
         // evidence on that node; anything else is logged as a project-level
@@ -701,5 +912,212 @@ mod tests {
         // The prune was logged, and no evidence was written for the bogus node.
         let events = store.events(&project.id, 50).unwrap();
         assert!(events.iter().any(|e| e.event_type == "critique.pruned"));
+    }
+
+    // ----- suspiciously-short-proof-for-a-hard-target heuristic ---------------
+
+    /// A short multi-tactic `by` block (2 non-comment steps).
+    const SHORT_PROOF: &str = "theorem t : P := by\n  simp";
+    /// A substantial proof (well over a handful of steps).
+    const LONG_PROOF: &str = "theorem t : P := by\n  intro x\n  induction x with\n  \
+                              | zero => simp\n  | succ n ih => rw [foo]; exact ih\n  ring";
+
+    #[test]
+    fn proof_size_counts_non_comment_tactic_steps() {
+        // Term-mode one-liner is a single step.
+        assert_eq!(proof_size("theorem t : True := trivial"), 1);
+        // `by` block: header line + one tactic.
+        assert_eq!(proof_size(SHORT_PROOF), 2);
+        // Separators `;` and `<;>` split steps; empty proof is size 0.
+        assert_eq!(proof_size("intro x; simp <;> ring"), 3);
+        assert_eq!(proof_size("   \n  \n"), 0);
+        // Comment-only lines / trailing comments contribute nothing.
+        assert_eq!(proof_size("simp -- trivial\n-- just a note\nring"), 2);
+        assert_eq!(proof_size("/- a\n block -/\nsimp\n(* rocq *) ring"), 2);
+        assert!(proof_size(LONG_PROOF) > ShortProofCfg::default().trivial_len);
+    }
+
+    #[test]
+    fn hard_target_with_tiny_proof_is_flagged_advisory() {
+        let cfg = ShortProofCfg::default();
+        let finding = short_proof_for_hard_target(0.9, SHORT_PROOF, &cfg)
+            .expect("hard target + tiny proof must flag");
+        assert_eq!(finding.category, SUSPICIOUS_SHORT_PROOF_CATEGORY);
+        assert_eq!(finding.severity, "advisory");
+        // Advisory ⇒ a justification gap, never a critical error; unconfirmed.
+        assert_eq!(finding.class, FindingClass::JustificationGap);
+        assert!(!finding.confirmed);
+        assert!(!finding.adversarial_checks.is_empty());
+    }
+
+    #[test]
+    fn easy_target_with_short_proof_is_not_flagged() {
+        let cfg = ShortProofCfg::default();
+        // Difficulty below the hard threshold: a short proof is expected, no smell.
+        assert!(short_proof_for_hard_target(0.3, SHORT_PROOF, &cfg).is_none());
+    }
+
+    #[test]
+    fn hard_target_with_substantial_proof_is_not_flagged() {
+        let cfg = ShortProofCfg::default();
+        assert!(short_proof_for_hard_target(0.95, LONG_PROOF, &cfg).is_none());
+    }
+
+    #[test]
+    fn empty_proof_is_not_flagged() {
+        let cfg = ShortProofCfg::default();
+        // No proof text to judge ⇒ no false alarm.
+        assert!(short_proof_for_hard_target(0.99, "   \n\n", &cfg).is_none());
+    }
+
+    #[test]
+    fn config_thresholds_are_respected() {
+        // A lenient hard_threshold flags a mid-difficulty node; a strict one does not.
+        let lenient = ShortProofCfg {
+            hard_threshold: 0.5,
+            trivial_len: 2,
+        };
+        let strict = ShortProofCfg {
+            hard_threshold: 0.8,
+            trivial_len: 2,
+        };
+        assert!(short_proof_for_hard_target(0.6, SHORT_PROOF, &lenient).is_some());
+        assert!(short_proof_for_hard_target(0.6, SHORT_PROOF, &strict).is_none());
+
+        // trivial_len controls the size cutoff at exactly the boundary.
+        let three_steps = "intro x; simp; ring"; // size 3
+        assert_eq!(proof_size(three_steps), 3);
+        let cutoff_2 = ShortProofCfg {
+            hard_threshold: 0.7,
+            trivial_len: 2,
+        };
+        let cutoff_3 = ShortProofCfg {
+            hard_threshold: 0.7,
+            trivial_len: 3,
+        };
+        assert!(short_proof_for_hard_target(0.9, three_steps, &cutoff_2).is_none());
+        assert!(short_proof_for_hard_target(0.9, three_steps, &cutoff_3).is_some());
+    }
+
+    #[test]
+    fn advisory_finding_never_rejects_a_node() {
+        let mut finding = short_proof_for_hard_target(0.9, SHORT_PROOF, &ShortProofCfg::default())
+            .expect("should flag");
+        finding.node_id = Some("n1".to_owned());
+        // Even if a downstream meta pass were to mark it confirmed, a
+        // justification gap can never drive a rejection.
+        finding.confirmed = true;
+        let report = CritiqueReport {
+            project_id: "p".to_owned(),
+            findings: vec![finding],
+            pruned: Vec::new(),
+            summary: String::new(),
+        };
+        assert!(!report.should_reject_node("n1"));
+    }
+
+    #[test]
+    fn helper_is_deterministic() {
+        let cfg = ShortProofCfg::default();
+        let a = short_proof_for_hard_target(0.9, SHORT_PROOF, &cfg).unwrap();
+        let b = short_proof_for_hard_target(0.9, SHORT_PROOF, &cfg).unwrap();
+        assert_eq!(a.category, b.category);
+        assert_eq!(a.issue, b.issue);
+        assert_eq!(a.class, b.class);
+    }
+
+    /// A critic provider that reports NO structural findings — so the only
+    /// finding a `critique()` can surface is the deterministic short-proof
+    /// advisory wired into the finding-production path.
+    struct SilentCritic;
+    impl ModelProvider for SilentCritic {
+        fn complete(&self, _req: &ModelRequest) -> Result<ModelResponse> {
+            Ok(ModelResponse {
+                content: json!({ "findings": [], "summary": "no structural findings" }),
+                model: "test".into(),
+                provider: "test".into(),
+            })
+        }
+        fn name(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[test]
+    fn critique_emits_short_proof_advisory_for_a_hard_certified_node() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "t").unwrap();
+        let node = store
+            .add_node(&project.id, NodeKind::Lemma, "hard lemma", "S", "test")
+            .unwrap();
+        // Mark it hard (strategy hint), give it a trivial certified proof.
+        store
+            .set_strategy_hint(&project.id, &node.id, Some("this is a hard, deep step"), "test")
+            .unwrap();
+        store
+            .set_formal_statement(&project.id, &node.id, "theorem t : P := by simp", "test")
+            .unwrap();
+        store
+            .set_verification_flags(&project.id, &node.id, true, true, "test")
+            .unwrap();
+
+        let critic = Critic {
+            store: &store,
+            provider: &SilentCritic,
+        };
+        let report = critic.critique(&project.id).unwrap();
+        let advisory: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.category == SUSPICIOUS_SHORT_PROOF_CATEGORY)
+            .collect();
+        assert_eq!(advisory.len(), 1, "one hard+short certified node ⇒ one advisory");
+        assert_eq!(advisory[0].node_id.as_deref(), Some(node.id.as_str()));
+        // It is advisory: it does not reject the node.
+        assert!(!report.should_reject_node(&node.id));
+        // It was grounded onto the node as durable evidence.
+        let events = store.events(&project.id, 50).unwrap();
+        assert!(events.iter().any(|e| e.event_type == "evidence.recorded"));
+    }
+
+    #[test]
+    fn critique_does_not_flag_an_easy_or_uncertified_short_proof() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "t").unwrap();
+
+        // Easy (no hard hint) but certified with a short proof: not flagged.
+        let easy = store
+            .add_node(&project.id, NodeKind::Lemma, "easy", "S", "test")
+            .unwrap();
+        store
+            .set_formal_statement(&project.id, &easy.id, "theorem t : P := by simp", "test")
+            .unwrap();
+        store
+            .set_verification_flags(&project.id, &easy.id, true, true, "test")
+            .unwrap();
+
+        // Hard + short proof but NOT certified (no proof_done): not flagged.
+        let uncertified = store
+            .add_node(&project.id, NodeKind::Lemma, "hard-open", "S", "test")
+            .unwrap();
+        store
+            .set_strategy_hint(&project.id, &uncertified.id, Some("hard"), "test")
+            .unwrap();
+        store
+            .set_formal_statement(&project.id, &uncertified.id, "theorem t : P := by simp", "test")
+            .unwrap();
+
+        let critic = Critic {
+            store: &store,
+            provider: &SilentCritic,
+        };
+        let report = critic.critique(&project.id).unwrap();
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.category == SUSPICIOUS_SHORT_PROOF_CATEGORY),
+            "neither an easy node nor an uncertified node should be flagged"
+        );
     }
 }
