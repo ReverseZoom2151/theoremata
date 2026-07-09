@@ -277,6 +277,10 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.geometry import run as geometry_run
 
         return geometry_run(request)
+    if tool == "graph_viewer":
+        from theoremata_tools.graph_viewer import run as graph_viewer_run
+
+        return graph_viewer_run(request)
     if tool == "geometry_synth":
         from theoremata_tools.geometry_synth import run as geometry_synth_run
 
