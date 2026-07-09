@@ -1,5 +1,6 @@
 pub mod driver;
 pub mod mcts;
+pub mod process_reward;
 pub mod proof_pool;
 pub mod sampler;
 pub mod sampling;

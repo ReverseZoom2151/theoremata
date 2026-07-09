@@ -13,7 +13,8 @@ pub use orchestration::{
     statement_validation, team,
 };
 pub use search::{
-    driver, fitness, goal_cache, inverse_method, mcts, minimize, proof_pool, progress, sampler,
+    driver, fitness, goal_cache, inverse_method, mcts, minimize, process_reward, proof_pool, progress,
+    sampler,
     sampling, subsumption, tactic_outcome, ttc,
 };
 pub use proving::{

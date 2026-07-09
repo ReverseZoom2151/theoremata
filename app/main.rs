@@ -22,8 +22,9 @@ pub use reason::{
     agent, blueprint, blueprint_run, certification, chat, consolidate, critic, decompose,
     definition_synthesis, driver, evolve_sketch, falsification, fitness, formal_generate,
     formalize_portfolio, goal_cache, guard, inverse_method, library, mathlib_export, mcts, memory,
-    method_transfer, minimize, observe, optimize, plan_history, portfolio, progress, proof_pool,
-    repair, research, retry, router, sampler, sampling, sketch, statement_validation, subsumption,
+    method_transfer, minimize, observe, optimize, plan_history, portfolio, process_reward,
+    progress, proof_pool, repair, research, retry, router, sampler, sampling, sketch,
+    statement_validation, subsumption,
     tactic_outcome, taint, team, ttc,
 };
 pub use prover::{
