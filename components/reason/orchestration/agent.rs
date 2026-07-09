@@ -716,13 +716,16 @@ impl AgentLoop<'_> {
         let meta_gate = super::certification::PoolMetaGate {
             store: self.store,
             provider: self.provider,
-            enabled: super::certification::gate_enabled(),
+            // Runtime reads the Config field, not the process env (which races
+            // under parallel tests); the field's env-derived default preserves
+            // the prior env-based behaviour.
+            enabled: self.config.pool_meta_gate,
         };
         // Aletheia abstention (item #2): when the abstention threshold env-seam is
         // set, an uncertified low-confidence node ABSTAINS (declines) rather than
         // being scored as a failure. Default (no threshold) keeps the exact prior
         // certify-or-fail behaviour.
-        let outcome = match abstain_threshold() {
+        let outcome = match self.config.abstain_threshold {
             Some(threshold) => meta_gate.evaluate_with_abstention(
                 project_id,
                 &node.id,
@@ -838,7 +841,10 @@ impl AgentLoop<'_> {
         informal: &str,
         formal: &str,
     ) -> Result<Option<ValidationOutcome>> {
-        if !crate::statement_validation::validation_enabled() {
+        // Runtime reads the Config field, not the process env (which races under
+        // parallel tests). The field's env-derived default preserves the prior
+        // `THEOREMATA_VALIDATE_STATEMENTS`-based behaviour.
+        if !self.config.validate_statements {
             return Ok(None);
         }
         let outcome = validator.validate(informal, formal);
@@ -1152,10 +1158,9 @@ mod tests {
         }
     }
 
-    // The validation-stage tests mutate the process-global
-    // THEOREMATA_VALIDATE_STATEMENTS env var; serialize them (with the sibling
-    // statement_validation tests) on the shared lock.
-    use crate::statement_validation::env_lock as validation_env_lock;
+    // The validation-stage tests set the `validate_statements` Config field
+    // directly (no process-global env mutation), so they are race-free under
+    // parallel execution — no shared env lock needed.
 
     fn validation_agent<'a>(
         store: &'a Store,
@@ -1171,11 +1176,12 @@ mod tests {
 
     #[test]
     fn faithful_statement_yields_ok_and_proving_proceeds() {
-        let _guard = validation_env_lock();
         use crate::statement_validation::Verdict;
-        std::env::set_var("THEOREMATA_VALIDATE_STATEMENTS", "1");
         let store = Store::open(Path::new(":memory:")).unwrap();
-        let config = Config::default();
+        let config = Config {
+            validate_statements: true,
+            ..Config::default()
+        };
         let project = store.create_project("p", "t").unwrap();
         let node = store
             .add_node(&project.id, NodeKind::Lemma, "n", "n = n", "test")
@@ -1198,16 +1204,16 @@ mod tests {
             .into_iter()
             .any(|e| e.event_type == "statement_validation.warning");
         assert!(!warned, "Ok verdict emits no warning");
-        std::env::remove_var("THEOREMATA_VALIDATE_STATEMENTS");
     }
 
     #[test]
     fn suspect_statement_warns_but_is_not_dropped() {
-        let _guard = validation_env_lock();
         use crate::statement_validation::Verdict;
-        std::env::set_var("THEOREMATA_VALIDATE_STATEMENTS", "1");
         let store = Store::open(Path::new(":memory:")).unwrap();
-        let config = Config::default();
+        let config = Config {
+            validate_statements: true,
+            ..Config::default()
+        };
         let project = store.create_project("p", "t").unwrap();
         let node = store
             .add_node(&project.id, NodeKind::Lemma, "n", "hard claim", "test")
@@ -1230,16 +1236,16 @@ mod tests {
         let fresh = store.nodes(&project.id).unwrap();
         assert_eq!(fresh.len(), 1);
         assert_eq!(fresh[0].status, node.status);
-        std::env::remove_var("THEOREMATA_VALIDATE_STATEMENTS");
     }
 
     #[test]
     fn stage_is_a_noop_when_flag_off() {
-        let _guard = validation_env_lock();
         use crate::statement_validation::Verdict;
-        std::env::remove_var("THEOREMATA_VALIDATE_STATEMENTS");
         let store = Store::open(Path::new(":memory:")).unwrap();
-        let config = Config::default();
+        let config = Config {
+            validate_statements: false,
+            ..Config::default()
+        };
         let project = store.create_project("p", "t").unwrap();
         let node = store
             .add_node(&project.id, NodeKind::Lemma, "n", "s", "test")
@@ -1262,11 +1268,12 @@ mod tests {
 
     #[test]
     fn validator_outcome_is_persisted_as_evidence() {
-        let _guard = validation_env_lock();
         use crate::statement_validation::Verdict;
-        std::env::set_var("THEOREMATA_VALIDATE_STATEMENTS", "1");
         let store = Store::open(Path::new(":memory:")).unwrap();
-        let config = Config::default();
+        let config = Config {
+            validate_statements: true,
+            ..Config::default()
+        };
         let project = store.create_project("p", "t").unwrap();
         let node = store
             .add_node(&project.id, NodeKind::Lemma, "n", "s", "test")
@@ -1289,7 +1296,6 @@ mod tests {
             .iter()
             .any(|e| e.event_type == "statement_validation.warning");
         assert!(warned, "Reject surfaces a warning event");
-        std::env::remove_var("THEOREMATA_VALIDATE_STATEMENTS");
     }
 
     #[test]

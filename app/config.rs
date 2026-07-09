@@ -81,6 +81,60 @@ pub struct Config {
     /// otherwise trust. The wiring + flag exist even when the check cannot run.
     #[serde(default)]
     pub kernel_validate_proof: bool,
+    /// Run the advisory statement-VALIDATION faithfulness stage. Promoted from the
+    /// `THEOREMATA_VALIDATE_STATEMENTS` env var to a Config field (mirroring
+    /// `prover_mock`) so the RUNTIME path reads this field, not the process env —
+    /// tests set it directly and no longer race on a global env var. The
+    /// env-derived default preserves existing env-based usage: OFF unless the env
+    /// is set to a truthy value at Config construction.
+    #[serde(default = "default_validate_statements")]
+    pub validate_statements: bool,
+    /// Aletheia abstention threshold in `(0, 1]`. Promoted from
+    /// `THEOREMATA_ABSTAIN_THRESHOLD` to a Config field. `None` (the default, and
+    /// the meaning of an absent/unparseable env) keeps the exact certify-or-fail
+    /// behaviour; a value makes the certify gate DECLINE (abstain) on any
+    /// uncertified node whose confidence is below it. Runtime reads this field.
+    #[serde(default = "default_abstain_threshold")]
+    pub abstain_threshold: Option<f64>,
+    /// Whether the scored proof-pool + critic meta-verification certification gate
+    /// is active. Promoted from `THEOREMATA_POOL_META_GATE` to a Config field. ON
+    /// by default (env-derived: anything but an explicit `0`/`false`/`off`).
+    /// Runtime reads this field, not the env.
+    #[serde(default = "default_pool_meta_gate")]
+    pub pool_meta_gate: bool,
+}
+
+/// Env-derived default for [`Config::validate_statements`]. Read ONCE at Config
+/// construction (mirrors `statement_validation::validation_enabled`): absent /
+/// empty / `0`/`false`/`off` means OFF.
+fn default_validate_statements() -> bool {
+    match std::env::var("THEOREMATA_VALIDATE_STATEMENTS") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "off"
+        ),
+        Err(_) => false,
+    }
+}
+
+/// Env-derived default for [`Config::abstain_threshold`]. Read ONCE at Config
+/// construction (mirrors the old `agent::abstain_threshold` free fn): absent /
+/// unparseable / non-positive means `None` (abstention OFF).
+fn default_abstain_threshold() -> Option<f64> {
+    std::env::var("THEOREMATA_ABSTAIN_THRESHOLD")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|t| *t > 0.0)
+}
+
+/// Env-derived default for [`Config::pool_meta_gate`]. Read ONCE at Config
+/// construction (mirrors `certification::gate_enabled`): ON unless the env is an
+/// explicit `0`/`false`/`off`.
+fn default_pool_meta_gate() -> bool {
+    match std::env::var("THEOREMATA_POOL_META_GATE") {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"),
+        Err(_) => true,
+    }
 }
 
 fn default_lean_bin() -> String {
@@ -146,6 +200,9 @@ impl Default for Config {
             isabelle_bin: default_isabelle_bin(),
             target_system: crate::prover::formal::FormalSystem::default(),
             kernel_validate_proof: false,
+            validate_statements: default_validate_statements(),
+            abstain_threshold: default_abstain_threshold(),
+            pool_meta_gate: default_pool_meta_gate(),
         }
     }
 }
