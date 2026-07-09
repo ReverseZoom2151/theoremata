@@ -171,6 +171,10 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.cert_wz import run as cert_wz_run
 
         return cert_wz_run(request)
+    if tool == "cert_pratt":
+        from theoremata_tools.cert_pratt import run as cert_pratt_run
+
+        return cert_pratt_run(request)
     if tool == "lemma_cache":
         from .lemma_cache import run as lemma_cache_run
 
