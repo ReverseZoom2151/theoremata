@@ -7,6 +7,7 @@ pub mod sketch;
 pub mod falsification;
 pub mod blueprint;
 pub mod library;
+pub mod mathlib_export;
 pub mod evolve_sketch;
 pub mod optimize;
 pub mod repair;
