@@ -9,13 +9,12 @@ pub mod search;
 // (`reason::mcts`, hence `crate::mcts` via app/main.rs, and sibling references
 // like `crate::mcts`) continue to resolve after the subgroup reorganization.
 pub use orchestration::{
-    agent, blueprint_run, certification, chat, consolidate, method_transfer, observe, research,
-    statement_validation, team,
+    agent, blueprint_generate, blueprint_run, certification, chat, consolidate, method_transfer,
+    observe, research, statement_validation, team,
 };
 pub use search::{
-    driver, fitness, goal_cache, inverse_method, mcts, minimize, process_reward, proof_pool, progress,
-    sampler,
-    sampling, subsumption, tactic_outcome, ttc,
+    discovery_game, driver, fitness, goal_cache, inverse_method, mcts, minimize, process_reward,
+    proof_pool, progress, sampler, sampling, subsumption, tactic_outcome, ttc,
 };
 pub use proving::{
     blueprint, decompose, definition_synthesis, evolve_sketch, falsification, formal_generate,
