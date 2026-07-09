@@ -298,9 +298,14 @@ mod tests {
         assert!(ok.axioms_clean, "fixed-axiom-base proof is axiom-clean: {ok:?}");
         assert!(ok.lexical_clean, "no escape hatch present: {ok:?}");
         // The 3+1 mapping is recorded in the detail (system + gate + layers).
+        // `verify()` nests each layer's whole report, so the recheck's own
+        // `detail` object sits under ["kernel_recheck"]["detail"].
         assert_eq!(ok.detail["system"], "candle");
         assert_eq!(ok.detail["gate"], "3+1-layer");
-        assert_eq!(ok.detail["kernel_recheck"]["proven_kernel"], true);
+        assert_eq!(
+            ok.detail["kernel_recheck"]["detail"]["proven_kernel"],
+            true
+        );
     }
 
     /// The layer-4 source scan / axiom audit fires on the HOL Light escape
@@ -347,10 +352,13 @@ mod tests {
         assert!(backend.source_scan("let X = TRUTH;;").unwrap().clean); // layer 2c
     }
 
-    /// A LIVE Candle gate. It probes the toolchain first and SELF-SKIPS when the
-    /// `candle` binary is absent (the HOL4/PolyML/CakeML toolchain is not present
-    /// on most machines), so the suite stays green without it.
+    /// A LIVE Candle gate. Marked `#[ignore]` so a normal `cargo test` run never
+    /// pays the (slow, WSL cold-start) toolchain probe — it only runs on demand
+    /// via `cargo test -- --ignored` on a machine with the HOL4/PolyML/CakeML
+    /// toolchain. It ALSO self-skips if the `candle` binary is still absent when
+    /// invoked that way, so `--ignored` stays green without the toolchain.
     #[test]
+    #[ignore = "requires the candle/HOL Light (HOL4/CakeML) toolchain; run with: cargo test -- --ignored"]
     fn candle_live_verifies_trivial_and_rejects_mk_thm() {
         let tmp = tempfile::tempdir().unwrap();
         let mut cfg = Config::default();
