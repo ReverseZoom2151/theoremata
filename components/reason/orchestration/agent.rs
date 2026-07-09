@@ -23,6 +23,9 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
+// Statement VALIDATION as a first-class pipeline stage (sibling module).
+use crate::statement_validation::{StatementValidator, ToolStatementValidator, ValidationOutcome};
+
 pub struct AgentLoop<'a> {
     pub store: &'a Store,
     pub config: &'a Config,
@@ -514,6 +517,9 @@ impl AgentLoop<'_> {
         }
         self.store
             .set_formal_statement(project_id, &node.id, &lean, "external_prover")?;
+        // Advisory statement-validation stage (default-off): does this formal
+        // statement faithfully encode the node's informal statement?
+        self.validate_new_statement(project_id, run, &node.id, &node.statement, &lean)?;
         let theorem = extract_theorem(&lean);
         let (compiles, axioms_clean) =
             self.verify_source(&lean, theorem.as_deref(), session)?;
@@ -583,6 +589,9 @@ impl AgentLoop<'_> {
         )?;
         self.store
             .set_formal_statement(project_id, &node.id, &sampled.value.lean, "formalizer")?;
+        // Advisory statement-validation stage (default-off): faithfulness check
+        // of the freshly formalized statement before proving is trusted.
+        self.validate_new_statement(project_id, run, &node.id, &node.statement, &sampled.value.lean)?;
         if sampled.accepted {
             let theorem = extract_theorem(&sampled.value.lean);
             self.certify_k_consecutive(
@@ -628,6 +637,9 @@ impl AgentLoop<'_> {
         )?;
         self.store
             .set_formal_statement(project_id, &node.id, &code, "formal_generator")?;
+        // Advisory statement-validation stage (default-off): faithfulness check
+        // of the generated system-native statement before its verdict is trusted.
+        self.validate_new_statement(project_id, run, &node.id, &node.statement, &code)?;
         self.store.add_evidence(
             project_id,
             &node.id,
@@ -804,6 +816,75 @@ impl AgentLoop<'_> {
                 *certified = certified.saturating_sub(1);
             }
         }
+        Ok(())
+    }
+
+    /// First-class statement-VALIDATION stage. Invoked additively right after a
+    /// node's `formal_statement` is set. When `THEOREMATA_VALIDATE_STATEMENTS` is
+    /// OFF (the default) this is a no-op that returns `Ok(None)`, so the pipeline
+    /// keeps its exact prior behaviour. When ON it runs the injectable
+    /// `validator` (production: [`ToolStatementValidator`]) to check whether the
+    /// formal statement faithfully encodes the node's informal statement,
+    /// records the advisory outcome as node evidence, and — on a Suspect/Reject
+    /// verdict — emits a warning event. It is strictly ADVISORY: the node is
+    /// NEVER dropped, rejected, or blocked here; proving always proceeds. The
+    /// formal gate remains ground truth.
+    fn validate_statement(
+        &self,
+        validator: &dyn StatementValidator,
+        project_id: &str,
+        run: Option<&str>,
+        node_id: &str,
+        informal: &str,
+        formal: &str,
+    ) -> Result<Option<ValidationOutcome>> {
+        if !crate::statement_validation::validation_enabled() {
+            return Ok(None);
+        }
+        let outcome = validator.validate(informal, formal);
+        // Persist the advisory outcome as node evidence (auditable, never a gate).
+        self.store.add_evidence(
+            project_id,
+            node_id,
+            "statement_validation",
+            "statement_validator",
+            outcome.verdict.as_str(),
+            outcome.to_json(),
+        )?;
+        // Surface a warning on Suspect/Reject — advisory only, proving proceeds.
+        if outcome.verdict.is_warning() {
+            self.store.event(
+                Some(project_id),
+                run,
+                "statement_validation.warning",
+                "statement_validator",
+                json!({
+                    "node": node_id,
+                    "verdict": outcome.verdict.as_str(),
+                    "faithful_score": outcome.faithful_score,
+                    "trivial": outcome.trivial,
+                    "advisory": true,
+                    "findings": outcome.findings,
+                }),
+            )?;
+        }
+        Ok(Some(outcome))
+    }
+
+    /// Production wiring for the statement-validation stage: build the tool-backed
+    /// validator and run the (default-off) stage. Kept as a thin wrapper so the
+    /// call sites stay one line and tests drive [`AgentLoop::validate_statement`]
+    /// directly with a deterministic mock validator.
+    fn validate_new_statement(
+        &self,
+        project_id: &str,
+        run: &str,
+        node_id: &str,
+        informal: &str,
+        formal: &str,
+    ) -> Result<()> {
+        let validator = ToolStatementValidator::new(self.config);
+        self.validate_statement(&validator, project_id, Some(run), node_id, informal, formal)?;
         Ok(())
     }
 
@@ -1039,6 +1120,176 @@ mod tests {
         .unwrap();
         assert!(!never.certified);
         assert_eq!(never.longest_streak, 1);
+    }
+
+    /// Deterministic mock validator: returns a fixed outcome, no Python. Records
+    /// how it was called so tests can assert the stage is a no-op when off.
+    struct MockValidator {
+        outcome: crate::statement_validation::ValidationOutcome,
+        calls: std::cell::Cell<u32>,
+    }
+    impl MockValidator {
+        fn new(v: crate::statement_validation::Verdict, score: f64, trivial: bool) -> Self {
+            Self {
+                outcome: crate::statement_validation::ValidationOutcome {
+                    faithful_score: score,
+                    trivial,
+                    verdict: v,
+                    findings: vec!["mock finding".into()],
+                },
+                calls: std::cell::Cell::new(0),
+            }
+        }
+    }
+    impl crate::statement_validation::StatementValidator for MockValidator {
+        fn validate(
+            &self,
+            _informal: &str,
+            _formal: &str,
+        ) -> crate::statement_validation::ValidationOutcome {
+            self.calls.set(self.calls.get() + 1);
+            self.outcome.clone()
+        }
+    }
+
+    // The validation-stage tests mutate the process-global
+    // THEOREMATA_VALIDATE_STATEMENTS env var; serialize them (with the sibling
+    // statement_validation tests) on the shared lock.
+    use crate::statement_validation::env_lock as validation_env_lock;
+
+    fn validation_agent<'a>(
+        store: &'a Store,
+        config: &'a Config,
+        provider: &'a dyn ModelProvider,
+    ) -> AgentLoop<'a> {
+        AgentLoop {
+            store,
+            config,
+            provider,
+        }
+    }
+
+    #[test]
+    fn faithful_statement_yields_ok_and_proving_proceeds() {
+        let _guard = validation_env_lock();
+        use crate::statement_validation::Verdict;
+        std::env::set_var("THEOREMATA_VALIDATE_STATEMENTS", "1");
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let config = Config::default();
+        let project = store.create_project("p", "t").unwrap();
+        let node = store
+            .add_node(&project.id, NodeKind::Lemma, "n", "n = n", "test")
+            .unwrap();
+        let agent = validation_agent(&store, &config, &MockProvider);
+        let mock = MockValidator::new(Verdict::Ok, 0.95, false);
+        let out = agent
+            .validate_statement(&mock, &project.id, None, &node.id, "n = n", "theorem t : n = n := rfl")
+            .unwrap()
+            .expect("stage ran (flag on)");
+        assert_eq!(out.verdict, Verdict::Ok);
+        assert_eq!(mock.calls.get(), 1);
+        // Advisory: the node is untouched — proving proceeds (status unchanged).
+        let fresh = store.nodes(&project.id).unwrap();
+        assert_eq!(fresh[0].status, node.status);
+        // No warning event on an Ok verdict.
+        let warned = store
+            .events(&project.id, 100)
+            .unwrap()
+            .into_iter()
+            .any(|e| e.event_type == "statement_validation.warning");
+        assert!(!warned, "Ok verdict emits no warning");
+        std::env::remove_var("THEOREMATA_VALIDATE_STATEMENTS");
+    }
+
+    #[test]
+    fn suspect_statement_warns_but_is_not_dropped() {
+        let _guard = validation_env_lock();
+        use crate::statement_validation::Verdict;
+        std::env::set_var("THEOREMATA_VALIDATE_STATEMENTS", "1");
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let config = Config::default();
+        let project = store.create_project("p", "t").unwrap();
+        let node = store
+            .add_node(&project.id, NodeKind::Lemma, "n", "hard claim", "test")
+            .unwrap();
+        let agent = validation_agent(&store, &config, &MockProvider);
+        let mock = MockValidator::new(Verdict::Suspect, 0.6, false);
+        let out = agent
+            .validate_statement(&mock, &project.id, None, &node.id, "hard claim", "theorem t : True := trivial")
+            .unwrap()
+            .unwrap();
+        assert_eq!(out.verdict, Verdict::Suspect);
+        // A warning event is surfaced...
+        let warned = store
+            .events(&project.id, 100)
+            .unwrap()
+            .into_iter()
+            .any(|e| e.event_type == "statement_validation.warning");
+        assert!(warned, "Suspect surfaces a warning");
+        // ...but the node is NOT dropped/rejected — it survives for proving.
+        let fresh = store.nodes(&project.id).unwrap();
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].status, node.status);
+        std::env::remove_var("THEOREMATA_VALIDATE_STATEMENTS");
+    }
+
+    #[test]
+    fn stage_is_a_noop_when_flag_off() {
+        let _guard = validation_env_lock();
+        use crate::statement_validation::Verdict;
+        std::env::remove_var("THEOREMATA_VALIDATE_STATEMENTS");
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let config = Config::default();
+        let project = store.create_project("p", "t").unwrap();
+        let node = store
+            .add_node(&project.id, NodeKind::Lemma, "n", "s", "test")
+            .unwrap();
+        let agent = validation_agent(&store, &config, &MockProvider);
+        let mock = MockValidator::new(Verdict::Reject, 0.1, true);
+        let result = agent
+            .validate_statement(&mock, &project.id, None, &node.id, "s", "theorem t : True := trivial")
+            .unwrap();
+        assert!(result.is_none(), "flag off ⇒ stage returns None");
+        assert_eq!(mock.calls.get(), 0, "validator is never called when off");
+        // No evidence/events beyond node creation were produced by the stage.
+        let warned = store
+            .events(&project.id, 100)
+            .unwrap()
+            .into_iter()
+            .any(|e| e.event_type == "statement_validation.warning");
+        assert!(!warned);
+    }
+
+    #[test]
+    fn validator_outcome_is_persisted_as_evidence() {
+        let _guard = validation_env_lock();
+        use crate::statement_validation::Verdict;
+        std::env::set_var("THEOREMATA_VALIDATE_STATEMENTS", "1");
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let config = Config::default();
+        let project = store.create_project("p", "t").unwrap();
+        let node = store
+            .add_node(&project.id, NodeKind::Lemma, "n", "s", "test")
+            .unwrap();
+        let agent = validation_agent(&store, &config, &MockProvider);
+        let mock = MockValidator::new(Verdict::Reject, 0.2, true);
+        agent
+            .validate_statement(&mock, &project.id, None, &node.id, "s", "theorem t : True := trivial")
+            .unwrap();
+        // add_evidence emits an `evidence.recorded` event tagged with our source;
+        // and a Reject surfaces the warning. Both prove the outcome was persisted.
+        let events = store.events(&project.id, 100).unwrap();
+        let recorded = events.iter().any(|e| {
+            e.event_type == "evidence.recorded"
+                && e.payload["evidence_type"] == "statement_validation"
+                && e.payload["verdict"] == "reject"
+        });
+        assert!(recorded, "advisory outcome persisted as node evidence");
+        let warned = events
+            .iter()
+            .any(|e| e.event_type == "statement_validation.warning");
+        assert!(warned, "Reject surfaces a warning event");
+        std::env::remove_var("THEOREMATA_VALIDATE_STATEMENTS");
     }
 
     #[test]
