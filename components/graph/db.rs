@@ -4,6 +4,18 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+
+/// Lowercase hex of a byte slice. sha2 0.11's digest output no longer implements
+/// `LowerHex`, so we format the bytes explicitly.
+fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
+    use std::fmt::Write as _;
+    let bytes = bytes.as_ref();
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
@@ -314,10 +326,7 @@ impl Store {
     ) -> Result<Node> {
         self.project(project_id)?;
         let now = Utc::now();
-        let hash = format!(
-            "{:x}",
-            Sha256::digest(format!("{kind}|{title}|{statement}"))
-        );
+        let hash = hex_lower(Sha256::digest(format!("{kind}|{title}|{statement}")));
         let lemmas_json = serde_json::to_string(suggested_lemmas)?;
         let node = Node {
             id: Uuid::new_v4().to_string(),
@@ -1351,7 +1360,7 @@ impl Store {
             .collect();
         deps.sort();
         let material = format!("{}|{}|{}", node.statement, deps.join(","), node.provenance);
-        let hash = format!("{:x}", Sha256::digest(material));
+        let hash = hex_lower(Sha256::digest(material));
         self.conn.execute(
             "UPDATE nodes SET content_hash=?1,updated_at=?2 WHERE id=?3 AND project_id=?4",
             params![hash, Utc::now().to_rfc3339(), node_id, project_id],

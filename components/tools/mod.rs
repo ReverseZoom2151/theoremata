@@ -2,6 +2,18 @@ use crate::{config::Config, model::ToolResult};
 use anyhow::{anyhow, Context, Result};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+
+/// Lowercase hex of a byte slice. sha2 0.11's digest output no longer implements
+/// `LowerHex`, so we format the bytes explicitly.
+fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
+    use std::fmt::Write as _;
+    let bytes = bytes.as_ref();
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -257,10 +269,7 @@ impl Tool for LeanCheck {
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let key = format!(
-            "{:x}",
-            Sha256::digest(format!("{project_key}\u{0}{contents}"))
-        );
+        let key = hex_lower(Sha256::digest(format!("{project_key}\u{0}{contents}")));
         if let Some(mut hit) = lean_cache().lock().unwrap().get(&key).cloned() {
             hit.metadata["cached"] = json!(true);
             return Ok(hit);
