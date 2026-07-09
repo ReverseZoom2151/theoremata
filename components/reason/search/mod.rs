@@ -14,3 +14,4 @@ pub mod fitness;
 pub mod minimize;
 pub mod tactic_outcome;
 pub mod skest;
+pub mod rewriting;

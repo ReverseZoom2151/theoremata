@@ -23,8 +23,8 @@ pub use reason::{
     decompose, definition_synthesis, discovery_game, driver, evolve_sketch, falsification, fitness,
     formal_generate, formalize_portfolio, goal_cache, guard, inverse_method, library, mathlib_export,
     mcts, memory, method_transfer, minimize, observe, optimize, plan_history, portfolio,
-    process_reward, progress, proof_pool, repair, research, retry, router, sampler, sampling, sketch, skest,
-    statement_validation, subsumption, tactic_outcome, taint, team, ttc,
+    process_reward, progress, proof_pool, repair, research, retry, rewriting, router, sampler,
+    sampling, sketch, skest, statement_validation, subsumption, tactic_outcome, taint, team, ttc,
 };
 pub use prover::{
     aristotle, attempt_run, exec, formal, goal_state, isabelle, lean, proof_job, rocq,
