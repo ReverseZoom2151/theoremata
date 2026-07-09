@@ -5,6 +5,10 @@ edition = "2021"
 description = "A graph-first agentic environment for mathematical research and formal verification"
 license = "MIT"
 
+[lib]
+name = "theoremata"
+path = "app/lib.rs"
+
 [[bin]]
 name = "theoremata"
 path = "app/main.rs"
