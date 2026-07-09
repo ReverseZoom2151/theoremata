@@ -187,6 +187,10 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.cert_continued_fraction import run as cert_continued_fraction_run
 
         return cert_continued_fraction_run(request)
+    if tool == "falsify_hardcase":
+        from theoremata_tools.falsify_hardcase import run as falsify_hardcase_run
+
+        return falsify_hardcase_run(request)
     if tool == "lemma_cache":
         from .lemma_cache import run as lemma_cache_run
 
