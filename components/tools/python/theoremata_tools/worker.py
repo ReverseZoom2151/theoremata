@@ -189,6 +189,10 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
             gold=request.get("gold"),
             ks=request.get("ks"),
         )
+    if tool == "novelty":
+        from theoremata_tools.novelty import run as novelty_run
+
+        return novelty_run(request)
     if tool == "cascade":
         from theoremata_tools.cascade import run as cascade_run
 
