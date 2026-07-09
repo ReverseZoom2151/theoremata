@@ -10,7 +10,7 @@ pub mod search;
 // like `crate::mcts`) continue to resolve after the subgroup reorganization.
 pub use orchestration::{
     agent, blueprint_generate, blueprint_run, certification, chat, consolidate, method_transfer,
-    observe, research, statement_validation, team,
+    observe, proof_import, research, statement_validation, team,
 };
 pub use search::{
     discovery_game, driver, fitness, goal_cache, inverse_method, mcts, minimize, process_reward,

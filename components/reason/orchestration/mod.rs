@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod blueprint_run;
 pub mod blueprint_generate;
+pub mod proof_import;
 pub mod method_transfer;
 pub mod statement_validation;
 pub mod certification;
