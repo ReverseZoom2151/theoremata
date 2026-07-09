@@ -191,6 +191,10 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.falsify_hardcase import run as falsify_hardcase_run
 
         return falsify_hardcase_run(request)
+    if tool == "geometry_wlog":
+        from theoremata_tools.geometry_wlog import run as geometry_wlog_run
+
+        return geometry_wlog_run(request)
     if tool == "lemma_cache":
         from .lemma_cache import run as lemma_cache_run
 
