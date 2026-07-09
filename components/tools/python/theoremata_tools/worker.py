@@ -183,6 +183,10 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.cert_taylor_model import run as cert_taylor_model_run
 
         return cert_taylor_model_run(request)
+    if tool == "cert_continued_fraction":
+        from theoremata_tools.cert_continued_fraction import run as cert_continued_fraction_run
+
+        return cert_continued_fraction_run(request)
     if tool == "lemma_cache":
         from .lemma_cache import run as lemma_cache_run
 
