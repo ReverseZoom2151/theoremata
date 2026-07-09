@@ -159,6 +159,10 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.cert_log import run as cert_log_run
 
         return cert_log_run(request)
+    if tool == "cert_flyspeck_lp":
+        from theoremata_tools.cert_flyspeck_lp import run as cert_flyspeck_lp_run
+
+        return cert_flyspeck_lp_run(request)
     if tool == "lemma_cache":
         from .lemma_cache import run as lemma_cache_run
 
