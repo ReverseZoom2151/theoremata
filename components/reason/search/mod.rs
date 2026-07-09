@@ -1,3 +1,4 @@
+pub mod discovery_game;
 pub mod driver;
 pub mod mcts;
 pub mod process_reward;
