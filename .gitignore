@@ -15,4 +15,5 @@ __pycache__/
 /.mcps/
 /.terminals/
 /math-papers/
+/atp/
 *.egg-info/
