@@ -14,4 +14,5 @@ __pycache__/
 .venv/
 /.mcps/
 /.terminals/
-/math-papers/*.egg-info/
+/math-papers/
+*.egg-info/
