@@ -265,6 +265,10 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.formal_lint import run as formal_lint_run
 
         return formal_lint_run(request)
+    if tool == "statement_roundtrip":
+        from theoremata_tools.statement_roundtrip import run as statement_roundtrip_run
+
+        return statement_roundtrip_run(request)
     if tool == "lp_geometry":
         from theoremata_tools.lp_geometry import run as lp_geometry_run
 
