@@ -1,0 +1,957 @@
+"""Verified-certificate **proof-log** exporter + self-contained **reference checker**.
+
+Theoremata already emits machine-checkable certificates from several producers
+(LP/Farkas duals, log-linear/asymptotic Farkas combinations, Wu's-method
+pseudo-remainders).  The catch: *only we* validate them.  This module closes
+that gap in the spirit of CakeML's "Verified Checkers" programme, which builds
+machine-code-correct proof-log checkers and explicitly seeks new proof-log
+*formats*.  We give our certificates
+
+1. a **self-describing, transport-neutral proof-log format**
+   (``theoremata.cert-log.v1``) — a linear list of typed, independently
+   re-checkable *steps* carrying exactly the numeric data a checker needs, and
+2. a **self-contained REFERENCE CHECKER** (:func:`check_cert_log`) that
+   RE-VERIFIES every step with exact rational arithmetic
+   (:class:`fractions.Fraction`) and no floating point, importing **nothing**
+   from the producers.
+
+The reference checker is the *offline stand-in* for a CakeML-verified checker.
+Because the log is plain self-describing JSON with a fixed, tiny per-step
+semantics, the same document is the intended input for a **CakeML-verified
+checker binary** once that toolchain is present (see ``CAKEML_TARGET`` below):
+the format is deliberately first-order, branch-free-checkable, and closed over
+the rationals so it maps onto a verified checker's specification.
+
+Soundness boundary
+------------------
+The checker is the sound boundary: a *tampered or invalid* certificate MUST be
+rejected (``valid=False`` with a ``reason``).  It never trusts a producer's
+own "verified" flag — it recomputes ``y^T A``, the Farkas combination, the
+pseudo-remainder, etc., from the raw numbers in the log and compares exactly.
+
+Everything here is pure standard library and deterministic.  All inputs
+(certificates, logs, ``resources/`` data) are treated as **UNTRUSTED DATA**:
+the checker validates structure/types defensively and converts any malformed
+input into ``valid=False`` rather than trusting or executing it.
+
+Worker dispatch key: ``cert_log`` (see :func:`run`).
+"""
+from __future__ import annotations
+
+import json
+from fractions import Fraction
+from typing import Any, Iterable, Optional
+
+FORMAT = "theoremata.cert-log.v1"
+
+# The upgrade path: this reference checker is the offline stand-in.  A
+# CakeML-verified checker binary, generated from a HOL4 specification of the
+# per-step semantics below, is the toolchain-gated replacement that validates
+# the *same* log documents with a machine-checked soundness guarantee.
+CAKEML_TARGET = (
+    "cake_certlog_check: a CakeML/HOL4-verified checker whose specification is "
+    "the per-step semantics in this module; consumes theoremata.cert-log.v1 "
+    "documents unchanged. This Python reference checker is the offline "
+    "stand-in until that verified binary/toolchain is available."
+)
+
+KINDS = ("lp_primal_dual", "lp_farkas", "asymptotic", "wu_geometry", "subsumption")
+
+
+# --------------------------------------------------------------------------- #
+# Exact-rational helpers (self-contained; no producer imports).
+# --------------------------------------------------------------------------- #
+
+def _frac(x: Any) -> Fraction:
+    """Parse a number exactly (via ``str`` to avoid float drift)."""
+    if isinstance(x, Fraction):
+        return x
+    if isinstance(x, bool):  # guard: bools are ints in Python
+        raise TypeError("boolean where a rational was expected")
+    if isinstance(x, int):
+        return Fraction(x)
+    return Fraction(str(x))
+
+
+def _fs(x: Fraction) -> str:
+    """Serialize a Fraction as ``"p"`` or ``"p/q"``."""
+    return str(x)
+
+
+def _ineq_fields(ineq: Any) -> tuple[dict[str, Fraction], str, Fraction]:
+    """Read ``(coeffs, sense, rhs)`` from an Inequality-like object or dict."""
+    if isinstance(ineq, dict):
+        coeffs = ineq.get("coeffs", {})
+        sense = ineq["sense"]
+        rhs = ineq.get("rhs", 0)
+    else:  # duck-typed linprog_cert.Inequality
+        coeffs = getattr(ineq, "coeffs")
+        sense = getattr(ineq, "sense")
+        rhs = getattr(ineq, "rhs")
+    _ALIAS = {"leq": "leq", "<=": "leq", "le": "leq", "lt": "lt", "<": "lt",
+              "geq": "geq", ">=": "geq", "ge": "geq", "gt": "gt", ">": "gt",
+              "eq": "eq", "=": "eq", "==": "eq"}
+    s = _ALIAS.get(str(sense))
+    if s is None:
+        raise ValueError(f"bad sense {sense!r}")
+    return ({str(k): _frac(v) for k, v in dict(coeffs).items()}, s, _frac(rhs))
+
+
+def _sorted_vars(constraints: list, objective: Optional[dict]) -> list[str]:
+    names: set[str] = set()
+    for ineq in constraints:
+        coeffs, _s, _r = _ineq_fields(ineq)
+        names.update(coeffs)
+    if objective:
+        names.update(str(k) for k in objective)
+    return sorted(names)
+
+
+# --------------------------------------------------------------------------- #
+# Exporter: LP dual optimality certificate (lp_geometry.primal_dual).
+# --------------------------------------------------------------------------- #
+
+def _normalize_leq(constraints: list, variables: list[str]
+                   ) -> tuple[list[list[Fraction]], list[Fraction], list[dict]]:
+    """Constraints -> ``G x <= h`` in the SAME order lp_geometry.primal_dual uses.
+
+    ``leq/lt`` kept; ``geq/gt`` negated; ``eq`` split into ``+``/``-`` rows.  The
+    resulting row order indexes the producer's dual vector ``y``.
+    """
+    G: list[list[Fraction]] = []
+    h: list[Fraction] = []
+    src: list[dict] = []
+    for idx, ineq in enumerate(constraints):
+        coeffs, sense, rhs = _ineq_fields(ineq)
+        row = [coeffs.get(v, Fraction(0)) for v in variables]
+        if sense in ("leq", "lt"):
+            G.append(row); h.append(rhs); src.append({"index": idx, "orientation": "leq"})
+        elif sense in ("geq", "gt"):
+            G.append([-v for v in row]); h.append(-rhs)
+            src.append({"index": idx, "orientation": "geq(neg)"})
+        else:
+            G.append(list(row)); h.append(rhs); src.append({"index": idx, "orientation": "eq(+)"})
+            G.append([-v for v in row]); h.append(-rhs); src.append({"index": idx, "orientation": "eq(-)"})
+    return G, h, src
+
+
+def export_lp_cert(cert: dict, *, constraints: Iterable,
+                   objective: Optional[dict] = None, sense: str = "max",
+                   claim: Optional[str] = None) -> dict:
+    """Serialize an LP certificate to a cert-log document.
+
+    Accepts either producer cert shape and dispatches on it:
+
+    * ``lp_geometry.primal_dual`` result (``certificate.type ==
+      "lp_primal_dual"``) -> a **dual optimality / bound** log carrying the
+      normalized ``G x <= h``, the maximised objective ``c``, the dual ``y`` and
+      the primal ``x``, with steps a checker re-verifies:
+      ``y >= 0``, ``G^T y >= c``, primal feasibility, strong duality
+      ``c.x == h.y`` and complementary slackness.
+    * ``linprog_cert.feasibility`` INFEASIBLE result (``certificate.type ==
+      "farkas"``) -> delegates to :func:`export_lp_farkas_cert`.
+
+    ``constraints`` are the original constraints handed to the producer (dicts
+    or Inequality objects); ``objective``/``sense`` mirror the primal_dual call.
+    """
+    constraints = list(constraints)
+    ctype = (cert.get("certificate") or {}).get("type") if isinstance(cert, dict) else None
+    if ctype == "farkas" or cert.get("feasible") is False:
+        return export_lp_farkas_cert(cert, constraints=constraints, claim=claim)
+    if ctype != "lp_primal_dual":
+        raise ValueError("unrecognized LP certificate shape for export_lp_cert")
+
+    obj_map = {str(k): _frac(v) for k, v in (objective or {}).items()}
+    variables = _sorted_vars(constraints, obj_map or None)
+    G, h, src = _normalize_leq(constraints, variables)
+    c = [obj_map.get(v, Fraction(0)) for v in variables]
+    c_solve = c if sense == "max" else [-v for v in c]  # objective actually bounded
+
+    y = [_frac(v) for v in cert["dual"]]
+    x = [_frac(cert["primal"][v]) for v in variables]
+    dual_obj = sum(h[k] * y[k] for k in range(len(G)))
+
+    steps = [
+        {"op": "lp_problem", "sense": sense, "variables": variables,
+         "G": [[_fs(v) for v in row] for row in G], "h": [_fs(v) for v in h],
+         "c": [_fs(v) for v in c_solve], "row_src": src,
+         "note": "bounds max c.x over {x : G x <= h, x >= 0}"},
+        {"op": "dual_vector", "y": [_fs(v) for v in y]},
+        {"op": "primal_vector", "x": [_fs(v) for v in x]},
+        {"op": "assert_dual_nonneg"},
+        {"op": "assert_dual_feasible"},
+        {"op": "assert_primal_feasible"},
+        {"op": "assert_complementary_slackness"},
+        {"op": "assert_strong_duality"},
+        {"op": "assert_bound", "bound": _fs(dual_obj)},
+    ]
+    return {
+        "format": FORMAT,
+        "kind": "lp_primal_dual",
+        "claim": claim or f"{sense} c.x subject to G x <= h, x >= 0 is bounded by h.y",
+        "steps": steps,
+        "meta": {
+            "producer": "lp_geometry.primal_dual",
+            "claimed_objective": str(cert.get("objective_value")),
+            "cakeml_target": CAKEML_TARGET,
+        },
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Exporter: LP Farkas infeasibility certificate (linprog_cert.feasibility).
+# --------------------------------------------------------------------------- #
+
+def _oriented_row(coeffs: dict[str, Fraction], sense: str, rhs: Fraction,
+                  orientation: int) -> tuple[dict[str, Fraction], bool, Fraction]:
+    """Reconstruct one normalized ``<=``/``<`` row for the given orientation.
+
+    ``orientation == +1`` keeps the row (``leq``/``lt`` sense); ``-1`` negates it
+    (the form used for a ``geq``/``gt`` or the ``-`` half of an ``eq``).  A row is
+    strict iff the ORIGINAL sense was strict (``lt``/``gt``).
+    """
+    strict = sense in ("lt", "gt")
+    if orientation == 1:
+        return dict(coeffs), strict, rhs
+    return {k: -v for k, v in coeffs.items()}, strict, -rhs
+
+
+def export_lp_farkas_cert(cert: dict, *, constraints: Iterable,
+                          claim: Optional[str] = None) -> dict:
+    """Serialize a ``linprog_cert.feasibility`` INFEASIBLE (Farkas) cert.
+
+    Rebuilds, from the certificate's ``multipliers`` (each an ``index`` into the
+    original constraints plus an ``orientation``) and the original
+    ``constraints``, the exact normalized ``<=``/``<`` rows the producer combined,
+    and pairs them with the nonnegative multipliers.  A checker re-verifies:
+    ``m >= 0``, ``sum m_k a_k == 0`` and ``sum m_k b_k < 0`` (contradiction).
+    """
+    constraints = list(constraints)
+    farkas = cert.get("certificate", cert)
+    if farkas.get("type") != "farkas":
+        raise ValueError("not a Farkas certificate")
+    variables = cert.get("variables") or _sorted_vars(constraints, None)
+
+    rows: list[dict] = []
+    m: list[Fraction] = []
+    for entry in farkas["multipliers"]:
+        idx = int(entry["index"])
+        orientation = int(entry["orientation"])
+        coeffs, sense, rhs = _ineq_fields(constraints[idx])
+        a, strict, b = _oriented_row(coeffs, sense, rhs, orientation)
+        rows.append({"a": {k: _fs(v) for k, v in a.items()},
+                     "strict": bool(strict), "b": _fs(b)})
+        m.append(_frac(entry["multiplier"]))
+
+    steps = [
+        {"op": "farkas_system", "variables": list(variables), "rows": rows,
+         "note": "each row a.x <= b (or < b) holds for any solution of the system"},
+        {"op": "farkas_multipliers", "m": [_fs(v) for v in m]},
+        {"op": "assert_multipliers_nonneg"},
+        {"op": "assert_combination_zero"},
+        {"op": "assert_contradiction"},
+    ]
+    return {
+        "format": FORMAT,
+        "kind": "lp_farkas",
+        "claim": claim or "the linear system is infeasible (Farkas certificate)",
+        "steps": steps,
+        "meta": {"producer": "linprog_cert.feasibility",
+                 "cakeml_target": CAKEML_TARGET},
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Exporter: asymptotic / log-linear certificate (log_linarith).
+# --------------------------------------------------------------------------- #
+
+_OPS = ((" <= ", "leq"), (" >= ", "geq"), (" < ", "lt"), (" > ", "gt"), (" = ", "eq"))
+
+
+def _parse_inequality_str(s: str) -> tuple[dict[str, Fraction], str, Fraction]:
+    """Parse a ``linprog_cert.Inequality`` string back to numeric fields.
+
+    Format (deterministic): ``"c1*v1 + c2*v2 OP rhs"`` where each ``ci`` is a
+    Fraction spelling (``1``, ``-1``, ``1/2``) and ``vi`` a base name that may
+    contain parentheses (e.g. ``Theta(x)``); an all-zero lhs renders as ``"0"``.
+    Used only inside the exporter; the emitted log carries clean numeric JSON.
+    """
+    s = str(s)
+    sense = None
+    lhs = rhs = ""
+    for token, name in _OPS:
+        if token in s:
+            lhs, rhs = s.split(token, 1)
+            sense = name
+            break
+    if sense is None:
+        raise ValueError(f"cannot parse inequality: {s!r}")
+    coeffs: dict[str, Fraction] = {}
+    lhs = lhs.strip()
+    if lhs and lhs != "0":
+        for term in lhs.split(" + "):
+            term = term.strip()
+            if "*" not in term:
+                if term in ("0", ""):
+                    continue
+                raise ValueError(f"cannot parse term: {term!r}")
+            cstr, var = term.split("*", 1)
+            coeffs[var.strip()] = _frac(cstr.strip())
+    return coeffs, sense, _frac(rhs.strip())
+
+
+def _farkas_steps_from(branch_ineqs: list, farkas: dict) -> tuple[list[dict], list[Fraction]]:
+    """Build ``(rows, m)`` for one infeasible branch from its ineqs + Farkas cert."""
+    rows: list[dict] = []
+    m: list[Fraction] = []
+    for entry in farkas["multipliers"]:
+        idx = int(entry["index"])
+        orientation = int(entry["orientation"])
+        coeffs, sense, rhs = _ineq_fields(branch_ineqs[idx])
+        a, strict, b = _oriented_row(coeffs, sense, rhs, orientation)
+        rows.append({"a": {k: _fs(v) for k, v in a.items()},
+                     "strict": bool(strict), "b": _fs(b)})
+        m.append(_frac(entry["multiplier"]))
+    return rows, m
+
+
+def export_asymptotic_cert(cert: dict, *, claim: Optional[str] = None) -> dict:
+    """Serialize a ``log_linarith`` PROVED asymptotic certificate.
+
+    The asymptotic goal is proved by reducing (via logs) to a linear system over
+    order-exponent variables and showing **every disjunction branch is
+    infeasible**, each branch carrying a Farkas combination.  This exporter emits
+    one ``branch_farkas`` step per branch; the checker re-verifies each branch's
+    Farkas contradiction independently.  The goal holds iff *all* branches
+    contradict.
+
+    ``cert`` is the ``log_linarith.log_linarith`` result (``proved=True`` with a
+    ``certificates`` list of ``{inequalities: [str], certificate: farkas}``), or
+    the ``evaluate`` ``"proved"`` payload whose ``certificate`` is that list.
+    """
+    branches = cert.get("certificates")
+    if branches is None and cert.get("verdict") == "proved":
+        branches = cert.get("certificate")
+    if not branches:
+        raise ValueError("no proved-branch certificates to export")
+
+    variables: set[str] = set()
+    steps: list[dict] = [None]  # placeholder for the goal step
+    for bi, branch in enumerate(branches):
+        ineq_strs = branch["inequalities"]
+        parsed = [
+            (lambda cs: {"coeffs": cs[0], "sense": cs[1], "rhs": cs[2]})(
+                _parse_inequality_str(s))
+            for s in ineq_strs
+        ]
+        for p in parsed:
+            variables.update(p["coeffs"])
+        rows, m = _farkas_steps_from(parsed, branch["certificate"])
+        steps.append({"op": "branch_farkas", "index": bi, "rows": rows,
+                      "m": [_fs(v) for v in m]})
+    steps[0] = {"op": "asymptotic_goal", "variables": sorted(variables),
+                "branches": len(branches),
+                "note": "goal proved iff every branch is Farkas-infeasible"}
+    return {
+        "format": FORMAT,
+        "kind": "asymptotic",
+        "claim": claim or "asymptotic goal proved: every log-linear branch is infeasible",
+        "steps": steps,
+        "meta": {"producer": "log_linarith.log_linarith",
+                 "cakeml_target": CAKEML_TARGET},
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Exporter: Wu's-method geometry certificate (geometry_algebraic).
+# --------------------------------------------------------------------------- #
+
+def _serialize_poly(p: Any) -> dict:
+    """Serialize a geometry_algebraic.Poly (``{monomial-tuple: Fraction}``)."""
+    return {"n": int(p.n),
+            "terms": [[list(m), _fs(Fraction(c))] for m, c in p.terms.items()]}
+
+
+def export_geometry_cert(cert: dict, *, points: dict, hypotheses: list,
+                         goal: dict, var_order: Optional[list] = None,
+                         claim: Optional[str] = None) -> dict:
+    """Serialize a Wu's-method PROVED geometry certificate.
+
+    The producer's ``prove`` result carries the characteristic set, goal
+    polynomials and pseudo-remainders only as *strings*, which cannot be
+    independently re-checked.  So this exporter re-imports the producer's
+    low-level polynomial builders to obtain the exact ``Poly`` objects (the
+    characteristic chain and the goal polynomials) for the SAME configuration and
+    serializes their monomial dictionaries.  The checker then RECOMPUTES the
+    successive pseudo-remainder with its own arithmetic and asserts it is exactly
+    the zero polynomial.
+
+    ``points``/``hypotheses``/``goal``/``var_order`` are the same inputs handed to
+    ``geometry_algebraic.prove``.
+    """
+    if not cert.get("proved"):
+        raise ValueError("only a proved (remainder==0) geometry cert is exportable")
+    from theoremata_tools.geometry_algebraic import (  # exporter-only import
+        _Coords, _goal_polys, _hypothesis_polys, triangulate,
+    )
+    co = _Coords(points, var_order)
+    chain = triangulate(_hypothesis_polys(list(hypotheses), co), co.n)
+    goal_polys = _goal_polys(goal, co)
+
+    nondeg = []
+    for p in sorted(chain, key=lambda q: q.class_index()):
+        v = p.class_index()
+        if v < 0:
+            continue
+        init = p.leading_coeff_in(v)
+        if not init.is_zero() and not init.is_const():
+            nondeg.append(_serialize_poly(init))
+
+    steps = [
+        {"op": "declare_ring", "nvars": int(co.n), "names": list(co.var_names)},
+        {"op": "characteristic_set", "polys": [_serialize_poly(p) for p in chain]},
+        {"op": "goal_polynomials", "polys": [_serialize_poly(p) for p in goal_polys]},
+        {"op": "non_degeneracy", "conditions": nondeg},
+        {"op": "assert_pseudo_remainders_zero"},
+    ]
+    return {
+        "format": FORMAT,
+        "kind": "wu_geometry",
+        "claim": claim or ("goal is an algebraic consequence of the hypotheses "
+                           "modulo the stated non-degeneracy conditions"),
+        "steps": steps,
+        "meta": {"producer": "geometry_algebraic.prove",
+                 "cakeml_target": CAKEML_TARGET},
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Exporter: subsumption certificate (optional).
+# --------------------------------------------------------------------------- #
+
+def export_subsumption_cert(subsumer: list, subsumed: list,
+                            substitution: dict, *,
+                            claim: Optional[str] = None) -> dict:
+    """Serialize a theta-subsumption relation ``subsumer.theta ⊆ subsumed``.
+
+    ``subsumer``/``subsumed`` are lists of literal strings; ``substitution`` maps
+    variable tokens to terms.  The checker re-applies ``theta`` and verifies every
+    substituted subsumer literal occurs in ``subsumed`` (sound clause subsumption:
+    if it holds, ``subsumer`` subsumes / is at least as general as ``subsumed``).
+    """
+    return {
+        "format": FORMAT,
+        "kind": "subsumption",
+        "claim": claim or "subsumer theta-subsumes subsumed",
+        "steps": [
+            {"op": "subsumption_relation",
+             "subsumer": [str(x) for x in subsumer],
+             "subsumed": [str(x) for x in subsumed],
+             "substitution": {str(k): str(v) for k, v in substitution.items()}},
+            {"op": "assert_theta_subsumes"},
+        ],
+        "meta": {"producer": "subsumption", "cakeml_target": CAKEML_TARGET},
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Self-contained polynomial arithmetic for the WU checker (no producer import).
+# --------------------------------------------------------------------------- #
+
+class _CheckPoly:
+    """Minimal multivariate poly over Fraction: ``{exponent-tuple: coeff}``.
+
+    A faithful, independent re-implementation of the arithmetic Wu's method
+    needs (pseudo-division), so the checker never trusts the producer's code.
+    """
+
+    __slots__ = ("n", "terms")
+
+    def __init__(self, n: int, terms: Optional[dict] = None):
+        self.n = n
+        self.terms: dict[tuple, Fraction] = {}
+        if terms:
+            for m, c in terms.items():
+                c = Fraction(c)
+                if c != 0:
+                    self.terms[tuple(m)] = c
+
+    def is_zero(self) -> bool:
+        return not self.terms
+
+    def __add__(self, other: "_CheckPoly") -> "_CheckPoly":
+        out = dict(self.terms)
+        for m, c in other.terms.items():
+            nc = out.get(m, Fraction(0)) + c
+            if nc == 0:
+                out.pop(m, None)
+            else:
+                out[m] = nc
+        return _CheckPoly(self.n, out)
+
+    def __neg__(self) -> "_CheckPoly":
+        return _CheckPoly(self.n, {m: -c for m, c in self.terms.items()})
+
+    def __sub__(self, other: "_CheckPoly") -> "_CheckPoly":
+        return self + (-other)
+
+    def __mul__(self, other: "_CheckPoly") -> "_CheckPoly":
+        out: dict[tuple, Fraction] = {}
+        for m1, c1 in self.terms.items():
+            for m2, c2 in other.terms.items():
+                m = tuple(a + b for a, b in zip(m1, m2))
+                nc = out.get(m, Fraction(0)) + c1 * c2
+                if nc == 0:
+                    out.pop(m, None)
+                else:
+                    out[m] = nc
+        return _CheckPoly(self.n, out)
+
+    def class_index(self) -> int:
+        cls = -1
+        for m in self.terms:
+            for i in range(self.n - 1, cls, -1):
+                if m[i] > 0:
+                    cls = i
+                    break
+        return cls
+
+    def degree_in(self, v: int) -> int:
+        return max((m[v] for m in self.terms), default=0)
+
+    def coeff_in(self, v: int, d: int) -> "_CheckPoly":
+        out: dict[tuple, Fraction] = {}
+        for m, c in self.terms.items():
+            if m[v] == d:
+                mm = list(m); mm[v] = 0
+                out[tuple(mm)] = c
+        return _CheckPoly(self.n, out)
+
+    def leading_coeff_in(self, v: int) -> "_CheckPoly":
+        return self.coeff_in(v, self.degree_in(v))
+
+    def mul_x_pow(self, v: int, k: int) -> "_CheckPoly":
+        if k == 0:
+            return self
+        out: dict[tuple, Fraction] = {}
+        for m, c in self.terms.items():
+            mm = list(m); mm[v] += k
+            out[tuple(mm)] = c
+        return _CheckPoly(self.n, out)
+
+
+def _deserialize_poly(obj: dict, nvars: int) -> _CheckPoly:
+    if not isinstance(obj, dict) or "terms" not in obj:
+        raise ValueError("malformed polynomial")
+    n = int(obj.get("n", nvars))
+    if n != nvars:
+        raise ValueError("polynomial arity mismatch")
+    terms: dict[tuple, Fraction] = {}
+    for entry in obj["terms"]:
+        exp, coeff = entry
+        exp = tuple(int(e) for e in exp)
+        if len(exp) != nvars or any(e < 0 for e in exp):
+            raise ValueError("malformed monomial")
+        terms[exp] = _frac(coeff)
+    return _CheckPoly(nvars, terms)
+
+
+def _pseudo_remainder(g: _CheckPoly, f: _CheckPoly, v: int) -> _CheckPoly:
+    df = f.degree_in(v)
+    if df == 0:
+        raise ValueError("divisor constant in variable")
+    lcf = f.leading_coeff_in(v)
+    r = g
+    span = g.degree_in(v) - df + 2 if g.degree_in(v) >= df else 0
+    for _ in range(span):
+        dr = r.degree_in(v)
+        if r.is_zero() or dr < df:
+            break
+        lcr = r.leading_coeff_in(v)
+        r = (lcf * r) - (lcr * f.mul_x_pow(v, dr - df))
+    return r
+
+
+def _wu_reduce(goal: _CheckPoly, chain: list[_CheckPoly]) -> _CheckPoly:
+    r = goal
+    for f in sorted(chain, key=lambda p: p.class_index(), reverse=True):
+        v = f.class_index()
+        if v < 0:
+            continue
+        if r.degree_in(v) >= f.degree_in(v):
+            r = _pseudo_remainder(r, f, v)
+        if r.is_zero():
+            break
+    return r
+
+
+# --------------------------------------------------------------------------- #
+# REFERENCE CHECKER.
+# --------------------------------------------------------------------------- #
+
+class _Reject(Exception):
+    """Raised to reject a certificate with a human-readable reason."""
+
+
+def _need(cond: bool, reason: str) -> None:
+    if not cond:
+        raise _Reject(reason)
+
+
+def _vec(values: Any) -> list[Fraction]:
+    _need(isinstance(values, list), "expected a list of rationals")
+    return [_frac(v) for v in values]
+
+
+# -- LP primal/dual handlers ------------------------------------------------- #
+
+def _h_lp_problem(step, ctx):
+    variables = step["variables"]
+    _need(isinstance(variables, list), "lp_problem: variables must be a list")
+    G = [_vec(r) for r in step["G"]]
+    h = _vec(step["h"])
+    c = _vec(step["c"])
+    _need(len(G) == len(h), "lp_problem: |G| != |h|")
+    _need(all(len(r) == len(variables) for r in G), "lp_problem: row width != #vars")
+    _need(len(c) == len(variables), "lp_problem: |c| != #vars")
+    ctx.update(G=G, h=h, c=c, variables=variables, sense=step.get("sense", "max"))
+
+
+def _h_dual_vector(step, ctx):
+    y = _vec(step["y"])
+    _need("G" in ctx, "dual_vector before lp_problem")
+    _need(len(y) == len(ctx["G"]), "dual_vector length != #rows")
+    ctx["y"] = y
+
+
+def _h_primal_vector(step, ctx):
+    x = _vec(step["x"])
+    _need(len(x) == len(ctx["variables"]), "primal_vector length != #vars")
+    ctx["x"] = x
+
+
+def _h_assert_dual_nonneg(step, ctx):
+    _need(all(v >= 0 for v in ctx["y"]), "dual y has a negative entry (y >= 0 violated)")
+
+
+def _h_assert_dual_feasible(step, ctx):
+    G, c, y = ctx["G"], ctx["c"], ctx["y"]
+    n = len(c)
+    gTy = [sum(G[k][j] * y[k] for k in range(len(G))) for j in range(n)]
+    _need(all(gTy[j] >= c[j] for j in range(n)),
+          "dual infeasible: (G^T y)_j >= c_j violated for some j")
+    ctx["gTy"] = gTy
+
+
+def _h_assert_primal_feasible(step, ctx):
+    G, h, x = ctx["G"], ctx["h"], ctx["x"]
+    _need(all(v >= 0 for v in x), "primal x has a negative entry (x >= 0 violated)")
+    for k in range(len(G)):
+        lhs = sum(G[k][j] * x[j] for j in range(len(x)))
+        _need(lhs <= h[k], f"primal infeasible: row {k} has G_k.x > h_k")
+
+
+def _h_assert_complementary_slackness(step, ctx):
+    G, h, x, y = ctx["G"], ctx["h"], ctx["x"], ctx["y"]
+    for k in range(len(G)):
+        slack = h[k] - sum(G[k][j] * x[j] for j in range(len(x)))
+        _need(y[k] * slack == 0, f"complementary slackness fails at row {k}")
+
+
+def _h_assert_strong_duality(step, ctx):
+    c, x, h, y = ctx["c"], ctx["x"], ctx["h"], ctx["y"]
+    cx = sum(c[j] * x[j] for j in range(len(x)))
+    hy = sum(h[k] * y[k] for k in range(len(h)))
+    _need(cx == hy, f"strong duality fails: c.x = {cx} != h.y = {hy}")
+    ctx["concluded"] = True
+
+
+def _h_assert_bound(step, ctx):
+    h, y = ctx["h"], ctx["y"]
+    hy = sum(h[k] * y[k] for k in range(len(h)))
+    _need(hy == _frac(step["bound"]), f"bound mismatch: h.y = {hy} != {step['bound']}")
+    if "x" in ctx:
+        cx = sum(ctx["c"][j] * ctx["x"][j] for j in range(len(ctx["x"])))
+        _need(cx <= hy, "claimed bound is not an upper bound on c.x")
+    ctx["concluded"] = True
+
+
+# -- Farkas handlers (shared by lp_farkas and asymptotic branches) ----------- #
+
+def _check_farkas(rows: Any, m: Any) -> None:
+    """Re-verify a Farkas infeasibility: m>=0, sum m_k a_k == 0, sum m_k b_k < 0."""
+    _need(isinstance(rows, list) and isinstance(m, list), "farkas: rows/m must be lists")
+    _need(len(rows) == len(m), "farkas: #rows != #multipliers")
+    mult = [_frac(v) for v in m]
+    _need(all(v >= 0 for v in mult), "farkas: a multiplier is negative")
+    combo: dict[str, Fraction] = {}
+    b_sum = Fraction(0)
+    strict = False
+    for row, mk in zip(rows, mult):
+        _need(isinstance(row, dict), "farkas: malformed row")
+        a = {str(k): _frac(v) for k, v in dict(row.get("a", {})).items()}
+        b = _frac(row["b"])
+        for var, coeff in a.items():
+            combo[var] = combo.get(var, Fraction(0)) + mk * coeff
+        b_sum += mk * b
+        if bool(row.get("strict")) and mk > 0:
+            strict = True
+    combo = {k: v for k, v in combo.items() if v != 0}
+    _need(not combo, f"farkas: combination is not the zero row (residual {combo})")
+    if strict:
+        _need(b_sum <= 0, f"farkas: strict combination needs rhs <= 0, got {b_sum}")
+    else:
+        _need(b_sum < 0, f"farkas: combination needs rhs < 0, got {b_sum}")
+
+
+def _h_farkas_system(step, ctx):
+    ctx["farkas_rows"] = step["rows"]
+
+
+def _h_farkas_multipliers(step, ctx):
+    ctx["farkas_m"] = step["m"]
+
+
+def _h_assert_multipliers_nonneg(step, ctx):
+    _need(all(_frac(v) >= 0 for v in ctx["farkas_m"]), "a multiplier is negative")
+
+
+def _h_assert_combination_zero(step, ctx):
+    # Recompute the combination independently and stash whether it is zero.
+    combo: dict[str, Fraction] = {}
+    mult = [_frac(v) for v in ctx["farkas_m"]]
+    _need(len(mult) == len(ctx["farkas_rows"]), "combination: #rows != #m")
+    for row, mk in zip(ctx["farkas_rows"], mult):
+        for var, coeff in dict(row.get("a", {})).items():
+            combo[str(var)] = combo.get(str(var), Fraction(0)) + mk * _frac(coeff)
+    combo = {k: v for k, v in combo.items() if v != 0}
+    _need(not combo, f"combination is not the zero row (residual {combo})")
+
+
+def _h_assert_contradiction(step, ctx):
+    # Full independent re-check (also re-verifies nonneg + zero combination).
+    _check_farkas(ctx["farkas_rows"], ctx["farkas_m"])
+    ctx["concluded"] = True
+
+
+# -- asymptotic handlers ----------------------------------------------------- #
+
+def _h_asymptotic_goal(step, ctx):
+    ctx["expected_branches"] = int(step["branches"])
+    ctx["seen_branches"] = 0
+    _need(ctx["expected_branches"] >= 1, "asymptotic: need at least one branch")
+
+
+def _h_branch_farkas(step, ctx):
+    _check_farkas(step["rows"], step["m"])
+    ctx["seen_branches"] = ctx.get("seen_branches", 0) + 1
+    # The goal is proved only once EVERY branch has contradicted.
+    if ctx["seen_branches"] >= ctx.get("expected_branches", 0):
+        ctx["concluded"] = True
+
+
+# -- Wu geometry handlers ---------------------------------------------------- #
+
+def _h_declare_ring(step, ctx):
+    ctx["nvars"] = int(step["nvars"])
+    ctx["names"] = list(step["names"])
+    _need(len(ctx["names"]) == ctx["nvars"], "declare_ring: #names != nvars")
+
+
+def _h_characteristic_set(step, ctx):
+    ctx["chain"] = [_deserialize_poly(p, ctx["nvars"]) for p in step["polys"]]
+
+
+def _h_goal_polynomials(step, ctx):
+    ctx["goal_polys"] = [_deserialize_poly(p, ctx["nvars"]) for p in step["polys"]]
+
+
+def _h_non_degeneracy(step, ctx):
+    # Well-formedness: each non-degeneracy initial must be a non-zero polynomial.
+    for p in step.get("conditions", []):
+        poly = _deserialize_poly(p, ctx["nvars"])
+        _need(not poly.is_zero(), "non-degeneracy condition is the zero polynomial")
+
+
+def _h_assert_pseudo_remainders_zero(step, ctx):
+    chain = ctx.get("chain")
+    goals = ctx.get("goal_polys")
+    _need(chain is not None and goals is not None,
+          "pseudo-remainder check before chain/goal declared")
+    _need(len(goals) >= 1, "no goal polynomials to reduce")
+    for i, g in enumerate(goals):
+        rem = _wu_reduce(g, chain)
+        _need(rem.is_zero(),
+              f"goal polynomial {i} has NONZERO pseudo-remainder "
+              f"(#terms={len(rem.terms)}); not an algebraic consequence")
+    ctx["concluded"] = True
+
+
+# -- subsumption handlers ---------------------------------------------------- #
+
+def _apply_theta(literal: str, theta: dict[str, str]) -> str:
+    import re
+    def repl(match):
+        tok = match.group(0)
+        return theta.get(tok, tok)
+    return re.sub(r"[A-Za-z_][A-Za-z0-9_]*", repl, literal)
+
+
+def _h_subsumption_relation(step, ctx):
+    ctx["subsumer"] = [str(x) for x in step["subsumer"]]
+    ctx["subsumed"] = [str(x) for x in step["subsumed"]]
+    ctx["theta"] = {str(k): str(v) for k, v in dict(step["substitution"]).items()}
+
+
+def _h_assert_theta_subsumes(step, ctx):
+    target = set(ctx["subsumed"])
+    for lit in ctx["subsumer"]:
+        sub = _apply_theta(lit, ctx["theta"])
+        _need(sub in target,
+              f"subsumption fails: literal {lit!r} -> {sub!r} not in subsumed set")
+    ctx["concluded"] = True
+
+
+_HANDLERS = {
+    "lp_problem": _h_lp_problem,
+    "dual_vector": _h_dual_vector,
+    "primal_vector": _h_primal_vector,
+    "assert_dual_nonneg": _h_assert_dual_nonneg,
+    "assert_dual_feasible": _h_assert_dual_feasible,
+    "assert_primal_feasible": _h_assert_primal_feasible,
+    "assert_complementary_slackness": _h_assert_complementary_slackness,
+    "assert_strong_duality": _h_assert_strong_duality,
+    "assert_bound": _h_assert_bound,
+    "farkas_system": _h_farkas_system,
+    "farkas_multipliers": _h_farkas_multipliers,
+    "assert_multipliers_nonneg": _h_assert_multipliers_nonneg,
+    "assert_combination_zero": _h_assert_combination_zero,
+    "assert_contradiction": _h_assert_contradiction,
+    "asymptotic_goal": _h_asymptotic_goal,
+    "branch_farkas": _h_branch_farkas,
+    "declare_ring": _h_declare_ring,
+    "characteristic_set": _h_characteristic_set,
+    "goal_polynomials": _h_goal_polynomials,
+    "non_degeneracy": _h_non_degeneracy,
+    "assert_pseudo_remainders_zero": _h_assert_pseudo_remainders_zero,
+    "subsumption_relation": _h_subsumption_relation,
+    "assert_theta_subsumes": _h_assert_theta_subsumes,
+}
+
+# Which ops are legal in which kind (a step from the wrong kind is rejected).
+_KIND_OPS = {
+    "lp_primal_dual": {"lp_problem", "dual_vector", "primal_vector",
+                       "assert_dual_nonneg", "assert_dual_feasible",
+                       "assert_primal_feasible", "assert_complementary_slackness",
+                       "assert_strong_duality", "assert_bound"},
+    "lp_farkas": {"farkas_system", "farkas_multipliers",
+                  "assert_multipliers_nonneg", "assert_combination_zero",
+                  "assert_contradiction"},
+    "asymptotic": {"asymptotic_goal", "branch_farkas"},
+    "wu_geometry": {"declare_ring", "characteristic_set", "goal_polynomials",
+                    "non_degeneracy", "assert_pseudo_remainders_zero"},
+    "subsumption": {"subsumption_relation", "assert_theta_subsumes"},
+}
+
+
+def check_cert_log(log: Any) -> dict:
+    """Independently RE-VERIFY a cert-log document.
+
+    Returns ``{valid: bool, reason: str, checked_steps: int, kind, claim}``.
+    Recomputes every assertion from the raw rationals in the log with exact
+    arithmetic; it never trusts a producer's own verdict.  Any malformed,
+    tampered, or unsatisfied step yields ``valid=False`` with a ``reason`` — this
+    is the sound boundary.
+    """
+    checked = 0
+    try:
+        _need(isinstance(log, dict), "log is not a JSON object")
+        _need(log.get("format") == FORMAT, f"unknown format: {log.get('format')!r}")
+        kind = log.get("kind")
+        _need(kind in KINDS, f"unknown kind: {kind!r}")
+        steps = log.get("steps")
+        _need(isinstance(steps, list) and steps, "steps must be a non-empty list")
+        _need(isinstance(log.get("claim", ""), str), "claim must be a string")
+        allowed = _KIND_OPS[kind]
+
+        ctx: dict[str, Any] = {"concluded": False}
+        for i, step in enumerate(steps):
+            _need(isinstance(step, dict), f"step {i} is not an object")
+            op = step.get("op")
+            _need(op in _HANDLERS, f"step {i}: unknown op {op!r}")
+            _need(op in allowed, f"step {i}: op {op!r} illegal for kind {kind!r}")
+            try:
+                _HANDLERS[op](step, ctx)
+            except _Reject:
+                raise
+            except (KeyError, IndexError, TypeError, ValueError, ZeroDivisionError) as exc:
+                raise _Reject(f"step {i} ({op}): malformed data ({exc})")
+            checked += 1
+
+        _need(ctx.get("concluded"), "log reached no verified conclusion step")
+        if kind == "asymptotic":
+            _need(ctx.get("seen_branches") == ctx.get("expected_branches"),
+                  "asymptotic: branch count mismatch")
+        return {"valid": True, "reason": "all steps independently re-verified",
+                "checked_steps": checked, "kind": kind, "claim": log.get("claim")}
+    except _Reject as exc:
+        return {"valid": False, "reason": str(exc), "checked_steps": checked,
+                "kind": log.get("kind") if isinstance(log, dict) else None,
+                "claim": log.get("claim") if isinstance(log, dict) else None}
+
+
+# --------------------------------------------------------------------------- #
+# Worker dispatch.
+# --------------------------------------------------------------------------- #
+
+def run(request: dict) -> dict:
+    """Worker entrypoint.  ``request["op"]`` is ``export`` or ``check``.
+
+    * ``export`` -> serialize a producer certificate to a cert-log document.
+      Requires ``kind`` and ``cert`` (the producer result); LP/geometry also
+      need the original problem inputs (``constraints``/``objective`` or
+      ``points``/``hypotheses``/``goal``).  Returns ``{"log": <document>}``.
+    * ``check`` -> ``check_cert_log(request["log"])``.
+    """
+    op = request.get("op", "check")
+    if op == "check":
+        return check_cert_log(request["log"])
+    if op == "export":
+        kind = request.get("kind")
+        cert = request.get("cert", {})
+        if kind in ("lp", "lp_primal_dual", "lp_farkas"):
+            log = export_lp_cert(cert, constraints=request["constraints"],
+                                 objective=request.get("objective"),
+                                 sense=request.get("sense", "max"),
+                                 claim=request.get("claim"))
+        elif kind == "asymptotic":
+            log = export_asymptotic_cert(cert, claim=request.get("claim"))
+        elif kind in ("wu_geometry", "geometry"):
+            log = export_geometry_cert(cert, points=request["points"],
+                                       hypotheses=request.get("hypotheses", []),
+                                       goal=request["goal"],
+                                       var_order=request.get("var_order"),
+                                       claim=request.get("claim"))
+        elif kind == "subsumption":
+            log = export_subsumption_cert(request["subsumer"], request["subsumed"],
+                                          request["substitution"],
+                                          claim=request.get("claim"))
+        else:
+            raise ValueError(f"unknown export kind: {kind!r}")
+        return {"log": log}
+    raise ValueError(f"unknown op: {op!r}")
+
+
+def main() -> None:
+    import sys
+    if len(sys.argv) >= 2:
+        with open(sys.argv[1], encoding="utf-8") as fh:
+            request = json.load(fh)
+    else:
+        request = json.load(sys.stdin)
+    print(json.dumps(run(request), indent=2, default=str))
+    raise SystemExit(0)
+
+
+if __name__ == "__main__":
+    main()
