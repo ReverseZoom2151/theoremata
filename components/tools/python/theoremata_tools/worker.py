@@ -201,6 +201,10 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.novelty import run as novelty_run
 
         return novelty_run(request)
+    if tool == "conjecture_discovery":
+        from theoremata_tools.conjecture_discovery import run as conjecture_discovery_run
+
+        return conjecture_discovery_run(request)
     if tool == "cascade":
         from theoremata_tools.cascade import run as cascade_run
 
