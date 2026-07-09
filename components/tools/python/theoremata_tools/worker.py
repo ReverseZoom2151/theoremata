@@ -68,6 +68,10 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         return grader_run(request["request"])
     if tool == "eval":
         return eval_run(request["request"])
+    if tool == "eval_execution":
+        from theoremata_tools.eval_execution import run as eval_execution_run
+
+        return eval_execution_run(request)
     if tool == "evolve":
         from .evolve import run as evolve_run
 
