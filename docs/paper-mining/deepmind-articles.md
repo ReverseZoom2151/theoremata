@@ -146,4 +146,48 @@ Deferred-by-necessity (same as the rest of the project): trained formalizer /
 aux-proposer weights and AlphaGeometry-scale synthetic-data generation (GPU +
 model), a live real-model run.
 
+## Build status (2026-07-09) — items 1-3 BUILT + a planning build
+
+All three buildable gaps shipped (offline, injected seams), plus a fourth from
+the 2026 SOTA research pass:
+
+- **#1 FunSearch → built as `tools/funsearch.py`** — and upgraded to its successor
+  **AlphaEvolve** (DeepMind May 2025, Tao-co-designed): island populations + a
+  **MAP-Elites archive** (`population=map_elites`), best-shot prompting,
+  keep-only-passing, complexity bias, migration. Candidate code never exec'd
+  in-process (evaluator seam is the sole boundary). Worker op `funsearch`. 19 tests.
+- **#2 Conjecture-discovery → built as `train/conjecture_discovery.py`** — the
+  4-stage recipe (build_dataset → detect_relationship vs permuted baseline →
+  permutation-importance attribution → propose_conjecture); the `form` feeds
+  novelty/falsify. Offline closed-form fallback. Worker op `conjecture_discovery`.
+  19 tests.
+- **#3 AlphaTensor game → built as `search/discovery_game.rs`** — DiscoveryGame
+  trait + Certificate soundness boundary; self-contained A* (reconstructs the
+  move sequence, prefers lowest-cost among certified terminals) + MCGS cross-check;
+  ResidualGame/TensorGame fixture. 8 tests.
+- **NEW (planning) — blueprint generation + refinement → `orchestration/blueprint_generate.rs`**:
+  the 2026 literature names *planning* as the bottleneck (["Why Reasoning Fails to
+  Plan" 2601.22311], Goedel-Architect blueprint generation+refinement). We drove
+  blueprints (`blueprint_run`) but didn't generate/refine them. BlueprintGenerator
+  (informal → acyclic \uses DAG) + BlueprintRefiner (decompose Failed lemmas,
+  preserve Proved) + the bounded generate→drive→refine loop (acyclicity gated by
+  the driver's cycle check; non-decreasing coverage). 7 tests.
+
+### 2026 SOTA research notes (from an online pass)
+- **AlphaEvolve** is the current FunSearch successor (whole-codebase evolution,
+  MAP-Elites) — folded into #1.
+- **Test-Time RL** (AlphaProof): generate + learn from millions of problem
+  variants at inference for problem-specific adaptation — NEW technique, GPU-gated;
+  variant-generation scaffold is buildable.
+- **MDP / statistical-provability** formalization of proof search (2602.10538) —
+  theory for our MCGS + TTC controller.
+- Frontier: Aristotle & Seed-Prover reached **IMO 2025 gold** (AlphaProof was
+  silver); Formal-Conjectures benchmark for verified discovery.
+
+### Still remaining from these articles
+- **#4 Cross-tree knowledge sharing in MCGS (AG2 SKEST)** — [ADJUSTMENT] general
+  MCGS version still unbuilt (geometry DDAR2 `clone()` is a local partial).
+- Deferred-by-necessity: trained weights / AlphaGeometry-scale data (GPU+model),
+  a live real-model run, and Test-Time RL's actual training loop.
+
 See [[theoremata-paper-mining]] and the parent `docs/paper-mining/README.md`.
