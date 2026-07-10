@@ -277,7 +277,18 @@ pub fn repair_proof(
     for round in 0..config.rounds {
         let seed = round_seed(config.seed, round);
         let failing_step = localize_failing_step(&current, &current_error);
-        let candidates = repairer.repair(&current, &current_error, seed);
+        // Hand the repairer a span-marked view of the error (Kimina-style: the
+        // offending line marked with context), without mutating `current_error`
+        // so `rounds`/`final_error` stay canonical.
+        let marked = crate::prover::statement_preservation::format_error_spans(
+            &current,
+            &[crate::prover::statement_preservation::LeanError::new(
+                current_error.span.as_ref().map(|s| s.line + 1).unwrap_or(0),
+                current_error.message.clone(),
+            )],
+        );
+        let error_for_repair = VerifyError::new(marked, current_error.span.clone());
+        let candidates = repairer.repair(&current, &error_for_repair, seed);
 
         // Single verify per candidate: take the first that passes; otherwise
         // remember the first that at least *changed* the proof (to advance).
