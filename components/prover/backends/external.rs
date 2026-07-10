@@ -407,6 +407,8 @@ impl FormalBackend for ExternalBackend {
                     findings.push(format!("{needle}: {reason}"));
                 }
             }
+        } else if self.system == FormalSystem::Metamath {
+            findings.extend(metamath_source_findings(code));
         }
         Ok(ScanReport {
             clean: findings.is_empty(),
@@ -414,6 +416,57 @@ impl FormalBackend for ExternalBackend {
             detail: json!({"system": self.system.as_str(), "fallback": true}),
         })
     }
+}
+
+/// Conservative lexical scan for the Metamath trust holes the kernel check
+/// cannot see. Over-flagging is safe here: it only makes the gate stricter.
+///
+/// A generated Metamath proof is trusted only when it merely *discharges* goals
+/// against the loaded (reviewed) `set.mm` database via the kernel's proof check.
+/// The findings below each mark a construct that bypasses or widens that base:
+///   * a bare `$a` axiomatic assertion introduced by the generated proof widens
+///     the trusted base (a new axiom, not a reuse of the loaded database);
+///   * a `?` placeholder step is an unproven proof — the Metamath analogue of
+///     Lean's `sorry`/Coq's `admit` (an `$p ... $= ? $.` incomplete proof);
+///   * a `$[ file $]` include that escapes the workspace (absolute path, a `..`
+///     parent-dir component, or a drive/root prefix) points at an untrusted,
+///     out-of-tree database (path traversal).
+fn metamath_source_findings(code: &str) -> Vec<String> {
+    use std::path::Component;
+    let mut findings = Vec::new();
+    // `$a` is a keyword token; any occurrence in the generated source introduces
+    // an axiom rather than reusing the loaded database.
+    if code.contains("$a") {
+        findings.push(
+            "$a: generated proof introduces an axiomatic assertion, widening the trusted base"
+                .to_string(),
+        );
+    }
+    // In Metamath, `?` is exclusively the incomplete-proof marker, so any bare
+    // `?` token disqualifies the proof.
+    if code.split(|c: char| c.is_whitespace()).any(|tok| tok == "?") {
+        findings.push(
+            "?: incomplete `$p ... $= ? $.` proof contains an unproven placeholder step"
+                .to_string(),
+        );
+    }
+    // An include that leaves the workspace/set.mm tree is untrusted.
+    for include in metamath_includes(code) {
+        let escapes = include.is_absolute()
+            || include.components().any(|c| {
+                matches!(
+                    c,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            });
+        if escapes {
+            findings.push(format!(
+                "$[ {} $]: include points outside the workspace/set.mm (path traversal / untrusted include)",
+                include.display()
+            ));
+        }
+    }
+    findings
 }
 
 fn metamath_includes(code: &str) -> Vec<PathBuf> {
@@ -454,5 +507,90 @@ impl ProofSession for ExternalBackend {
             goals: vec![],
             detail: json!({"system": self.system.as_str()}),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // GAP 1 — Metamath source scan. These exercise the pure lexical helper
+    // directly, so they are deterministic regardless of whether the Python
+    // `source_scan` worker is present.
+
+    #[test]
+    fn metamath_placeholder_proof_is_flagged() {
+        // A `?` step = an unproven proof (the Metamath `sorry`).
+        let findings = metamath_source_findings("$[ set.mm $]\nfoo $p wff ph $= ? $.\n");
+        assert!(
+            findings.iter().any(|f| f.starts_with("?:")),
+            "a `?` placeholder step must be flagged: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn metamath_generated_axiom_is_flagged() {
+        // A generated `$a` widens the trusted base beyond the loaded database.
+        let findings = metamath_source_findings("badax $a |- ph $.\n");
+        assert!(
+            findings.iter().any(|f| f.starts_with("$a:")),
+            "a generated `$a` axiom must be flagged: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn metamath_outside_include_is_flagged() {
+        // `..` parent-dir traversal and absolute/root includes both escape.
+        for src in ["$[ ../evil.mm $]\n", "$[ /etc/passwd $]\n"] {
+            let findings = metamath_source_findings(src);
+            assert!(
+                findings.iter().any(|f| f.contains("path traversal")),
+                "an out-of-workspace include must be flagged: {src:?} -> {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn metamath_clean_proof_passes() {
+        // Reuses the loaded database via a normal relative include and a complete
+        // `$= ... $.` proof with no placeholder and no new axiom.
+        let findings = metamath_source_findings("$[ set.mm $]\nmp2 $p |- ph $= wph wps mp1 mp3 $.\n");
+        assert!(findings.is_empty(), "clean proof must not flag: {findings:?}");
+    }
+
+    #[test]
+    fn metamath_source_scan_flags_and_passes_via_backend() {
+        // Same behavior through the backend's `source_scan` entry point (mock).
+        let cfg = crate::config::Config::default();
+        let backend = ExternalBackend::new(&cfg, FormalSystem::Metamath, true);
+        // The built-in fallback only runs when the Python worker is absent; guard
+        // the assertions on that so the test stays deterministic in either env.
+        if crate::prover::formal::worker_source_scan(FormalSystem::Metamath, "$a |- ph $.\n")
+            .is_none()
+        {
+            assert!(!backend.source_scan("bad $a |- ph $.\n").unwrap().clean);
+            assert!(backend
+                .source_scan("$[ set.mm $]\nt $p |- ph $= a b c $.\n")
+                .unwrap()
+                .clean);
+        }
+    }
+
+    // GAP 2 — a MOCK (toolchain-absent) check must NEVER be a LIVE certification
+    // (audit invariant #2). Downstream only grants `FormallyVerified` when both
+    // `report.lexically_verified && report.live` hold (agent.rs), so the mock
+    // report carrying `live == false` is what keeps mock proofs out of it.
+
+    #[test]
+    fn mock_async_verification_is_not_live() {
+        let cfg = crate::config::Config::default();
+        let backend = ExternalBackend::new(&cfg, FormalSystem::Metamath, true);
+        let report = backend
+            .verify(&cfg, "$c wff |- $.\n$v ph $.\nph $f wff ph $.\n", "some statement")
+            .expect("mock verify should not error");
+        assert!(
+            !report.live,
+            "a mock verification must never be a live certification"
+        );
     }
 }
