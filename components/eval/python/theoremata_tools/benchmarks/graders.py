@@ -210,7 +210,107 @@ def _run_comparator(
             }
 
 
+def _formal_system(item: dict[str, Any]) -> str:
+    """Identify the formal system of a formalization item so grading never
+    applies a Lean-only comparator to Agda/Metamath syntax.
+
+    We read the loader-set signals (``grading.method`` / ``expected.mode`` /
+    ``provenance.corpus``) rather than assume every ``kind == "formalization"``
+    item is Lean. Returns ``"agda"``, ``"metamath"``, or ``"lean"`` (default).
+    """
+    expected = item.get("expected") or {}
+    grading = item.get("grading") or {}
+    prov = item.get("provenance") or {}
+    hints = " ".join(
+        str(x).lower()
+        for x in (
+            grading.get("system"),
+            expected.get("system"),
+            grading.get("method"),
+            expected.get("mode"),
+            prov.get("corpus"),
+        )
+        if x
+    )
+    if "agda" in hints or "1lab" in hints:
+        return "agda"
+    if "metamath" in hints:
+        return "metamath"
+    return "lean"
+
+
+def _grade_nonlean_formalization(
+    item: dict[str, Any], response: str, system: str
+) -> dict[str, Any]:
+    """Language-appropriate grading for a non-Lean formalization item.
+
+    Never runs the Lean comparator, the Lean ``:=`` statement split, or the Lean
+    ``sorry``/``#print axioms`` gate. When the item has no gold formal statement
+    (to-be-formalized corpora such as 1Lab), it is marked *not auto-gradable*
+    instead of being spuriously scored. When a gold formal statement exists
+    (e.g. a Metamath ``$p`` assertion), correctness is a language-agnostic
+    whitespace-normalized comparison; a live typecheck/verifier is still needed
+    for a real pass.
+    """
+    expected = item.get("expected") or {}
+    grading = item.get("grading") or {}
+    expected_formal = expected.get("formal_statement") or item.get("formal") or ""
+    response = response or ""
+    is_solved = bool(response.strip())
+    gold_present = bool(expected.get("gold_present", bool(expected_formal)))
+    auto_gradable = bool(grading.get("auto_gradable", gold_present))
+
+    if not expected_formal or not gold_present or not auto_gradable:
+        return {
+            "is_solved": is_solved,
+            "is_correct": False,
+            "detail": {
+                "track": "formalization",
+                "system": system,
+                "method": f"{system}_not_auto_gradable",
+                "auto_gradable": False,
+                "gold_present": gold_present,
+                "statement_preserved": None,
+                "comparator": None,
+                "invoked": False,
+                "note": (
+                    f"{system} formalization item has no gold formal statement to "
+                    f"compare against; a real pass requires a live {system} "
+                    "typecheck/verifier. Not auto-gradable — the Lean grader is "
+                    "deliberately NOT applied."
+                ),
+            },
+        }
+
+    exp_n = _normalize_lean(expected_formal)
+    resp_n = _normalize_lean(response)
+    preserved = bool(exp_n) and exp_n in resp_n
+    return {
+        "is_solved": is_solved,
+        "is_correct": preserved,
+        "detail": {
+            "track": "formalization",
+            "system": system,
+            "method": f"{system}_statement_match",
+            "statement_preserved": preserved,
+            "auto_gradable": True,
+            "gold_present": True,
+            "comparator": None,
+            "invoked": False,
+            "note": (
+                f"{system} statement graded by a language-agnostic normalized "
+                f"comparison (no Lean syntax assumed); a verified pass requires "
+                f"the {system} backend."
+            ),
+        },
+    }
+
+
 def grade_formalization(item: dict[str, Any], response: str) -> dict[str, Any]:
+    system = _formal_system(item)
+    if system != "lean":
+        return _grade_nonlean_formalization(item, response, system)
+
     expected = item.get("expected") or {}
     expected_formal = expected.get("formal_statement") or item.get("formal") or ""
     whitelist = expected.get("axioms_whitelist") or []
@@ -231,6 +331,7 @@ def grade_formalization(item: dict[str, Any], response: str) -> dict[str, Any]:
             "is_correct": bool(cmp.get("ok")),
             "detail": {
                 "track": "formalization",
+                "system": "lean",
                 "method": "comparator",
                 "statement_preserved": bool(cmp.get("ok")),
                 "axioms_ok": bool(cmp.get("ok")),
@@ -249,6 +350,7 @@ def grade_formalization(item: dict[str, Any], response: str) -> dict[str, Any]:
         "is_correct": is_correct,
         "detail": {
             "track": "formalization",
+            "system": "lean",
             "method": "comparator" if comparator else "statement+axioms",
             "statement_preserved": preserved,
             "axioms_ok": axioms_ok,

@@ -305,6 +305,110 @@ def test_formalization_uses_comparator_failure(monkeypatch, tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# Formalization grader — per-system routing (audit finding #10)
+# --------------------------------------------------------------------------- #
+
+def _agda_1lab_item():
+    # mirrors load_1lab(): kind=formalization, no gold formal, not auto-gradable
+    return make_item(
+        id="1lab:Foo.Bar", kind="formalization", informal="Agda module Foo.Bar",
+        formal=None,
+        expected={"mode": "agda_typecheck", "gold_present": False,
+                  "axioms_whitelist": ["propext"]},
+        grading={"track": "formalization", "method": "agda_typecheck",
+                 "auto_gradable": False},
+        provenance={"corpus": "1lab", "module": "Foo.Bar"},
+    )
+
+
+def _metamath_item():
+    # mirrors load_metamath_100(): kind=formalization, gold formal present
+    return make_item(
+        id="metamath:mp2", kind="formalization", informal="Metamath theorem mp2",
+        formal="|- ph => |- ps => |- ch",
+        expected={"mode": "metamath_verify", "gold_present": True},
+        grading={"track": "formalization", "method": "metamath_verify",
+                 "auto_gradable": True},
+        provenance={"corpus": "metamath_100", "label": "mp2"},
+    )
+
+
+def test_agda_item_not_graded_by_lean_comparator(monkeypatch, tmp_path):
+    # Even with a Lean comparator configured, an Agda item must NOT invoke it,
+    # and must not be spuriously scored (1Lab is to-be-formalized: no gold).
+    comparator = tmp_path / "fake-comparator"
+    marker = tmp_path / "agda-called.txt"
+    comparator.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, sys\n"
+        f"pathlib.Path({str(marker)!r}).write_text('called')\n"
+        "raise SystemExit(0)\n",
+        encoding="utf-8",
+    )
+    comparator.chmod(0o755)
+    monkeypatch.setenv("THEOREMATA_COMPARATOR", str(comparator))
+
+    res = grade(_agda_1lab_item(), "postulate foo : Set")
+    assert res["detail"]["system"] == "agda"
+    assert res["detail"]["method"] != "comparator"
+    assert res["detail"]["auto_gradable"] is False
+    assert res["is_correct"] is False
+    # the Lean comparator was never spawned for an Agda item
+    assert not marker.exists()
+
+
+def test_metamath_item_graded_language_agnostic_not_lean():
+    # Metamath has a gold formal statement → language-agnostic normalized match,
+    # NOT the Lean `:=` split / sorry gate.
+    item = _metamath_item()
+    ok = grade(item, "prefix |- ph => |- ps => |- ch suffix")
+    assert ok["detail"]["system"] == "metamath"
+    assert ok["detail"]["method"] == "metamath_statement_match"
+    assert ok["is_correct"] is True
+    # a "sorry" that would trip the Lean axiom gate is irrelevant here: the
+    # statement simply is not present, so it is judged incorrect for the right
+    # reason (no Lean-specific token handling)
+    bad = grade(item, "totally different statement with sorry in it")
+    assert bad["is_correct"] is False
+    assert bad["detail"]["method"] == "metamath_statement_match"
+
+
+def test_lean_formalization_still_uses_lean_path_no_regression():
+    stmt = "theorem MainTheorem (n : Nat) : n = n := by"
+    item = make_item(
+        id="f", kind="formalization", informal="", formal=stmt,
+        expected={"formal_statement": stmt, "lean_name": "Foo.MainTheorem",
+                  "axioms_whitelist": ["propext", "Quot.sound", "Classical.choice"]},
+        grading={"track": "formalization", "method": "comparator_or_statement"},
+    )
+    res = grade(item, "theorem MainTheorem (n : Nat) : n = n := by exact rfl")
+    assert res["detail"]["system"] == "lean"
+    assert res["detail"]["method"] in {"comparator", "statement+axioms"}
+    assert res["is_correct"] is True
+    # Lean sorry gate still fires
+    assert grade(item, "theorem MainTheorem (n : Nat) : n = n := by sorry")["is_correct"] is False
+
+
+def test_to_be_formalized_item_not_spuriously_scored():
+    # Echoing the informal text back must never yield a pass for a no-gold item.
+    res = grade(_agda_1lab_item(), "Agda module Foo.Bar")
+    assert res["is_correct"] is False
+    assert res["detail"]["auto_gradable"] is False
+    assert res["detail"]["statement_preserved"] is None
+
+
+def test_agda_and_metamath_load_and_grade_if_present():
+    for name, system in (("1lab", "agda"), ("metamath_100", "metamath")):
+        if not _corpus_present(name):
+            continue
+        items = load_benchmark(name)
+        assert len(items) > 0
+        res = grade(items[0], "some response text")
+        assert res["detail"]["system"] == system
+        assert res["detail"]["method"] != "comparator"
+
+
+# --------------------------------------------------------------------------- #
 # Falsification grader
 # --------------------------------------------------------------------------- #
 
