@@ -86,15 +86,21 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install available formal toolchains
+        env:
+          # `agda` pulls emacs -> postfix/mailutils, whose debconf prompt blocks
+          # a non-interactive runner even with `-y`. Force noninteractive and skip
+          # recommends so only the Agda binary + libraries are installed (also far
+          # faster: no emacs/postfix/ghc-doc bloat).
+          DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update
-          sudo apt-get install -y agda
+          sudo apt-get install -y --no-install-recommends agda
           # Ubuntu images do not all carry a Metamath package. The test remains
           # a clean self-skip when it is unavailable, while Agda is exercised
           # on every run. Deployments can point THEOREMATA_METAMATH_COMMAND at
           # a locally built `metamath` binary.
           if apt-cache show metamath >/dev/null 2>&1; then
-            sudo apt-get install -y metamath
+            sudo apt-get install -y --no-install-recommends metamath
           fi
 
       - name: Agda live gate
