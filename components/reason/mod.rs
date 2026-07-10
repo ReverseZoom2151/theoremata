@@ -19,7 +19,7 @@ pub use search::{
 };
 pub use proving::{
     blueprint, conjecture_engine, decompose, definition_synthesis, evolve_sketch, falsification,
-    formal_generate, formalize_portfolio, library, mathlib_export, optimize, portfolio, repair, retry,
-    router, sketch,
+    formal_generate, formalize_portfolio, library, mathlib_export, optimize, portfolio, refine_ops,
+    repair, retry, router, sketch,
 };
 pub use critique::{critic, guard, memory, plan_history, taint};
