@@ -433,11 +433,16 @@ pub trait FormalBackend {
         let kernel_clean = compile.compiled && recheck.rechecked;
         // Anti-cheat: the existing mention check, tightened to reject a proof
         // spliced onto a WEAKENED/renamed/trivially-restated statement -- but only
-        // on positively-detected weakening, so a non-Lean or unparsable canonical
-        // (e.g. HOL Light `let`) falls back to the mention check unchanged.
+        // on positively-detected weakening, so a non-parsable canonical falls back
+        // to the mention check unchanged. `check_entry_signature` dispatches per
+        // system: Lean/Rocq/Isabelle/Candle keep the theorem-signature parse, while
+        // Agda (`name : Type`) and Metamath (`$p … $=`) gain a real per-system
+        // signature check so a proof of a DIFFERENT theorem no longer slips through
+        // on the weak lexical `statement_mentioned` substring fallback alone.
         let statement_preserved = statement_mentioned(stmt, code)
             && !matches!(
-                crate::prover::statement_preservation::check_statement_preserved(stmt, code).verdict,
+                crate::prover::statement_preservation::check_entry_signature(system, stmt, code)
+                    .verdict,
                 crate::prover::statement_preservation::PreservationVerdict::Renamed
                     | crate::prover::statement_preservation::PreservationVerdict::BindersChanged
                     | crate::prover::statement_preservation::PreservationVerdict::ConclusionChanged
@@ -583,7 +588,11 @@ fn block_closer(c: char, next: Option<char>) -> Option<(char, char)> {
 /// Operates on a `Vec<char>` and only ever compares against ASCII delimiter
 /// chars, so it is panic-free on arbitrary UTF-8 (multi-byte chars simply never
 /// match a delimiter and are copied through unchanged).
-fn strip_comments(code: &str) -> String {
+///
+/// `pub(crate)` so the per-system entry-signature checks in
+/// [`crate::prover::statement_preservation`] can reuse the same multi-system
+/// comment stripping (Agda `{- -}` / `--`, Metamath `$( $)`) before parsing.
+pub(crate) fn strip_comments(code: &str) -> String {
     let chars: Vec<char> = code.chars().collect();
     let mut out = String::with_capacity(chars.len());
     let mut i = 0usize;

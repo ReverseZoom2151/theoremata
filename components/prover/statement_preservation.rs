@@ -34,7 +34,7 @@
 //! layer 2c rather than inventing a new gate-result type where a plug-in view is
 //! useful.
 
-use crate::prover::formal::ScanReport;
+use crate::prover::formal::{FormalSystem, ScanReport};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -319,6 +319,333 @@ fn report(
         submitted,
         detail,
     }
+}
+
+// ===========================================================================
+// Per-system entry-signature preservation (Agda / Metamath)
+// ===========================================================================
+
+/// Per-system statement-signature preservation check.
+///
+/// For Lean / Rocq / Isabelle / Candle this delegates verbatim to
+/// [`check_statement_preserved`] (the theorem-signature parser), so their gate
+/// behavior is unchanged. For **Agda** and **Metamath** — whose declarations do
+/// NOT use the `theorem` / `lemma` keyword the Lean-oriented parser looks for, so
+/// they previously fell through to the weak lexical
+/// [`statement_mentioned`](crate::prover::formal) substring fallback where a proof
+/// of a DIFFERENT theorem could pass merely because the statement text appears in
+/// the source — it applies a system-specific signature parse:
+///
+/// * **Agda**: a declaration is `name : Type`; the statement IS the type. The
+///   canonical type of the entry is compared against the type the submission
+///   declares for the same entry, up to whitespace. A submission that declares a
+///   DIFFERENT type is flagged [`ConclusionChanged`](PreservationVerdict::ConclusionChanged).
+/// * **Metamath**: a theorem is `label $p <typecode> <symbols> $= <proof> $.`; the
+///   asserted statement is the symbol sequence between `$p` and `$=`. The
+///   canonical symbol sequence for `label` is compared against what the
+///   submission's `$p` asserts. A `$p` asserting a DIFFERENT statement is flagged
+///   [`ConclusionChanged`](PreservationVerdict::ConclusionChanged).
+///
+/// Conservative by construction: when the canonical statement or the submitted
+/// entry cannot be parsed for the given system, the verdict is a *fallback* one
+/// ([`CanonicalUnparsable`](PreservationVerdict::CanonicalUnparsable) /
+/// [`SubmittedMissing`](PreservationVerdict::SubmittedMissing)) that is NOT in the
+/// gate's flagged set, so `verify()` falls back to the lexical mention check
+/// rather than rejecting a legitimate proof. Only a POSITIVELY-detected different
+/// signature yields a flagged verdict — mirroring the Lean wiring already in
+/// `verify()`.
+pub fn check_entry_signature(
+    system: FormalSystem,
+    canonical_statement: &str,
+    submitted_code: &str,
+) -> PreservationReport {
+    match system {
+        FormalSystem::Agda => check_agda_signature(canonical_statement, submitted_code),
+        FormalSystem::Metamath => check_metamath_signature(canonical_statement, submitted_code),
+        // Lean / Rocq / Isabelle / Candle: unchanged theorem-signature path.
+        FormalSystem::Lean
+        | FormalSystem::Rocq
+        | FormalSystem::Isabelle
+        | FormalSystem::Candle => check_statement_preserved(canonical_statement, submitted_code),
+    }
+}
+
+/// A minimal `name : conclusion` signature for the non-Lean systems (no binder
+/// region — Agda folds binders into the type; Metamath has none).
+fn entry_sig(kind: &str, name: &str, conclusion: &str) -> TheoremSig {
+    TheoremSig {
+        kind: kind.to_string(),
+        name: name.to_string(),
+        binders: String::new(),
+        conclusion: norm_ws(conclusion),
+    }
+}
+
+// --- Agda ------------------------------------------------------------------
+
+/// Confirm the submission declares the canonical Agda entry with the SAME type.
+fn check_agda_signature(canonical_statement: &str, submitted_code: &str) -> PreservationReport {
+    let Some((name, canon_type)) = parse_agda_decl(canonical_statement) else {
+        return report(
+            PreservationVerdict::CanonicalUnparsable,
+            vec![
+                "Agda canonical statement did not parse into a `name : Type` signature \
+                 (falling back to the lexical mention check)"
+                    .to_string(),
+            ],
+            None,
+            None,
+        );
+    };
+    let stripped: Vec<char> = crate::prover::formal::strip_comments(submitted_code)
+        .chars()
+        .collect();
+    let Some(sub_type) = find_agda_type(&stripped, &name) else {
+        return report(
+            PreservationVerdict::SubmittedMissing,
+            vec![format!(
+                "Agda entry `{name}` has no `{name} : …` type signature in the submission \
+                 (falling back to the lexical mention check)"
+            )],
+            Some(entry_sig("agda", &name, &canon_type)),
+            None,
+        );
+    };
+    if norm_ws(&canon_type) == norm_ws(&sub_type) {
+        return report(
+            PreservationVerdict::Preserved,
+            Vec::new(),
+            Some(entry_sig("agda", &name, &canon_type)),
+            Some(entry_sig("agda", &name, &sub_type)),
+        );
+    }
+    report(
+        PreservationVerdict::ConclusionChanged,
+        vec![format!(
+            "altered Agda type: entry `{name}` is declared with type `{}` but the canonical \
+             statement's type is `{}` — a proof of a DIFFERENT proposition",
+            norm_ws(&sub_type),
+            norm_ws(&canon_type)
+        )],
+        Some(entry_sig("agda", &name, &canon_type)),
+        Some(entry_sig("agda", &name, &sub_type)),
+    )
+}
+
+/// Parse a canonical Agda statement `name : Type` into `(name, type)`. Comments
+/// are stripped first. `None` when there is no top-level `:` ascription.
+fn parse_agda_decl(statement: &str) -> Option<(String, String)> {
+    let stripped = crate::prover::formal::strip_comments(statement);
+    let chars: Vec<char> = stripped.chars().collect();
+    let colon = agda_top_level_colon(&chars)?;
+    let name_region: String = chars[..colon].iter().collect();
+    let name = name_region.split_whitespace().next()?.to_string();
+    let ty = agda_type_region(&chars[colon + 1..]);
+    if name.is_empty() || ty.is_empty() {
+        return None;
+    }
+    Some((name, ty))
+}
+
+/// Index of the first depth-0 `:` ascription colon (not `:=`), tracking bracket
+/// depth so a binder-local `{x : T}` colon is skipped.
+fn agda_top_level_colon(chars: &[char]) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    while i < chars.len() {
+        match chars[i] {
+            '(' | '[' | '{' | '⟨' | '⦃' => depth += 1,
+            ')' | ']' | '}' | '⟩' | '⦄' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            ':' if depth == 0 && chars.get(i + 1) != Some(&'=') => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Extract an Agda type region: from the start of `region` up to the end of the
+/// type signature — the first depth-0 de-dented line break (which begins the
+/// equation `name = …` or a sibling declaration) or a depth-0 standalone `=`.
+/// Indented continuation lines are folded in. Whitespace-normalized.
+fn agda_type_region(region: &[char]) -> String {
+    let mut depth = 0i32;
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < region.len() {
+        let c = region[i];
+        match c {
+            '(' | '[' | '{' | '⟨' | '⦃' => depth += 1,
+            ')' | ']' | '}' | '⟩' | '⦄' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            '\n' if depth == 0 => {
+                // A continuation line must be indented; a de-dented token or a
+                // blank line ends the signature.
+                match region.get(i + 1) {
+                    Some(' ') | Some('\t') => {
+                        out.push(' ');
+                        i += 1;
+                        continue;
+                    }
+                    _ => break,
+                }
+            }
+            '=' if depth == 0 => {
+                let prev = if i > 0 { Some(region[i - 1]) } else { None };
+                let next = region.get(i + 1).copied();
+                // Skip `==` / `=>` / `<=` / `>=` / `:=` / `!=` operators; a lone
+                // `=` at depth 0 is the equation delimiter and ends the type.
+                let part_of_op = matches!(prev, Some('=') | Some('<') | Some('>') | Some(':') | Some('!'))
+                    || matches!(next, Some('=') | Some('>'));
+                if !part_of_op {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        out.push(c);
+        i += 1;
+    }
+    norm_ws(&out)
+}
+
+/// Find the type the submission declares for Agda entry `name`: the first
+/// whole-token occurrence of `name` immediately followed (spaces/tabs only) by a
+/// `:` ascription. Returns the whitespace-normalized type, or `None`.
+fn find_agda_type(stripped: &[char], name: &str) -> Option<String> {
+    let n: Vec<char> = name.chars().collect();
+    if n.is_empty() || stripped.len() < n.len() {
+        return None;
+    }
+    let mut i = 0usize;
+    while i + n.len() <= stripped.len() {
+        if stripped[i..i + n.len()] == n[..] {
+            let before_ok = i == 0 || !is_word(stripped[i - 1]);
+            let after = i + n.len();
+            let after_ok = stripped.get(after).map_or(true, |&c| !is_word(c));
+            if before_ok && after_ok {
+                let mut j = after;
+                while j < stripped.len() && (stripped[j] == ' ' || stripped[j] == '\t') {
+                    j += 1;
+                }
+                if stripped.get(j) == Some(&':') && stripped.get(j + 1) != Some(&'=') {
+                    let ty = agda_type_region(&stripped[j + 1..]);
+                    if !ty.is_empty() {
+                        return Some(ty);
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+// --- Metamath --------------------------------------------------------------
+
+/// Confirm the submission's `$p` for the canonical label asserts the SAME symbol
+/// sequence as the canonical statement.
+fn check_metamath_signature(canonical_statement: &str, submitted_code: &str) -> PreservationReport {
+    let Some((label, canon_syms)) = parse_metamath_assertion(canonical_statement) else {
+        return report(
+            PreservationVerdict::CanonicalUnparsable,
+            vec![
+                "Metamath canonical statement did not parse into a `label $p/$a … ` assertion \
+                 (falling back to the lexical mention check)"
+                    .to_string(),
+            ],
+            None,
+            None,
+        );
+    };
+    let Some(sub_syms) = find_metamath_assertion(submitted_code, &label) else {
+        return report(
+            PreservationVerdict::SubmittedMissing,
+            vec![format!(
+                "Metamath label `{label}` is not asserted by a `$p` in the submission \
+                 (falling back to the lexical mention check)"
+            )],
+            Some(entry_sig("metamath", &label, &canon_syms.join(" "))),
+            None,
+        );
+    };
+    if canon_syms == sub_syms {
+        return report(
+            PreservationVerdict::Preserved,
+            Vec::new(),
+            Some(entry_sig("metamath", &label, &canon_syms.join(" "))),
+            Some(entry_sig("metamath", &label, &sub_syms.join(" "))),
+        );
+    }
+    report(
+        PreservationVerdict::ConclusionChanged,
+        vec![format!(
+            "altered Metamath assertion: `$p {label}` asserts `{}` but the canonical statement \
+             asserts `{}` — a proof of a DIFFERENT statement",
+            sub_syms.join(" "),
+            canon_syms.join(" ")
+        )],
+        Some(entry_sig("metamath", &label, &canon_syms.join(" "))),
+        Some(entry_sig("metamath", &label, &sub_syms.join(" "))),
+    )
+}
+
+/// Parse a canonical Metamath assertion `label $p/$a <symbols> ($= | $.)` into
+/// `(label, symbols)`. Comments are stripped first. `None` when no labelled
+/// `$p`/`$a` with symbols is present.
+fn parse_metamath_assertion(statement: &str) -> Option<(String, Vec<String>)> {
+    let stripped = crate::prover::formal::strip_comments(statement);
+    let toks: Vec<&str> = stripped.split_whitespace().collect();
+    for k in 1..toks.len() {
+        if toks[k] == "$p" || toks[k] == "$a" {
+            let label = toks[k - 1];
+            // The preceding token must be a real label, not another keyword.
+            if label.starts_with('$') {
+                continue;
+            }
+            let syms = metamath_symbols(&toks[k + 1..]);
+            if !label.is_empty() && !syms.is_empty() {
+                return Some((label.to_string(), syms));
+            }
+        }
+    }
+    None
+}
+
+/// Find the symbol sequence the submission's `$p` for `label` asserts (between
+/// `$p` and `$=`/`$.`). Comments are stripped first. `None` when absent.
+fn find_metamath_assertion(submitted_code: &str, label: &str) -> Option<Vec<String>> {
+    let stripped = crate::prover::formal::strip_comments(submitted_code);
+    let toks: Vec<&str> = stripped.split_whitespace().collect();
+    for k in 1..toks.len() {
+        if toks[k] == "$p" && toks[k - 1] == label {
+            let syms = metamath_symbols(&toks[k + 1..]);
+            if !syms.is_empty() {
+                return Some(syms);
+            }
+        }
+    }
+    None
+}
+
+/// Collect assertion symbols from the tokens after `$p`/`$a`, stopping at the
+/// proof separator `$=` or the statement terminator `$.`.
+fn metamath_symbols(rest: &[&str]) -> Vec<String> {
+    let mut syms = Vec::new();
+    for &t in rest {
+        if t == "$=" || t == "$." {
+            break;
+        }
+        syms.push(t.to_string());
+    }
+    syms
 }
 
 // ===========================================================================
@@ -1032,6 +1359,147 @@ def aux : Nat := 0
 ";
         let r = check_statement_preserved(canonical, submitted);
         assert!(r.preserved, "{:?}", r);
+    }
+
+    // -- per-system entry signature (Agda / Metamath) -----------------------
+
+    /// `check_entry_signature` delegates the Lean/Rocq/Isabelle path to
+    /// `check_statement_preserved` unchanged (no regression).
+    #[test]
+    fn entry_signature_delegates_for_lean_family() {
+        let canonical = "theorem T (n : Nat) (h : n > 0) : n ≥ 1";
+        let submitted = "theorem T (n : Nat) : n ≥ 1 := by omega";
+        for sys in [
+            FormalSystem::Lean,
+            FormalSystem::Rocq,
+            FormalSystem::Isabelle,
+            FormalSystem::Candle,
+        ] {
+            let a = check_entry_signature(sys, canonical, submitted);
+            let b = check_statement_preserved(canonical, submitted);
+            assert_eq!(a.verdict, b.verdict, "{sys:?} must delegate unchanged");
+        }
+    }
+
+    /// Agda: a proof declaring the requested `foo : A` passes.
+    #[test]
+    fn agda_same_type_is_preserved() {
+        let canonical = "foo : A";
+        let submitted = "foo : A\nfoo = a\n";
+        let r = check_entry_signature(FormalSystem::Agda, canonical, submitted);
+        assert!(r.preserved, "{:?}", r.findings);
+        assert_eq!(r.verdict, PreservationVerdict::Preserved);
+    }
+
+    /// Agda: whitespace / indented-continuation differences still preserve.
+    #[test]
+    fn agda_multiline_type_is_preserved() {
+        let canonical = "foo : A -> B -> C";
+        let submitted = "foo : A -> B\n      -> C\nfoo x y = c\n";
+        let r = check_entry_signature(FormalSystem::Agda, canonical, submitted);
+        assert!(r.preserved, "{:?}", r);
+        assert_eq!(r.verdict, PreservationVerdict::Preserved);
+    }
+
+    /// Agda: a proof declaring a DIFFERENT type (`foo : B`) is flagged.
+    #[test]
+    fn agda_different_type_is_flagged() {
+        let canonical = "foo : A";
+        let submitted = "foo : B\nfoo = b\n";
+        let r = check_entry_signature(FormalSystem::Agda, canonical, submitted);
+        assert!(!r.preserved);
+        assert_eq!(r.verdict, PreservationVerdict::ConclusionChanged);
+        assert!(r.findings.iter().any(|f| f.contains("DIFFERENT")));
+    }
+
+    /// Agda: an unparsable canonical (no `:`) falls back — NOT a flagged verdict,
+    /// so `verify()` defers to the mention check rather than rejecting.
+    #[test]
+    fn agda_unparsable_canonical_falls_back() {
+        let r = check_entry_signature(FormalSystem::Agda, "foo", "foo : A\nfoo = a\n");
+        assert_eq!(r.verdict, PreservationVerdict::CanonicalUnparsable);
+        assert!(!is_flagged(r.verdict));
+    }
+
+    /// Agda: a legit proof whose entry the parser cannot locate falls back
+    /// (does not spuriously reject).
+    #[test]
+    fn agda_missing_entry_falls_back() {
+        // Canonical parses, but the submission declares only the equation, no sig.
+        let r = check_entry_signature(FormalSystem::Agda, "foo : A", "foo = a\n");
+        assert_eq!(r.verdict, PreservationVerdict::SubmittedMissing);
+        assert!(!is_flagged(r.verdict));
+    }
+
+    /// Metamath: a `$p` asserting the requested statement passes.
+    #[test]
+    fn metamath_same_assertion_is_preserved() {
+        let canonical = "th1 $p |- ( ph -> ph ) $= ? $.";
+        let submitted = "th1 $p |- ( ph -> ph ) $= wph wph mpd $.";
+        let r = check_entry_signature(FormalSystem::Metamath, canonical, submitted);
+        assert!(r.preserved, "{:?}", r.findings);
+        assert_eq!(r.verdict, PreservationVerdict::Preserved);
+    }
+
+    /// Metamath: a `$p` asserting a DIFFERENT statement is flagged.
+    #[test]
+    fn metamath_different_assertion_is_flagged() {
+        let canonical = "th1 $p |- ( ph -> ph ) $= ? $.";
+        let submitted = "th1 $p |- ( ph -> ps ) $= wph wps mpd $.";
+        let r = check_entry_signature(FormalSystem::Metamath, canonical, submitted);
+        assert!(!r.preserved);
+        assert_eq!(r.verdict, PreservationVerdict::ConclusionChanged);
+        assert!(r.findings.iter().any(|f| f.contains("DIFFERENT")));
+    }
+
+    /// Metamath: canonical without a `$p`/`$a` assertion falls back (not flagged).
+    #[test]
+    fn metamath_unparsable_canonical_falls_back() {
+        let r = check_entry_signature(FormalSystem::Metamath, "|- ( ph -> ph )", "th1 $p |- ( ph -> ph ) $= x $.");
+        assert_eq!(r.verdict, PreservationVerdict::CanonicalUnparsable);
+        assert!(!is_flagged(r.verdict));
+    }
+
+    /// Metamath: a commented-out `$p` does not satisfy the check (falls back).
+    #[test]
+    fn metamath_commented_assertion_falls_back() {
+        let canonical = "th1 $p |- ( ph -> ph ) $= ? $.";
+        let submitted = "$( th1 $p |- ( ph -> ph ) $= x $. $)\n";
+        let r = check_entry_signature(FormalSystem::Metamath, canonical, submitted);
+        assert_eq!(r.verdict, PreservationVerdict::SubmittedMissing);
+        assert!(!is_flagged(r.verdict));
+    }
+
+    /// Non-ASCII input never panics for either non-Lean system.
+    #[test]
+    fn non_ascii_entry_signature_does_not_panic() {
+        let _ = check_entry_signature(FormalSystem::Agda, "β : ∀ x → x ≡ x", "β : ∀ x → x ≡ x\nβ x = refl\n");
+        let _ = check_entry_signature(FormalSystem::Agda, "café", "≤ ∞ λ π");
+        let _ = check_entry_signature(FormalSystem::Metamath, "τ $p |- ∀ x $= ? $.", "τ $p |- ∀ x $= π $.");
+        let _ = check_entry_signature(FormalSystem::Metamath, "", "");
+    }
+
+    /// Deterministic across repeated calls for both non-Lean systems.
+    #[test]
+    fn entry_signature_is_deterministic() {
+        let a1 = check_entry_signature(FormalSystem::Agda, "foo : A", "foo : B\nfoo = b\n");
+        let a2 = check_entry_signature(FormalSystem::Agda, "foo : A", "foo : B\nfoo = b\n");
+        assert_eq!(a1, a2);
+        let m1 = check_entry_signature(FormalSystem::Metamath, "t $p |- a $= ? $.", "t $p |- b $= x $.");
+        let m2 = check_entry_signature(FormalSystem::Metamath, "t $p |- a $= ? $.", "t $p |- b $= x $.");
+        assert_eq!(m1, m2);
+    }
+
+    /// Mirror of `verify()`'s flagged set: only these verdicts reject the proof;
+    /// every other verdict falls back to the lexical mention check.
+    fn is_flagged(v: PreservationVerdict) -> bool {
+        matches!(
+            v,
+            PreservationVerdict::Renamed
+                | PreservationVerdict::BindersChanged
+                | PreservationVerdict::ConclusionChanged
+                | PreservationVerdict::TriviallyRestated
+        )
     }
 
     // -- escape hatches ------------------------------------------------------
