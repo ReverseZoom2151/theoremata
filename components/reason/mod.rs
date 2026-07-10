@@ -18,7 +18,8 @@ pub use search::{
     symmetry_dedup, tactic_outcome, ttc,
 };
 pub use proving::{
-    blueprint, decompose, definition_synthesis, evolve_sketch, falsification, formal_generate,
-    formalize_portfolio, library, mathlib_export, optimize, portfolio, repair, retry, router, sketch,
+    blueprint, conjecture_engine, decompose, definition_synthesis, evolve_sketch, falsification,
+    formal_generate, formalize_portfolio, library, mathlib_export, optimize, portfolio, repair, retry,
+    router, sketch,
 };
 pub use critique::{critic, guard, memory, plan_history, taint};

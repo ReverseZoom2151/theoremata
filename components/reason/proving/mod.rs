@@ -13,3 +13,4 @@ pub mod evolve_sketch;
 pub mod optimize;
 pub mod repair;
 pub mod formalize_portfolio;
+pub mod conjecture_engine;
