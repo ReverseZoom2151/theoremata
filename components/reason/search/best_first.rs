@@ -1,0 +1,778 @@
+//! Value-free **best-first** proof search + a **DPO preference-pair extractor**
+//! (the BFS-Prover pattern, `docs/paper-mining/` / prover-mining adopt-list).
+//!
+//! The MCGS driver ([`super::driver`]) runs PUCT with transposition and a
+//! process-reward / value prior. That is powerful but needs a *value* signal
+//! (progress estimates, rollouts) to steer selection. BFS-Prover shows a second,
+//! **value-free** mode is competitive and much simpler: expand states in order of
+//! their **length-normalized cumulative path log-probability** under the policy,
+//! with *no* value network, *no* rollouts, and *no* backpropagation. A single
+//! global priority queue holds the whole frontier; the best-scoring partial proof
+//! is always expanded next, until the goal closes or a step budget is hit.
+//!
+//! This module adds exactly that on top of the driver's existing abstractions:
+//!
+//! * It reuses [`GoalState`](super::driver::GoalState) unchanged — a state still
+//!   knows its [`dedup_key`](super::driver::GoalState::dedup_key) and whether it
+//!   [`is_closed`](super::driver::GoalState::is_closed).
+//! * The tactic *scorer* is the injected seam. In the real system it is the policy
+//!   LLM returning `(tactic, logprob)` candidates for a state (the GPU-gated part);
+//!   here it is a [`TacticScorer`] trait so a deterministic mock — or the driver's
+//!   own [`TacticExpander`](super::driver::TacticExpander), via the
+//!   [`ExpanderScorer`] adapter — plugs into the same search with no changes.
+//!
+//! ## Length-normalized priority
+//!
+//! A frontier node reached by tactics `a_1..a_L` from the root has priority
+//! `Σ_t log p(a_t | s_t) / L^alpha` with `alpha ∈ [0, 1]` (config, default `0.5`).
+//! Because every `log p ≤ 0`, a raw cumulative sum penalizes *deep* paths (more
+//! terms ⇒ more negative), biasing the search shallow; dividing by `L^alpha`
+//! counters that bias — `alpha = 0` recovers the pure cumulative score (maximal
+//! depth penalty), `alpha = 1` is full per-step averaging (no depth penalty), and
+//! intermediate `alpha` interpolates. This is the standard beam-search length
+//! normalization, here driving a best-first frontier.
+//!
+//! ## DPO preference pairs
+//!
+//! A *solved* search is also a supervision signal. Along the found proof path,
+//! at each on-path state the tactic that continued toward the closed goal is a
+//! **winner**; the sibling tactics the policy also proposed but that the prover
+//! rejected — the [`Discard`](super::tactic_outcome::TacticOutcome::Discard)
+//! edges (a Lean error / dead end) the search would otherwise throw away — are
+//! **losers**. [`dpo_pairs`] emits one `(state, winning_tactic, losing_tactic)`
+//! preference triple per such sibling, in deterministic root→leaf order, ready to
+//! train the policy with Direct Preference Optimization.
+//!
+//! ## Determinism contract
+//!
+//! The search is a pure algorithm: given the same scorer, root, and
+//! [`BestFirstConfig`] (including its `seed`) it returns byte-identical results.
+//! There is **no** wall-clock and **no** unseeded randomness anywhere — the
+//! priority queue breaks ties by insertion order (a total order) and per-state
+//! seeds are derived deterministically from the base seed. The search itself is
+//! offline and reproducible; the only stochastic, GPU-gated component is the
+//! injected policy that scores tactics, which lives entirely behind the
+//! [`TacticScorer`] seam.
+
+use super::driver::{GoalState, TacticExpander};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashSet};
+
+/// Smallest prior treated as non-zero when converting a `[0,1]` prior to a
+/// log-probability (avoids `ln(0) = -∞`).
+const PRIOR_EPS: f64 = 1e-12;
+
+/// One candidate tactic scored by the injected policy seam: the tactic text, its
+/// log-probability `log p(a | s) ≤ 0`, and the state applying it yields.
+#[derive(Debug, Clone)]
+pub struct ScoredTactic<S> {
+    /// The tactic text (opaque to the search).
+    pub tactic: String,
+    /// `log p(a | s)` under the policy — `≤ 0`. Higher (closer to `0`) ⇒ more
+    /// probable ⇒ expanded sooner (after length normalization).
+    pub logprob: f64,
+    /// The goal state that results from applying `tactic` (error-free edge).
+    pub next: S,
+}
+
+impl<S> ScoredTactic<S> {
+    pub fn new(tactic: impl Into<String>, logprob: f64, next: S) -> Self {
+        Self {
+            tactic: tactic.into(),
+            logprob,
+            next,
+        }
+    }
+}
+
+/// The result of scoring a state: the *live* (error-free) candidate tactics the
+/// search may descend into, plus the tactics the policy proposed that the prover
+/// **discarded** (a Lean error / dead end). The live set drives the frontier; the
+/// discarded set is retained only so [`dpo_pairs`] can mine it for losers.
+#[derive(Debug, Clone)]
+pub struct ScoredExpansion<S> {
+    /// Error-free candidate edges, in the policy's proposal order.
+    pub live: Vec<ScoredTactic<S>>,
+    /// Tactics tried and discarded at this state (the DPO losers). Order is
+    /// preserved for deterministic pair extraction.
+    pub discarded: Vec<String>,
+}
+
+impl<S> ScoredExpansion<S> {
+    /// An expansion with live edges and no discarded siblings.
+    pub fn live_only(live: Vec<ScoredTactic<S>>) -> Self {
+        Self {
+            live,
+            discarded: Vec::new(),
+        }
+    }
+}
+
+/// The injected policy seam: given a proof state, return the scored candidate
+/// tactics (and the discarded siblings). A real policy LLM implements this — the
+/// GPU-gated component — as does the deterministic mock in the tests. `seed` is
+/// threaded so a sampling policy stays reproducible; deterministic scorers ignore
+/// it.
+pub trait TacticScorer {
+    /// The proof-state type this scorer operates on.
+    type State: GoalState;
+
+    /// Score `state` into candidate `(tactic, logprob, next)` edges plus discarded
+    /// siblings. An empty `live` set marks a dead end. Implementations MUST be a
+    /// pure function of `(state, seed)` — no wall-clock, no unseeded randomness —
+    /// so the search is reproducible.
+    fn score(&mut self, state: &Self::State, seed: u64) -> ScoredExpansion<Self::State>;
+}
+
+/// Adapts any driver [`TacticExpander`] into a [`TacticScorer`], so the value-free
+/// best-first search reuses the exact same environment the MCGS driver does. A
+/// step's `[0,1]` prior is read as a probability and mapped to `log(prior)`; the
+/// expander exposes no discards, so [`ScoredExpansion::discarded`] is empty.
+pub struct ExpanderScorer<E>(pub E);
+
+impl<E: TacticExpander> TacticScorer for ExpanderScorer<E> {
+    type State = E::State;
+
+    fn score(&mut self, state: &Self::State, seed: u64) -> ScoredExpansion<Self::State> {
+        let live = self
+            .0
+            .expand(state, seed)
+            .into_iter()
+            .map(|step| ScoredTactic {
+                tactic: step.tactic,
+                logprob: step.prior.max(PRIOR_EPS).ln(),
+                next: step.next,
+            })
+            .collect();
+        ScoredExpansion::live_only(live)
+    }
+}
+
+/// Tuning for [`best_first_search`].
+#[derive(Debug, Clone, Copy)]
+pub struct BestFirstConfig {
+    /// Length-normalization exponent `alpha ∈ [0, 1]` for the priority
+    /// `Σ log p / L^alpha`. `0` = pure cumulative log-prob (maximal depth
+    /// penalty); `1` = per-step average (no depth penalty). Default `0.5`.
+    pub alpha: f64,
+    /// Hard cap on expansions (states popped and scored). Guarantees termination
+    /// even on an infinite state space — the search stops without a false proof.
+    pub max_steps: usize,
+    /// Base seed threaded into scoring (per-state seeds are derived from it), so a
+    /// sampling policy is reproducible.
+    pub seed: u64,
+}
+
+impl Default for BestFirstConfig {
+    fn default() -> Self {
+        Self {
+            alpha: 0.5,
+            max_steps: 1_000,
+            seed: 0,
+        }
+    }
+}
+
+/// The length-normalized priority of a frontier node: `Σ log p / L^alpha`. A
+/// higher (less negative) score is expanded sooner. `depth == 0` (the root) uses
+/// `L = 1` so the root's empty-path score is exactly its cumulative log-prob
+/// (`0`).
+fn length_normalized_score(cum_logprob: f64, depth: usize, alpha: f64) -> f64 {
+    let l = (depth as f64).max(1.0);
+    cum_logprob / l.powf(alpha)
+}
+
+/// One node in the best-first search arena.
+struct Node<S> {
+    state: S,
+    /// Arena index of the parent, `None` for the root.
+    parent: Option<usize>,
+    /// The tactic applied at the parent to reach this node, `None` for the root.
+    tactic_in: Option<String>,
+    /// Path length `L` from the root (number of tactics applied).
+    depth: usize,
+    /// Cumulative `Σ log p(a_t | s_t)` along the path from the root.
+    cum_logprob: f64,
+    /// Discarded sibling tactics recorded when this node was expanded — the DPO
+    /// losers proposed at this state. Empty until the node is expanded.
+    discarded: Vec<String>,
+}
+
+/// A frontier entry in the priority queue: a length-normalized score, a
+/// deterministic insertion sequence for tie-breaking, and the arena node it
+/// refers to. The queue is a max-heap on `score`; equal scores break toward the
+/// **earlier**-inserted node (FIFO), keeping the search fully deterministic.
+#[derive(Clone, Copy)]
+struct QueueItem {
+    score: f64,
+    seq: u64,
+    node: usize,
+}
+
+impl PartialEq for QueueItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.score.total_cmp(&other.score) == Ordering::Equal && self.seq == other.seq
+    }
+}
+impl Eq for QueueItem {}
+impl Ord for QueueItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Max-heap on score; on a tie, the smaller `seq` must be "greater" so it
+        // pops first (BinaryHeap yields the maximum).
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| other.seq.cmp(&self.seq))
+    }
+}
+impl PartialOrd for QueueItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// One edge of a reconstructed proof path: the state a tactic was applied to and
+/// the tactic that advanced it toward the closed goal.
+#[derive(Debug, Clone)]
+pub struct ProofStep<S> {
+    /// The state the tactic was applied to (the *from* state of the edge).
+    pub state: S,
+    /// The winning tactic applied at `state`.
+    pub tactic: String,
+}
+
+/// A single Direct-Preference-Optimization training triple mined from a solved
+/// search: at `state`, the policy should prefer `winning_tactic` (it continued the
+/// proof) over `losing_tactic` (a discarded sibling that hit a Lean error / dead
+/// end).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DpoPair<S> {
+    /// The proof state at which the preference holds.
+    pub state: S,
+    /// The tactic on the solution path (preferred).
+    pub winning_tactic: String,
+    /// A discarded sibling tactic at the same state (dispreferred).
+    pub losing_tactic: String,
+}
+
+/// The outcome of a best-first search — the proof path (if solved) plus enough of
+/// the search trace for [`dpo_pairs`] to mine preference triples.
+pub struct BestFirstOutcome<S> {
+    /// Whether a closed (proof-complete) state was reached.
+    pub solved: bool,
+    /// Expansions performed (states popped and scored), bounded by the budget.
+    pub steps: usize,
+    /// Dedup keys of the states popped from the frontier, in expansion order —
+    /// the observable trace of *which* states the priority ordering visited and
+    /// in what order. Deterministic.
+    pub order: Vec<String>,
+    /// The search arena (all discovered nodes).
+    arena: Vec<Node<S>>,
+    /// Arena index of the closed node that solved the search, if any.
+    solved_node: Option<usize>,
+}
+
+impl<S: GoalState> BestFirstOutcome<S> {
+    /// Arena indices along the found proof path, root first, closed leaf last.
+    /// Empty when the search did not solve.
+    fn path_nodes(&self) -> Vec<usize> {
+        let mut path = Vec::new();
+        let mut cur = self.solved_node;
+        while let Some(idx) = cur {
+            path.push(idx);
+            cur = self.arena[idx].parent;
+        }
+        path.reverse();
+        path
+    }
+
+    /// The winning tactics from the root to the closed goal, in order. Empty when
+    /// the search did not solve.
+    pub fn proof_tactics(&self) -> Vec<String> {
+        self.path_nodes()
+            .iter()
+            .filter_map(|&idx| self.arena[idx].tactic_in.clone())
+            .collect()
+    }
+
+    /// The proof path as `(from-state, tactic)` edges, root→leaf. Empty when the
+    /// search did not solve.
+    pub fn proof_path(&self) -> Vec<ProofStep<S>>
+    where
+        S: Clone,
+    {
+        let nodes = self.path_nodes();
+        let mut out = Vec::new();
+        for w in nodes.windows(2) {
+            let (parent, child) = (w[0], w[1]);
+            if let Some(tactic) = &self.arena[child].tactic_in {
+                out.push(ProofStep {
+                    state: self.arena[parent].state.clone(),
+                    tactic: tactic.clone(),
+                });
+            }
+        }
+        out
+    }
+}
+
+/// Run value-free best-first search from `root`, expanding states in descending
+/// length-normalized cumulative log-prob until a closed state is reached or the
+/// step budget is exhausted.
+///
+/// The search maintains a single global priority queue (the frontier) and a set
+/// of already-expanded state keys, so a state that is reached by two paths (a
+/// transposition) is expanded only once — the graph, not tree, discipline the
+/// MCGS driver also follows. No value, rollout, or backpropagation is used: the
+/// only signal is the policy log-prob the [`TacticScorer`] returns.
+pub fn best_first_search<Sc: TacticScorer>(
+    scorer: &mut Sc,
+    root: Sc::State,
+    cfg: &BestFirstConfig,
+) -> BestFirstOutcome<Sc::State> {
+    let mut arena: Vec<Node<Sc::State>> = Vec::new();
+    let mut heap: BinaryHeap<QueueItem> = BinaryHeap::new();
+    let mut expanded: HashSet<String> = HashSet::new();
+    let mut order: Vec<String> = Vec::new();
+
+    arena.push(Node {
+        state: root,
+        parent: None,
+        tactic_in: None,
+        depth: 0,
+        cum_logprob: 0.0,
+        discarded: Vec::new(),
+    });
+    let mut seq = 0u64;
+    heap.push(QueueItem {
+        score: length_normalized_score(0.0, 0, cfg.alpha),
+        seq,
+        node: 0,
+    });
+
+    let mut steps = 0usize;
+    let mut solved = false;
+    let mut solved_node = None;
+
+    while let Some(item) = heap.pop() {
+        let node = item.node;
+        let key = arena[node].state.dedup_key();
+        // Transposition guard: a state already expanded is not re-expanded.
+        if expanded.contains(&key) {
+            continue;
+        }
+        order.push(key.clone());
+
+        // A closed state is a proof — detected on pop, so a solution already on
+        // the frontier is returned even once the budget is spent.
+        if arena[node].state.is_closed() {
+            solved = true;
+            solved_node = Some(node);
+            break;
+        }
+        // Budget: stop before scoring once the expansion cap is hit.
+        if steps >= cfg.max_steps {
+            break;
+        }
+        expanded.insert(key.clone());
+
+        let seed = mix_seed(cfg.seed, &key);
+        let expansion = scorer.score(&arena[node].state, seed);
+        steps += 1;
+        arena[node].discarded = expansion.discarded;
+
+        let parent_depth = arena[node].depth;
+        let parent_cum = arena[node].cum_logprob;
+        for st in expansion.live {
+            let child_depth = parent_depth + 1;
+            let child_cum = parent_cum + st.logprob;
+            let child = arena.len();
+            arena.push(Node {
+                state: st.next,
+                parent: Some(node),
+                tactic_in: Some(st.tactic),
+                depth: child_depth,
+                cum_logprob: child_cum,
+                discarded: Vec::new(),
+            });
+            seq += 1;
+            heap.push(QueueItem {
+                score: length_normalized_score(child_cum, child_depth, cfg.alpha),
+                seq,
+                node: child,
+            });
+        }
+    }
+
+    BestFirstOutcome {
+        solved,
+        steps,
+        order,
+        arena,
+        solved_node,
+    }
+}
+
+/// Extract Direct-Preference-Optimization pairs from a solved search.
+///
+/// Walks the found proof path root→leaf; at each on-path state the tactic that
+/// continued the proof is the winner, and every **discarded** sibling recorded at
+/// that state (a Lean error / dead end — the edges the search otherwise throws
+/// away) becomes a loser. Emits one [`DpoPair`] per `(on-path state, winner,
+/// loser)` in deterministic order (path order, then the scorer's discard order).
+/// Returns empty for an unsolved search.
+pub fn dpo_pairs<S: GoalState + Clone>(outcome: &BestFirstOutcome<S>) -> Vec<DpoPair<S>> {
+    let mut out = Vec::new();
+    if !outcome.solved {
+        return out;
+    }
+    let nodes = outcome.path_nodes();
+    for w in nodes.windows(2) {
+        let (parent, child) = (w[0], w[1]);
+        let winner = match &outcome.arena[child].tactic_in {
+            Some(t) => t.clone(),
+            None => continue,
+        };
+        for loser in &outcome.arena[parent].discarded {
+            out.push(DpoPair {
+                state: outcome.arena[parent].state.clone(),
+                winning_tactic: winner.clone(),
+                losing_tactic: loser.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// Derive a deterministic per-state seed from a base seed and a state's dedup key
+/// (FNV-1a). Same `(base, key)` ⇒ same seed, so a sampling scorer behaves
+/// identically every time it sees the same state — no nondeterminism enters.
+fn mix_seed(base: u64, key: &str) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64 ^ base;
+    for b in key.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::driver::TacticStep;
+    use std::collections::HashMap;
+
+    // ---- Deterministic mocks -------------------------------------------------
+
+    /// A table-driven proof state: `key` identifies it, `closed` marks completion.
+    #[derive(Clone, Debug, PartialEq)]
+    struct MockGoal {
+        key: String,
+        closed: bool,
+    }
+    impl MockGoal {
+        fn open(key: &str) -> Self {
+            Self {
+                key: key.into(),
+                closed: false,
+            }
+        }
+        fn closed(key: &str) -> Self {
+            Self {
+                key: key.into(),
+                closed: true,
+            }
+        }
+    }
+    impl GoalState for MockGoal {
+        fn dedup_key(&self) -> String {
+            self.key.clone()
+        }
+        fn is_closed(&self) -> bool {
+            self.closed
+        }
+    }
+
+    /// A deterministic scorer: a map from a state key to its live scored tactics
+    /// (`tactic`, `logprob`, `next`) and its discarded siblings. Missing keys are
+    /// dead ends. The `seed` is accepted but ignored (this mock is deterministic).
+    struct TableScorer {
+        live: HashMap<String, Vec<ScoredTactic<MockGoal>>>,
+        dead: HashMap<String, Vec<String>>,
+    }
+    impl TableScorer {
+        fn new() -> Self {
+            Self {
+                live: HashMap::new(),
+                dead: HashMap::new(),
+            }
+        }
+        fn edge(mut self, from: &str, tactic: &str, logprob: f64, to: MockGoal) -> Self {
+            self.live
+                .entry(from.into())
+                .or_default()
+                .push(ScoredTactic::new(tactic, logprob, to));
+            self
+        }
+        fn discard(mut self, from: &str, tactic: &str) -> Self {
+            self.dead.entry(from.into()).or_default().push(tactic.into());
+            self
+        }
+    }
+    impl TacticScorer for TableScorer {
+        type State = MockGoal;
+        fn score(&mut self, state: &MockGoal, _seed: u64) -> ScoredExpansion<MockGoal> {
+            ScoredExpansion {
+                live: self.live.get(&state.key).cloned().unwrap_or_default(),
+                discarded: self.dead.get(&state.key).cloned().unwrap_or_default(),
+            }
+        }
+    }
+
+    // ---- Length-normalization arithmetic ------------------------------------
+
+    #[test]
+    fn alpha_flips_the_priority_of_a_shallow_vs_deep_node() {
+        // Shallow X: depth 1, cum = ln(0.6). Deep Y: depth 3, cum = 3·ln(0.8).
+        // X has the *higher* (less negative) cumulative log-prob, but Y wins once
+        // normalized by depth.
+        let x_cum = 0.6f64.ln();
+        let y_cum = 3.0 * 0.8f64.ln();
+        assert!(x_cum > y_cum, "X has higher raw cumulative log-prob");
+
+        // alpha = 0: pure cumulative ⇒ shallow X is preferred.
+        let x0 = length_normalized_score(x_cum, 1, 0.0);
+        let y0 = length_normalized_score(y_cum, 3, 0.0);
+        assert!(x0 > y0, "alpha=0 must prefer the shallow node");
+
+        // alpha = 1: per-step average ⇒ the deep high-per-step Y is preferred.
+        let x1 = length_normalized_score(x_cum, 1, 1.0);
+        let y1 = length_normalized_score(y_cum, 3, 1.0);
+        assert!(y1 > x1, "alpha=1 must prefer the deep node");
+    }
+
+    // ---- Best-first search ---------------------------------------------------
+
+    #[test]
+    fn best_first_finds_the_closing_path() {
+        // Two competing branches: A closes with high per-step log-prob, B is a
+        // low-prob dead end. Best-first must follow A to the closed goal.
+        let mut scorer = TableScorer::new()
+            .edge("root", "tA", 0.9f64.ln(), MockGoal::open("A"))
+            .edge("root", "tB", 0.2f64.ln(), MockGoal::open("B"))
+            .edge("A", "aClose", 0.9f64.ln(), MockGoal::closed("cA"));
+        let out = best_first_search(&mut scorer, MockGoal::open("root"), &BestFirstConfig::default());
+
+        assert!(out.solved, "the A branch closes the goal");
+        assert_eq!(out.proof_tactics(), vec!["tA", "aClose"]);
+        // The closed state was reached; B was never on the winning path.
+        assert_eq!(out.proof_path().last().unwrap().tactic, "aClose");
+    }
+
+    #[test]
+    fn prefers_higher_length_normalized_prior_at_equal_depth() {
+        // At equal depth the higher-log-prob sibling is expanded first. From root,
+        // "hi" (ln 0.9) and "lo" (ln 0.1) reach two dead-end leaves; the frontier
+        // must pop root, then Hi, then Lo.
+        let mut scorer = TableScorer::new()
+            .edge("root", "hi", 0.9f64.ln(), MockGoal::open("Hi"))
+            .edge("root", "lo", 0.1f64.ln(), MockGoal::open("Lo"));
+        let out = best_first_search(&mut scorer, MockGoal::open("root"), &BestFirstConfig::default());
+
+        assert_eq!(out.order, vec!["root", "Hi", "Lo"]);
+    }
+
+    /// A state space where a shallow node X and a deep node Y coexist on the
+    /// frontier, so `alpha` decides which is popped first (see the arithmetic
+    /// test). X: root→X, ln(0.6). Y: root→Y0→Y1→Y2, each ln(0.8). X and Y2 are
+    /// dead-end leaves. After Y0,Y1 are expanded, X(depth1) and Y2(depth3) race.
+    fn alpha_ordering_scorer() -> TableScorer {
+        TableScorer::new()
+            .edge("root", "tx", 0.6f64.ln(), MockGoal::open("X"))
+            .edge("root", "ty0", 0.8f64.ln(), MockGoal::open("Y0"))
+            .edge("Y0", "ty1", 0.8f64.ln(), MockGoal::open("Y1"))
+            .edge("Y1", "ty2", 0.8f64.ln(), MockGoal::open("Y2"))
+    }
+
+    #[test]
+    fn alpha_changes_the_expansion_order() {
+        let pos = |order: &[String], k: &str| order.iter().position(|s| s == k).unwrap();
+
+        // alpha = 0 (max depth penalty): shallow X pops before deep Y2.
+        let mut s0 = alpha_ordering_scorer();
+        let o0 = best_first_search(
+            &mut s0,
+            MockGoal::open("root"),
+            &BestFirstConfig { alpha: 0.0, ..BestFirstConfig::default() },
+        );
+        assert!(
+            pos(&o0.order, "X") < pos(&o0.order, "Y2"),
+            "alpha=0 must expand shallow X before deep Y2 (order {:?})",
+            o0.order
+        );
+
+        // alpha = 1 (no depth penalty): deep Y2 pops before shallow X.
+        let mut s1 = alpha_ordering_scorer();
+        let o1 = best_first_search(
+            &mut s1,
+            MockGoal::open("root"),
+            &BestFirstConfig { alpha: 1.0, ..BestFirstConfig::default() },
+        );
+        assert!(
+            pos(&o1.order, "Y2") < pos(&o1.order, "X"),
+            "alpha=1 must expand deep Y2 before shallow X (order {:?})",
+            o1.order
+        );
+    }
+
+    #[test]
+    fn already_closed_root_is_trivially_solved() {
+        let mut scorer = TableScorer::new();
+        let out = best_first_search(&mut scorer, MockGoal::closed("done"), &BestFirstConfig::default());
+        assert!(out.solved);
+        assert_eq!(out.steps, 0, "no expansion needed for a closed root");
+        assert!(out.proof_tactics().is_empty());
+    }
+
+    #[test]
+    fn transposition_state_is_expanded_only_once() {
+        // Diamond: root→L→D and root→R→D. The shared state D must be expanded once.
+        let mut scorer = TableScorer::new()
+            .edge("root", "l", 0.5f64.ln(), MockGoal::open("L"))
+            .edge("root", "r", 0.5f64.ln(), MockGoal::open("R"))
+            .edge("L", "ld", 0.9f64.ln(), MockGoal::open("D"))
+            .edge("R", "rd", 0.9f64.ln(), MockGoal::open("D"));
+        let out = best_first_search(&mut scorer, MockGoal::open("root"), &BestFirstConfig::default());
+        let d_count = out.order.iter().filter(|k| *k == "D").count();
+        assert_eq!(d_count, 1, "the transposed state D is expanded only once");
+    }
+
+    #[test]
+    fn budget_bounds_the_search_on_an_infinite_chain() {
+        // An unbounded chain n0→n1→n2→… never closes; the budget must stop it.
+        let mut scorer = TableScorer::new()
+            .edge("n0", "s", 0.9f64.ln(), MockGoal::open("n1"))
+            .edge("n1", "s", 0.9f64.ln(), MockGoal::open("n2"))
+            .edge("n2", "s", 0.9f64.ln(), MockGoal::open("n3"))
+            .edge("n3", "s", 0.9f64.ln(), MockGoal::open("n4"))
+            .edge("n4", "s", 0.9f64.ln(), MockGoal::open("n5"));
+        let out = best_first_search(
+            &mut scorer,
+            MockGoal::open("n0"),
+            &BestFirstConfig { max_steps: 3, ..BestFirstConfig::default() },
+        );
+        assert!(!out.solved, "an unclosable chain must not be solved");
+        assert!(out.steps <= 3, "expansions must not exceed the budget");
+    }
+
+    #[test]
+    fn search_is_deterministic() {
+        let build = || {
+            TableScorer::new()
+                .edge("root", "a", 0.7f64.ln(), MockGoal::open("A"))
+                .edge("root", "b", 0.6f64.ln(), MockGoal::open("B"))
+                .edge("A", "ac", 0.9f64.ln(), MockGoal::closed("cA"))
+                .edge("B", "bc", 0.9f64.ln(), MockGoal::closed("cB"))
+        };
+        let mut s1 = build();
+        let mut s2 = build();
+        let o1 = best_first_search(&mut s1, MockGoal::open("root"), &BestFirstConfig::default());
+        let o2 = best_first_search(&mut s2, MockGoal::open("root"), &BestFirstConfig::default());
+        assert_eq!(o1.solved, o2.solved);
+        assert_eq!(o1.order, o2.order);
+        assert_eq!(o1.steps, o2.steps);
+        assert_eq!(o1.proof_tactics(), o2.proof_tactics());
+    }
+
+    // ---- ExpanderScorer adapter (reuses the driver's TacticExpander) ---------
+
+    struct TableExpander {
+        table: HashMap<String, Vec<TacticStep<MockGoal>>>,
+    }
+    impl TableExpander {
+        fn new() -> Self {
+            Self { table: HashMap::new() }
+        }
+        fn edge(mut self, from: &str, tactic: &str, prior: f64, to: MockGoal) -> Self {
+            self.table
+                .entry(from.into())
+                .or_default()
+                .push(TacticStep::new(tactic, prior, to));
+            self
+        }
+    }
+    impl TacticExpander for TableExpander {
+        type State = MockGoal;
+        fn expand(&mut self, state: &MockGoal, _seed: u64) -> Vec<TacticStep<MockGoal>> {
+            self.table.get(&state.key).cloned().unwrap_or_default()
+        }
+    }
+
+    #[test]
+    fn expander_scorer_adapter_drives_best_first() {
+        // A driver TacticExpander (priors in [0,1]) plugs straight into best-first
+        // via the adapter, which reads log(prior) as the log-prob.
+        let expander = TableExpander::new()
+            .edge("g2", "close", 1.0, MockGoal::open("g1"))
+            .edge("g1", "close", 1.0, MockGoal::closed("g0"));
+        let mut scorer = ExpanderScorer(expander);
+        let out = best_first_search(&mut scorer, MockGoal::open("g2"), &BestFirstConfig::default());
+        assert!(out.solved);
+        assert_eq!(out.proof_tactics(), vec!["close", "close"]);
+    }
+
+    // ---- DPO preference-pair extraction -------------------------------------
+
+    #[test]
+    fn dpo_pairs_pairs_winners_with_discarded_siblings() {
+        // Path root -tA-> A -aClose-> cA(closed). At root the policy also proposed
+        // two tactics the prover discarded (simp_fails, ring_fails); at A it
+        // discarded omega_fails. Each becomes a (winner > loser) pair.
+        let mut scorer = TableScorer::new()
+            .edge("root", "tA", 0.9f64.ln(), MockGoal::open("A"))
+            .edge("root", "tB", 0.2f64.ln(), MockGoal::open("B"))
+            .discard("root", "simp_fails")
+            .discard("root", "ring_fails")
+            .edge("A", "aClose", 0.9f64.ln(), MockGoal::closed("cA"))
+            .discard("A", "omega_fails");
+        let out = best_first_search(&mut scorer, MockGoal::open("root"), &BestFirstConfig::default());
+        assert!(out.solved);
+
+        let pairs = dpo_pairs(&out);
+        // Deterministic root→leaf, discard-order pairs.
+        assert_eq!(
+            pairs,
+            vec![
+                DpoPair {
+                    state: MockGoal::open("root"),
+                    winning_tactic: "tA".into(),
+                    losing_tactic: "simp_fails".into(),
+                },
+                DpoPair {
+                    state: MockGoal::open("root"),
+                    winning_tactic: "tA".into(),
+                    losing_tactic: "ring_fails".into(),
+                },
+                DpoPair {
+                    state: MockGoal::open("A"),
+                    winning_tactic: "aClose".into(),
+                    losing_tactic: "omega_fails".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn dpo_pairs_empty_without_a_solution() {
+        // No closing edge ⇒ unsolved ⇒ no preference pairs even with discards.
+        let mut scorer = TableScorer::new()
+            .edge("root", "t", 0.5f64.ln(), MockGoal::open("stuck"))
+            .discard("root", "bad");
+        let out = best_first_search(
+            &mut scorer,
+            MockGoal::open("root"),
+            &BestFirstConfig { max_steps: 10, ..BestFirstConfig::default() },
+        );
+        assert!(!out.solved);
+        assert!(dpo_pairs(&out).is_empty());
+    }
+}
