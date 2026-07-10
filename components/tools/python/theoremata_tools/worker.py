@@ -203,6 +203,10 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.trajectory_recycler import run as trajectory_recycler_run
 
         return trajectory_recycler_run(request)
+    if tool == "roundtrip_audit":
+        from theoremata_tools.roundtrip_audit import run as roundtrip_audit_run
+
+        return roundtrip_audit_run(request)
     if tool == "cert_taylor_model":
         from theoremata_tools.cert_taylor_model import run as cert_taylor_model_run
 
