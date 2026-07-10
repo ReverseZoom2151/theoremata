@@ -16,3 +16,5 @@ pub mod formalize_portfolio;
 pub mod conjecture_engine;
 pub mod refine_ops;
 pub mod formalize_modes;
+pub mod model_router;
+pub mod graph_rag;

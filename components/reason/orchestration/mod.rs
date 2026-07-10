@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod context_assembly;
 pub mod blueprint_run;
 pub mod blueprint_generate;
 pub mod proof_import;
@@ -10,3 +11,6 @@ pub mod consolidate;
 pub mod observe;
 pub mod team;
 pub mod chat;
+pub mod meta_tools;
+pub mod live_plan;
+pub mod trace;

@@ -19,13 +19,15 @@ mod verify;
 // paths unchanged — the physical layout is by component, the namespace is flat.
 pub use graph::{db, model, scheduler};
 pub use reason::{
-    agent, best_first, blueprint, blueprint_generate, blueprint_run, certification, chat, consolidate,
-    conjecture_engine, critic, critic_scorer, dag_projection, decompose, definition_synthesis,
-    discovery_game, distance_critic, driver, evolve_sketch, falsification, fitness, hybrid_search,
-    formal_generate, formalize_modes, formalize_portfolio, goal_cache, guard, inverse_method, library, mathlib_export,
-    mcts, memory, method_transfer, minimize, model_elimination, observe, optimize, plan_history, portfolio,
+    agent, best_first, blueprint, blueprint_generate, blueprint_run, certification, chat, concurrent,
+    consolidate, conjecture_engine, context_assembly, critic, critic_scorer, dag_projection, decompose,
+    definition_synthesis, discovery_game, distance_critic, driver, evolve_sketch, falsification, fitness,
+    graph_rag, guardrails, hybrid_search,
+    formal_generate, formalize_modes, formalize_portfolio, goal_cache, guard, inverse_method, library, live_plan,
+    mathlib_export, mcts, memory, meta_tools, method_transfer, minimize, model_elimination, model_router,
+    observe, optimize, plan_history, portfolio,
     preference_pairs, process_reward, progress, proof_import, proof_pool, refine_ops, repair, research, retry, rewriting, router, sampler, search_telemetry,
-    sampling, sketch, skest, statement_validation, subsumption, symmetry_dedup, tactic_outcome,
+    sampling, sketch, skest, statement_validation, subsumption, symmetry_dedup, tactic_outcome, trace,
     taint, team, ttc,
 };
 pub use prover::{

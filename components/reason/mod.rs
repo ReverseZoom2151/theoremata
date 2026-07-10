@@ -9,18 +9,19 @@ pub mod search;
 // (`reason::mcts`, hence `crate::mcts` via app/main.rs, and sibling references
 // like `crate::mcts`) continue to resolve after the subgroup reorganization.
 pub use orchestration::{
-    agent, blueprint_generate, blueprint_run, certification, chat, consolidate, method_transfer,
-    observe, proof_import, research, statement_validation, team,
+    agent, blueprint_generate, blueprint_run, certification, chat, consolidate, context_assembly,
+    live_plan, meta_tools, method_transfer, observe, proof_import, research, statement_validation,
+    team, trace,
 };
 pub use search::{
-    best_first, critic_scorer, dag_projection, discovery_game, distance_critic, driver, fitness,
-    goal_cache, hybrid_search,
+    best_first, concurrent, critic_scorer, dag_projection, discovery_game, distance_critic, driver,
+    fitness, goal_cache, hybrid_search,
     inverse_method, mcts, minimize, model_elimination, preference_pairs, process_reward, proof_pool, progress, rewriting,
     sampler, sampling, search_telemetry, skest, subsumption, symmetry_dedup, tactic_outcome, ttc,
 };
 pub use proving::{
     blueprint, conjecture_engine, decompose, definition_synthesis, evolve_sketch, falsification,
-    formal_generate, formalize_modes, formalize_portfolio, library, mathlib_export, optimize, portfolio,
-    refine_ops, repair, retry, router, sketch,
+    formal_generate, formalize_modes, formalize_portfolio, graph_rag, library, mathlib_export,
+    model_router, optimize, portfolio, refine_ops, repair, retry, router, sketch,
 };
-pub use critique::{critic, guard, memory, plan_history, taint};
+pub use critique::{critic, guard, guardrails, memory, plan_history, taint};
