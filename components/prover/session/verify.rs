@@ -70,6 +70,10 @@ pub fn verify_lean_round_trip(
         statement_preserved,
         lexical_clean: lexical,
         hardening_clean,
+        // A lexical pre-screen of external-prover output — NOT a live compile.
+        // The authoritative certify step does the real toolchain check, so this
+        // report must never itself count as a live formal certification.
+        live: false,
         detail: json!({
             "expected_statement": expected_statement,
             "hardening_enabled": config.harden_proofs,

@@ -354,6 +354,16 @@ pub struct ScanReport {
 pub trait FormalBackend {
     fn system(&self) -> FormalSystem;
 
+    /// Whether this backend is a MOCK (canned compile/axiom/kernel layers) rather
+    /// than a live toolchain. The default is `false` (a real backend); every
+    /// mock-capable backend overrides this to return `self.mock`. The default
+    /// [`verify`](FormalBackend::verify) stamps the produced report's `live` flag
+    /// as `!self.is_mock()`, so a mock verification can NEVER be mistaken for a
+    /// live formal certification downstream.
+    fn is_mock(&self) -> bool {
+        false
+    }
+
     /// Probe whether this backend's toolchain is usable right now. The default is
     /// `true` (mock backends are always available); live backends override this
     /// to actually probe the configured runner, so callers can skip cleanly when
@@ -442,6 +452,10 @@ pub trait FormalBackend {
             statement_preserved,
             lexical_clean,
             hardening_clean: Some(kernel_clean),
+            // A mock backend's canned kernel layers are NOT a live proof: mark the
+            // report non-live so no downstream site can upgrade it to
+            // `FormallyVerified`.
+            live: !self.is_mock(),
             detail: json!({
                 "system": system.as_str(),
                 "gate": "3+1-layer",
@@ -544,10 +558,101 @@ pub(crate) fn theorem_name_hint(stmt: &str) -> String {
     "MainTheorem".to_string()
 }
 
+/// Given the first two chars of a potential block-comment opener, return the
+/// two-char closer it expects, or `None` if this is not an opener. Covers the
+/// supported systems: `(* *)` (Rocq/Isabelle/HOL), `/- -/` (Lean), `{- -}`
+/// (Agda), `$( $)` (Metamath). All delimiters are ASCII, so these comparisons
+/// never match a multi-byte char and never split one.
+fn block_closer(c: char, next: Option<char>) -> Option<(char, char)> {
+    match (c, next) {
+        ('(', Some('*')) => Some(('*', ')')),
+        ('/', Some('-')) => Some(('-', '/')),
+        ('{', Some('-')) => Some(('-', '}')),
+        ('$', Some('(')) => Some(('$', ')')),
+        _ => None,
+    }
+}
+
+/// Remove comments across the supported formal systems, replacing every stripped
+/// char with a space so token boundaries are preserved and no substring bridges
+/// across a removed comment. Handles nestable block comments `(* *)`, `/- -/`,
+/// `{- -}`, the non-nesting Metamath `$( $)`, and line comments `--` and `//`.
+/// `#` is intentionally left untouched (too ambiguous). Conservative bias: when
+/// a delimiter is ambiguous we strip, which only makes the caller stricter.
+///
+/// Operates on a `Vec<char>` and only ever compares against ASCII delimiter
+/// chars, so it is panic-free on arbitrary UTF-8 (multi-byte chars simply never
+/// match a delimiter and are copied through unchanged).
+fn strip_comments(code: &str) -> String {
+    let chars: Vec<char> = code.chars().collect();
+    let mut out = String::with_capacity(chars.len());
+    let mut i = 0usize;
+    // Stack of expected block-comment closers, supporting nested block comments.
+    let mut stack: Vec<(char, char)> = Vec::new();
+    let mut in_line = false;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        if in_line {
+            if c == '\n' {
+                in_line = false;
+                out.push('\n');
+            } else {
+                out.push(' ');
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(&(a, b)) = stack.last() {
+            // Inside a block comment: a matching closer pops; a nested opener
+            // pushes; everything else is blanked (newlines preserved).
+            if c == a && next == Some(b) {
+                stack.pop();
+                out.push(' ');
+                out.push(' ');
+                i += 2;
+                continue;
+            }
+            if let Some(close) = block_closer(c, next) {
+                stack.push(close);
+                out.push(' ');
+                out.push(' ');
+                i += 2;
+                continue;
+            }
+            out.push(if c == '\n' { '\n' } else { ' ' });
+            i += 1;
+            continue;
+        }
+        if let Some(close) = block_closer(c, next) {
+            stack.push(close);
+            out.push(' ');
+            out.push(' ');
+            i += 2;
+            continue;
+        }
+        if (c == '-' && next == Some('-')) || (c == '/' && next == Some('/')) {
+            in_line = true;
+            out.push(' ');
+            out.push(' ');
+            i += 2;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 /// Cheap lexical "the code is about this statement" check: the statement's
 /// leading identifier/head appears in the whitespace-normalized source.
+///
+/// Comments are stripped from `code` first so a statement hidden in a comment
+/// (e.g. `-- theorem foo : goal` or `(* ... goal ... *)`) cannot satisfy the
+/// check — a trust-boundary concern for this statement-preservation fallback.
 pub(crate) fn statement_mentioned(stmt: &str, code: &str) -> bool {
-    let code_norm: String = code.split_whitespace().collect();
+    let stripped = strip_comments(code);
+    let code_norm: String = stripped.split_whitespace().collect();
     let stmt_norm: String = stmt.split_whitespace().collect();
     if stmt_norm.is_empty() {
         return false;
@@ -961,6 +1066,40 @@ mod tests {
         let status = per_declaration_status(FormalSystem::Lean, code, true, &[]);
         assert_eq!(status.len(), 2);
         assert!(status.iter().all(|u| u.ok));
+    }
+
+    #[test]
+    fn statement_hidden_in_comment_is_not_matched() {
+        let stmt = "theorem foo : goal";
+        // Present only inside a Lean `--` line comment -> must NOT match.
+        let commented = "-- theorem foo : goal\nexample : True := trivial\n";
+        assert!(!statement_mentioned(stmt, commented));
+        // Same statement present as real code -> MUST match.
+        let real = "theorem foo : goal := by trivial\n";
+        assert!(statement_mentioned(stmt, real));
+        // Present only inside a `(* ... *)` block comment -> must NOT match.
+        let block = "(* theorem foo : goal *)\nexample : True := trivial\n";
+        assert!(!statement_mentioned(stmt, block));
+        // `//` line comment and `/- -/` / `{- -}` block comments also hidden.
+        assert!(!statement_mentioned(stmt, "// theorem foo : goal\n"));
+        assert!(!statement_mentioned(stmt, "/- theorem foo : goal -/\n"));
+        assert!(!statement_mentioned(stmt, "{- theorem foo : goal -}\n"));
+    }
+
+    #[test]
+    fn strip_comments_is_panic_free_on_non_ascii_and_deterministic() {
+        // Multi-byte chars adjacent to delimiters must not panic or split.
+        let code = "theorem β : ∀ x, x = x -- comment with π\n(* café ≤ ∞ *)λ\n";
+        let a = strip_comments(code);
+        let b = strip_comments(code);
+        assert_eq!(a, b, "strip_comments must be deterministic");
+        // Real (non-comment) tokens survive; comment content is gone.
+        assert!(a.contains('β'));
+        assert!(a.contains('λ'));
+        assert!(!a.contains("comment"));
+        assert!(!a.contains("café"));
+        // Length in chars is preserved (every stripped char -> one space).
+        assert_eq!(a.chars().count(), code.chars().count());
     }
 
     #[test]

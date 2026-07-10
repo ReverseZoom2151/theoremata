@@ -340,6 +340,10 @@ impl FormalBackend for LeanBackend {
         SYSTEM
     }
 
+    fn is_mock(&self) -> bool {
+        self.mock
+    }
+
     fn available(&self) -> bool {
         self.mock || exec::probe(&self.runner, &[&self.lean, "--version"])
     }

@@ -98,6 +98,14 @@ pub struct VerificationReport {
     pub lexical_clean: bool,
     #[serde(default)]
     pub hardening_clean: Option<bool>,
+    /// Whether this report was produced by a LIVE prover toolchain, as opposed to
+    /// a MOCK backend (canned kernel layers). Conservative serde default `false`:
+    /// unknown provenance is NOT live, so a report can never be mistaken for a
+    /// live certification. The default [`FormalBackend::verify`] sets this to
+    /// `!self.is_mock()`. A mock pass is at most *informal* — never
+    /// [`FormallyVerified`](crate::model::NodeStatus::FormallyVerified).
+    #[serde(default)]
+    pub live: bool,
     #[serde(default)]
     pub detail: Value,
 }

@@ -236,6 +236,10 @@ impl FormalBackend for ExternalBackend {
         self.system
     }
 
+    fn is_mock(&self) -> bool {
+        self.mock
+    }
+
     fn available(&self) -> bool {
         if self.mock {
             return true;

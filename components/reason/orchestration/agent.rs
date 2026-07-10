@@ -652,7 +652,9 @@ impl AgentLoop<'_> {
             },
             serde_json::to_value(&report)?,
         )?;
-        if report.lexically_verified {
+        if report.lexically_verified && report.live {
+            // A LIVE prover ran the full 3+1-layer gate: a real formal
+            // certification.
             self.store.set_node_status(
                 project_id,
                 &node.id,
@@ -661,6 +663,17 @@ impl AgentLoop<'_> {
             )?;
             *certified += 1;
             Ok("formal_generate")
+        } else if report.lexically_verified {
+            // The lexical gate passed but NO live prover ran (mock backend: the
+            // toolchain was absent or `prover_mock` was set). A mock check is at
+            // most INFORMAL — it must never yield `FormallyVerified`.
+            self.store.set_node_status(
+                project_id,
+                &node.id,
+                NodeStatus::InformallyVerified,
+                "verifier",
+            )?;
+            Ok("formal_generate_informal")
         } else {
             Ok("formal_generate_unverified")
         }
