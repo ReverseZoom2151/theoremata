@@ -32,7 +32,7 @@ use std::{
 };
 
 /// Which formal system a proof object belongs to. Serialized `snake_case`
-/// (`lean` / `rocq` / `isabelle` / `candle`) to match the `backend` string
+/// (`lean` / `rocq` / `isabelle` / `candle` / `agda` / `metamath`) to match the `backend` string
 /// dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -45,6 +45,10 @@ pub enum FormalSystem {
     /// so its layer-3 kernel re-check carries a stronger guarantee than the
     /// smaller-trusted-checker approach of `leanchecker`/`coqchk`.
     Candle,
+    /// Agda, an intuitionistic Martin-Lof dependent type theory checker.
+    Agda,
+    /// Metamath's tiny substitution kernel and explicit proof language.
+    Metamath,
 }
 
 impl Default for FormalSystem {
@@ -61,6 +65,8 @@ impl FormalSystem {
             FormalSystem::Rocq => "rocq",
             FormalSystem::Isabelle => "isabelle",
             FormalSystem::Candle => "candle",
+            FormalSystem::Agda => "agda",
+            FormalSystem::Metamath => "metamath",
         }
     }
 
@@ -90,6 +96,8 @@ impl FormalSystem {
             FormalSystem::Candle => {
                 vec!["ETA_AX".into(), "SELECT_AX".into(), "INFINITY_AX".into()]
             }
+            FormalSystem::Agda => Vec::new(),
+            FormalSystem::Metamath => Vec::new(),
         }
     }
 
@@ -101,6 +109,8 @@ impl FormalSystem {
             FormalSystem::Isabelle => ".thy",
             // HOL Light proofs are OCaml scripts executed by the Candle kernel.
             FormalSystem::Candle => ".ml",
+            FormalSystem::Agda => ".agda",
+            FormalSystem::Metamath => ".mm",
         }
     }
 
@@ -112,6 +122,8 @@ impl FormalSystem {
             FormalSystem::Isabelle => vec!["Main".into()],
             // HOL Light's standard prelude (loaded by the Candle image).
             FormalSystem::Candle => vec!["hol_light".into()],
+            FormalSystem::Agda => vec!["Agda.Builtin".into()],
+            FormalSystem::Metamath => vec!["set.mm".into()],
         }
     }
 
@@ -176,6 +188,22 @@ impl FormalSystem {
                        simplest serious foundation by concept count; axioms \
                        ETA_AX / SELECT_AX / INFINITY_AX (= our axiom_whitelist)",
             },
+            FormalSystem::Agda => FoundationProfile {
+                foundation: "Martin-Lof dependent type theory (Agda)",
+                classical: false,
+                choice: false,
+                all_math: true,
+                primitive_notions: None,
+                note: "constructive dependent type theory; Agda postulates are rejected by the source gate unless explicitly profiled",
+            },
+            FormalSystem::Metamath => FoundationProfile {
+                foundation: "Metamath set theory / ZFC-style axiomatic foundation",
+                classical: true,
+                choice: true,
+                all_math: true,
+                primitive_notions: None,
+                note: "explicit substitution proofs checked by the Metamath kernel; database foundation depends on the loaded .mm corpus",
+            },
         }
     }
 }
@@ -216,6 +244,8 @@ impl FromStr for FormalSystem {
             // `hol` is already claimed by Isabelle above, so Candle takes the
             // explicit tags only.
             "candle" | "hol_light" | "hol-light" | "hollight" => Ok(FormalSystem::Candle),
+            "agda" => Ok(FormalSystem::Agda),
+            "metamath" | "mm" => Ok(FormalSystem::Metamath),
             other => Err(anyhow::anyhow!("unknown formal system: {other}")),
         }
     }
@@ -556,6 +586,8 @@ pub(crate) fn entry_name(system: FormalSystem, code: &str) -> Option<String> {
         FormalSystem::Isabelle => &["theorem", "lemma", "corollary", "proposition"],
         // HOL Light theorems are OCaml let-bindings: `let FOO = prove(...)`.
         FormalSystem::Candle => &["let"],
+        FormalSystem::Agda => &["module", "data", "record", "postulate"],
+        FormalSystem::Metamath => &["$p", "$a"],
     };
     for raw in code.lines() {
         let line = raw.trim_start();
@@ -631,6 +663,8 @@ pub(crate) fn all_entry_names(system: FormalSystem, code: &str) -> Vec<String> {
         FormalSystem::Isabelle => &["theorem", "lemma", "corollary", "proposition"],
         // HOL Light theorems are OCaml let-bindings: `let FOO = prove(...)`.
         FormalSystem::Candle => &["let"],
+        FormalSystem::Agda => &["module", "data", "record", "postulate"],
+        FormalSystem::Metamath => &["$p", "$a"],
     };
     let mut out = Vec::new();
     for raw in code.lines() {
@@ -748,6 +782,8 @@ pub fn backend_for(cfg: &Config, system: FormalSystem, mock: bool) -> Box<dyn Fo
         (FormalSystem::Candle, false) => {
             Box::new(crate::prover::backends::candle::CandleBackend::live(cfg))
         }
+        (FormalSystem::Agda, mock) => Box::new(crate::prover::backends::external::ExternalBackend::new(cfg, FormalSystem::Agda, mock)),
+        (FormalSystem::Metamath, mock) => Box::new(crate::prover::backends::external::ExternalBackend::new(cfg, FormalSystem::Metamath, mock)),
     }
 }
 

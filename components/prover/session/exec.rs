@@ -127,6 +127,10 @@ pub struct FormalRunners {
     /// HOL4/PolyML/CakeML toolchain that builds `candle` lives on this machine.
     #[serde(default = "runner_wsl_ubuntu")]
     pub candle: Runner,
+    #[serde(default = "runner_native")]
+    pub agda: Runner,
+    #[serde(default = "runner_native")]
+    pub metamath: Runner,
 }
 
 fn runner_native() -> Runner {
@@ -146,6 +150,8 @@ impl Default for FormalRunners {
             rocq: runner_wsl_ubuntu(),
             isabelle: runner_wsl_ubuntu(),
             candle: runner_wsl_ubuntu(),
+            agda: runner_native(),
+            metamath: runner_native(),
         }
     }
 }
@@ -158,6 +164,8 @@ impl FormalRunners {
             FormalSystem::Rocq => &self.rocq,
             FormalSystem::Isabelle => &self.isabelle,
             FormalSystem::Candle => &self.candle,
+            FormalSystem::Agda => &self.agda,
+            FormalSystem::Metamath => &self.metamath,
         };
         base.resolved()
     }

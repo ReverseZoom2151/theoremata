@@ -5,3 +5,4 @@ pub mod lean;
 pub mod rocq;
 pub mod isabelle;
 pub mod candle;
+pub mod external;

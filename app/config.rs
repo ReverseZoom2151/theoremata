@@ -70,6 +70,12 @@ pub struct Config {
     /// (`candle <file>.ml`). Env: `THEOREMATA_CANDLE`.
     #[serde(default = "default_candle_bin")]
     pub candle_bin: String,
+    /// Binary for Agda source checking. Env: `THEOREMATA_AGDA`.
+    #[serde(default = "default_agda_bin")]
+    pub agda_bin: String,
+    /// Binary for Metamath verification. Env: `THEOREMATA_METAMATH`.
+    #[serde(default = "default_metamath_bin")]
+    pub metamath_bin: String,
     /// Which formal system the agent targets when generating proofs for
     /// `Route::Prove`/`Route::Formalize`. Defaults to Lean (existing behavior);
     /// set to `rocq`/`isabelle` to route through the per-system generator.
@@ -165,6 +171,10 @@ fn default_candle_bin() -> String {
     "candle".into()
 }
 
+fn default_agda_bin() -> String { "agda".into() }
+
+fn default_metamath_bin() -> String { "metamath".into() }
+
 fn default_k_consecutive_clean() -> u32 {
     3
 }
@@ -209,6 +219,8 @@ impl Default for Config {
             coqchk_bin: default_coqchk_bin(),
             isabelle_bin: default_isabelle_bin(),
             candle_bin: default_candle_bin(),
+            agda_bin: default_agda_bin(),
+            metamath_bin: default_metamath_bin(),
             target_system: crate::prover::formal::FormalSystem::default(),
             kernel_validate_proof: false,
             validate_statements: default_validate_statements(),

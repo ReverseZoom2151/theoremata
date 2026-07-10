@@ -13,7 +13,7 @@ pub mod statement_preservation;
 // Re-export every leaf module flat at the component root so existing paths
 // (`prover::aristotle`, hence `crate::prover::aristotle`, and sibling
 // references) continue to resolve after the subgroup reorganization.
-pub use backends::{aristotle, isabelle, lean, leandojo, reprover, rocq};
+pub use backends::{aristotle, external, isabelle, lean, leandojo, reprover, rocq};
 pub use session::{exec, goal_state, statement_guard, verify};
 
 #[cfg(test)]
