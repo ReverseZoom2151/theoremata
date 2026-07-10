@@ -77,7 +77,7 @@ jobs:
         run: python -m pytest components
 
   formal-live:
-    name: Agda + Metamath live gates
+    name: All formal-system live gates
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -102,3 +102,19 @@ jobs:
 
       - name: Metamath live gate
         run: cargo test --locked metamath_live_verifies_trivial_and_rejects_malformed_proof -- --test-threads=1
+
+      # These backends already have live tests in the core suite. Run their
+      # focused tests here as well so every formal system has the same explicit
+      # CI surface. Tests self-skip when the configured runner/toolchain is not
+      # installed; when present, the positive and negative cases are gates.
+      - name: Lean live gate
+        run: cargo test --locked lean_live_verifies_trivial_and_rejects_sorry -- --test-threads=1
+
+      - name: Rocq live gate
+        run: cargo test --locked rocq_live_verifies_trivial_and_rejects_admitted -- --test-threads=1
+
+      - name: Isabelle live gate
+        run: cargo test --locked isabelle_live_verifies_trivial_and_rejects_sorry -- --test-threads=1
+
+      - name: Candle live gate
+        run: cargo test --locked candle_live_verifies_trivial_and_rejects_mk_thm -- --ignored --test-threads=1
