@@ -315,22 +315,35 @@ impl FormalBackend for ExternalBackend {
         let out = self.run_file(ws);
         let filename = ws.source_path.file_name().and_then(|s| s.to_str()).unwrap_or("Generated");
         let command = self.command(filename);
-        let errors = if out.success() {
+        // SOUNDNESS: the Metamath reference binary (`metamath`) returns exit code 0
+        // even when `verify proof *` FAILS (failures only print `?Error` to stdout;
+        // its `main()` unconditionally returns 0). So the exit code is NOT a
+        // reliable pass signal for Metamath, and trusting it (`out.success()`) would
+        // mark a failed proof as verified. Require the explicit success sentinel and
+        // the absence of any error/warning markers instead (fail-closed). Agda's
+        // `--safe` sets a correct non-zero exit on failure, so it keeps `success()`.
+        let verified = match self.system {
+            FormalSystem::Metamath => {
+                metamath_output_verified(&out.stdout, &out.stderr, out.launched)
+            }
+            _ => out.success(),
+        };
+        let errors = if verified {
             vec![]
         } else {
             vec![out.stderr.clone(), out.stdout.clone()]
         };
         let code = std::fs::read_to_string(&ws.source_path).unwrap_or_default();
         Ok(CompileReport {
-            compiled: out.success(),
+            compiled: verified,
             per_unit: crate::prover::formal::per_declaration_status(
                 self.system,
                 &code,
-                out.success(),
+                verified,
                 &errors,
             ),
             errors,
-            detail: json!({"runner": self.runner.tag(), "binary": self.binary.clone(), "command": command, "code": out.code, "stdout": out.stdout, "stderr": out.stderr}),
+            detail: json!({"runner": self.runner.tag(), "binary": self.binary.clone(), "command": command, "code": out.code, "verified": verified, "stdout": out.stdout, "stderr": out.stderr}),
         })
     }
 
@@ -484,6 +497,21 @@ fn metamath_includes(code: &str) -> Vec<PathBuf> {
     includes
 }
 
+/// Decide whether a Metamath `verify proof *` run actually PASSED. The `metamath`
+/// reference binary returns exit code 0 even on failure (failures only print
+/// `?Error` to stdout), so the exit code is not a reliable pass signal. A genuine
+/// pass requires the explicit success sentinel and no error/warning markers.
+fn metamath_output_verified(stdout: &str, stderr: &str, launched: bool) -> bool {
+    let combined = format!("{stdout}\n{stderr}");
+    let lc = combined.to_lowercase();
+    launched
+        && combined.contains("All proofs in the database were verified")
+        && !combined.contains("?Error")
+        && !combined.contains("?Warning")
+        && !lc.contains("were not proved")
+        && !lc.contains("no source file")
+}
+
 impl ProofSession for ExternalBackend {
     fn start(&mut self, _project: &FormalProject) -> Result<()> {
         Ok(())
@@ -513,6 +541,40 @@ impl ProofSession for ExternalBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Metamath exit-code soundness: a failed `verify proof *` must NOT read as
+    // verified even though the binary exits 0. Only the explicit success sentinel
+    // (with no error/warning markers) counts.
+    #[test]
+    fn metamath_verified_requires_the_success_sentinel() {
+        // Genuine pass.
+        assert!(metamath_output_verified(
+            "All proofs in the database were verified in 0.01 s.",
+            "",
+            true
+        ));
+        // Failure that (like the real binary) still exited 0 -> must be rejected.
+        assert!(!metamath_output_verified(
+            "?Error on line 5: ... proof does not verify.",
+            "",
+            true
+        ));
+        // Silent / empty output (missing file, no sentinel) -> rejected.
+        assert!(!metamath_output_verified("", "", true));
+        assert!(!metamath_output_verified("No source file was read in.", "", true));
+        // Warnings (e.g. an incomplete `? ` proof) -> rejected (fail-closed).
+        assert!(!metamath_output_verified(
+            "?Warning: proof is incomplete.\nAll proofs in the database were verified.",
+            "",
+            true
+        ));
+        // Never launched -> rejected.
+        assert!(!metamath_output_verified(
+            "All proofs in the database were verified.",
+            "",
+            false
+        ));
+    }
 
     // GAP 1 — Metamath source scan. These exercise the pure lexical helper
     // directly, so they are deterministic regardless of whether the Python
