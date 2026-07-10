@@ -199,6 +199,10 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.format_filters import run as format_filters_run
 
         return format_filters_run(request)
+    if tool == "trajectory_recycler":
+        from theoremata_tools.trajectory_recycler import run as trajectory_recycler_run
+
+        return trajectory_recycler_run(request)
     if tool == "cert_taylor_model":
         from theoremata_tools.cert_taylor_model import run as cert_taylor_model_run
 
