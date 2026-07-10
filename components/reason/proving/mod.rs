@@ -15,3 +15,4 @@ pub mod repair;
 pub mod formalize_portfolio;
 pub mod conjecture_engine;
 pub mod refine_ops;
+pub mod formalize_modes;
