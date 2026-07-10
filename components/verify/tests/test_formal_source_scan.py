@@ -45,6 +45,24 @@ def test_masker_preserves_length_and_newlines(masker, src):
     ]
 
 
+def test_agda_unsafe_features_are_rejected_but_comments_are_ignored():
+    clean = "-- postulate fake\nmodule M where\n\nfoo : Set\n"
+    assert scan("agda", clean)["clean"] is True
+    for source, pattern in [
+        ("module M where\npostulate bad : Set\n", "postulate"),
+        ("{-# OPTIONS --type-in-type #-}\nmodule M where\n", "type_in_type"),
+        ("{-# OPTIONS --no-termination-check #-}\nmodule M where\n", "no_termination_check"),
+    ]:
+        result = scan("agda", source)
+        assert result["clean"] is False
+        assert pattern in _patterns(result, "critical")
+
+
+def test_metamath_database_commands_are_not_confused_with_axioms():
+    source = "$c wff |- $.\n$a wff ph $.\n$p wff ph $= ax $.\n"
+    assert scan("metamath", source)["clean"] is True
+
+
 # ---------------------------------------------------------------------------
 # Rocq
 # ---------------------------------------------------------------------------
@@ -334,4 +352,4 @@ def test_coq_alias_routes_to_rocq():
 
 def test_unknown_system_raises():
     with pytest.raises(ValueError):
-        scan("agda", "postulate p : Set\n")
+        scan("unknown-system", "postulate p : Set\n")

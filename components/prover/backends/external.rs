@@ -48,7 +48,9 @@ impl ExternalBackend {
 
     fn command(&self, filename: &str) -> Vec<String> {
         match self.system {
-            FormalSystem::Agda => vec![self.binary.clone(), filename.to_string()],
+            // Safe mode disables postulates and unsafe options at the checker
+            // boundary; source scanning still reports which policy was used.
+            FormalSystem::Agda => vec![self.binary.clone(), "--safe".into(), filename.to_string()],
             // Metamath's command-line mode accepts each command as one argv
             // item, avoiding an interactive process that could otherwise hang.
             FormalSystem::Metamath => vec![
@@ -128,6 +130,8 @@ impl FormalBackend for ExternalBackend {
             });
         }
         let out = self.run_file(ws);
+        let filename = ws.source_path.file_name().and_then(|s| s.to_str()).unwrap_or("Generated");
+        let command = self.command(filename);
         let errors = if out.success() {
             vec![]
         } else {
@@ -143,7 +147,7 @@ impl FormalBackend for ExternalBackend {
                 &errors,
             ),
             errors,
-            detail: json!({"runner": self.runner.tag(), "code": out.code, "stdout": out.stdout, "stderr": out.stderr}),
+            detail: json!({"runner": self.runner.tag(), "binary": self.binary.clone(), "command": command, "code": out.code, "stdout": out.stdout, "stderr": out.stderr}),
         })
     }
 
@@ -176,9 +180,11 @@ impl FormalBackend for ExternalBackend {
             });
         }
         let out = self.run_file(ws);
+        let filename = ws.source_path.file_name().and_then(|s| s.to_str()).unwrap_or("Generated");
+        let command = self.command(filename);
         Ok(RecheckReport {
             rechecked: out.success(),
-            detail: json!({"code": out.code, "stdout": out.stdout, "stderr": out.stderr, "checker": self.system.as_str()}),
+            detail: json!({"binary": self.binary.clone(), "command": command, "code": out.code, "stdout": out.stdout, "stderr": out.stderr, "checker": self.system.as_str()}),
         })
     }
 

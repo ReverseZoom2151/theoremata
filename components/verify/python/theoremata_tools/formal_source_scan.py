@@ -42,7 +42,7 @@ from typing import Any
 CRITICAL = "critical"
 WARNING = "warning"
 
-SYSTEMS = ("lean", "rocq", "isabelle")
+SYSTEMS = ("lean", "rocq", "isabelle", "agda", "metamath")
 
 _SNIPPET_MAX = 160
 
@@ -190,6 +190,26 @@ def mask_isabelle(text: str) -> str:
     )
 
 
+def mask_agda(text: str) -> str:
+    """Mask Agda ``--`` comments, nested ``{- -}`` comments, and strings."""
+    # Agda pragmas use ``{-# ... #-}``, which begins like a block comment but
+    # must remain visible to the policy scanner.
+    text = re.sub(
+        r"{-#.*?#-}",
+        lambda m: m.group(0).replace("{-#", "@@A").replace("#-}", "@@B").replace("--", "@@C"),
+        text,
+        flags=re.DOTALL,
+    )
+    masked = _mask(
+        text,
+        line_comment="--",
+        blocks=(("{-", "-}"),),
+        string_quote='"',
+        string_escape="backslash",
+    )
+    return masked.replace("@@A", "{-#").replace("@@B", "#-}").replace("@@C", "--")
+
+
 # ---------------------------------------------------------------------------
 # Per-system escape-hatch pattern tables: (pattern_name, regex, severity)
 # ---------------------------------------------------------------------------
@@ -216,6 +236,22 @@ _LEAN_RULES: tuple[tuple[str, re.Pattern[str], str], ...] = (
     ("implemented_by", _lean_attr("implemented_by"), WARNING),
     ("extern", _lean_attr("extern"), WARNING),
     ("csimp", _lean_attr("csimp"), WARNING),
+)
+
+_AGDA_RULES: tuple[tuple[str, re.Pattern[str], str], ...] = (
+    ("postulate", re.compile(r"\bpostulate\b"), CRITICAL),
+    ("allow_unsolved_metas", re.compile(r"--allow-unsolved-metas\b"), CRITICAL),
+    ("type_in_type", re.compile(r"--type-in-type\b"), CRITICAL),
+    ("unsafe", re.compile(r"\b{-#\s*OPTIONS\s+[^#]*--unsafe\b"), CRITICAL),
+    ("no_termination_check", re.compile(r"--no-termination-check\b"), CRITICAL),
+    ("no_positivity_check", re.compile(r"--no-positivity-check\b"), CRITICAL),
+    ("no_coverage_check", re.compile(r"--no-coverage-check\b"), CRITICAL),
+    ("primTrustMe", re.compile(r"\bprimTrustMe\b"), CRITICAL),
+    ("compiled_ffi", re.compile(r"{-#\s*(?:COMPILED|COMPILED_DATA|COMPILED_TYPE|IMPORT)\b"), WARNING),
+)
+
+_METAMATH_RULES: tuple[tuple[str, re.Pattern[str], str], ...] = (
+    ("unsafe_command", re.compile(r"\b(?:verify\s+markup|write\s+source)\b", re.IGNORECASE), WARNING),
 )
 
 _ROCQ_RULES: tuple[tuple[str, re.Pattern[str], str], ...] = (
@@ -257,12 +293,16 @@ _RULES = {
     "lean": _LEAN_RULES,
     "rocq": _ROCQ_RULES,
     "isabelle": _ISABELLE_RULES,
+    "agda": _AGDA_RULES,
+    "metamath": _METAMATH_RULES,
 }
 
 _MASKERS = {
     "lean": mask_lean,
     "rocq": mask_rocq,
     "isabelle": mask_isabelle,
+    "agda": mask_agda,
+    "metamath": lambda text: text,
 }
 
 # Aliases for the two systems that have common alternate names.
