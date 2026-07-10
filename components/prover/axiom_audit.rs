@@ -193,6 +193,19 @@ pub fn audit_hol_light(code: &str, whitelist: &[String]) -> AxiomAudit {
         ));
     }
 
+    // (1b) CHEAT_TAC — HOL Light's `tactics.ml` defines it as
+    // `ACCEPT_TAC(mk_thm([],w))`, i.e. a NAMED `mk_thm` wrapper that closes any
+    // goal without proof. A raw `mk_thm` grep misses it, so flag it explicitly.
+    for pos in word_positions(chars, "CHEAT_TAC") {
+        findings.push(Finding::critical(
+            "cheat_tac",
+            line_of(chars, pos),
+            "fabricated theorem: `CHEAT_TAC` is `ACCEPT_TAC(mk_thm([],w))` — it \
+             closes the goal with an unproven theorem, bypassing the kernel"
+                .to_string(),
+        ));
+    }
+
     // (2) new_axiom — undue axiom unless the bound name is whitelisted.
     for pos in word_positions(chars, "new_axiom") {
         let name = binding_name(chars, pos);
@@ -514,6 +527,19 @@ let ID_DEF = new_definition `(myid:'a->'a) = \\x. x`;;
         let report = audit.into_scan_report();
         assert!(!report.clean);
         assert!(report.findings.iter().any(|s| s.contains("CRITICAL") && s.contains("mk_thm")));
+    }
+
+    #[test]
+    fn cheat_tac_is_critical() {
+        // CHEAT_TAC = ACCEPT_TAC(mk_thm([],w)) — a named mk_thm wrapper a raw
+        // `mk_thm` grep misses.
+        let code = "let BOGUS = prove(`p /\\ ~p`, CHEAT_TAC);;\n";
+        let audit = audit_hol_light(code, &whitelist());
+        assert!(!audit.is_clean(), "CHEAT_TAC must fail the audit");
+        assert!(audit
+            .findings
+            .iter()
+            .any(|f| f.rule == "cheat_tac" && f.severity == Severity::Critical));
     }
 
     /// A `new_axiom` whose bound name is NOT whitelisted is flagged CRITICAL.
