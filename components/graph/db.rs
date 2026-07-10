@@ -463,6 +463,10 @@ impl Store {
         status: NodeStatus,
         actor: &str,
     ) -> Result<()> {
+        // Atomic: the status UPDATE, the (conditional) taint recomputation and
+        // the `node.status_changed` event commit together, so an observer never
+        // sees a new status without its event or with stale taint.
+        let tx = self.conn.unchecked_transaction()?;
         let changed = self.conn.execute(
             "UPDATE nodes SET status=?1,updated_at=?2 WHERE id=?3 AND project_id=?4",
             params![
@@ -485,6 +489,7 @@ impl Store {
             actor,
             serde_json::json!({"node_id":node_id,"status":status}),
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -564,6 +569,29 @@ impl Store {
     /// Add a dependency edge tagged with its leanblueprint `\uses` scope
     /// (statement / proof / both). Cycle-checked; taint recomputed.
     pub fn add_edge_scoped(
+        &self,
+        project_id: &str,
+        source: &str,
+        target: &str,
+        kind: EdgeKind,
+        dep_scope: DepScope,
+    ) -> Result<()> {
+        // Atomic: the insert, the acyclicity check, the cycle-rollback delete,
+        // the taint recomputation and the event write all commit together. On
+        // any early return the transaction is dropped and rolled back, so a
+        // failure mid-sequence leaves no partial edge row, and a concurrent
+        // insert cannot slip a cycle in between the check and the write.
+        let tx = self.conn.unchecked_transaction()?;
+        self.add_edge_scoped_inner(project_id, source, target, kind, dep_scope)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Transaction-free core of [`Store::add_edge_scoped`]. Every statement runs
+    /// on `self.conn`, so it participates in whatever transaction the caller has
+    /// already opened (e.g. [`Store::merge_nodes`]). It never opens its own
+    /// transaction — call it only from inside one.
+    fn add_edge_scoped_inner(
         &self,
         project_id: &str,
         source: &str,
@@ -658,9 +686,22 @@ impl Store {
         parents: &[String],
         provenance: &str,
     ) -> Result<Node> {
+        // Atomic: the merged node, every DependsOn edge to its parents (each
+        // cycle-checked) and the `nodes.merged` event commit together. A failure
+        // partway — e.g. a parent that would form a cycle — rolls the whole
+        // merge back, leaving neither a dangling node nor partial edges. The
+        // edges use the transaction-free `add_edge_scoped_inner` so they join
+        // this transaction instead of opening (illegally nested) ones.
+        let tx = self.conn.unchecked_transaction()?;
         let node = self.add_node(project_id, kind, title, statement, provenance)?;
         for parent in parents {
-            self.add_edge(project_id, &node.id, parent, EdgeKind::DependsOn)?;
+            self.add_edge_scoped_inner(
+                project_id,
+                &node.id,
+                parent,
+                EdgeKind::DependsOn,
+                DepScope::Statement,
+            )?;
         }
         self.event(
             Some(project_id),
@@ -669,6 +710,7 @@ impl Store {
             provenance,
             serde_json::json!({"node_id": node.id, "parents": parents}),
         )?;
+        tx.commit()?;
         Ok(node)
     }
 
@@ -2310,5 +2352,83 @@ mod tests {
         .unwrap();
         let got = s.nodes(&p.id).unwrap().into_iter().next().unwrap();
         assert_eq!(got.lean_decls, vec!["Ns.main", "Ns.helper"]);
+    }
+
+    #[test]
+    fn cycle_rejection_leaves_no_partial_edge() {
+        let s = Store::open(Path::new(":memory:")).unwrap();
+        let p = s.create_project("p", "t").unwrap();
+        let a = s.add_node(&p.id, NodeKind::Lemma, "a", "a", "test").unwrap();
+        let b = s.add_node(&p.id, NodeKind::Lemma, "b", "b", "test").unwrap();
+        s.add_edge(&p.id, &a.id, &b.id, EdgeKind::DependsOn).unwrap();
+        let edges_before = s.edges(&p.id).unwrap();
+        // b -> a would close a cycle: it must be rejected AND leave the edge set
+        // exactly as it was — no lingering half-inserted row from the aborted
+        // insert-then-check.
+        let err = s
+            .add_edge(&p.id, &b.id, &a.id, EdgeKind::DependsOn)
+            .unwrap_err();
+        assert!(err.to_string().contains("cycle"));
+        let edges_after = s.edges(&p.id).unwrap();
+        assert_eq!(edges_after.len(), edges_before.len());
+        assert!(edges_after
+            .iter()
+            .all(|e| !(e.source_id == b.id && e.target_id == a.id)));
+    }
+
+    #[test]
+    fn status_change_emits_event_atomically() {
+        let s = Store::open(Path::new(":memory:")).unwrap();
+        let p = s.create_project("p", "t").unwrap();
+        let n = s.add_node(&p.id, NodeKind::Lemma, "n", "N", "test").unwrap();
+        s.set_node_status(&p.id, &n.id, NodeStatus::InformallyVerified, "test")
+            .unwrap();
+        let got = s
+            .nodes(&p.id)
+            .unwrap()
+            .into_iter()
+            .find(|x| x.id == n.id)
+            .unwrap();
+        assert_eq!(got.status, NodeStatus::InformallyVerified);
+        let evented = s
+            .events(&p.id, 10_000)
+            .unwrap()
+            .iter()
+            .any(|e| e.event_type == "node.status_changed");
+        assert!(evented, "status change must emit its event");
+        // A status change against a missing node fails and writes nothing.
+        assert!(s
+            .set_node_status(&p.id, "does-not-exist", NodeStatus::Rejected, "test")
+            .is_err());
+    }
+
+    #[test]
+    fn merge_rolls_back_when_an_edge_fails() {
+        let s = Store::open(Path::new(":memory:")).unwrap();
+        let p = s.create_project("p", "t").unwrap();
+        let parent = s
+            .add_node(&p.id, NodeKind::Lemma, "parent", "P", "test")
+            .unwrap();
+        let nodes_before = s.nodes(&p.id).unwrap().len();
+        let edges_before = s.edges(&p.id).unwrap().len();
+        // The second "parent" id does not exist, so its edge INSERT hits a
+        // foreign-key violation partway through the merge. The whole merge —
+        // the new node, its first (valid) edge, and the events — must roll back.
+        let res = s.merge_nodes(
+            &p.id,
+            NodeKind::Lemma,
+            "merged",
+            "M",
+            &[parent.id.clone(), "does-not-exist".to_string()],
+            "test",
+        );
+        assert!(res.is_err());
+        assert_eq!(s.nodes(&p.id).unwrap().len(), nodes_before);
+        assert_eq!(s.edges(&p.id).unwrap().len(), edges_before);
+        assert!(s
+            .events(&p.id, 10_000)
+            .unwrap()
+            .iter()
+            .all(|e| e.event_type != "nodes.merged"));
     }
 }
