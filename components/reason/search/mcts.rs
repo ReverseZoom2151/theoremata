@@ -73,6 +73,10 @@ pub struct SearchConfig {
     /// Where the MCGS driver draws action priors from. Default
     /// [`PriorMode::Progress`].
     pub prior_mode: PriorMode,
+    /// Blend weight for a trained state-value critic `V(s)` in PUCT selection
+    /// (the [`crate::critic_scorer`] seam). `0.0` (default) makes the critic term
+    /// inert, so behaviour is unchanged until a critic is injected.
+    pub critic_weight: f64,
 }
 
 impl Default for SearchConfig {
@@ -85,6 +89,7 @@ impl Default for SearchConfig {
             progress_weight: crate::progress::PROGRESS_PRIOR_WEIGHT,
             selection: SelectionMode::Puct,
             prior_mode: PriorMode::Progress,
+            critic_weight: 0.0,
         }
     }
 }

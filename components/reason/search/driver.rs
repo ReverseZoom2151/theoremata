@@ -25,10 +25,12 @@
 //! its per-goal budget (width/rollouts); with no controller attached it uses the
 //! fixed [`SearchConfig`] budget, exactly like [`crate::search::mcts`].
 
+use super::critic_scorer::CriticScorer;
 use super::mcts::{PriorMode, SearchConfig, SelectionMode};
 use super::ttc::TtcController;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// A proof state the driver searches over. Equivalent states must share a
 /// [`dedup_key`](GoalState::dedup_key) so they collapse into one graph node.
@@ -133,6 +135,9 @@ struct DagNode<S> {
     state: S,
     closed: bool,
     progress: f64,
+    /// Trained-critic V(s) in [0,1]; defaults to `progress` when no critic is
+    /// injected, so `critic_weight = 0.0` leaves selection unchanged.
+    critic: f64,
     visits: usize,
     value_sum: f64,
     edges: Vec<Edge>,
@@ -241,6 +246,10 @@ pub struct ProofSearchDriver<E: TacticExpander> {
     /// driver runs negation-augmented search — a disproof competes for the same
     /// budget and, if it closes first, the search returns `refuted`.
     negator: Option<Box<dyn Fn(&E::State) -> Option<E::State>>>,
+    /// Optional trained state-value critic, blended into PUCT selection via
+    /// `cfg.critic_weight` (the [`super::critic_scorer`] seam). `None` ⇒ nodes
+    /// fall back to their `progress` estimate.
+    critic: Option<Arc<dyn CriticScorer>>,
 }
 
 impl<E: TacticExpander> ProofSearchDriver<E> {
@@ -253,12 +262,20 @@ impl<E: TacticExpander> ProofSearchDriver<E> {
             ttc: None,
             seed: 0,
             negator: None,
+            critic: None,
         }
     }
 
     /// Override the search budget / PUCT tuning.
     pub fn with_config(mut self, cfg: SearchConfig) -> Self {
         self.cfg = cfg;
+        self
+    }
+
+    /// Inject a trained state-value critic. Combine with a non-zero
+    /// `SearchConfig::critic_weight` to fold `V(s)` into PUCT selection.
+    pub fn with_critic(mut self, critic: Arc<dyn CriticScorer>) -> Self {
+        self.critic = Some(critic);
         self
     }
 
@@ -329,10 +346,16 @@ impl<E: TacticExpander> ProofSearchDriver<E> {
         let root_key = root.dedup_key();
         let root_closed = root.is_closed();
         let root_progress = root.progress();
+        let root_critic = self
+            .critic
+            .as_ref()
+            .map(|c| c.score(&root))
+            .unwrap_or(root_progress);
         nodes.push(DagNode {
             state: root,
             closed: root_closed,
             progress: root_progress,
+            critic: root_critic,
             visits: 0,
             value_sum: 0.0,
             edges: Vec::new(),
@@ -389,7 +412,14 @@ impl<E: TacticExpander> ProofSearchDriver<E> {
                             let u = self.cfg.exploration * e.prior * n_parent
                                 / (1.0 + c.visits as f64);
                             // LeanProgress-style value prior, identical to mcts.rs.
-                            let score = q + self.cfg.progress_weight * c.progress + u;
+                            let score = super::critic_scorer::blend_priority(
+                                q,
+                                c.progress,
+                                self.cfg.progress_weight,
+                                c.critic,
+                                self.cfg.critic_weight,
+                                u,
+                            );
                             if score > best_score {
                                 best_score = score;
                                 chosen = Some(e.child);
@@ -455,11 +485,17 @@ impl<E: TacticExpander> ProofSearchDriver<E> {
                             }
                             let closed = step.next.is_closed();
                             let progress = step.next.progress();
+                            let critic = self
+                                .critic
+                                .as_ref()
+                                .map(|c| c.score(&step.next))
+                                .unwrap_or(progress);
                             let idx = nodes.len();
                             nodes.push(DagNode {
                                 state: step.next,
                                 closed,
                                 progress,
+                                critic,
                                 visits: 0,
                                 value_sum: 0.0,
                                 edges: Vec::new(),
@@ -495,11 +531,17 @@ impl<E: TacticExpander> ProofSearchDriver<E> {
                             } else {
                                 let closed = neg_state.is_closed();
                                 let progress = neg_state.progress();
+                                let critic = self
+                                    .critic
+                                    .as_ref()
+                                    .map(|c| c.score(&neg_state))
+                                    .unwrap_or(progress);
                                 let idx = nodes.len();
                                 nodes.push(DagNode {
                                     state: neg_state,
                                     closed,
                                     progress,
+                                    critic,
                                     visits: 0,
                                     value_sum: 0.0,
                                     edges: Vec::new(),
@@ -949,6 +991,7 @@ mod tests {
             state: MockGoal::open(key),
             closed: false,
             progress: 0.0,
+            critic: 0.0,
             visits,
             value_sum,
             edges: Vec::new(),

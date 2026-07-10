@@ -13,9 +13,9 @@ pub use orchestration::{
     observe, proof_import, research, statement_validation, team,
 };
 pub use search::{
-    best_first, discovery_game, distance_critic, driver, fitness, goal_cache, inverse_method, mcts,
-    minimize, process_reward, proof_pool, progress, rewriting, sampler, sampling, skest, subsumption,
-    symmetry_dedup, tactic_outcome, ttc,
+    best_first, critic_scorer, discovery_game, distance_critic, driver, fitness, goal_cache,
+    inverse_method, mcts, minimize, process_reward, proof_pool, progress, rewriting, sampler, sampling,
+    skest, subsumption, symmetry_dedup, tactic_outcome, ttc,
 };
 pub use proving::{
     blueprint, conjecture_engine, decompose, definition_synthesis, evolve_sketch, falsification,
