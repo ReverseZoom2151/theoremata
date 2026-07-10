@@ -30,7 +30,7 @@ pub use reason::{
 };
 pub use prover::{
     aristotle, attempt_run, axiom_audit, exec, formal, goal_state, isabelle, lean, proof_job,
-    proof_log, rocq,
+    proof_log, rocq, statement_preservation,
 };
 pub use verify::{hardening, lean_session};
 

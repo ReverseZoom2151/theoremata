@@ -8,6 +8,7 @@ pub mod proof_job;
 pub mod attempt_run;
 pub mod axiom_audit;
 pub mod proof_log;
+pub mod statement_preservation;
 
 // Re-export every leaf module flat at the component root so existing paths
 // (`prover::aristotle`, hence `crate::prover::aristotle`, and sibling

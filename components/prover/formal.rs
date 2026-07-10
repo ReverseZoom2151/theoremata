@@ -382,7 +382,18 @@ pub trait FormalBackend {
         let axioms_clean = axioms.within_whitelist;
         let lexical_clean = scan.clean;
         let kernel_clean = compile.compiled && recheck.rechecked;
-        let statement_preserved = statement_mentioned(stmt, code);
+        // Anti-cheat: the existing mention check, tightened to reject a proof
+        // spliced onto a WEAKENED/renamed/trivially-restated statement -- but only
+        // on positively-detected weakening, so a non-Lean or unparsable canonical
+        // (e.g. HOL Light `let`) falls back to the mention check unchanged.
+        let statement_preserved = statement_mentioned(stmt, code)
+            && !matches!(
+                crate::prover::statement_preservation::check_statement_preserved(stmt, code).verdict,
+                crate::prover::statement_preservation::PreservationVerdict::Renamed
+                    | crate::prover::statement_preservation::PreservationVerdict::BindersChanged
+                    | crate::prover::statement_preservation::PreservationVerdict::ConclusionChanged
+                    | crate::prover::statement_preservation::PreservationVerdict::TriviallyRestated
+            );
         let lexically_verified =
             kernel_clean && axioms_clean && lexical_clean && statement_preserved;
 
