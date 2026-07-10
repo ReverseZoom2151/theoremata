@@ -69,10 +69,21 @@ _CORPUS_GLOB = {
     "imo_gradingbench": "IMO-Bench-main",
     "zero_to_qed": "zero-to-qed-main",
     "lean_tactics_kb": "zero-to-qed-main",
+    # Agda 1Lab and Metamath corpora are resources-based (absent by default).
+    "1lab": "1lab-main",
+    "metamath_100": "metamath-main",
+    # Formalizing-100 ships a committed fixture (no resources corpus); glob a
+    # never-present dir so `_corpus_present` reports absent and the loader is
+    # handled via `_COMMITTED_FIXTURE` below.
+    "formalizing_100": "formalizing-100-none",
 }
 
 # corpora that exist but ship no structured problems (PDF-only data cards)
 _STRUCTURELESS = {"aime24", "aime25", "aime26"}
+
+# benchmarks whose data is a committed fixture beside the loader (not under
+# resources/), so they legitimately return items even with resources/ absent.
+_COMMITTED_FIXTURE = {"formalizing_100"}
 
 
 def _corpus_present(name: str) -> bool:
@@ -125,9 +136,13 @@ def test_loader_present_or_skips(name):
 
 
 def test_absent_corpus_skips(monkeypatch, tmp_path):
-    # point the resource root at an empty dir → every loader returns []
+    # point the resource root at an empty dir → every resources-based loader
+    # returns []. Committed-fixture benchmarks (data beside the loader) are
+    # exempt: they legitimately return items regardless of resources/.
     monkeypatch.setenv("THEOREMATA_RESOURCES", str(tmp_path))
     for name in ALL_NAMES:
+        if name in _COMMITTED_FIXTURE:
+            continue
         assert load_benchmark(name) == []
 
 
