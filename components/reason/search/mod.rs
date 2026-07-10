@@ -19,3 +19,4 @@ pub mod symmetry_dedup;
 pub mod best_first;
 pub mod distance_critic;
 pub mod critic_scorer;
+pub mod preference_pairs;

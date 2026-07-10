@@ -24,7 +24,7 @@ pub use reason::{
     distance_critic, driver, evolve_sketch, falsification, fitness,
     formal_generate, formalize_portfolio, goal_cache, guard, inverse_method, library, mathlib_export,
     mcts, memory, method_transfer, minimize, observe, optimize, plan_history, portfolio,
-    process_reward, progress, proof_import, proof_pool, refine_ops, repair, research, retry, rewriting, router, sampler,
+    preference_pairs, process_reward, progress, proof_import, proof_pool, refine_ops, repair, research, retry, rewriting, router, sampler,
     sampling, sketch, skest, statement_validation, subsumption, symmetry_dedup, tactic_outcome,
     taint, team, ttc,
 };
