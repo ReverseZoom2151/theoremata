@@ -50,6 +50,7 @@ _TRACK_KIND = {
     "imo_gradingbench": ("proof_grading", "proof_grading"),
     "zero_to_qed": ("formalization", "formalization"),
     "lean_tactics_kb": ("tactic_reference", "tactic_reference"),
+    "formalizing_100": ("formalization", "formalization"),
 }
 
 

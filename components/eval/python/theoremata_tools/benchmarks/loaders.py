@@ -34,6 +34,7 @@ from .parsing import (
 )
 from .resources import find_dir, find_files, rel
 from .schema import AXIOMS_WHITELIST, make_item
+from .formalizing_100 import load_formalizing_100
 
 log = logging.getLogger("theoremata.benchmarks")
 
@@ -1546,4 +1547,5 @@ LOADERS: dict[str, Callable[[], list[dict[str, Any]]]] = {
     "imo_gradingbench": load_imo_gradingbench,
     "zero_to_qed": load_zero_to_qed,
     "lean_tactics_kb": load_lean_tactics_kb,
+    "formalizing_100": load_formalizing_100,
 }
