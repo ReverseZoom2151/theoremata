@@ -22,3 +22,4 @@ pub mod critic_scorer;
 pub mod preference_pairs;
 pub mod search_telemetry;
 pub mod hybrid_search;
+pub mod dag_projection;

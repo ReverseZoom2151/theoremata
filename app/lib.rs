@@ -20,8 +20,8 @@ mod verify;
 pub use graph::{db, model, scheduler};
 pub use reason::{
     agent, best_first, blueprint, blueprint_generate, blueprint_run, certification, chat, consolidate,
-    conjecture_engine, critic, critic_scorer, decompose, definition_synthesis, discovery_game,
-    distance_critic, driver, evolve_sketch, falsification, fitness, hybrid_search,
+    conjecture_engine, critic, critic_scorer, dag_projection, decompose, definition_synthesis,
+    discovery_game, distance_critic, driver, evolve_sketch, falsification, fitness, hybrid_search,
     formal_generate, formalize_modes, formalize_portfolio, goal_cache, guard, inverse_method, library, mathlib_export,
     mcts, memory, method_transfer, minimize, observe, optimize, plan_history, portfolio,
     preference_pairs, process_reward, progress, proof_import, proof_pool, refine_ops, repair, research, retry, rewriting, router, sampler, search_telemetry,
