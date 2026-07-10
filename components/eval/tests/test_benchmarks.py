@@ -96,7 +96,7 @@ def test_registry_lists_all_tracks():
         "proof_grading",
         "tactic_reference",
     }
-    assert len(ALL_NAMES) == 31
+    assert len(ALL_NAMES) == 33
 
 
 def test_load_unknown_benchmark_raises():

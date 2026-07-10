@@ -51,6 +51,8 @@ _TRACK_KIND = {
     "zero_to_qed": ("formalization", "formalization"),
     "lean_tactics_kb": ("tactic_reference", "tactic_reference"),
     "formalizing_100": ("formalization", "formalization"),
+    "1lab": ("formalization", "formalization"),
+    "metamath_100": ("formalization", "formalization"),
 }
 
 

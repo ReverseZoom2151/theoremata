@@ -35,6 +35,8 @@ from .parsing import (
 from .resources import find_dir, find_files, rel
 from .schema import AXIOMS_WHITELIST, make_item
 from .formalizing_100 import load_formalizing_100
+from .agda_1lab import load_1lab
+from .metamath_100 import load_metamath_100
 
 log = logging.getLogger("theoremata.benchmarks")
 
@@ -1548,4 +1550,6 @@ LOADERS: dict[str, Callable[[], list[dict[str, Any]]]] = {
     "zero_to_qed": load_zero_to_qed,
     "lean_tactics_kb": load_lean_tactics_kb,
     "formalizing_100": load_formalizing_100,
+    "1lab": load_1lab,
+    "metamath_100": load_metamath_100,
 }
