@@ -315,6 +315,11 @@ def _load_aime(corpus: str, glob_prefix: str) -> list[dict[str, Any]]:
         f"{glob_prefix}/**/*.json",
         f"{glob_prefix}/**/problems*.csv",
     )
+    # resources/ is gitignored, so also read a committed fixture beside this
+    # loader (inert until a maintainer drops real data/aimeXX.jsonl there).
+    committed = Path(__file__).parent / "data" / f"{corpus}.jsonl"
+    if committed.exists():
+        files = [committed, *files]
     items: list[dict[str, Any]] = []
     skipped = 0
     seen: set[str] = set()

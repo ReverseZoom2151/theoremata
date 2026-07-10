@@ -1,0 +1,912 @@
+{
+  "source": "math-papers/Strong PNT.pdf",
+  "description": "Numbered-lemma blueprint of a strong Prime Number Theorem proof; proof-DAG subset (foundational lemmas 1-120). Dependencies parsed from explicit in-proof citations.",
+  "note": "Subset of a larger blueprint; nodes keyed L/D/T + number.",
+  "n_nodes": 120,
+  "nodes": {
+    "L1": {
+      "statement": "For 𝑡 > 1 we have 2log 𝑡 ≤ 𝑂(log 𝑡)",
+      "kind": "Lemma",
+      "title": "Log growth",
+      "depends_on": []
+    },
+    "L2": {
+      "statement": "For 𝑡 ≥ 2 we have log(𝑡2) = 2log 𝑡",
+      "kind": "Lemma",
+      "title": "Square log",
+      "depends_on": []
+    },
+    "L3": {
+      "statement": "For 𝑡 ≥ 2 we have log(2𝑡) ≤log(𝑡2)",
+      "kind": "Lemma",
+      "title": "Double log",
+      "depends_on": []
+    },
+    "L4": {
+      "statement": "For 𝑡 ≥ 2 we have log(2𝑡) ≤ 2log 𝑡",
+      "kind": "Lemma",
+      "title": "Log compare",
+      "depends_on": [
+        "L2",
+        "L3"
+      ]
+    },
+    "L5": {
+      "statement": "For any 𝑛 ≥ 1 and 𝛼, 𝛽 ∈ ℂ we have 𝑛𝛼+𝛽 = 𝑛𝛼 ⋅ 𝑛𝛽",
+      "kind": "Lemma",
+      "title": "Exp rule",
+      "depends_on": []
+    },
+    "L6": {
+      "statement": "For 𝑏 ∈ ℝ and 𝑤 ∈ ℂ we have ℜ(𝑏𝑤) = 𝑏ℜ(𝑤).",
+      "kind": "Lemma",
+      "title": "Real scale",
+      "depends_on": []
+    },
+    "L7": {
+      "statement": "For a convergent series 𝑣 = ∑ ∞ 𝑛=1 𝑣𝑛 with 𝑣𝑛 ∈ ℂ , we have ℜ(𝑣) = ∑ ∞ 𝑛=1 ℜ(𝑣𝑛).",
+      "kind": "Lemma",
+      "title": "Real series",
+      "depends_on": []
+    },
+    "L8": {
+      "statement": "For 𝑎 ∈ ℝ we have 𝑒𝑖𝑎 = cos(𝑎) + 𝑖sin(𝑎)",
+      "kind": "Lemma",
+      "title": "Euler’s formula",
+      "depends_on": []
+    },
+    "L9": {
+      "statement": "For 𝑎 ∈ ℝ we have ℜ(𝑒𝑖𝑎) =cos(𝑎)",
+      "kind": "Lemma",
+      "title": "Real cosine",
+      "depends_on": [
+        "L8"
+      ]
+    },
+    "L10": {
+      "statement": "For 𝑛 ≥ 1 we have 𝑛 = 𝑒log 𝑛.",
+      "kind": "Lemma",
+      "title": "Log inverse",
+      "depends_on": []
+    },
+    "L11": {
+      "statement": "For 𝑎 ∈ ℝ we have cos(−𝑎) =cos(𝑎)",
+      "kind": "Lemma",
+      "title": "Cos even",
+      "depends_on": []
+    },
+    "L12": {
+      "statement": "For 𝑛 ≥ 1, 𝑦 ∈ ℝ we have cos(−𝑦log 𝑛) =cos(𝑦log 𝑛)",
+      "kind": "Lemma",
+      "title": "Cos even",
+      "depends_on": [
+        "L11"
+      ]
+    },
+    "L13": {
+      "statement": "For 𝑛 ≥ 1 and 𝑦 ∈ ℝ we have 𝑛−𝑖𝑦 = 𝑒−𝑖𝑦 log 𝑛.",
+      "kind": "Lemma",
+      "title": "Exp form",
+      "depends_on": [
+        "L10"
+      ]
+    },
+    "L14": {
+      "statement": "For 𝑛 ≥ 1 and 𝑦 ∈ ℝ we have ℜ(𝑒−𝑖𝑦 log 𝑛) =cos(−𝑦log 𝑛).",
+      "kind": "Lemma",
+      "title": "Real cosine",
+      "depends_on": [
+        "L9"
+      ]
+    },
+    "L15": {
+      "statement": "For 𝑛 ≥ 1 and 𝑦 ∈ ℝ we have ℜ(𝑛−𝑖𝑦) =cos(−𝑦log 𝑛).",
+      "kind": "Lemma",
+      "title": "Real cosine",
+      "depends_on": [
+        "L13",
+        "L14"
+      ]
+    },
+    "L16": {
+      "statement": "For 𝑛 ≥ 1 and 𝑦 ∈ ℝ we have ℜ(𝑛−𝑖𝑦) =cos(𝑦log 𝑛).",
+      "kind": "Lemma",
+      "title": "Real cosine",
+      "depends_on": [
+        "L12",
+        "L15"
+      ]
+    },
+    "L17": {
+      "statement": "For any 𝜃 ∈ ℝ we have cos(2𝜃) = 2cos(𝜃)2 − 1.",
+      "kind": "Lemma",
+      "title": "Double angle",
+      "depends_on": []
+    },
+    "L18": {
+      "statement": "For any 𝜃 ∈ ℝ we have 2cos(𝜃)2 = 1 + cos(2𝜃).",
+      "kind": "Lemma",
+      "title": "Cos square",
+      "depends_on": [
+        "L17"
+      ]
+    },
+    "L19": {
+      "statement": "For any 𝜃 ∈ ℝ we have 2(1 +cos(𝜃))2 = 2 + 4 cos(𝜃) + 2cos(𝜃)2.",
+      "kind": "Lemma",
+      "title": "Square expand",
+      "depends_on": []
+    },
+    "L20": {
+      "statement": "For any 𝜃 ∈ ℝ we have 2(1 +cos(𝜃))2 = 3 + 4 cos(𝜃) +cos(2𝜃).",
+      "kind": "Lemma",
+      "title": "Trig identity",
+      "depends_on": [
+        "L18",
+        "L19"
+      ]
+    },
+    "L21": {
+      "statement": "For 𝑦 ∈ ℝ we have 0 ≤ 𝑦2.",
+      "kind": "Lemma",
+      "title": "Square nonneg",
+      "depends_on": []
+    },
+    "L22": {
+      "statement": "For 𝑦 ∈ ℝ we have 0 ≤ 2𝑦2.",
+      "kind": "Lemma",
+      "title": "Double square",
+      "depends_on": [
+        "L21"
+      ]
+    },
+    "L23": {
+      "statement": "For any 𝜃 ∈ ℝ we have 0 ≤ 2(1 +cos(𝜃))2.",
+      "kind": "Lemma",
+      "title": "Cos square",
+      "depends_on": [
+        "L22"
+      ]
+    },
+    "L24": {
+      "statement": "For any 𝜃 ∈ ℝ we have 0 ≤ 3 + 4 cos(𝜃) +cos(2𝜃).",
+      "kind": "Lemma",
+      "title": "Trig positive",
+      "depends_on": [
+        "L20",
+        "L23"
+      ]
+    },
+    "L25": {
+      "statement": "For 𝑛 ≥ 1 and 𝑡 ∈ ℝ we have 0 ≤ 3 + 4 cos(𝑡log 𝑛) +cos(2𝑡log 𝑛).",
+      "kind": "Lemma",
+      "title": "Trig positive",
+      "depends_on": [
+        "L24"
+      ]
+    },
+    "L26": {
+      "statement": "For a convergent series 𝑟 = ∑ ∞ 𝑛=1 𝑟𝑛, if 𝑟𝑛 ≥ 0 for all 𝑛 ≥ 1, then 𝑟 ≥ 0.",
+      "kind": "Lemma",
+      "title": "Series positive",
+      "depends_on": []
+    },
+    "L27": {
+      "statement": "For any 𝑤 ∈ ℂ, ℜ(2𝑀 − 𝑤) = 2𝑀 − ℜ(𝑤).",
+      "kind": "Lemma",
+      "title": "Real part diff",
+      "depends_on": []
+    },
+    "L28": {
+      "statement": "We have ℜ(2𝑀 − 𝑓(𝑧)) = 2𝑀 − ℜ(𝑓(𝑧)).",
+      "kind": "Lemma",
+      "title": "Real part 2M",
+      "depends_on": [
+        "L27"
+      ]
+    },
+    "L29": {
+      "statement": "For 𝑥, 𝑀 ∈ ℝ, if 𝑥 ≤ 𝑀 then 2𝑀 − 𝑥 ≥ 𝑀.",
+      "kind": "Lemma",
+      "title": "Inequality reversal",
+      "depends_on": []
+    },
+    "L30": {
+      "statement": "For 𝑤 ∈ ℂ and 𝑀 > 0, if ℜ(𝑤) ≤ 𝑀then 2𝑀 −ℜ(𝑤) ≥ 𝑀.",
+      "kind": "Lemma",
+      "title": "Real part lower bound",
+      "depends_on": [
+        "L29"
+      ]
+    },
+    "L31": {
+      "statement": "For 𝑤 ∈ ℂ and 𝑀 > 0, if ℜ(𝑤) ≤ 𝑀then ℜ(2𝑀 − 𝑤) ≥ 𝑀.",
+      "kind": "Lemma",
+      "title": "Real part bound",
+      "depends_on": [
+        "L28",
+        "L30"
+      ]
+    },
+    "L32": {
+      "statement": "For 𝑤 ∈ ℂ and 𝑀 > 0, if ℜ(𝑤) ≤ 𝑀then ℜ(2𝑀 − 𝑤) > 0.",
+      "kind": "Lemma",
+      "title": "Real part >0",
+      "depends_on": [
+        "L28",
+        "L30"
+      ]
+    },
+    "L33": {
+      "statement": "If 𝑤 ∈ ℂ has ℜ(𝑤) > 0, then 𝑤 ≠ 0.",
+      "kind": "Lemma",
+      "title": "Pos real nonzero",
+      "depends_on": []
+    },
+    "L34": {
+      "statement": "For 𝑤 ∈ ℂ and 𝑀 > 0, if ℜ(𝑤) ≤ 𝑀then 2𝑀 − 𝑤 ≠ 0.",
+      "kind": "Lemma",
+      "title": "2M minus nonzero",
+      "depends_on": [
+        "L32",
+        "L33"
+      ]
+    },
+    "L35": {
+      "statement": "Let 𝑧 ∈ ℂ . If 𝑧 ≠ 0 then |𝑧| > 0.",
+      "kind": "Lemma",
+      "title": "Absolute value positive",
+      "depends_on": []
+    },
+    "L36": {
+      "statement": "For 𝑤 ∈ ℂ and 𝑀 > 0, if ℜ(𝑤) ≤ 𝑀then |2𝑀 − 𝑤| > 0.",
+      "kind": "Lemma",
+      "title": "2M minus mod",
+      "depends_on": [
+        "L34",
+        "L35"
+      ]
+    },
+    "L37": {
+      "statement": "For any 𝑤 ∈ ℂ, we have 𝑤 = ℜ(𝑤) + 𝑖ℑ𝑤.",
+      "kind": "Lemma",
+      "title": "Real imaginary",
+      "depends_on": []
+    },
+    "L38": {
+      "statement": "For any 𝑎, 𝑏 ∈ ℝ, we have |𝑎 + 𝑖𝑏|2 = 𝑎2 + 𝑏2.",
+      "kind": "Lemma",
+      "title": "Mod square",
+      "depends_on": []
+    },
+    "L39": {
+      "statement": "For any 𝑎, 𝑏, 𝑐 ∈ ℝ, we have |𝑐 − 𝑎 − 𝑖𝑏|2 = (𝑐 − 𝑎)2 + 𝑏2.",
+      "kind": "Lemma",
+      "title": "Shifted mod",
+      "depends_on": []
+    },
+    "L40": {
+      "statement": "For any 𝑎, 𝑏, 𝑐 ∈ ℝ, we have |𝑐 − 𝑎 − 𝑖𝑏|2 − |𝑎 + 𝑖𝑏|2 = (𝑐 − 𝑎)2 − 𝑎2.",
+      "kind": "Lemma",
+      "title": "Mod diff",
+      "depends_on": [
+        "L38",
+        "L39"
+      ]
+    },
+    "L41": {
+      "statement": "For any 𝑎, 𝑐 ∈ ℝ, we have (𝑐 − 𝑎)2 = 𝑎2 − 2𝑎𝑐 + 𝑐2.",
+      "kind": "Lemma",
+      "title": "Square expand",
+      "depends_on": []
+    },
+    "L42": {
+      "statement": "For any 𝑎, 𝑐 ∈ ℝ, we have (𝑐 − 𝑎)2 − 𝑎2 = 2𝑐(𝑐 − 𝑎).",
+      "kind": "Lemma",
+      "title": "Square diff",
+      "depends_on": [
+        "L41"
+      ]
+    },
+    "L43": {
+      "statement": "For any 𝑎, 𝑏, 𝑐 ∈ ℝ, we have |𝑐 − 𝑎 − 𝑖𝑏|2 − |𝑎 + 𝑖𝑏|2 = 2𝑐(𝑐 − 𝑎).",
+      "kind": "Lemma",
+      "title": "Mod diff",
+      "depends_on": [
+        "L40",
+        "L42"
+      ]
+    },
+    "L44": {
+      "statement": "For any 𝑤 ∈ ℂ, |2𝑀 − ℜ(𝑤) − 𝑖ℑ𝑤|2 − |ℜ(𝑤) + 𝑖ℑ𝑤|2 = 4𝑀 (𝑀 − ℜ(𝑤)).",
+      "kind": "Lemma",
+      "title": "Modulus diff",
+      "depends_on": [
+        "L43"
+      ]
+    },
+    "L45": {
+      "statement": "For any 𝑤 ∈ ℂ, |2𝑀 − 𝑤|2 − |𝑤|2 = 4𝑀 (𝑀 − ℜ(𝑤)).",
+      "kind": "Lemma",
+      "title": "Modulus identity",
+      "depends_on": [
+        "L37",
+        "L44"
+      ]
+    },
+    "L46": {
+      "statement": "If 𝑀 > 0 and 𝑥 ≤ 𝑀, then 4𝑀 (𝑀 − 𝑥) ≥ 0.",
+      "kind": "Lemma",
+      "title": "Nonneg product",
+      "depends_on": []
+    },
+    "L47": {
+      "statement": "Let 𝑀 > 0 and 𝑤 ∈ ℂ. If ℜ(𝑤) ≤ 𝑀then 4𝑀 (𝑀 − ℜ(𝑤)) ≥ 0.",
+      "kind": "Lemma",
+      "title": "Nonneg product",
+      "depends_on": [
+        "L46"
+      ]
+    },
+    "L48": {
+      "statement": "Let 𝑀 > 0 and 𝑤 ∈ ℂ. If ℜ(𝑤) ≤ 𝑀then |2𝑀 −𝑤|2 −|𝑤|2 ≥ 0.",
+      "kind": "Lemma",
+      "title": "Modulus compare",
+      "depends_on": [
+        "L45",
+        "L47"
+      ]
+    },
+    "L49": {
+      "statement": "Let 𝑀 > 0 and 𝑤 ∈ ℂ. If ℜ(𝑤) ≤ 𝑀then |2𝑀 − 𝑤|2 ≥ |𝑤|2.",
+      "kind": "Lemma",
+      "title": "Modulus bound",
+      "depends_on": [
+        "L48"
+      ]
+    },
+    "L50": {
+      "statement": "Let 𝑀 > 0 and 𝑤 ∈ ℂ. If ℜ(𝑤) ≤ 𝑀then |2𝑀 − 𝑤| ≥ |𝑤|.",
+      "kind": "Lemma",
+      "title": "Modulus bound",
+      "depends_on": [
+        "L49"
+      ]
+    },
+    "L51": {
+      "statement": "Let 𝑀 > 0 and 𝑤 ∈ ℂ. If ℜ(𝑤) ≤ 𝑀then |𝑤| ≤ |2𝑀 − 𝑤|.",
+      "kind": "Lemma",
+      "title": "Modulus order",
+      "depends_on": [
+        "L50"
+      ]
+    },
+    "L52": {
+      "statement": "If 𝑐 > 0 and 0 ≤ 𝑎 ≤ 𝑏, then 𝑎/𝑐 ≤ 𝑏/𝑐.",
+      "kind": "Lemma",
+      "title": "Divide inequality",
+      "depends_on": []
+    },
+    "L53": {
+      "statement": "If 𝑏 > 0 and 0 ≤ 𝑎 ≤ 𝑏, then 𝑎/𝑏 ≤ 1.",
+      "kind": "Lemma",
+      "title": "Ratio bound",
+      "depends_on": [
+        "L52"
+      ]
+    },
+    "L54": {
+      "statement": "Let 𝑀 > 0 and 𝑤 ∈ ℂ . If |2𝑀 − 𝑤| > 0 and |𝑤| ≤ |2𝑀 − 𝑤| then |𝑤| |2𝑀−𝑤| ≤ 1.",
+      "kind": "Lemma",
+      "title": "Ratio bound",
+      "depends_on": [
+        "L36",
+        "L51",
+        "L53"
+      ]
+    },
+    "L55": {
+      "statement": "Let 𝑀 > 0 and 𝑤 ∈ ℂ . If ℜ(𝑤) ≤ 𝑀and |𝑤| ≤ |2𝑀 − 𝑤| then |𝑤| |2𝑀−𝑤| ≤ 1.",
+      "kind": "Lemma",
+      "title": "Ratio bound",
+      "depends_on": [
+        "L36",
+        "L54"
+      ]
+    },
+    "L56": {
+      "statement": "Let 𝑀 > 0 and 𝑤 ∈ ℂ. If ℜ(𝑤) ≤ 𝑀then |𝑤| |2𝑀−𝑤| ≤ 1.",
+      "kind": "Lemma",
+      "title": "Ratio bound",
+      "depends_on": [
+        "L51",
+        "L55"
+      ]
+    },
+    "L57": {
+      "statement": "Let 𝑁 , 𝐺 ∈ ℂ. We have |𝑁 + 𝐺| ≤ |𝑁 | + |𝐺|",
+      "kind": "Lemma",
+      "title": "Triangle inequality",
+      "depends_on": []
+    },
+    "L58": {
+      "statement": "Let 𝑁 , 𝐹 ∈ ℂ. We have |𝑁 − 𝐹 | ≤ |𝑁 | + |𝐹 |",
+      "kind": "Lemma",
+      "title": "Triangle minus",
+      "depends_on": [
+        "L57"
+      ]
+    },
+    "L59": {
+      "statement": "Let 𝑟 > 0 and 𝑁 , 𝐹 ∈ ℂ. We have 𝑟|𝑁 − 𝐹 | ≤ 𝑟(|𝑁 | + |𝐹 |)",
+      "kind": "Lemma",
+      "title": "Scaled triangle",
+      "depends_on": [
+        "L52",
+        "L57"
+      ]
+    },
+    "L60": {
+      "statement": "Let 𝑟 > 0 and 𝑁 , 𝐹 ∈ ℂ. We have 𝑟|𝑁 − 𝐹 | ≤ 𝑟|𝑁 | + 𝑟|𝐹 |",
+      "kind": "Lemma",
+      "title": "Scaled triangle",
+      "depends_on": [
+        "L59"
+      ]
+    },
+    "L61": {
+      "statement": "Let 0 < 𝑟 < 𝑅 and 𝑁 , 𝐹 ∈ ℂ. If 𝑅|𝐹 | ≤ 𝑟|𝑁 −𝐹 |then 𝑅|𝐹 | ≤ 𝑟|𝑁 |+𝑟|𝐹 |",
+      "kind": "Lemma",
+      "title": "Ineq step",
+      "depends_on": [
+        "L60"
+      ]
+    },
+    "L62": {
+      "statement": "Let 0 < 𝑟 < 𝑅 and 𝑁 , 𝐹 ∈ ℂ . If 𝑅|𝐹 | ≤ 𝑟|𝑁 − 𝐹 | then (𝑅 − 𝑟)|𝐹 | ≤ 𝑟|𝑁 |",
+      "kind": "Lemma",
+      "title": "Rearranged bound",
+      "depends_on": [
+        "L61"
+      ]
+    },
+    "L63": {
+      "statement": "For 𝑎 ∈ ℝ, if 𝑎 > 0 then |𝑎| = 𝑎.",
+      "kind": "Lemma",
+      "title": "Abs positive",
+      "depends_on": []
+    },
+    "L64": {
+      "statement": "For 𝑎 ∈ ℝ, if 𝑎 > 0 then 2𝑎 > 0.",
+      "kind": "Lemma",
+      "title": "Double positive",
+      "depends_on": []
+    },
+    "L65": {
+      "statement": "For 𝑎 ∈ ℝ, if 𝑎 > 0 then |2𝑎| = 2𝑎.",
+      "kind": "Lemma",
+      "title": "Scaled abs",
+      "depends_on": [
+        "L63",
+        "L64"
+      ]
+    },
+    "L66": {
+      "statement": "Let 0 < 𝑟 < 𝑅 , 𝑀 > 0 , and 𝐹 ∈ ℂ . If 𝑅𝐹 ≤ 𝑟|2𝑀 − 𝐹 | then (𝑅 − 𝑟)|𝐹 | ≤ 2𝑀 𝑟",
+      "kind": "Lemma",
+      "title": "Key bound",
+      "depends_on": [
+        "L62",
+        "L65"
+      ]
+    },
+    "L67": {
+      "statement": "Let 0 < 𝑟 < 𝑅 and 𝐹 ∈ ℂ . Then we have (𝑅 − 𝑟)|𝐹 | ≥ 0",
+      "kind": "Lemma",
+      "title": "Nonneg factor",
+      "depends_on": []
+    },
+    "L68": {
+      "statement": "Let 0 < 𝑟 < 𝑅 , 𝑀 > 0 , and 𝐹 ∈ ℂ . If (𝑅 − 𝑟)|𝐹 | ≤ 2𝑀 𝑟then |𝐹 | ≤ 2𝑀𝑟 𝑅−𝑟 . 5",
+      "kind": "Lemma",
+      "title": "Divide bound",
+      "depends_on": [
+        "L52",
+        "L67"
+      ]
+    },
+    "L69": {
+      "statement": "Let 0 < 𝑟 < 𝑅 , 𝑀 > 0 , and 𝐹 ∈ ℂ . If 𝑅|𝐹 | ≤ 𝑟|2𝑀 − 𝐹 | then |𝐹 | ≤ 2𝑀𝑟 𝑅−𝑟",
+      "kind": "Lemma",
+      "title": "Final bound",
+      "depends_on": [
+        "L66",
+        "L68"
+      ]
+    },
+    "L70": {
+      "statement": "Let 𝑓 ∶ ℂ → ℂ be analytic, and let 𝑛0 be the analyticOrderAt for 𝑓 at 0. If 𝑓(0) = 0then 𝑛0 ≠ 0.",
+      "kind": "Lemma",
+      "title": "Order nonzero",
+      "depends_on": []
+    },
+    "L71": {
+      "statement": "Let 𝑓 ∶ ℂ → ℂ be analytic, and let 𝑛0 be the analyticOrderAt for 𝑓 at 0. If 𝑓 ≠ 0 then 𝑛0 ∈ ℕ.",
+      "kind": "Lemma",
+      "title": "Order natural",
+      "depends_on": []
+    },
+    "L72": {
+      "statement": "Let 𝑓 ∶ ℂ → ℂ be analytic at 0, and let 𝑛0 be the analyticOrderAt for 𝑓 at 0. If 𝑛0 ∈ ℕ then there exists a nhd 𝑁 of 0 and 𝑔 ∶ ℂ → ℂ such that 𝑔 is analytic at 0, and 𝑓(𝑧) = 𝑧𝑛0 𝑔(𝑧)on 𝑁.",
+      "kind": "Lemma",
+      "title": "Factor power",
+      "depends_on": []
+    },
+    "L73": {
+      "statement": "Let 𝑓 ∶ ℂ → ℂ be analytic at 0, and let 𝑛0 be the analyticOrderAt for 𝑓 at 0. If 𝑛0 ∈ ℕ and 𝑛0 ≠ 0, then there exists a nhd 𝑁 of 0 and ℎ ∶ ℂ → ℂ such that ℎ is analytic at 0, and 𝑓(𝑧) = 𝑧ℎ(𝑧)on 𝑁.",
+      "kind": "Lemma",
+      "title": "Factor linear",
+      "depends_on": [
+        "L72"
+      ]
+    },
+    "L74": {
+      "statement": "Let 𝑓 ∶ ℂ → ℂ be analytic at 0, and let 𝑛0 be the analyticOrderAt for 𝑓 at 0. If 𝑓 ≠ 0 and 𝑓(0) = 0, then ℎ(𝑧) = 𝑓(𝑧)/𝑧is analytic at 0.",
+      "kind": "Lemma",
+      "title": "Divide zero",
+      "depends_on": [
+        "L70",
+        "L71",
+        "L73"
+      ]
+    },
+    "L75": {
+      "statement": "The function 𝑓1(𝑧) =1 𝑧 is analytic on {𝑧 ∈ ℂ ∶ 𝑧 ≠ 0}.",
+      "kind": "Lemma",
+      "title": "Inverse analytic",
+      "depends_on": []
+    },
+    "L76": {
+      "statement": "Let 𝑇 ⊂ 𝑆 ⊂ ℂ and 𝑓 ∶ 𝑆 → ℂ . If 𝑓 is analytic on 𝑆 then 𝑓 is analytic on 𝑇 .",
+      "kind": "Lemma",
+      "title": "Analytic mono",
+      "depends_on": []
+    },
+    "L77": {
+      "statement": "Let 0 < 𝑅 < 1 and 𝑉 = {𝑧 ∈ 𝔻𝑅 ∶ 𝑧 ≠ 0} and 𝑈 = {𝑧 ∈ ℂ ∶ 𝑧 ≠ 0}. Then 𝑉 ⊂ 𝑈 .",
+      "kind": "Lemma",
+      "title": "Nonzero subset",
+      "depends_on": []
+    },
+    "L78": {
+      "statement": "The function 𝑓1(𝑧) =1 𝑧 is analytic on 𝑇 = {𝑧 ∈ 𝔻𝑅 ∶ 𝑧 ≠ 0} .",
+      "kind": "Lemma",
+      "title": "Inverse analytic",
+      "depends_on": [
+        "L75",
+        "L76",
+        "L77"
+      ]
+    },
+    "L79": {
+      "statement": "Let 𝑇 ⊂ 𝑆 ⊂ ℂ , and let 𝑓1 ∶ 𝑆 → ℂ and 𝑓2 ∶ 𝑆 → ℂ . If 𝑓1 is analytic on 𝑇 and 𝑓2 is analytic on 𝑇 , then 𝑓1 ⋅ 𝑓2 is analytic on 𝑇 .",
+      "kind": "Lemma",
+      "title": "Product analytic",
+      "depends_on": []
+    },
+    "L80": {
+      "statement": "Let 𝑇 ⊂ 𝑆 ⊂ ℂ , and let 𝑓1 ∶ 𝑆 → ℂ and 𝑓2 ∶ 𝑆 → ℂ . If 𝑓1 is analytic on 𝑇 and 𝑓2 is analytic on 𝑆, then 𝑓1 ⋅ 𝑓2 is analytic on 𝑇 .",
+      "kind": "Lemma",
+      "title": "Product analytic",
+      "depends_on": [
+        "L76",
+        "L79"
+      ]
+    },
+    "L81": {
+      "statement": "Let 𝑇 = {𝑧 ∈ 𝔻𝑅 ∶ 𝑧 ≠ 0} and 𝑓1 ∶ ℂ → ℂ and 𝑓2 ∶ ℂ → ℂ . If 𝑓1 is analytic on 𝑇 and 𝑓2 is analytic on 𝔻𝑅, then 𝑓1 ⋅ 𝑓2 is analytic on 𝑇 .",
+      "kind": "Lemma",
+      "title": "Product analytic",
+      "depends_on": [
+        "L80"
+      ]
+    },
+    "L82": {
+      "statement": "Let 𝑇 = {𝑧 ∈ 𝔻𝑅 ∶ 𝑧 ≠ 0} and 𝑓 ∶ ℂ → ℂ . If 𝑓(𝑧)is analytic on 𝔻𝑅, then 𝑓(𝑧)/𝑧is analytic on 𝑇 .",
+      "kind": "Lemma",
+      "title": "Quotient analytic",
+      "depends_on": [
+        "L78",
+        "L81"
+      ]
+    },
+    "L83": {
+      "statement": "Let 𝑉 ⊂ ℂ and ℎ ∶ ℂ → ℂ . If ℎ is AnalyticOn 𝑉 , then ℎ is AnalyticWithinAt 𝑧 for all 𝑧 ∈ 𝑉 .",
+      "kind": "Lemma",
+      "title": "On implies within",
+      "depends_on": []
+    },
+    "L84": {
+      "statement": "Let ℎ ∶ ℂ → ℂ . If ℎ is AnalyticWithinAt 𝑧 for all 𝑧 ∈ 𝔻𝑅, then ℎ is AnalyticOn 𝔻𝑅.",
+      "kind": "Lemma",
+      "title": "Within implies on",
+      "depends_on": []
+    },
+    "L85": {
+      "statement": "Let 𝑇 = {𝑧 ∈ 𝔻𝑅 ∶ 𝑧 ≠ 0} . Then 𝔻𝑅 = {0} ∪ 𝑇.",
+      "kind": "Lemma",
+      "title": "Disk split",
+      "depends_on": []
+    },
+    "L86": {
+      "statement": "Let 𝑇 = {𝑧 ∈ 𝔻𝑅 ∶ 𝑧 ≠ 0} and ℎ ∶ ℂ → ℂ . If ℎ is AnalyticWithinAt 0 and ℎ is AnalyticWithinAt 𝑧 for all 𝑧 ∈ 𝑇 , then ℎ is AnalyticWithinAt 𝑧 for all 𝑧 ∈ 𝔻𝑅.",
+      "kind": "Lemma",
+      "title": "Within union",
+      "depends_on": [
+        "L85"
+      ]
+    },
+    "L87": {
+      "statement": "Let 𝑇 = {𝑧 ∈ 𝔻𝑅 ∶ 𝑧 ≠ 0} and ℎ ∶ ℂ → ℂ . If ℎ is AnalyticWithi- nAt 0 and ℎ is AnalyticWithinAt 𝑧 for all 𝑧 ∈ 𝑇 , then ℎ is AnalyticOn 𝔻𝑅.",
+      "kind": "Lemma",
+      "title": "Within gives on",
+      "depends_on": [
+        "L84",
+        "L86"
+      ]
+    },
+    "L88": {
+      "statement": "Let ℎ ∶ ℂ → ℂ . If ℎ is AnalyticAt 0, then ℎ is AnalyticWithinAt 0.",
+      "kind": "Lemma",
+      "title": "At to within",
+      "depends_on": []
+    },
+    "L89": {
+      "statement": "Let 𝑇 = {𝑧 ∈ 𝔻𝑅 ∶ 𝑧 ≠ 0} and ℎ ∶ ℂ → ℂ . If ℎ is AnalyticAt 0 and ℎ is AnalyticOn 𝑇 , then ℎ is AnalyticOn 𝔻𝑅.",
+      "kind": "Lemma",
+      "title": "Local to global",
+      "depends_on": [
+        "L87",
+        "L88"
+      ]
+    },
+    "D90": {
+      "statement": "For 𝑅 > 0, define the open ball 𝔻𝑅 ∶= {𝑧 ∈ ℂ ∶ |𝑧| < 𝑅}.",
+      "kind": "Definition",
+      "title": "Open disk",
+      "depends_on": []
+    },
+    "L91": {
+      "statement": "For 𝑅 > 0, the closure of 𝔻𝑅 equals 𝔻𝑅 ∶= {𝑧 ∈ ℂ ∶ |𝑧| ≤ 𝑅}",
+      "kind": "Lemma",
+      "title": "Disk closure",
+      "depends_on": []
+    },
+    "L92": {
+      "statement": "For 𝑅 > 0, if 𝑤 ∈ 𝔻𝑅 then |𝑤| ≤ 𝑅.",
+      "kind": "Lemma",
+      "title": "In disk bound",
+      "depends_on": [
+        "L91"
+      ]
+    },
+    "L93": {
+      "statement": "For 𝑅 > 0, if 𝑤 ∉ 𝔻𝑅 then |𝑤| ≥ 𝑅.",
+      "kind": "Lemma",
+      "title": "Outside disk bound",
+      "depends_on": [
+        "D90"
+      ]
+    },
+    "L94": {
+      "statement": "For 𝑅 > 0, if |𝑤| ≤ 𝑅 and |𝑤| ≥ 𝑅 then |𝑤| = 𝑅.",
+      "kind": "Lemma",
+      "title": "Modulus equal",
+      "depends_on": []
+    },
+    "L95": {
+      "statement": "For 𝑅 > 0, if 𝑤 ∈ 𝔻𝑅 and 𝑤 ∉ 𝔻𝑅, then |𝑤| = 𝑅.",
+      "kind": "Lemma",
+      "title": "Boundary modulus",
+      "depends_on": [
+        "L92",
+        "L93",
+        "L94"
+      ]
+    },
+    "L96": {
+      "statement": "For 𝑅 > 0 we have |𝑅| = 𝑅.",
+      "kind": "Lemma",
+      "title": "Positive modulus",
+      "depends_on": []
+    },
+    "L97": {
+      "statement": "For 𝑅 > 0 we have |𝑅| ≤ 𝑅.",
+      "kind": "Lemma",
+      "title": "Modulus bound",
+      "depends_on": [
+        "L96"
+      ]
+    },
+    "L98": {
+      "statement": "For 𝑅 > 0 we have 𝑅 ∈ 𝔻𝑅.",
+      "kind": "Lemma",
+      "title": "Positive radius belongs to its closed disk",
+      "depends_on": [
+        "L97"
+      ]
+    },
+    "L99": {
+      "statement": "For 𝑅 > 0 the ball 𝔻𝑅 is a compact subset of ℂ.",
+      "kind": "Lemma",
+      "title": "Compactness",
+      "depends_on": []
+    },
+    "L100": {
+      "statement": "If 𝐾 ⊂ ℂ is compact and 𝑔 ∶ 𝐾 → ℂ is continuous, then there exists 𝑣 ∈ 𝐾 such that |𝑔(𝑣)| ≥ |𝑔(𝑧)|for all 𝑧 ∈ 𝐾.",
+      "kind": "Lemma",
+      "title": "ExtrValThm",
+      "depends_on": []
+    },
+    "L101": {
+      "statement": "If 𝑔 ∶ 𝔻𝑅 → ℂ is continuous, then there exists 𝑣 ∈ 𝔻𝑅 such that |𝑔(𝑣)| ≥ |𝑔(𝑧)|for all 𝑧 ∈ 𝔻𝑅.",
+      "kind": "Lemma",
+      "title": "Disk Boundary",
+      "depends_on": [
+        "L99",
+        "L100"
+      ]
+    },
+    "L102": {
+      "statement": "If ℎ ∶ 𝔻𝑅 → ℂ is analytic, then ℎ is continuous.",
+      "kind": "Lemma",
+      "title": "Analytic Continuation",
+      "depends_on": []
+    },
+    "L103": {
+      "statement": "If ℎ ∶ 𝔻𝑅 → ℂ is analytic, then there exists 𝑢 ∈ 𝔻𝑅 such that |ℎ(𝑢)| ≥ |ℎ(𝑧)|for all 𝑧 ∈ 𝔻𝑅.",
+      "kind": "Lemma",
+      "title": "Max modulus",
+      "depends_on": [
+        "L101",
+        "L102"
+      ]
+    },
+    "L104": {
+      "statement": "Let 𝑅 > 0 . Let ℎ ∶ 𝔻𝑅 → ℂ be analytic. Suppose there exists 𝑤 ∈ 𝔻𝑅 such that |ℎ(𝑤)| ≥ |ℎ(𝑧)|for all 𝑧 ∈ 𝔻 𝑅. Then |ℎ(𝑧)| = |ℎ(𝑤)|for all 𝑧 ∈ 𝔻𝑅.",
+      "kind": "Lemma",
+      "title": "Interior max",
+      "depends_on": [
+        "L91"
+      ]
+    },
+    "L105": {
+      "statement": "Let 𝑅 > 0 . Let ℎ ∶ 𝔻𝑅 → ℂ be analytic. Suppose there exists 𝑤 ∈ 𝔻𝑅 such that |ℎ(𝑤)| ≥ |ℎ(𝑧)|for all 𝑧 ∈ 𝔻 𝑅. Then |ℎ(𝑅)| = |ℎ(𝑤)|.",
+      "kind": "Lemma",
+      "title": "Boundary value",
+      "depends_on": [
+        "L98",
+        "L104"
+      ]
+    },
+    "L106": {
+      "statement": "Let 𝑅 > 0. Let ℎ ∶ 𝔻𝑅 → ℂ be analytic. Suppose there exists 𝑤 ∈ 𝔻𝑅 such that |ℎ(𝑤)| ≥ |ℎ(𝑧)|for all 𝑧 ∈ 𝔻 𝑅. Then |ℎ(𝑅)| ≥ |ℎ(𝑧)|for all 𝑧 ∈ 𝔻𝑅",
+      "kind": "Lemma",
+      "title": "Boundary bound",
+      "depends_on": [
+        "L104",
+        "L105"
+      ]
+    },
+    "L107": {
+      "statement": "Let 𝑅 > 0. Let ℎ ∶ 𝔻𝑅 → ℂ be analytic. There exists 𝑣 ∈ 𝔻𝑅 with |𝑣| = 𝑅 such that |ℎ(𝑣)| ≥ |ℎ(𝑧)|for all 𝑧 ∈ 𝔻𝑅",
+      "kind": "Lemma",
+      "title": "Boundary point",
+      "depends_on": [
+        "L95",
+        "L103",
+        "L106"
+      ]
+    },
+    "L108": {
+      "statement": "Let 𝑅 > 0. Let ℎ(𝑧)be analytic on |𝑧| ≤ 𝑅. There exists 𝑣 ∈ ℂ with |𝑣| = 𝑅 such that |ℎ(𝑣)| ≥ |ℎ(𝑧)|for all 𝑧 ∈ ℂ with |𝑧| ≤ 𝑅.",
+      "kind": "Lemma",
+      "title": "Boundary point",
+      "depends_on": [
+        "L92",
+        "L107"
+      ]
+    },
+    "L109": {
+      "statement": "Let 𝑅 > 0 and 𝐵 ≥ 0. Let ℎ(𝑧)be a function analytic on |𝑧| ≤ 𝑅. Suppose that |ℎ(𝑧)| ≤ 𝐵for all 𝑧 ∈ ℂ with |𝑧| = 𝑅 . Then there exists 𝑣 ∈ ℂ with |𝑣| = 𝑅 such that |ℎ(𝑣)| ≥ |ℎ(𝑤)|for all 𝑤 ∈ ℂ with |𝑤| ≤ 𝑅, and |ℎ(𝑣)| ≤ 𝐵.",
+      "kind": "Lemma",
+      "title": "Boundary max",
+      "depends_on": [
+        "L108"
+      ]
+    },
+    "L110": {
+      "statement": "Let 𝑅 > 0 and 𝐵 ≥ 0. Let ℎ(𝑧)be a function analytic on |𝑧| ≤ 𝑅. Suppose that |ℎ(𝑧)| ≤ 𝐵for all 𝑧 ∈ ℂ with |𝑧| = 𝑅. Then |ℎ(𝑤)| ≤ 𝐵for all 𝑤 ∈ ℂ with |𝑤| ≤ 𝑅.",
+      "kind": "Lemma",
+      "title": "Max principle",
+      "depends_on": [
+        "L109"
+      ]
+    },
+    "L111": {
+      "statement": "Let 𝑅 > 0 and 𝐵 ≥ 0. Let ℎ(𝑧)be a function analytic on |𝑧| ≤ 𝑅. Suppose that |ℎ(𝑤)| ≤ 𝐵for all 𝑤 ∈ ℂ with |𝑤| ≤ 𝑅. Then |ℎ(𝑧)| ≤ 𝐵for all 𝑧 ∈ ℂ with |𝑧| = 𝑅.",
+      "kind": "Lemma",
+      "title": "Easy maximum principle",
+      "depends_on": []
+    },
+    "L112": {
+      "statement": "Let 𝑇 > 0 and 𝐵 ≥ 0 . Let ℎ(𝑧)be a function analytic on |𝑧| ≤ 𝑇 . We have |ℎ(𝑧)| ≤ 𝐵for all 𝑧 ∈ ℂ with |𝑧| ≤ 𝑇 if and only if |ℎ(𝑧)| ≤ 𝐵for all 𝑧 ∈ ℂ with |𝑧| = 𝑇 .",
+      "kind": "Lemma",
+      "title": "Maximum modulus principle",
+      "depends_on": [
+        "L110",
+        "L111"
+      ]
+    },
+    "L113": {
+      "statement": "Let 𝑅, 𝑀 > 0. Suppose 𝑓(𝑧)is an analytic function on |𝑧| ≤ 𝑅 satisfying ℜ(𝑓(𝑧)) ≤ 𝑀. Then 2𝑀 − 𝑓(𝑧) ≠ 0for all |𝑧| ≤ 𝑅.",
+      "kind": "Lemma",
+      "title": "Denom nonzero",
+      "depends_on": [
+        "L34"
+      ]
+    },
+    "L114": {
+      "statement": "Let 𝑅, 𝑀 > 0. Suppose 𝑓(𝑧)is an analytic function on |𝑧| ≤ 𝑅 satisfying ℜ(𝑓(𝑧)) ≤ 𝑀. For any 𝑧 with |𝑧| ≤ 𝑅, we have |𝑓(𝑧)| |2𝑀−𝑓(𝑧)|≤ 1.",
+      "kind": "Lemma",
+      "title": "Ratio bound",
+      "depends_on": [
+        "L56"
+      ]
+    },
+    "L115": {
+      "statement": "Let 𝑅 > 0 . Let 𝑓 be analytic on |𝑧| ≤ 𝑅 such that 𝑓(0) = 0. Then the function ℎ(𝑧) = 𝑓(𝑧)/𝑧is analytic on |𝑧| ≤ 𝑅.",
+      "kind": "Lemma",
+      "title": "Removable zero",
+      "depends_on": []
+    },
+    "L116": {
+      "statement": "Let 𝑅 > 0 . If ℎ1(𝑧)and ℎ2(𝑧)are analytic for |𝑧| ≤ 𝑅 and ℎ2(𝑧) ≠ 0for all |𝑧| ≤ 𝑅, then ℎ1(𝑧)/ℎ2(𝑧)is analytic for |𝑧| ≤ 𝑅.",
+      "kind": "Lemma",
+      "title": "Quotient analytic",
+      "depends_on": []
+    },
+    "D117": {
+      "statement": "Let 𝑅, 𝑀 > 0 . Let 𝑓 be analytic on |𝑧| ≤ 𝑅 such that 𝑓(0) = 0and suppose ℜ𝑓(𝑧) ≤ 𝑀for all |𝑧| ≤ 𝑅. Define the function 𝑓𝑀 (𝑧)for |𝑧| ≤ 𝑅 as 𝑓𝑀 (𝑧) = 𝑓(𝑧)/𝑧 2𝑀 − 𝑓(𝑧).",
+      "kind": "Definition",
+      "title": "Modified function",
+      "depends_on": []
+    },
+    "L118": {
+      "statement": "The function 𝑓𝑀 (𝑧)from Definition 117 is analytic on |𝑧| ≤ 𝑅.",
+      "kind": "Lemma",
+      "title": "g analytic",
+      "depends_on": [
+        "L113",
+        "L115",
+        "L116"
+      ]
+    },
+    "L119": {
+      "statement": "Let 𝑎, 𝑏 ∈ ℂ. If 𝑏 ≠ 0 then |𝑎/𝑏| = |𝑎|/|𝑏|.",
+      "kind": "Lemma",
+      "title": "Quotient modulus",
+      "depends_on": []
+    },
+    "L120": {
+      "statement": "Let 𝑅, 𝑀 > 0. Let 𝑓 be analytic on |𝑧| ≤ 𝑅 such that 𝑓(0) = 0and suppose ℜ𝑓(𝑧) ≤ 𝑀for all |𝑧| ≤ 𝑅. We have |𝑓𝑀 (𝑧)| =|𝑓(𝑧)/𝑧| |2𝑀−𝑓(𝑧)|.",
+      "kind": "Lemma",
+      "title": "g modulus",
+      "depends_on": [
+        "L113",
+        "D117",
+        "L119"
+      ]
+    }
+  }
+}
