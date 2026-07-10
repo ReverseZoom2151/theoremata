@@ -138,7 +138,7 @@ pub fn poll(
     job.completed_at = Some(Utc::now());
     job.result = Some(ProofResult {
         task_id: job.task.id.clone(), job_id: job.id.clone(), status: job.status,
-        formal_code: Some(code), counterexample: None, verification,
+        formal_code: Some(code.clone()), counterexample: None, verification,
         artifacts_dir: job.artifacts_dir.clone(), duration_ms: 0, cost: None,
         message: Some(format!("mock {system} checker completed")),
         provenance: json!({"backend": backend_name(system), "system": system.as_str(), "mock": true}),
