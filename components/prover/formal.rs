@@ -380,7 +380,16 @@ pub trait FormalBackend {
 
         // Layer 2c is mandatory and layers combine conjunctively (fail-closed).
         let axioms_clean = axioms.within_whitelist;
-        let lexical_clean = scan.clean;
+        // Also reject the non-reproducible proof-search SUGGESTION tactics
+        // (`apply?`/`exact?`/`rfl?`) — the DeepSeek-Prover-V2 reward-hacking
+        // erratum. These never occur in a legit compiled proof (and not at all in
+        // the non-Lean backends), so this only ever tightens. `native_decide` is
+        // left to config policy (it has legitimate uses); `sorry`/`admit` are
+        // already covered by `scan.clean`.
+        let suggestion_hatch = crate::prover::statement_preservation::scan_escape_hatches(code)
+            .iter()
+            .any(|h| matches!(h.rule, "apply?" | "exact?" | "rfl?"));
+        let lexical_clean = scan.clean && !suggestion_hatch;
         let kernel_clean = compile.compiled && recheck.rechecked;
         // Anti-cheat: the existing mention check, tightened to reject a proof
         // spliced onto a WEAKENED/renamed/trivially-restated statement -- but only
