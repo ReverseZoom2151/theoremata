@@ -247,23 +247,23 @@ model provider, and optional library is probed. If it is present it is used; if 
 is absent it is skipped, and `theoremata doctor` reports which is which. Nothing
 external blocks a build or a run.
 
-| Integration | Role | How it's resolved |
-|-------------|------|-------------------|
-| [Rust](https://www.rust-lang.org) 2021 | Core binary: proof-DAG, orchestration, verification gate, certificate checkers | Required (`cargo`) |
-| [SQLite](https://www.sqlite.org) via [`rusqlite`](https://docs.rs/rusqlite) | The proof-DAG store (WAL, transactional) | Bundled, nothing to install |
-| [`clap`](https://docs.rs/clap), [`ratatui`](https://ratatui.rs), [`crossterm`](https://docs.rs/crossterm) | CLI and interactive TUI | `cargo` |
-| [Python](https://www.python.org) 3.12 | Deterministic workers (falsify, retrieval, grading, training, cert checkers) | Required for the tool layer |
-| [Lean 4](https://lean-lang.org) + [Mathlib](https://github.com/leanprover-community/mathlib4) | Formal backend and premise corpus | Detected at runtime, optional |
-| [Rocq (Coq)](https://rocq-prover.org), [Isabelle/HOL](https://isabelle.in.tum.de) | Formal backends | Detected at runtime, optional |
-| [HOL Light](https://github.com/jrh13/hol-light) / [Candle](https://cakeml.org) (CakeML) | Verified-kernel backend | Detected at runtime, optional |
-| [Agda](https://github.com/agda/agda), [Metamath](https://us.metamath.org) | Formal backends | Detected at runtime, optional |
-| Sledgehammer, [CoqHammer](https://coqhammer.github.io), [aesop](https://github.com/leanprover-community/aesop) | Hammers: find a tactic, verify it through the gate | Ships with its prover, optional |
-| Docker and WSL | Runners: run any backend native, in WSL, or in a container | Config (`formal_runners`), optional |
-| [LiteLLM](https://github.com/BerriAI/litellm) | Model provider seam (any chat model) | Optional, a deterministic mock runs without it |
-| [SymPy](https://www.sympy.org) (with bundled [mpmath](https://mpmath.org)) | Symbolic math, Wu's-method geometry, certificate generation | Core dependency, with stdlib fallbacks in the hot paths |
-| [`rank_bm25`](https://pypi.org/project/rank-bm25/) | BM25 premise retrieval | Optional, a stdlib BM25 backend runs without it |
-| [scikit-learn](https://scikit-learn.org) | Learned backend and difficulty selectors | Optional, deterministic fallbacks otherwise |
-| [PyTorch](https://pytorch.org), [Transformers](https://github.com/huggingface/transformers), [TRL](https://github.com/huggingface/trl) | Retriever, reward, and SFT/GRPO training | Optional, GPU only for real training runs |
+| | Integration | Role | How it's resolved |
+|-|-------------|------|-------------------|
+| <img src="assets/logos/rust.svg" height="16"> | [Rust](https://www.rust-lang.org) 2021 | Core binary: proof-DAG, orchestration, verification gate, certificate checkers | Required (`cargo`) |
+| <img src="assets/logos/sqlite.svg" height="16"> | [SQLite](https://www.sqlite.org) via [`rusqlite`](https://docs.rs/rusqlite) | The proof-DAG store (WAL, transactional) | Bundled, nothing to install |
+| <img src="assets/logos/ratatui.svg" height="16"> | [`clap`](https://docs.rs/clap), [`ratatui`](https://ratatui.rs), [`crossterm`](https://docs.rs/crossterm) | CLI and interactive TUI | `cargo` |
+| <img src="assets/logos/python.svg" height="16"> | [Python](https://www.python.org) 3.12 | Deterministic workers (falsify, retrieval, grading, training, cert checkers) | Required for the tool layer |
+| <img src="assets/logos/lean.png" height="18"> | [Lean 4](https://lean-lang.org) + [Mathlib](https://github.com/leanprover-community/mathlib4) | Formal backend and premise corpus | Detected at runtime, optional |
+| <img src="assets/logos/rocq.svg" height="14"> | [Rocq (Coq)](https://rocq-prover.org), [Isabelle/HOL](https://isabelle.in.tum.de) | Formal backends | Detected at runtime, optional |
+| | [HOL Light](https://github.com/jrh13/hol-light) / [Candle](https://cakeml.org) (CakeML) | Verified-kernel backend | Detected at runtime, optional |
+| <img src="assets/logos/agda.svg" height="16"> | [Agda](https://github.com/agda/agda), [Metamath](https://us.metamath.org) | Formal backends | Detected at runtime, optional |
+| | Sledgehammer, [CoqHammer](https://coqhammer.github.io), [aesop](https://github.com/leanprover-community/aesop) | Hammers: find a tactic, verify it through the gate | Ships with its prover, optional |
+| <img src="assets/logos/docker.svg" height="16"> <img src="assets/logos/ubuntu.svg" height="16"> | Docker and WSL | Runners: run any backend native, in WSL, or in a container | Config (`formal_runners`), optional |
+| | [LiteLLM](https://github.com/BerriAI/litellm) | Model provider seam (any chat model) | Optional, a deterministic mock runs without it |
+| <img src="assets/logos/sympy.svg" height="16"> | [SymPy](https://www.sympy.org) (with bundled [mpmath](https://mpmath.org)) | Symbolic math, Wu's-method geometry, certificate generation | Core dependency, with stdlib fallbacks in the hot paths |
+| | [`rank_bm25`](https://pypi.org/project/rank-bm25/) | BM25 premise retrieval | Optional, a stdlib BM25 backend runs without it |
+| <img src="assets/logos/scikitlearn.svg" height="16"> | [scikit-learn](https://scikit-learn.org) | Learned backend and difficulty selectors | Optional, deterministic fallbacks otherwise |
+| <img src="assets/logos/pytorch.svg" height="16"> <img src="assets/logos/huggingface.svg" height="16"> | [PyTorch](https://pytorch.org), [Transformers](https://github.com/huggingface/transformers), [TRL](https://github.com/huggingface/trl) | Retriever, reward, and SFT/GRPO training | Optional, GPU only for real training runs |
 
 ## Building
 
