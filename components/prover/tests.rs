@@ -446,10 +446,17 @@ fn metamath_live_verifies_trivial_and_rejects_malformed_proof() {
         eprintln!("SKIP metamath_live: metamath unavailable via configured runner");
         return;
     }
+    // A genuinely VALID minimal Metamath proof. The RPN proof of `th : |- ph`
+    // is `wph id`: `wph` (the floating hypothesis) pushes `wff ph`, then `id`
+    // (which has mandatory hypothesis `wph`) consumes it and yields `|- ph`. The
+    // previous fixture used `$= id $.`, which metamath actually REJECTS ("id
+    // requires a hypothesis but the RPN stack is empty"); it only "certified"
+    // because the old backend trusted metamath's exit code, which is 0 even on a
+    // failed `verify proof *` -- the soundness bug now fixed.
     let ok = backend
         .verify(
             &cfg,
-            "$c wff |- $.\n$v ph $.\nwph $f wff ph $.\nid $a |- ph $.\nth $p |- ph $= id $.\n",
+            "$c wff |- $.\n$v ph $.\nwph $f wff ph $.\nid $a |- ph $.\nth $p |- ph $= wph id $.\n",
             "th",
         )
         .unwrap();
