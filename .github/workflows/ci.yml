@@ -75,3 +75,30 @@ jobs:
       # This step now genuinely gates the build.
       - name: pytest components
         run: python -m pytest components
+
+  formal-live:
+    name: Agda + Metamath live gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install available formal toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y agda
+          # Ubuntu images do not all carry a Metamath package. The test remains
+          # a clean self-skip when it is unavailable, while Agda is exercised
+          # on every run. Deployments can point THEOREMATA_METAMATH_COMMAND at
+          # a locally built `metamath` binary.
+          if apt-cache show metamath >/dev/null 2>&1; then
+            sudo apt-get install -y metamath
+          fi
+
+      - name: Agda live gate
+        run: cargo test --locked agda_live_verifies_trivial_and_rejects_postulate -- --test-threads=1
+
+      - name: Metamath live gate
+        run: cargo test --locked metamath_live_verifies_trivial_and_rejects_malformed_proof -- --test-threads=1
