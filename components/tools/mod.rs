@@ -437,6 +437,9 @@ pub fn capability_report(config: &Config) -> serde_json::Value {
         FormalSystem::Lean,
         FormalSystem::Rocq,
         FormalSystem::Isabelle,
+        FormalSystem::Candle,
+        FormalSystem::Agda,
+        FormalSystem::Metamath,
     ]
     .into_iter()
     .map(|system| {
