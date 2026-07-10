@@ -468,7 +468,17 @@ impl<E: TacticExpander> ProofSearchDriver<E> {
                         ),
                     };
                     let mut edges = Vec::new();
-                    for step in candidates.into_iter().take(expand_k) {
+                    // eta-MCTS: optionally size this node's expansion breadth by its
+                    // critic (uncertainty) signal; `None` keeps the fixed `expand_k`.
+                    let expand_budget = match &self.cfg.eta_mcts {
+                        Some(eta) => super::distance_critic::expansion_budget(
+                            nodes[current].critic,
+                            expand_k,
+                            eta,
+                        ),
+                        None => expand_k,
+                    };
+                    for step in candidates.into_iter().take(expand_budget) {
                         let key = step.next.dedup_key();
                         let child = if let Some(&idx) = table.get(&key) {
                             // Transposition: two paths converge onto one node.

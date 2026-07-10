@@ -77,6 +77,11 @@ pub struct SearchConfig {
     /// (the [`crate::critic_scorer`] seam). `0.0` (default) makes the critic term
     /// inert, so behaviour is unchanged until a critic is injected.
     pub critic_weight: f64,
+    /// Optional eta-MCTS adaptive per-node expansion budget
+    /// ([`super::distance_critic::expansion_budget`]). `None` (default) keeps the
+    /// fixed `expand_k` breadth; `Some(cfg)` spends more breadth on high-critic
+    /// (uncertain) nodes and less on settled ones.
+    pub eta_mcts: Option<super::distance_critic::EtaMctsConfig>,
 }
 
 impl Default for SearchConfig {
@@ -90,6 +95,7 @@ impl Default for SearchConfig {
             selection: SelectionMode::Puct,
             prior_mode: PriorMode::Progress,
             critic_weight: 0.0,
+            eta_mcts: None,
         }
     }
 }
