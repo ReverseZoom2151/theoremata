@@ -857,11 +857,17 @@ _KIND_OPS = {
 def check_cert_log(log: Any) -> dict:
     """Independently RE-VERIFY a cert-log document.
 
-    Returns ``{valid: bool, reason: str, checked_steps: int, kind, claim}``.
-    Recomputes every assertion from the raw rationals in the log with exact
-    arithmetic; it never trusts a producer's own verdict.  Any malformed,
-    tampered, or unsatisfied step yields ``valid=False`` with a ``reason`` — this
-    is the sound boundary.
+    Returns ``{valid, reason, checked_steps, kind, claim, claim_verified,
+    verified_statement}``.  Recomputes every assertion from the raw rationals in
+    the log with exact arithmetic; it never trusts a producer's own verdict.  Any
+    malformed, tampered, or unsatisfied step yields ``valid=False`` with a
+    ``reason`` — this is the sound boundary.
+
+    IMPORTANT: ``valid`` attests ONLY to the certificate's mathematical content.
+    The ``claim`` field is untrusted producer display text and is **never**
+    checked against what the steps prove, so ``claim_verified`` is always
+    ``False``; ``verified_statement`` is the machine-derived description of what
+    was actually re-verified.  Do not present ``claim`` as a proven statement.
     """
     checked = 0
     try:
@@ -892,12 +898,28 @@ def check_cert_log(log: Any) -> dict:
         if kind == "asymptotic":
             _need(ctx.get("seen_branches") == ctx.get("expected_branches"),
                   "asymptotic: branch count mismatch")
+        # SOUNDNESS: `valid` means ONLY that the certificate's mathematical steps
+        # re-verify. The producer-supplied `claim` is free display text that is
+        # NEVER checked against what the steps actually prove — a valid LP cert can
+        # carry the claim "the Riemann hypothesis is true" and its math still
+        # checks. So the claim is returned explicitly as unverified, alongside a
+        # machine-derived statement of what WAS checked, so no caller can mistake
+        # the free text for a proven fact. (Binding the claim string to the
+        # certificate content is a deeper per-kind follow-up.)
         return {"valid": True, "reason": "all steps independently re-verified",
-                "checked_steps": checked, "kind": kind, "claim": log.get("claim")}
+                "checked_steps": checked, "kind": kind,
+                "claim": log.get("claim"),
+                "claim_verified": False,
+                "verified_statement": (
+                    f"the {kind} certificate's {checked} step(s) are internally "
+                    "re-verified with exact arithmetic; this does NOT assert the "
+                    "free-text `claim` field"
+                )}
     except _Reject as exc:
         return {"valid": False, "reason": str(exc), "checked_steps": checked,
                 "kind": log.get("kind") if isinstance(log, dict) else None,
-                "claim": log.get("claim") if isinstance(log, dict) else None}
+                "claim": log.get("claim") if isinstance(log, dict) else None,
+                "claim_verified": False}
 
 
 # --------------------------------------------------------------------------- #

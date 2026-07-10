@@ -104,6 +104,22 @@ def test_lp_primal_dual_exports_and_validates():
     assert res["checked_steps"] == len(log["steps"])
 
 
+def test_free_text_claim_is_never_reported_as_verified():
+    # SOUNDNESS: a valid certificate can carry an arbitrary, unrelated claim; the
+    # checker must NOT present that free text as proven.
+    cert, constraints, objective = _lp_primal_dual_cert()
+    log = export_lp_cert(cert, constraints=constraints, objective=objective, sense="max")
+    log["claim"] = "the Riemann hypothesis is true"
+    res = check_cert_log(log)
+    assert res["valid"] is True  # the LP math still checks
+    assert res["claim_verified"] is False  # ...but the claim is NOT verified
+    assert "does NOT assert" in res["verified_statement"]
+    # A rejected certificate also reports claim_verified False.
+    bad = dict(log)
+    bad["kind"] = "not_a_real_kind"
+    assert check_cert_log(bad)["claim_verified"] is False
+
+
 def test_lp_primal_dual_roundtrips_through_json():
     cert, constraints, objective = _lp_primal_dual_cert()
     log = export_lp_cert(cert, constraints=constraints, objective=objective, sense="max")
