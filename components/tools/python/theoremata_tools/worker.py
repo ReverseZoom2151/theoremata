@@ -235,6 +235,22 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.roundtrip_audit import run as roundtrip_audit_run
 
         return roundtrip_audit_run(request)
+    if tool == "trajectory_eval":
+        from theoremata_tools.trajectory_eval import run as trajectory_eval_run
+
+        return trajectory_eval_run(request)
+    if tool == "query_rewrite":
+        from theoremata_tools.query_rewrite import run as query_rewrite_run
+
+        return query_rewrite_run(request)
+    if tool == "semantic_memory":
+        from theoremata_tools.semantic_memory import run as semantic_memory_run
+
+        return semantic_memory_run(request)
+    if tool == "grpo_upgrades":
+        from theoremata_tools.grpo_upgrades import run as grpo_upgrades_run
+
+        return grpo_upgrades_run(request)
     if tool == "cert_taylor_model":
         from theoremata_tools.cert_taylor_model import run as cert_taylor_model_run
 
