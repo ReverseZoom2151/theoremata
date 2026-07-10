@@ -17,3 +17,4 @@ pub mod skest;
 pub mod rewriting;
 pub mod symmetry_dedup;
 pub mod best_first;
+pub mod distance_critic;
