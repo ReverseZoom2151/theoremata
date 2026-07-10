@@ -23,7 +23,7 @@ pub use reason::{
     conjecture_engine, critic, critic_scorer, dag_projection, decompose, definition_synthesis,
     discovery_game, distance_critic, driver, evolve_sketch, falsification, fitness, hybrid_search,
     formal_generate, formalize_modes, formalize_portfolio, goal_cache, guard, inverse_method, library, mathlib_export,
-    mcts, memory, method_transfer, minimize, observe, optimize, plan_history, portfolio,
+    mcts, memory, method_transfer, minimize, model_elimination, observe, optimize, plan_history, portfolio,
     preference_pairs, process_reward, progress, proof_import, proof_pool, refine_ops, repair, research, retry, rewriting, router, sampler, search_telemetry,
     sampling, sketch, skest, statement_validation, subsumption, symmetry_dedup, tactic_outcome,
     taint, team, ttc,

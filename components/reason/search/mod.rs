@@ -9,6 +9,7 @@ pub mod progress;
 pub mod ttc;
 pub mod subsumption;
 pub mod inverse_method;
+pub mod model_elimination;
 pub mod goal_cache;
 pub mod fitness;
 pub mod minimize;

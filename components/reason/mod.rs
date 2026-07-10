@@ -15,7 +15,7 @@ pub use orchestration::{
 pub use search::{
     best_first, critic_scorer, dag_projection, discovery_game, distance_critic, driver, fitness,
     goal_cache, hybrid_search,
-    inverse_method, mcts, minimize, preference_pairs, process_reward, proof_pool, progress, rewriting,
+    inverse_method, mcts, minimize, model_elimination, preference_pairs, process_reward, proof_pool, progress, rewriting,
     sampler, sampling, search_telemetry, skest, subsumption, symmetry_dedup, tactic_outcome, ttc,
 };
 pub use proving::{
