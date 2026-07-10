@@ -5,7 +5,7 @@ use crate::{
     db::Store,
     provider::ModelProvider,
     prover::{
-        aristotle, isabelle, lean, leandojo,
+        aristotle, external, isabelle, lean, leandojo,
         model::{ProofJob, ProofResult, ProofTask, ProverJobStatus},
         reprover, rocq,
     },
@@ -25,6 +25,7 @@ pub fn submit(
         "lean" => lean::submit(store, config, task, artifacts_dir),
         "rocq" => rocq::submit(store, config, task, artifacts_dir),
         "isabelle" => isabelle::submit(store, config, task, artifacts_dir),
+        "agda" | "metamath" => external::submit(store, config, task, artifacts_dir),
         "leandojo" => leandojo::submit(store, config, task, artifacts_dir),
         "reprover" => reprover::submit(store, config, task, artifacts_dir),
         other => Err(anyhow!("unsupported prover backend: {other}")),
@@ -45,6 +46,8 @@ pub fn poll(
         "lean" => lean::poll(store, config, job_id),
         "rocq" => rocq::poll(store, config, job_id),
         "isabelle" => isabelle::poll(store, config, job_id),
+        "agda" => external::poll(store, config, job_id, crate::prover::formal::FormalSystem::Agda),
+        "metamath" => external::poll(store, config, job_id, crate::prover::formal::FormalSystem::Metamath),
         "leandojo" => leandojo::poll(store, config, job_id),
         "reprover" => {
             let p = provider.ok_or_else(|| anyhow!("reprover backend requires a model provider"))?;
@@ -63,6 +66,7 @@ pub fn cancel(store: &Store, job_id: &str) -> Result<ProofJob> {
         "lean" => lean::cancel(store, job_id),
         "rocq" => rocq::cancel(store, job_id),
         "isabelle" => isabelle::cancel(store, job_id),
+        "agda" | "metamath" => external::cancel(store, job_id),
         "leandojo" => leandojo::cancel(store, job_id),
         "reprover" => reprover::cancel(store, job_id),
         other => Err(anyhow!("unsupported prover backend: {other}")),
@@ -96,6 +100,10 @@ pub fn any_prover_available(config: &Config, model_ready: bool) -> bool {
         "isabelle" => {
             isabelle::mock_enabled(config) || std::env::var("THEOREMATA_ISABELLE_COMMAND").is_ok()
         }
+        "agda" => external::mock_enabled(config, crate::prover::formal::FormalSystem::Agda)
+            || std::env::var("THEOREMATA_AGDA_COMMAND").is_ok(),
+        "metamath" => external::mock_enabled(config, crate::prover::formal::FormalSystem::Metamath)
+            || std::env::var("THEOREMATA_METAMATH_COMMAND").is_ok(),
         "leandojo" => leandojo::available(),
         "reprover" => reprover::available(model_ready),
         _ => false,

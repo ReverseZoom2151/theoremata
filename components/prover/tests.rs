@@ -6,6 +6,7 @@ use crate::{
     prover::{
         aristotle,
         attempt_run,
+        external,
         formal::{FormalBackend, FormalSystem, ProofSession, SessionError},
         isabelle,
         lean,
@@ -151,6 +152,37 @@ fn isabelle_submit_poll_result_mock() {
     assert!(v.lexically_verified);
     assert!(v.axioms_clean);
     assert!(v.lexical_clean);
+}
+
+#[test]
+fn agda_and_metamath_submit_poll_result_mock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = test_config(tmp.path());
+    let store = Store::open(&config.database).unwrap();
+    let project = store.create_project("p", "True").unwrap();
+
+    for system in [FormalSystem::Agda, FormalSystem::Metamath] {
+        let statement = match system {
+            FormalSystem::Agda => "generated",
+            FormalSystem::Metamath => "ph",
+            _ => unreachable!(),
+        };
+        let task = external::build_task(
+            Some(project.id.clone()),
+            None,
+            statement,
+            "Theoremata.ExternalThm",
+            &config,
+            system,
+        );
+        let job = proof_job::submit(&store, &config, task, None).unwrap();
+        let mid = proof_job::poll(&store, &config, &job.id, None).unwrap();
+        assert_eq!(mid.status, ProverJobStatus::InProgress);
+        let done = proof_job::poll(&store, &config, &job.id, None).unwrap();
+        assert_eq!(done.status, ProverJobStatus::Proved);
+        assert_eq!(done.task.system, system);
+        assert!(done.result.as_ref().and_then(|r| r.verification.as_ref()).is_some());
+    }
 }
 
 #[test]
@@ -375,6 +407,58 @@ fn isabelle_live_verifies_trivial_and_rejects_sorry() {
         !bad.lexically_verified,
         "a `sorry` Isabelle proof must be rejected: {bad:?}"
     );
+}
+
+#[test]
+fn agda_live_verifies_trivial_and_rejects_postulate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = live_config(tmp.path());
+    let backend = external::ExternalBackend::new(&cfg, FormalSystem::Agda, false);
+    if !backend.available() {
+        eprintln!("SKIP agda_live: agda unavailable via configured runner");
+        return;
+    }
+    let ok = backend
+        .verify(
+            &cfg,
+            "module Generated where\nopen import Agda.Builtin.Unit\ntrivial : \u{22a4}\ntrivial = tt\n",
+            "trivial : \u{22a4}",
+        )
+        .unwrap();
+    assert!(ok.lexically_verified, "trivial Agda proof must certify: {ok:?}");
+
+    let bad = backend
+        .verify(
+            &cfg,
+            "module Generated where\nopen import Agda.Builtin.Unit\npostulate bad : \u{22a4}\n",
+            "bad : \u{22a4}",
+        )
+        .unwrap();
+    assert!(!bad.lexically_verified, "Agda postulates must be rejected: {bad:?}");
+}
+
+#[test]
+fn metamath_live_verifies_trivial_and_rejects_malformed_proof() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = live_config(tmp.path());
+    let backend = external::ExternalBackend::new(&cfg, FormalSystem::Metamath, false);
+    if !backend.available() {
+        eprintln!("SKIP metamath_live: metamath unavailable via configured runner");
+        return;
+    }
+    let ok = backend
+        .verify(
+            &cfg,
+            "$c wff |- $.\n$v ph $.\nwph $f wff ph $.\nid $a |- ph $.\nth $p |- ph $= id $.\n",
+            "th",
+        )
+        .unwrap();
+    assert!(ok.lexically_verified, "trivial Metamath proof must certify: {ok:?}");
+
+    let bad = backend
+        .verify(&cfg, "$c wff $.\nthis is not Metamath\n", "bad")
+        .unwrap();
+    assert!(!bad.lexically_verified, "malformed Metamath must be rejected: {bad:?}");
 }
 
 #[test]

@@ -7,16 +7,18 @@
 
 use crate::{
     config::Config,
+    db::Store,
     prover::{
         exec::{self, Runner},
         formal::{
             AxiomReport, CompileReport, FormalBackend, FormalSystem, GoalState, ProofSession,
             RecheckReport, ScanReport, SessionError, StateResult, UnitResult, Workspace,
         },
-        model::FormalProject,
+        model::{FormalProject, ProofJob, ProofResult, ProofTask, ProverJobStatus},
     },
 };
 use anyhow::Result;
+use chrono::Utc;
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -25,6 +27,155 @@ pub struct ExternalBackend {
     pub mock: bool,
     pub runner: Runner,
     pub binary: String,
+    pub secondary_binary: Option<String>,
+}
+
+fn backend_name(system: FormalSystem) -> &'static str {
+    system.as_str()
+}
+
+pub fn mock_enabled(config: &Config, system: FormalSystem) -> bool {
+    config.prover_mock || match system {
+        FormalSystem::Agda => std::env::var("THEOREMATA_AGDA_COMMAND").is_err(),
+        FormalSystem::Metamath => std::env::var("THEOREMATA_METAMATH_COMMAND").is_err(),
+        _ => false,
+    }
+}
+
+pub fn build_task(
+    project_id: Option<String>,
+    node_id: Option<String>,
+    statement: &str,
+    theorem_name: &str,
+    config: &Config,
+    system: FormalSystem,
+) -> ProofTask {
+    ProofTask {
+        id: uuid::Uuid::new_v4().to_string(), project_id, node_id,
+        theorem: crate::prover::model::TheoremIdentity {
+            repo: Some("theoremata".into()), commit: None, file: None,
+            full_name: theorem_name.into(), line: None,
+        },
+        system,
+        formal_project: FormalProject {
+            system, root: config.resources.clone(), toolchain: None,
+            imports: system.default_imports(), metadata: json!({}),
+        },
+        statement: statement.into(), stub: None, prompt: None,
+        backend: backend_name(system).into(), metadata: json!({}),
+    }
+}
+
+pub fn submit(store: &Store, config: &Config, task: ProofTask,
+              artifacts_dir: Option<std::path::PathBuf>) -> Result<ProofJob> {
+    let mock = mock_enabled(config, task.system);
+    let external_id = mock.then(|| format!("mock-{}", &task.id[..8.min(task.id.len())]));
+    let job = store.create_proof_job(
+        &task,
+        backend_name(task.system),
+        ProverJobStatus::Submitted,
+        external_id.as_deref(),
+        artifacts_dir.as_deref(),
+        0.0,
+    )?;
+    store.event(
+        task.project_id.as_deref(),
+        None,
+        "proof_job.submitted",
+        backend_name(task.system),
+        json!({"job_id": job.id, "task_id": task.id, "mock": mock}),
+    )?;
+    Ok(job)
+}
+
+pub fn poll(
+    store: &Store,
+    config: &Config,
+    job_id: &str,
+    system: FormalSystem,
+) -> Result<ProofJob> {
+    let mut job = store
+        .get_proof_job(job_id)?
+        .ok_or_else(|| anyhow::anyhow!("unknown proof job {job_id}"))?;
+    if job.status.is_terminal() {
+        return Ok(job);
+    }
+    if !mock_enabled(config, system) {
+        return crate::prover::formal::live_poll(store, config, job, backend_name(system), system);
+    }
+    job.poll_count += 1;
+    job.updated_at = Utc::now();
+    if job.poll_count == 1 {
+        job.status = ProverJobStatus::InProgress;
+        job.percent_complete = 50.0;
+        store.update_proof_job(&job)?;
+        store.event(
+            job.project_id.as_deref(),
+            None,
+            "proof_job.progress",
+            backend_name(system),
+            json!({"job_id": job.id, "status": job.status, "percent_complete": job.percent_complete}),
+        )?;
+        return Ok(job);
+    }
+    let code = job.task.stub.clone().unwrap_or_else(|| match system {
+        FormalSystem::Agda => "module Generated where\n\nopen import Agda.Builtin.Unit\ngenerated : Agda.Builtin.Unit.\u{22a4}\ngenerated = Agda.Builtin.Unit.tt\n".into(),
+        FormalSystem::Metamath => "$c wff |- $.\n$v ph $.\nph $f wff ph $.\n".into(),
+        _ => String::new(),
+    });
+    let backend = ExternalBackend::new(config, system, true);
+    let verification = backend.verify(config, &code, &job.task.statement).ok();
+    job.status = if verification
+        .as_ref()
+        .map(|report| report.lexically_verified)
+        .unwrap_or(false)
+    {
+        ProverJobStatus::Proved
+    } else {
+        ProverJobStatus::Failed
+    };
+    job.percent_complete = 100.0;
+    job.completed_at = Some(Utc::now());
+    job.result = Some(ProofResult {
+        task_id: job.task.id.clone(), job_id: job.id.clone(), status: job.status,
+        formal_code: Some(code), counterexample: None, verification,
+        artifacts_dir: job.artifacts_dir.clone(), duration_ms: 0, cost: None,
+        message: Some(format!("mock {system} checker completed")),
+        provenance: json!({"backend": backend_name(system), "system": system.as_str(), "mock": true}),
+    });
+    if let Some(dir) = &job.artifacts_dir {
+        let sub = dir.join(backend_name(system));
+        std::fs::create_dir_all(&sub)?;
+        std::fs::write(sub.join(format!("solution{}", system.source_extension())), &code)?;
+        std::fs::write(dir.join("result.json"), serde_json::to_string_pretty(job.result.as_ref().unwrap())?)?;
+    }
+    store.update_proof_job(&job)?;
+    store.event(
+        job.project_id.as_deref(),
+        None,
+        "proof_job.completed",
+        backend_name(system),
+        json!({"job_id": job.id, "status": job.status, "mock": true}),
+    )?;
+    Ok(job)
+}
+
+pub fn cancel(store: &Store, job_id: &str) -> Result<ProofJob> {
+    let mut job = store.get_proof_job(job_id)?.ok_or_else(|| anyhow::anyhow!("unknown proof job {job_id}"))?;
+    if !job.status.is_terminal() {
+        job.status = ProverJobStatus::Cancelled;
+        job.completed_at = Some(Utc::now());
+        job.updated_at = Utc::now();
+        store.update_proof_job(&job)?;
+        store.event(
+            job.project_id.as_deref(),
+            None,
+            "proof_job.cancelled",
+            &job.backend,
+            json!({"job_id": job.id}),
+        )?;
+    }
+    Ok(job)
 }
 
 impl ExternalBackend {
@@ -43,6 +194,11 @@ impl ExternalBackend {
                 cfg.formal_runners.for_system(system)
             },
             binary: exec::env_or(env_name, binary),
+            secondary_binary: if system == FormalSystem::Metamath {
+                std::env::var("THEOREMATA_METAMATH_SECONDARY").ok()
+            } else {
+                None
+            },
         }
     }
 
@@ -104,6 +260,29 @@ impl FormalBackend for ExternalBackend {
         let root = crate::prover::formal::live_workspace_dir(cfg, self.system)?;
         let source_path = root.join(format!("Generated{}", self.system.source_extension()));
         std::fs::write(&source_path, code)?;
+        if self.system == FormalSystem::Metamath {
+            // Metamath resolves `$[ file $]` relative to the current working
+            // directory. Copy explicitly referenced resources into the
+            // isolated workspace so a proof cannot silently depend on an
+            // undeclared host-global database.
+            for include in metamath_includes(code) {
+                let destination = root.join(&include);
+                if destination.exists() {
+                    continue;
+                }
+                let source = cfg.resources.join(&include);
+                if !source.is_file() {
+                    anyhow::bail!(
+                        "Metamath dependency `{}` is not present in the configured resources",
+                        include.display()
+                    );
+                }
+                if let Some(parent) = destination.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::copy(source, destination)?;
+            }
+        }
         Ok(Workspace {
             system: self.system,
             root,
@@ -182,9 +361,27 @@ impl FormalBackend for ExternalBackend {
         let out = self.run_file(ws);
         let filename = ws.source_path.file_name().and_then(|s| s.to_str()).unwrap_or("Generated");
         let command = self.command(filename);
+        let mut secondary = json!(null);
+        let mut rechecked = out.success();
+        if rechecked {
+            if let (FormalSystem::Metamath, Some(binary)) = (self.system, &self.secondary_binary) {
+                let filename = ws.source_path.file_name().and_then(|s| s.to_str()).unwrap_or("Generated");
+                let args = [binary.as_str(), filename];
+                let second = exec::run(&self.runner, &args, &ws.root);
+                rechecked = second.success();
+                secondary = json!({
+                    "binary": binary,
+                    "command": args,
+                    "code": second.code,
+                    "stdout": second.stdout,
+                    "stderr": second.stderr,
+                    "passed": second.success(),
+                });
+            }
+        }
         Ok(RecheckReport {
-            rechecked: out.success(),
-            detail: json!({"binary": self.binary.clone(), "command": command, "code": out.code, "stdout": out.stdout, "stderr": out.stderr, "checker": self.system.as_str()}),
+            rechecked,
+            detail: json!({"binary": self.binary.clone(), "command": command, "code": out.code, "stdout": out.stdout, "stderr": out.stderr, "checker": self.system.as_str(), "secondary": secondary}),
         })
     }
 
@@ -213,6 +410,21 @@ impl FormalBackend for ExternalBackend {
             detail: json!({"system": self.system.as_str(), "fallback": true}),
         })
     }
+}
+
+fn metamath_includes(code: &str) -> Vec<PathBuf> {
+    let mut includes = Vec::new();
+    let mut rest = code;
+    while let Some(start) = rest.find("$[") {
+        rest = &rest[start + 2..];
+        let Some(end) = rest.find("$]") else { break };
+        let name = rest[..end].trim();
+        if !name.is_empty() {
+            includes.push(PathBuf::from(name));
+        }
+        rest = &rest[end + 2..];
+    }
+    includes
 }
 
 impl ProofSession for ExternalBackend {
