@@ -183,6 +183,34 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.cert_bernstein import run as cert_bernstein_run
 
         return cert_bernstein_run(request)
+    if tool == "cert_bezout":
+        from theoremata_tools.cert_bezout import run as cert_bezout_run
+
+        return cert_bezout_run(request)
+    if tool == "cert_bnb":
+        from theoremata_tools.cert_bnb import run as cert_bnb_run
+
+        return cert_bnb_run(request)
+    if tool == "cert_herbrand":
+        from theoremata_tools.cert_herbrand import run as cert_herbrand_run
+
+        return cert_herbrand_run(request)
+    if tool == "cert_pocklington":
+        from theoremata_tools.cert_pocklington import run as cert_pocklington_run
+
+        return cert_pocklington_run(request)
+    if tool == "cert_positivstellensatz":
+        from theoremata_tools.cert_positivstellensatz import run as cert_positivstellensatz_run
+
+        return cert_positivstellensatz_run(request)
+    if tool == "cert_sturm":
+        from theoremata_tools.cert_sturm import run as cert_sturm_run
+
+        return cert_sturm_run(request)
+    if tool == "formalizing_100":
+        from theoremata_tools.benchmarks.formalizing_100 import load_formalizing_100
+
+        return {"op": "load", "name": "formalizing_100", "items": load_formalizing_100()}
     if tool == "formalization_reward":
         from theoremata_tools.formalization_reward import run as formalization_reward_run
 
