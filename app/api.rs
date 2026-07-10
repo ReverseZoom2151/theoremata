@@ -175,6 +175,17 @@ pub fn handle(store: &Store, req: ApiRequest) -> ApiResponse {
             node,
             status,
         } => {
+            // Trust boundary: `FormallyVerified` asserts a machine-checked proof
+            // and may ONLY be reached through the verification pipeline (which
+            // attaches evidence). The plain status-mutation API must not be able
+            // to fabricate it by fiat.
+            if matches!(status, NodeStatus::FormallyVerified) {
+                return error(
+                    "forbidden",
+                    "formally_verified is set only by the verification pipeline \
+                     (with proof evidence), not via set_status",
+                );
+            }
             if let Err(e) = store.set_node_status(&project, &node, status, API_ACTOR) {
                 // The only documented failure is a missing node.
                 return error("not_found", e.to_string());
