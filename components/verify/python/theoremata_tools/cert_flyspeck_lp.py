@@ -100,20 +100,39 @@ def _sorted_vars(rows: list, objective: Optional[dict]) -> list[str]:
     return sorted(names)
 
 
-def repair_dual(dual: Iterable, *, max_denominator: int = DEFAULT_MAX_DENOMINATOR
-                ) -> list[Fraction]:
+def _round_grid(f: Fraction, max_denominator: int, direction: str) -> Fraction:
+    """Round ``f`` onto the rational grid of denominator ``max_denominator``.
+    ``nearest`` uses :meth:`limit_denominator`; ``down``/``up`` floor/ceil onto
+    the grid (the Flyspeck LP-HL directional rounding — round a multiplier the way
+    that keeps the reconstructed combination a valid bound)."""
+    if direction == "nearest":
+        return f.limit_denominator(max_denominator)
+    scaled = f * max_denominator
+    if direction == "down":
+        k = math.floor(scaled)
+    elif direction == "up":
+        k = math.ceil(scaled)
+    else:
+        raise ValueError(f"unknown rounding direction: {direction!r}")
+    return Fraction(int(k), max_denominator)
+
+
+def repair_dual(dual: Iterable, *, max_denominator: int = DEFAULT_MAX_DENOMINATOR,
+                direction: str = "nearest") -> list[Fraction]:
     """The **modified-dual repair**: untrusted multipliers -> exact rational ``y >= 0``.
 
-    Each (possibly floating-point) multiplier is rounded to the nearest rational
-    whose denominator divides no more than ``max_denominator`` (via
-    :meth:`Fraction.limit_denominator`), and any negative result is clamped to
-    ``0``.  Deterministic.  This is a *heuristic* reconstruction on the untrusted
-    side — its output is only ever accepted if the checker's exact recomputation
-    confirms it, so a bad reconstruction can never be unsound (it is rejected).
+    Each (possibly floating-point) multiplier is rounded onto the rational grid of
+    denominator ``max_denominator`` and any negative result is clamped to ``0``.
+    ``direction`` selects the Flyspeck LP-HL rounding mode: ``nearest`` (default,
+    nearest rational), or ``down``/``up`` (directional — the sound-preserving
+    rounding LP-HL applies to lower/upper-bound marginals). Deterministic. This is
+    a *heuristic* reconstruction on the untrusted side — its output is only ever
+    accepted if the checker's exact recomputation confirms it, so a bad
+    reconstruction can never be unsound (it is rejected).
     """
     out: list[Fraction] = []
     for v in dual:
-        f = _frac(v).limit_denominator(max_denominator)
+        f = _round_grid(_frac(v), max_denominator, direction)
         out.append(f if f > 0 else Fraction(0))
     return out
 
