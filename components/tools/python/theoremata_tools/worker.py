@@ -183,6 +183,10 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.cert_bernstein import run as cert_bernstein_run
 
         return cert_bernstein_run(request)
+    if tool == "formalization_reward":
+        from theoremata_tools.formalization_reward import run as formalization_reward_run
+
+        return formalization_reward_run(request)
     if tool == "cert_taylor_model":
         from theoremata_tools.cert_taylor_model import run as cert_taylor_model_run
 
