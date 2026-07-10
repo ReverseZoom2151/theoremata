@@ -195,6 +195,10 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.error_keyed_retrieval import run as error_keyed_retrieval_run
 
         return error_keyed_retrieval_run(request)
+    if tool == "format_filters":
+        from theoremata_tools.format_filters import run as format_filters_run
+
+        return format_filters_run(request)
     if tool == "cert_taylor_model":
         from theoremata_tools.cert_taylor_model import run as cert_taylor_model_run
 
