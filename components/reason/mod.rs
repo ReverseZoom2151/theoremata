@@ -13,7 +13,7 @@ pub use orchestration::{
     observe, proof_import, research, statement_validation, team,
 };
 pub use search::{
-    best_first, critic_scorer, discovery_game, distance_critic, driver, fitness, goal_cache,
+    best_first, critic_scorer, discovery_game, distance_critic, driver, fitness, goal_cache, hybrid_search,
     inverse_method, mcts, minimize, preference_pairs, process_reward, proof_pool, progress, rewriting,
     sampler, sampling, search_telemetry, skest, subsumption, symmetry_dedup, tactic_outcome, ttc,
 };

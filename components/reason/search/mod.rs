@@ -21,3 +21,4 @@ pub mod distance_critic;
 pub mod critic_scorer;
 pub mod preference_pairs;
 pub mod search_telemetry;
+pub mod hybrid_search;
