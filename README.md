@@ -226,18 +226,19 @@ log is the toolchain-gated upgrade.
 ## Tech stack & integrations
 
 <div align="center">
-<img src="https://cdn.simpleicons.org/rust/000000" height="34" alt="Rust">&nbsp;&nbsp;&nbsp;&nbsp;
-<img src="https://cdn.simpleicons.org/python/3776AB" height="34" alt="Python">&nbsp;&nbsp;&nbsp;&nbsp;
+<img src="assets/logos/rust.svg" height="34" alt="Rust">&nbsp;&nbsp;&nbsp;&nbsp;
+<img src="assets/logos/python.svg" height="34" alt="Python">&nbsp;&nbsp;&nbsp;&nbsp;
 <img src="assets/logos/lean.png" height="34" alt="Lean 4">&nbsp;&nbsp;&nbsp;&nbsp;
 <img src="assets/logos/rocq.svg" height="26" alt="Rocq (Coq)">&nbsp;&nbsp;&nbsp;&nbsp;
-<img src="https://cdn.simpleicons.org/sqlite/003B57" height="30" alt="SQLite">&nbsp;&nbsp;&nbsp;&nbsp;
+<img src="assets/logos/agda.svg" height="30" alt="Agda">&nbsp;&nbsp;&nbsp;&nbsp;
+<img src="assets/logos/sqlite.svg" height="30" alt="SQLite">&nbsp;&nbsp;&nbsp;&nbsp;
 <img src="assets/logos/ratatui.svg" height="32" alt="ratatui">&nbsp;&nbsp;&nbsp;&nbsp;
-<img src="https://cdn.simpleicons.org/docker/2496ED" height="30" alt="Docker">&nbsp;&nbsp;&nbsp;&nbsp;
-<img src="https://cdn.simpleicons.org/ubuntu/E95420" height="30" alt="WSL / Ubuntu">&nbsp;&nbsp;&nbsp;&nbsp;
-<img src="https://cdn.simpleicons.org/sympy/3B5526" height="30" alt="SymPy">&nbsp;&nbsp;&nbsp;&nbsp;
-<img src="https://cdn.simpleicons.org/scikitlearn/F7931E" height="30" alt="scikit-learn">&nbsp;&nbsp;&nbsp;&nbsp;
-<img src="https://cdn.simpleicons.org/pytorch/EE4C2C" height="30" alt="PyTorch">&nbsp;&nbsp;&nbsp;&nbsp;
-<img src="https://cdn.simpleicons.org/huggingface/FFD21E" height="30" alt="Hugging Face">
+<img src="assets/logos/docker.svg" height="30" alt="Docker">&nbsp;&nbsp;&nbsp;&nbsp;
+<img src="assets/logos/ubuntu.svg" height="30" alt="WSL / Ubuntu">&nbsp;&nbsp;&nbsp;&nbsp;
+<img src="assets/logos/sympy.svg" height="30" alt="SymPy">&nbsp;&nbsp;&nbsp;&nbsp;
+<img src="assets/logos/scikitlearn.svg" height="30" alt="scikit-learn">&nbsp;&nbsp;&nbsp;&nbsp;
+<img src="assets/logos/pytorch.svg" height="30" alt="PyTorch">&nbsp;&nbsp;&nbsp;&nbsp;
+<img src="assets/logos/huggingface.svg" height="30" alt="Hugging Face">
 </div>
 
 The rule for external tools is: detect at runtime, degrade gracefully. The only
