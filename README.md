@@ -13,7 +13,7 @@
 ![Agda](https://img.shields.io/badge/Agda-2-2C6BAA?style=flat-square)
 ![Metamath](https://img.shields.io/badge/Metamath-set.mm-444444?style=flat-square)
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)
-![Tests](https://img.shields.io/badge/tests-590%2B%20Rust%20%2B%201400%2B%20Python-2ea44f?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-1150%2B%20Rust%20%2B%201500%2B%20Python-2ea44f?style=flat-square)
 
 </div>
 
@@ -145,6 +145,15 @@ log is the toolchain-gated upgrade.
 - Trust hardening: a mock or toolchain-absent check downgrades to
   `InformallyVerified` and can never yield `FormallyVerified`; the API cannot set
   the verified status by fiat; graph mutations are transactional.
+- Statement screening before a new statement enters the graph: a multi-sample
+  model judge and a negation prover (the falsifier proving the negation) vote on
+  whether a proposed statement is well-formed and non-trivial, and the screen
+  fails closed, so an errored or absent verdict never reads as a pass.
+- A vacuity guard against proofs that discharge a goal by making the hypotheses
+  contradictory: a bounded numeric searcher constructs and checks a satisfiability
+  witness for a decidable fragment, and both "found nothing in bounds" and
+  "outside the fragment" collapse to no-witness so the guard cannot be talked into
+  a pass by a search it never actually ran.
 
 **Search and proving**
 
@@ -155,6 +164,11 @@ log is the toolchain-gated upgrade.
 - A value-free best-first search, a goal-directed model-elimination / connection
   tableau prover, and a hybrid router that runs both because they cover disjoint
   proof space.
+- Additional search calculi that report candidates rather than proofs: an
+  inverse-method forward-saturation prover and a speculative ensemble search that
+  reuses one tree's proven fact across its siblings by subsumption. Every outcome
+  they emit is branded unverified and recorded as evidence, never as a closed
+  node, so a search hit can never be mistaken for a checked proof.
 - Negation-augmented search where a disproof competes for the same budget, AND/OR
   minimax selection, empirical sampled-action priors, and symmetry-orbit dedup.
 - First-order term rewriting primitives: true unification with occurs-check,
@@ -165,6 +179,13 @@ log is the toolchain-gated upgrade.
   self-summarizing restarts on failure.
 - A conjecture-and-prove engine that proposes conjectures, falsifies then proves
   the survivors, and graduates the proved ones into the lemma library.
+- Failed-attempt feedback that turns a rejected proof into structured next steps:
+  the checker diagnostics are rendered with corrected source spans, the explicit
+  holes and error positions are lifted out as unproved obligations, and an
+  `unknown identifier` is resolved against a declaration index that separates
+  "no such name" (abandon it) from "real but unimported" (add this import). The
+  lifted obligations always enter the graph unproved; a failed compile is never
+  read as evidence that any of them holds.
 - Blueprint and paper-scale runs: drive a whole multi-lemma `leanblueprint`
   `content.tex` end to end, proving dependencies before dependents, with
   content-addressed theorem import for tamper-evident reassembly.
@@ -274,10 +295,10 @@ runtime.
 ```sh
 # Rust core
 cargo build --release
-cargo test                     # 590+ tests, no provers required (mock-backed)
+cargo test                     # 1,150+ tests, no provers required (mock-backed)
 
 # Python workers (the namespace package resolves from the source tree)
-python -m pytest components     # 1,400+ tests, offline and deterministic
+python -m pytest components     # 1,500+ tests, offline and deterministic
 ```
 
 Then initialize a workspace and check what is available on your machine:
@@ -339,9 +360,40 @@ theoremata tool '{"tool":"cert_sturm","op":"check","log": ...}'
 theoremata tool '{"tool":"benchmark","request":{"op":"list"}}'
 ```
 
-Run `theoremata help` (or `theoremata <command> --help`) for the full list.
-Projects, graph editing, retrieval, evaluation, training exports, proof-job
-management, and the interactive chat/TUI are all there.
+The reasoning and search subsystems are reachable individually, which is useful
+for driving one stage in isolation or inspecting what it produces:
+
+```sh
+# Proof-producing stages (each result still passes, or fails, the live gate)
+theoremata conjecture <project>                    # propose, falsify, graduate the survivors
+theoremata evolve-sketch <project> "<goal>" "<templated sketch>"
+theoremata formalize-modes <project> "<informal statement>"   # fast vs chain-of-thought
+theoremata method-transfer '{"method":{...},"family":[...],"systems":["lean"]}'
+theoremata mathlib-export <project> --system lean  # re-verifies each skill before export
+
+# Search stages: these emit CANDIDATES, branded unverified, never a checked proof
+theoremata inverse-method <project> '{"axioms":[...],"goal":"...","rules":[...]}'
+theoremata model-elim <project> '{"clauses":[...],"max_bound":1000}'
+theoremata discovery-search '{"basis":[[...]],"root":[...],"seed":0}'
+theoremata skest-search '{"closed_goals":[...],"edges":[...],"root":"...","seed":0}'
+
+# Advisory and observability stages
+theoremata define-synth <project> "<statement>"    # detect undefined symbols, propose definitions
+theoremata preference-pairs <project> '[{"states":[...],"verdict":"Passing"}]'
+theoremata dag-project <project> '<DagView JSON>'  # project a search DAG to its MCGS tree
+theoremata proof-log-check <file>                  # re-check a proof log independently
+theoremata search-telemetry '{"proofs":[...],"rounds":[[...]]}'
+```
+
+The distinction the CLI keeps visible is the one the whole system turns on: a
+search stage reports a candidate with `formally_verified: false` and cannot
+promote itself, a proof-producing stage counts a result as solved only when a
+live backend closed it, and `mathlib-export` exports nothing at all when no live
+gate is present.
+
+Run `theoremata help` (or `theoremata <command> --help`) for the full list of 90+
+commands. Projects, graph editing, retrieval, evaluation, training exports,
+proof-job management, and the interactive chat/TUI are all there.
 
 ## Architecture
 
@@ -389,7 +441,7 @@ and the Rust-side certificate and search primitives stay in Rust.
 - Live and verified in CI: the full 3+1 gate abstraction for all six provers,
   portfolio and hammer-assisted proving, the sketch and blueprint-run pipelines,
   falsification, retrieval, grading, the proof-DAG and memory, all fourteen
-  certificate checkers, and the whole test suite (590+ Rust, 1,400+ Python).
+  certificate checkers, and the whole test suite (1,150+ Rust, 1,500+ Python).
 - Toolchain-gated: a genuinely certified pass from any live backend needs that
   backend's toolchain present (Lean/Mathlib, Rocq, Isabelle, HOL4/CakeML/Candle,
   Agda, or Metamath). Without a toolchain the backend runs mock-only and can never
