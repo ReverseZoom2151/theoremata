@@ -80,6 +80,18 @@ the kernel re-check, so the source is always scanned, and the statement the proo
 actually proves is checked against the statement that was asked. See
 [`docs/formal-systems/`](docs/formal-systems/) for the full trust model.
 
+A compiler's exit code is never trusted on its own. Each backend declares how it
+signals success (a non-zero exit that is honest, or a required stdout sentinel
+plus a forbidden one), because a checker that reports success by exit status
+alone can be made to pass a proof it did not accept. This finding came out of the
+[Higher Order Co ecosystem audit](docs/resource-mining/new/higher-order-co.md):
+that ecosystem (HVM / Bend / Kind) was evaluated as a possible backend and
+deliberately NOT adopted, for licensing and because it could not enter the
+trusted path, but the exit-code lesson and a search-priority idea were worth
+keeping. Every system also carries a `FoundationProfile` recording its logical
+foundation and trusted base, so the gate reasons about what it is actually
+trusting rather than treating all six alike.
+
 ### The six formal systems
 
 | System | Foundation | Compile / check | Escape hatches the gate rejects |
@@ -178,14 +190,21 @@ log is the toolchain-gated upgrade.
   assembly unless every hole closes; with reflective re-decomposition and
   self-summarizing restarts on failure.
 - A conjecture-and-prove engine that proposes conjectures, falsifies then proves
-  the survivors, and graduates the proved ones into the lemma library.
+  the survivors, and graduates the proved ones into the lemma library. Each
+  proposed batch is deduplicated before any prover effort is spent, so two
+  conjectures that are the same statement are never both attempted.
 - Failed-attempt feedback that turns a rejected proof into structured next steps:
   the checker diagnostics are rendered with corrected source spans, the explicit
-  holes and error positions are lifted out as unproved obligations, and an
+  holes and error positions are lifted out as unproved obligations, an
   `unknown identifier` is resolved against a declaration index that separates
-  "no such name" (abandon it) from "real but unimported" (add this import). The
+  "no such name" (abandon it) from "real but unimported" (add this import), and
+  when a warm Lean REPL is running, the actual goal state at the error is
+  recovered from the elaboration infotree and attached to the feedback. The
   lifted obligations always enter the graph unproved; a failed compile is never
   read as evidence that any of them holds.
+- Proof minimization: a solved tactic sequence is shrunk to a shorter one that is
+  RE-CHECKED against the gate, never merely guessed. A shrink is accepted only
+  when it still verifies; otherwise the original stands.
 - Blueprint and paper-scale runs: drive a whole multi-lemma `leanblueprint`
   `content.tex` end to end, proving dependencies before dependents, with
   content-addressed theorem import for tamper-evident reassembly.
@@ -281,6 +300,7 @@ external blocks a build or a run.
 | | Sledgehammer, [CoqHammer](https://coqhammer.github.io), [aesop](https://github.com/leanprover-community/aesop) | Hammers: find a tactic, verify it through the gate | Ships with its prover, optional |
 | <img src="assets/logos/docker.svg" height="16"> <img src="assets/logos/ubuntu.svg" height="16"> | Docker and WSL | Runners: run any backend native, in WSL, or in a container | Config (`formal_runners`), optional |
 | | [LiteLLM](https://github.com/BerriAI/litellm) | Model provider seam (any chat model) | Optional, a deterministic mock runs without it |
+| | [Model Context Protocol](https://modelcontextprotocol.io) | `theoremata mcp` serves the tool workers over JSON-RPC to any MCP client; an Aristotle MCP reference client is included | Optional, stdio |
 | <img src="assets/logos/sympy.svg" height="16"> | [SymPy](https://www.sympy.org) (with bundled [mpmath](https://mpmath.org)) | Symbolic math, Wu's-method geometry, certificate generation | Core dependency, with stdlib fallbacks in the hot paths |
 | | [`rank_bm25`](https://pypi.org/project/rank-bm25/) | BM25 premise retrieval | Optional, a stdlib BM25 backend runs without it |
 | <img src="assets/logos/scikitlearn.svg" height="16"> | [scikit-learn](https://scikit-learn.org) | Learned backend and difficulty selectors | Optional, deterministic fallbacks otherwise |
@@ -394,6 +414,14 @@ gate is present.
 Run `theoremata help` (or `theoremata <command> --help`) for the full list of 90+
 commands. Projects, graph editing, retrieval, evaluation, training exports,
 proof-job management, and the interactive chat/TUI are all there.
+
+Beyond the CLI and TUI there are three more ways in. `theoremata mcp` starts a
+Model Context Protocol stdio server that exposes the Python tool workers over
+JSON-RPC, so an MCP client (or the included Aristotle reference client) can drive
+falsification, retrieval, grading, and the certificate checkers directly. The
+binary also speaks a stable versioned JSON API for editor and MCP integrations.
+And `graph_viewer` renders a proof-DAG as a self-contained web page for
+inspection, with no server to run.
 
 ## Architecture
 
