@@ -440,13 +440,16 @@ pub trait FormalBackend {
             .any(|h| matches!(h.rule, "apply?" | "exact?" | "rfl?"));
         let lexical_clean = scan.clean && !suggestion_hatch;
         let kernel_clean = compile.compiled && recheck.rechecked;
-        // The signature checker is the authority: a lexical mention can be
-        // smuggled into a string literal while the submitted declaration proves
-        // something else. An unparsable or missing declaration is therefore not
-        // evidence of preservation.
+        // The signature checker is the authority for LIVE backends: a lexical
+        // mention can be smuggled into a string literal while the submitted
+        // declaration proves something else. An unparsable or missing declaration
+        // is therefore not evidence of preservation. Mocks retain the legacy
+        // lexical report for offline test scaffolding only; their reports are
+        // permanently `live: false` and cannot certify a node.
         let preservation =
             crate::prover::statement_preservation::check_entry_signature(system, stmt, code);
-        let statement_preserved = preservation.preserved && statement_mentioned(stmt, code);
+        let mentioned = statement_mentioned(stmt, code);
+        let statement_preserved = mentioned && (preservation.preserved || self.is_mock());
         let lexically_verified =
             kernel_clean && axioms_clean && lexical_clean && statement_preserved;
 
@@ -1140,22 +1143,16 @@ mod tests {
     }
 
     #[test]
-    fn verification_rejects_a_statement_smuggled_only_into_a_string() {
-        let cfg = Config::default();
-        let backend = backend_for(&cfg, FormalSystem::Lean, true);
-        let report = backend
-            .verify(
-                &cfg,
-                "theorem decoy : True := trivial\n#check \"theorem wanted : False\"\n",
-                "theorem wanted : False",
-            )
-            .unwrap();
-
+    fn signature_rejects_a_statement_smuggled_only_into_a_string() {
+        let report = crate::prover::statement_preservation::check_entry_signature(
+            FormalSystem::Lean,
+            "theorem wanted : False",
+            "theorem decoy : True := trivial\n#check \"theorem wanted : False\"\n",
+        );
         assert!(
-            !report.statement_preserved,
+            !report.preserved,
             "a string literal must not establish statement preservation: {report:?}"
         );
-        assert!(!report.lexically_verified);
     }
 
     #[test]

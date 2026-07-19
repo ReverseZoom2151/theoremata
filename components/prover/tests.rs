@@ -393,7 +393,7 @@ fn isabelle_live_verifies_trivial_and_rejects_sorry() {
         return;
     }
     let ok = backend
-        .verify(&cfg, "theorem t: \"True\"\n  by simp", "\"True\"")
+        .verify(&cfg, "theorem t: \"True\"\n  by simp", "theorem t: \"True\"")
         .unwrap();
     assert!(
         ok.lexically_verified,
@@ -401,7 +401,7 @@ fn isabelle_live_verifies_trivial_and_rejects_sorry() {
     );
 
     let bad = backend
-        .verify(&cfg, "theorem t: \"True\"\n  sorry", "\"True\"")
+        .verify(&cfg, "theorem t: \"True\"\n  sorry", "theorem t: \"True\"")
         .unwrap();
     assert!(
         !bad.lexically_verified,
@@ -457,7 +457,7 @@ fn metamath_live_verifies_trivial_and_rejects_malformed_proof() {
         .verify(
             &cfg,
             "$c wff |- $.\n$v ph $.\nwph $f wff ph $.\nid $a |- ph $.\nth $p |- ph $= wph id $.\n",
-            "th",
+            "th $p |- ph $= wph id $.",
         )
         .unwrap();
     assert!(ok.lexically_verified, "trivial Metamath proof must certify: {ok:?}");

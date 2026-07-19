@@ -362,11 +362,11 @@ pub fn check_entry_signature(
     match system {
         FormalSystem::Agda => check_agda_signature(canonical_statement, submitted_code),
         FormalSystem::Metamath => check_metamath_signature(canonical_statement, submitted_code),
-        // Lean / Rocq / Isabelle / Candle: unchanged theorem-signature path.
-        FormalSystem::Lean
-        | FormalSystem::Rocq
-        | FormalSystem::Isabelle
-        | FormalSystem::Candle => check_statement_preserved(canonical_statement, submitted_code),
+        FormalSystem::Isabelle => check_isabelle_signature(canonical_statement, submitted_code),
+        // Lean / Rocq / Candle: theorem-signature path.
+        FormalSystem::Lean | FormalSystem::Rocq | FormalSystem::Candle => {
+            check_statement_preserved(canonical_statement, submitted_code)
+        }
     }
 }
 
@@ -385,6 +385,169 @@ fn entry_sig(kind: &str, name: &str, conclusion: &str) -> TheoremSig {
 
 /// Confirm the submission declares the canonical Agda entry with the SAME type.
 fn check_agda_signature(canonical_statement: &str, submitted_code: &str) -> PreservationReport {
+// --- Isabelle --------------------------------------------------------------
+
+/// Confirm a quoted Isabelle declaration has the same entry name and proposition.
+/// Isabelle propositions are delimited by `"..."`, so feeding its source through
+/// the Lean sanitizer erases the very conclusion the preservation check must
+/// compare. This intentionally narrow parser covers the batch backend's emitted
+/// `theorem name: "proposition"` form and fails closed for other syntax.
+fn check_isabelle_signature(
+    canonical_statement: &str,
+    submitted_code: &str,
+) -> PreservationReport {
+    let Some(canonical) = parse_first_isabelle_decl(canonical_statement) else {
+        return report(
+            PreservationVerdict::CanonicalUnparsable,
+            vec![
+                "Isabelle canonical statement did not parse into a quoted `theorem`/`lemma` \
+                 signature (fail-closed: cannot confirm preservation)"
+                    .to_string(),
+            ],
+            None,
+            None,
+        );
+    };
+    let submitted = parse_all_isabelle_decls(submitted_code);
+    if let Some(by_name) = submitted.iter().find(|d| d.name == canonical.name) {
+        let (verdict, findings) = classify(&canonical, by_name);
+        return report(verdict, findings, Some(canonical), Some(by_name.clone()));
+    }
+    if let Some(renamed) = submitted
+        .iter()
+        .find(|d| sig_matches(&canonical, d).is_some())
+    {
+        return report(
+            PreservationVerdict::Renamed,
+            vec![format!(
+                "renamed statement: the canonical theorem `{}` is proved under the \
+                 different name `{}` — the canonical name is never established",
+                canonical.name, renamed.name
+            )],
+            Some(canonical),
+            Some(renamed.clone()),
+        );
+    }
+    report(
+        PreservationVerdict::SubmittedMissing,
+        vec![format!(
+            "missing statement: no quoted Isabelle declaration in the submission proves \
+             the canonical theorem `{}`",
+            canonical.name
+        )],
+        Some(canonical),
+        None,
+    )
+}
+
+fn parse_first_isabelle_decl(src: &str) -> Option<TheoremSig> {
+    parse_all_isabelle_decls(src).into_iter().next()
+}
+
+/// Parse Isabelle's ordinary `theorem name: "proposition"` and `lemma` forms,
+/// skipping nested `(* ... *)` comments so a declaration-shaped comment cannot
+/// establish preservation.
+fn parse_all_isabelle_decls(src: &str) -> Vec<TheoremSig> {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars.get(i) == Some(&'(') && chars.get(i + 1) == Some(&'*') {
+            i = skip_isabelle_comment(&chars, i + 2);
+            continue;
+        }
+        if chars[i] == '"' {
+            i = skip_isabelle_quote(&chars, i + 1);
+            continue;
+        }
+        let boundary = i == 0 || !is_word(chars[i - 1]);
+        if boundary {
+            for keyword in ["theorem", "lemma"] {
+                let k: Vec<char> = keyword.chars().collect();
+                if i + k.len() <= chars.len()
+                    && chars[i..i + k.len()] == k[..]
+                    && chars.get(i + k.len()).map_or(true, |&c| !is_word(c))
+                {
+                    if let Some((sig, consumed)) = parse_isabelle_decl_at(&chars, keyword, i + k.len()) {
+                        out.push(sig);
+                        i = consumed;
+                        break;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn parse_isabelle_decl_at(
+    chars: &[char],
+    keyword: &str,
+    mut i: usize,
+) -> Option<(TheoremSig, usize)> {
+    while chars.get(i).is_some_and(|c| c.is_whitespace()) {
+        i += 1;
+    }
+    let name_start = i;
+    while chars.get(i).is_some_and(|&c| is_name(c)) {
+        i += 1;
+    }
+    let name: String = chars[name_start..i].iter().collect();
+    if name.is_empty() {
+        return None;
+    }
+    while chars.get(i).is_some_and(|c| c.is_whitespace()) {
+        i += 1;
+    }
+    if chars.get(i) != Some(&':') {
+        return None;
+    }
+    i += 1;
+    while chars.get(i).is_some_and(|c| c.is_whitespace()) {
+        i += 1;
+    }
+    if chars.get(i) != Some(&'"') {
+        return None;
+    }
+    let conclusion_start = i + 1;
+    let end = skip_isabelle_quote(chars, conclusion_start);
+    if end <= conclusion_start || chars.get(end - 1) != Some(&'"') {
+        return None;
+    }
+    let conclusion: String = chars[conclusion_start..end - 1].iter().collect();
+    Some((entry_sig(keyword, &name, &conclusion), end))
+}
+
+fn skip_isabelle_quote(chars: &[char], mut i: usize) -> usize {
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 1 < chars.len() {
+            i += 2;
+        } else if chars[i] == '"' {
+            return i + 1;
+        } else {
+            i += 1;
+        }
+    }
+    chars.len()
+}
+
+fn skip_isabelle_comment(chars: &[char], mut i: usize) -> usize {
+    let mut depth = 1usize;
+    while i < chars.len() && depth > 0 {
+        if chars.get(i) == Some(&'(') && chars.get(i + 1) == Some(&'*') {
+            depth += 1;
+            i += 2;
+        } else if chars.get(i) == Some(&'*') && chars.get(i + 1) == Some(&')') {
+            depth -= 1;
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    i
+}
+
     let Some((name, canon_type)) = parse_agda_decl(canonical_statement) else {
         return report(
             PreservationVerdict::CanonicalUnparsable,
@@ -1372,7 +1535,6 @@ def aux : Nat := 0
         for sys in [
             FormalSystem::Lean,
             FormalSystem::Rocq,
-            FormalSystem::Isabelle,
             FormalSystem::Candle,
         ] {
             let a = check_entry_signature(sys, canonical, submitted);
@@ -1403,6 +1565,21 @@ def aux : Nat := 0
 
     /// Agda: a proof declaring a DIFFERENT type (`foo : B`) is flagged.
     #[test]
+    #[test]
+    fn isabelle_quoted_signature_is_preserved_and_comment_cannot_spoof_it() {
+        let canonical = "theorem t: \"x = x\"";
+        let submitted = "(* theorem t: \"x = x\" *)\ntheorem t: \"x = x\"\n  by simp\n";
+        let preserved = check_entry_signature(FormalSystem::Isabelle, canonical, submitted);
+        assert!(preserved.preserved, "{:?}", preserved.findings);
+
+        let altered = check_entry_signature(
+            FormalSystem::Isabelle,
+            canonical,
+            "theorem t: \"True\"\n  by simp\n",
+        );
+        assert_eq!(altered.verdict, PreservationVerdict::TriviallyRestated);
+    }
+
     fn agda_different_type_is_flagged() {
         let canonical = "foo : A";
         let submitted = "foo : B\nfoo = b\n";
