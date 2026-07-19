@@ -70,7 +70,7 @@ same four layers for all six systems:
 
 | Layer | What it does |
 |-------|--------------|
-| **1. Compile** | The proof elaborates and type-checks in the target system. |
+| **1. Compile** | The proof elaborates and type-checks in the target system. Success is read from a per-backend signal it declares (an honest non-zero exit, or a required-plus-forbidden stdout sentinel), never from the exit code alone. |
 | **2. Axiom / oracle audit** | The axioms and oracles the proof depends on are inside a per-system whitelist; anything else fails closed. |
 | **3. Kernel re-check** | An independent kernel re-validates the term (a smaller trusted checker, or for Candle a machine-proven kernel). |
 | **4. Source scan** | The source is scanned for the escape hatches the first three layers cannot see, and the submitted proof is confirmed to declare the requested statement (not a weakened or different one). |
