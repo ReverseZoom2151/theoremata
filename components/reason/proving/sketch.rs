@@ -22,6 +22,7 @@
 
 use crate::{
     db::Store,
+    informal_defect_prior::{analyze, RiskReport, RoutingHints},
     model::{EdgeKind, NodeKind, NodeStatus, NodeTier},
     prover::{formal::FormalSystem, model::VerificationReport},
     provider::ModelProvider,
@@ -303,6 +304,16 @@ pub struct SketchAssembly {
     pub assembled_proof: Option<String>,
     /// Step ids of holes left open (empty iff assembled).
     pub open_holes: Vec<String>,
+    /// The document-level informal-defect scan of this sketch, computed ONCE
+    /// before any hole was dispatched. Advisory only: nothing in this pipeline
+    /// reads it back, and no route, order, or certification decision depends on
+    /// it. See [`SketchAssembly::defect_hints`] for the router-shaped view.
+    pub defect_report: RiskReport,
+    /// [`Self::defect_report`] split into the two router buckets. A future,
+    /// deliberate change may let a router consume these to probe
+    /// `falsify_first` regions with the cheap counterexample gate before
+    /// spending proof effort; today they are only computed and recorded.
+    pub defect_hints: RoutingHints,
 }
 
 impl SketchAssembly {
@@ -385,6 +396,35 @@ impl<G: SketchGenerator, P: HoleProver> SketchPipeline<'_, G, P> {
             None,
             &[],
             "sketch:root",
+        )?;
+
+        // 1b. Scan the informal text ONCE, document-level, before any hole node
+        //     exists and long before any hole is dispatched — the hints have to
+        //     be available to a future router at dispatch time, and a per-step
+        //     scan would both miss cross-step spans and land too late.
+        //
+        //     This pass is advisory: it COMPUTES and RECORDS, and nothing below
+        //     reads it back. Acting on the hints is a separate, deliberate step.
+        let defect_text = defect_scan_text(sketch);
+        let defect_report = analyze(&defect_text);
+        let defect_hints = defect_report.to_routing_hints();
+        // Recorded on the sketch root the same way per-hole metadata is recorded
+        // on its hole node: an evidence row carrying the full structured payload.
+        // Offsets in `findings`/regions index `defect_text` (the statement, then
+        // each step's prose, newline-joined), NOT any single step's prose.
+        self.store.add_evidence(
+            project_id,
+            &root.id,
+            "sketch_defect_prior",
+            "informal_defect_prior",
+            "scanned",
+            json!({
+                "overall_risk": defect_hints.overall_risk,
+                "findings": defect_report.findings,
+                "falsify_first": defect_hints.falsify_first,
+                "decompose_first": defect_hints.decompose_first,
+                "scanned_bytes": defect_text.len(),
+            }),
         )?;
 
         // 2. One obligation node per hole; record step-id → node-id.
@@ -619,6 +659,8 @@ impl<G: SketchGenerator, P: HoleProver> SketchPipeline<'_, G, P> {
             hole_results,
             assembled_proof,
             open_holes,
+            defect_report,
+            defect_hints,
         })
     }
 
@@ -645,6 +687,25 @@ impl<G: SketchGenerator, P: HoleProver> SketchPipeline<'_, G, P> {
         }
         out
     }
+}
+
+/// The exact text handed to the informal-defect scanner: the statement followed
+/// by every step's prose, newline-joined, in sketch order.
+///
+/// Document-level on purpose. Scanning per step would miss a notion introduced
+/// in one step and never reused in a later one (the `IntroducedNotion`
+/// detector's whole premise), and would produce a report per step rather than
+/// one ordering over the sketch. The join is a plain `\n` so byte offsets stay
+/// meaningful and the concatenation cannot fabricate a match across a boundary
+/// that a space would have allowed.
+fn defect_scan_text(sketch: &InformalSketch) -> String {
+    let mut text = String::with_capacity(sketch.statement.len() + 64);
+    text.push_str(&sketch.statement);
+    for step in &sketch.steps {
+        text.push('\n');
+        text.push_str(&step.prose);
+    }
+    text
 }
 
 /// A per-hole prover that dispatches each subgoal through the existing portfolio
@@ -1130,5 +1191,191 @@ mod tests {
         let assembly = pipeline.run(&project.id, "P 0").unwrap();
         assert!(!assembly.is_assembled());
         assert_eq!(prover.seen_states.into_inner(), vec![None]);
+    }
+
+    // ---- informal-defect prior -------------------------------------------
+
+    use crate::informal_defect_prior::DefectCategory;
+    use crate::router::Route;
+
+    /// A one-hole generator whose step prose is supplied by the test, so the
+    /// defect scanner sees exactly the informal text under examination.
+    struct ProseGenerator {
+        prose: String,
+    }
+    impl SketchGenerator for ProseGenerator {
+        fn generate(&self, statement: &str) -> Result<InformalSketch> {
+            Ok(InformalSketch::new(
+                statement,
+                vec![SketchStep::hole("h1", self.prose.clone(), "goal : P 0")],
+            ))
+        }
+    }
+
+    /// The prose from the case study's headline defect.
+    const RISKY_PROSE: &str =
+        "The remaining cases may be checked directly for small n, so we are done.";
+
+    /// Rigorous prose with nothing to flag.
+    const CLEAN_PROSE: &str =
+        "Multiplying both sides by the inverse of a modulo p yields the identity, \
+         and the bound then follows from Lemma 3.2 with parameter t = 1/2.";
+
+    fn run_with_prose(prose: &str) -> (Store, String, SketchAssembly) {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "P 0").unwrap();
+        let generator = ProseGenerator {
+            prose: prose.into(),
+        };
+        let assembly = {
+            let pipeline = SketchPipeline {
+                store: &store,
+                generator: &generator,
+                prover: &AllClosingProver,
+            };
+            pipeline.run(&project.id, "P 0").unwrap()
+        };
+        (store, project.id, assembly)
+    }
+
+    #[test]
+    fn hand_waved_finite_check_in_prose_is_routed_to_falsification() {
+        let (_store, _project, assembly) = run_with_prose(RISKY_PROSE);
+
+        // The finding is present...
+        assert!(
+            assembly
+                .defect_report
+                .findings
+                .iter()
+                .any(|f| f.category == DefectCategory::HandWavedFiniteCheck),
+            "no finite-check finding in {:?}",
+            assembly.defect_report.findings
+        );
+        assert!(assembly.defect_report.score > 0.0);
+
+        // ...and it lands in the falsify-first bucket, not the decompose one.
+        let hints = &assembly.defect_hints;
+        assert!(
+            hints
+                .falsify_first
+                .iter()
+                .any(|r| r.categories.contains(&DefectCategory::HandWavedFiniteCheck)),
+            "finite check was not routed to falsification: {hints:?}"
+        );
+        for region in &hints.falsify_first {
+            assert_eq!(region.route, Route::Falsify);
+        }
+        assert!(!hints
+            .decompose_first
+            .iter()
+            .any(|r| r.categories.contains(&DefectCategory::HandWavedFiniteCheck)));
+        assert_eq!(hints.overall_risk, assembly.defect_report.score);
+    }
+
+    #[test]
+    fn clean_prose_produces_a_zero_risk_report_and_empty_hints() {
+        let (_store, _project, assembly) = run_with_prose(CLEAN_PROSE);
+
+        assert!(
+            assembly.defect_report.findings.is_empty(),
+            "clean prose produced findings: {:?}",
+            assembly.defect_report.findings
+        );
+        assert_eq!(assembly.defect_report.score, 0.0);
+        assert!(assembly.defect_hints.falsify_first.is_empty());
+        assert!(assembly.defect_hints.decompose_first.is_empty());
+        assert_eq!(assembly.defect_hints.overall_risk, 0.0);
+    }
+
+    #[test]
+    fn defect_hints_are_recorded_on_the_sketch_root_before_any_hole_runs() {
+        let (store, project, assembly) = run_with_prose(RISKY_PROSE);
+
+        // The scan is recorded as evidence on the ROOT, and `add_evidence`
+        // surfaces every row as an auditable event. Events come back newest
+        // first, so the defect-prior row must appear AFTER (i.e. later in the
+        // returned vector than) every per-hole row — it was written first, hence
+        // before any hole was dispatched.
+        let events = store.events(&project, 200).unwrap();
+        let recorded: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "evidence.recorded")
+            .collect();
+        let prior_pos = recorded
+            .iter()
+            .position(|e| e.payload["evidence_type"] == "sketch_defect_prior")
+            .expect("the defect scan was recorded as evidence");
+        let hole_pos = recorded
+            .iter()
+            .position(|e| e.payload["evidence_type"] == "sketch_hole")
+            .expect("the hole outcome was recorded as evidence");
+        assert!(
+            prior_pos > hole_pos,
+            "defect hints were not recorded before the hole was dispatched"
+        );
+        assert_eq!(
+            recorded[prior_pos].payload["node_id"],
+            serde_json::Value::String(assembly.sketch_node_id.clone())
+        );
+    }
+
+    #[test]
+    fn recording_hints_does_not_change_what_the_pipeline_proves() {
+        // Two runs identical in every way that can affect proving — same
+        // statement, same subgoal, same prover — differing only in whether the
+        // informal prose trips the defect scanner. The scan must be inert: the
+        // holes, their proofs, the open set, and the node statuses must match.
+        let (risky_store, risky_project, risky) = run_with_prose(RISKY_PROSE);
+        let (clean_store, clean_project, clean) = run_with_prose(CLEAN_PROSE);
+
+        // The scan DID see a difference...
+        assert!(risky.defect_report.score > clean.defect_report.score);
+        assert!(!risky.defect_hints.falsify_first.is_empty());
+        assert!(clean.defect_hints.falsify_first.is_empty());
+
+        // ...and it changed nothing about the proving.
+        assert_eq!(risky.is_assembled(), clean.is_assembled());
+        assert!(risky.is_assembled());
+        assert_eq!(risky.open_holes, clean.open_holes);
+        assert!(risky.open_holes.is_empty());
+        assert_eq!(risky.hole_results.len(), clean.hole_results.len());
+        for (r, c) in risky.hole_results.iter().zip(&clean.hole_results) {
+            assert_eq!(r.step_id, c.step_id);
+            assert_eq!(r.subgoal, c.subgoal);
+            assert_eq!(r.closed, c.closed);
+            assert_eq!(r.proof, c.proof);
+            assert_eq!(r.goal_state, c.goal_state);
+        }
+
+        // Same DAG shape and same statuses on both sides.
+        let statuses = |store: &Store, project: &str| {
+            let mut out: Vec<_> = store
+                .nodes(project)
+                .unwrap()
+                .iter()
+                .map(|n| (n.kind, n.status))
+                .collect();
+            out.sort_by_key(|(kind, status)| (format!("{kind}"), format!("{status}")));
+            out
+        };
+        assert_eq!(
+            statuses(&risky_store, &risky_project),
+            statuses(&clean_store, &clean_project)
+        );
+        assert_eq!(
+            risky_store.edges(&risky_project).unwrap().len(),
+            clean_store.edges(&clean_project).unwrap().len()
+        );
+
+        // The only prose-driven difference in the assembled proof is the prose
+        // line itself; the spliced hole proof is byte-identical.
+        let risky_proof = risky.assembled_proof.unwrap();
+        let clean_proof = clean.assembled_proof.unwrap();
+        assert!(risky_proof.contains("theorem h1 := by decide"));
+        assert_eq!(
+            risky_proof.replace(RISKY_PROSE, ""),
+            clean_proof.replace(CLEAN_PROSE, "")
+        );
     }
 }
