@@ -28,6 +28,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 // Statement VALIDATION as a first-class pipeline stage (sibling module).
 use crate::statement_validation::{StatementValidator, ToolStatementValidator, ValidationOutcome};
+// Statement-VALIDITY filter stack (unanimity / negation / triviality). Runs
+// alongside the advisory validator; RECORD-ONLY for now — see
+// `AgentLoop::screen_statement_validity`.
+use crate::statement_validity::{StatementValidity, ValidityReport};
 use crate::trace::{
     ErrorContext, FailureClass, FailureTaxonomy, Layer, RunTrace, SpanKind, SpanStatus,
 };
@@ -1241,7 +1245,95 @@ impl AgentLoop<'_> {
     ) -> Result<()> {
         let validator = ToolStatementValidator::new(self.config);
         self.validate_statement(&validator, project_id, Some(run), node_id, informal, formal)?;
+        // Second, independent screen: the statement-VALIDITY filter stack. No
+        // seams are wired here yet, so every check reports `Skipped` and the
+        // verdict is `Indeterminate` — behavior-preserving by construction.
+        let screen = StatementValidity::default();
+        self.screen_statement_validity(
+            &screen,
+            project_id,
+            Some(run),
+            node_id,
+            informal,
+            formal,
+        )?;
         Ok(())
+    }
+
+    /// Statement-VALIDITY screen (`crate::statement_validity`), run alongside the
+    /// advisory statement validator right after `formal_statement` is set. It asks
+    /// a curation question — *is this candidate worth spending proof budget on?* —
+    /// via three seams (multi-sample judge, negation prover, trivial prover).
+    ///
+    /// # This stage is RECORD-ONLY
+    ///
+    /// The report is persisted as node evidence and, on a blocking verdict, a
+    /// warning event is emitted — and nothing else. Proof search is **never**
+    /// skipped here, not even on [`crate::statement_validity::StatementVerdict::Reject`];
+    /// gating on `verdict.blocks_attempt()` is a later, deliberate step. This
+    /// stack is likewise NEVER a soundness authority: the formal gate remains the
+    /// sole authority on whether a proof is valid.
+    ///
+    /// Gated by the same `validate_statements` config field as
+    /// [`AgentLoop::validate_statement`] so the default-off pipeline writes no new
+    /// rows. With the flag on but no seams injected, `screen` yields an all-
+    /// `Skipped`, `Indeterminate` report which does not block anything.
+    fn screen_statement_validity(
+        &self,
+        screen: &StatementValidity<'_>,
+        project_id: &str,
+        run: Option<&str>,
+        node_id: &str,
+        informal: &str,
+        formal: &str,
+    ) -> Result<Option<ValidityReport>> {
+        if !self.config.validate_statements {
+            return Ok(None);
+        }
+        let report = screen.screen(informal, formal);
+        let failed: Vec<&str> = report.failed().iter().map(|c| c.id()).collect();
+        let skipped: Vec<&str> = report.skipped().iter().map(|c| c.id()).collect();
+        let payload = json!({
+            "verdict": report.verdict.tag(),
+            "failed": failed.clone(),
+            "skipped": skipped,
+            "reasons": report.reasons(),
+            "votes": report.votes().map(|v| json!({
+                "faithful": v.faithful,
+                "dissenting": v.dissenting,
+            })),
+            "advisory": true,
+            "soundness_authority": false,
+        });
+        // Persist the screen as node evidence (auditable, never a gate) — same
+        // shape as the advisory validation stage above.
+        self.store.add_evidence(
+            project_id,
+            node_id,
+            "statement_validity",
+            "statement_validity_screen",
+            report.verdict.tag(),
+            payload,
+        )?;
+        // Surface a warning when the stack advises skipping the attempt. Advisory
+        // only: we record it and prove anyway.
+        if report.verdict.blocks_attempt() {
+            self.store.event(
+                Some(project_id),
+                run,
+                "statement_validity.warning",
+                "statement_validity_screen",
+                json!({
+                    "node": node_id,
+                    "verdict": report.verdict.tag(),
+                    "failed": failed,
+                    "advisory": true,
+                    "enforced": false,
+                    "reasons": report.reasons(),
+                }),
+            )?;
+        }
+        Ok(Some(report))
     }
 
     fn formalize_once(&self, node: &Node, attempt: usize) -> Result<String> {
@@ -1950,6 +2042,166 @@ mod tests {
             .iter()
             .any(|e| e.event_type == "statement_validation.warning");
         assert!(warned, "Reject surfaces a warning event");
+    }
+
+    /// Deterministic mock trivial-prover seam: a `Proved` outcome makes the
+    /// triviality check FAIL, which rejects the whole stack.
+    struct MockTrivialProver(crate::statement_validity::ProofOutcome);
+    impl crate::statement_validity::TrivialProver for MockTrivialProver {
+        fn prove_trivially(
+            &self,
+            _informal: &str,
+            _formal: &str,
+        ) -> crate::statement_validity::ProofOutcome {
+            self.0
+        }
+    }
+
+    #[test]
+    fn validity_screen_with_no_seams_is_indeterminate_and_changes_nothing() {
+        use crate::statement_validation::Verdict;
+        use crate::statement_validity::{CheckStatus, StatementValidity, StatementVerdict};
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let config = Config {
+            validate_statements: true,
+            ..Config::default()
+        };
+        let project = store.create_project("p", "t").unwrap();
+        let node = store
+            .add_node(&project.id, NodeKind::Lemma, "n", "n = n", "test")
+            .unwrap();
+        let agent = validation_agent(&store, &config, &MockProvider);
+
+        // The advisory validator's outcome is what it always was...
+        let mock = MockValidator::new(Verdict::Ok, 0.95, false);
+        let out = agent
+            .validate_statement(
+                &mock,
+                &project.id,
+                None,
+                &node.id,
+                "n = n",
+                "theorem t : n = n := rfl",
+            )
+            .unwrap()
+            .expect("stage ran (flag on)");
+        assert_eq!(out.verdict, Verdict::Ok);
+
+        // ...and the seam-less screen alongside it establishes nothing.
+        let screen = StatementValidity::default();
+        let report = agent
+            .screen_statement_validity(
+                &screen,
+                &project.id,
+                None,
+                &node.id,
+                "n = n",
+                "theorem t : n = n := rfl",
+            )
+            .unwrap()
+            .expect("screen ran (flag on)");
+        assert_eq!(report.verdict, StatementVerdict::Indeterminate);
+        assert!(
+            report.checks.iter().all(|c| c.status == CheckStatus::Skipped),
+            "no seams wired ⇒ every check is Skipped, never Passed"
+        );
+        assert!(
+            !report.verdict.blocks_attempt(),
+            "the default configuration must be behavior-preserving"
+        );
+        // The advisory verdict is untouched, no warning is emitted, and the node
+        // survives for proving exactly as before.
+        let events = store.events(&project.id, 100).unwrap();
+        assert!(!events
+            .iter()
+            .any(|e| e.event_type == "statement_validity.warning"));
+        let fresh = store.nodes(&project.id).unwrap();
+        assert_eq!(fresh[0].status, node.status);
+    }
+
+    #[test]
+    fn validity_screen_is_a_noop_when_flag_off() {
+        use crate::statement_validity::{ProofOutcome, StatementValidity};
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let config = Config {
+            validate_statements: false,
+            ..Config::default()
+        };
+        let project = store.create_project("p", "t").unwrap();
+        let node = store
+            .add_node(&project.id, NodeKind::Lemma, "n", "s", "test")
+            .unwrap();
+        let agent = validation_agent(&store, &config, &MockProvider);
+        let trivial = MockTrivialProver(ProofOutcome::Proved);
+        let screen = StatementValidity::default().with_trivial_prover(&trivial);
+        let result = agent
+            .screen_statement_validity(
+                &screen,
+                &project.id,
+                None,
+                &node.id,
+                "s",
+                "theorem t : True := trivial",
+            )
+            .unwrap();
+        assert!(result.is_none(), "flag off ⇒ screen returns None");
+        let events = store.events(&project.id, 100).unwrap();
+        assert!(!events.iter().any(|e| e.event_type
+            == "statement_validity.warning"
+            || e.payload["evidence_type"] == "statement_validity"));
+    }
+
+    #[test]
+    fn a_wired_reject_is_recorded_but_does_not_change_control_flow() {
+        use crate::statement_validity::{Check, ProofOutcome, StatementValidity, StatementVerdict};
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let config = Config {
+            validate_statements: true,
+            ..Config::default()
+        };
+        let project = store.create_project("p", "t").unwrap();
+        let node = store
+            .add_node(&project.id, NodeKind::Lemma, "n", "hard claim", "test")
+            .unwrap();
+        let agent = validation_agent(&store, &config, &MockProvider);
+
+        // A cheap proof closes the goal ⇒ the triviality check FAILS ⇒ Reject.
+        let trivial = MockTrivialProver(ProofOutcome::Proved);
+        let screen = StatementValidity::default().with_trivial_prover(&trivial);
+        let report = agent
+            .screen_statement_validity(
+                &screen,
+                &project.id,
+                None,
+                &node.id,
+                "hard claim",
+                "theorem t : True := trivial",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.verdict, StatementVerdict::Reject);
+        assert_eq!(report.failed(), vec![Check::Triviality]);
+        assert!(report.verdict.blocks_attempt(), "the stack ADVISES a skip...");
+
+        // ...and that advice is RECORDED as evidence plus a warning event.
+        let events = store.events(&project.id, 100).unwrap();
+        let recorded = events.iter().any(|e| {
+            e.event_type == "evidence.recorded"
+                && e.payload["evidence_type"] == "statement_validity"
+                && e.payload["verdict"] == "reject"
+        });
+        assert!(recorded, "the validity report is persisted as node evidence");
+        let warned = events
+            .iter()
+            .any(|e| e.event_type == "statement_validity.warning");
+        assert!(warned, "a blocking verdict surfaces a warning");
+
+        // ...but control flow is UNCHANGED: the node is not dropped, not
+        // rejected, and proof search is not skipped. Gating is a later step.
+        let fresh = store.nodes(&project.id).unwrap();
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].status, node.status);
+        assert!(!screen.is_soundness_authority());
     }
 
     #[test]
