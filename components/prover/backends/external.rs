@@ -20,7 +20,15 @@ use crate::{
 use anyhow::Result;
 use chrono::Utc;
 use serde_json::json;
-use std::path::PathBuf;
+use std::{
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    time::Duration,
+};
+use wait_timeout::ChildExt;
+
+const AGDA_INTERACTION_DIAGNOSTICS_ENV: &str = "THEOREMATA_AGDA_INTERACTION_JSON";
 
 pub struct ExternalBackend {
     pub system: FormalSystem,
@@ -32,6 +40,517 @@ pub struct ExternalBackend {
 
 fn backend_name(system: FormalSystem) -> &'static str {
     system.as_str()
+}
+
+/// Parsed, advisory-only output from Agda's JSON interaction protocol.
+///
+/// `Malformed` is deliberately distinct from `Unsupported`: malformed output is
+/// a failed diagnostic attempt and exposes no partial goals/errors, while an
+/// older Agda that does not implement `--interaction-json` simply leaves the
+/// optional enrichment unavailable. Neither state can influence the batch
+/// `agda --safe` verdict.
+#[derive(Debug, Clone, PartialEq)]
+enum AgdaInteractionDiagnostics {
+    Ready {
+        records: usize,
+        goals: Vec<serde_json::Value>,
+        errors: Vec<serde_json::Value>,
+        warnings: Vec<serde_json::Value>,
+    },
+    Unsupported {
+        reason: String,
+    },
+    Malformed {
+        reason: String,
+    },
+}
+
+impl AgdaInteractionDiagnostics {
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            Self::Ready {
+                records,
+                goals,
+                errors,
+                warnings,
+            } => json!({
+                "status": "ready",
+                "well_formed": true,
+                "records": records,
+                "goals": goals,
+                "errors": errors,
+                "warnings": warnings,
+            }),
+            Self::Unsupported { reason } => json!({
+                "status": "unsupported",
+                "well_formed": false,
+                "reason": reason,
+            }),
+            Self::Malformed { reason } => json!({
+                "status": "malformed",
+                "well_formed": false,
+                "fail_closed": true,
+                "reason": reason,
+                "goals": [],
+                "errors": [],
+                "warnings": [],
+            }),
+        }
+    }
+}
+
+fn agda_interaction_diagnostics_enabled() -> bool {
+    std::env::var(AGDA_INTERACTION_DIAGNOSTICS_ENV)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Parse one JSON object per output line, accepting Agda's optional `JSON>`
+/// prefix. The parser is strict at the protocol boundary: once output claims to
+/// be JSON, malformed JSON or a malformed recognised diagnostic record rejects
+/// the complete diagnostic response rather than returning partial information.
+fn parse_agda_interaction_output(stdout: &str) -> AgdaInteractionDiagnostics {
+    let mut records = 0usize;
+    let mut recognised = 0usize;
+    let mut goals = Vec::new();
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+    let mut non_json = Vec::new();
+
+    for (index, raw_line) in stdout.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (claims_json, payload) = match line.strip_prefix("JSON>") {
+            Some(payload) => (true, payload.trim()),
+            None => (line.starts_with('{'), line),
+        };
+        if !claims_json {
+            non_json.push(format!("line {}: {line}", index + 1));
+            continue;
+        }
+        let value: serde_json::Value = match serde_json::from_str(payload) {
+            Ok(value) => value,
+            Err(error) => {
+                return AgdaInteractionDiagnostics::Malformed {
+                    reason: format!("invalid JSON on line {}: {error}", index + 1),
+                };
+            }
+        };
+        records += 1;
+        let Some(object) = value.as_object() else {
+            return AgdaInteractionDiagnostics::Malformed {
+                reason: format!("interaction record {} is not an object", records),
+            };
+        };
+        if object.get("kind").and_then(|v| v.as_str()) != Some("DisplayInfo") {
+            continue;
+        }
+        let Some(info) = object.get("info").and_then(|v| v.as_object()) else {
+            return AgdaInteractionDiagnostics::Malformed {
+                reason: format!("DisplayInfo record {} has no object-valued info", records),
+            };
+        };
+
+        match info.get("kind").and_then(|v| v.as_str()) {
+            Some("AllGoalsWarnings") => {
+                recognised += 1;
+                let visible = match info.get("visibleGoals").and_then(|v| v.as_array()) {
+                    Some(goals) => goals,
+                    None => {
+                        return AgdaInteractionDiagnostics::Malformed {
+                            reason: "AllGoalsWarnings.visibleGoals is not an array".into(),
+                        };
+                    }
+                };
+                let invisible = match info.get("invisibleGoals").and_then(|v| v.as_array()) {
+                    Some(goals) => goals,
+                    None => {
+                        return AgdaInteractionDiagnostics::Malformed {
+                            reason: "AllGoalsWarnings.invisibleGoals is not an array".into(),
+                        };
+                    }
+                };
+                let record_warnings = match info.get("warnings").and_then(|v| v.as_array()) {
+                    Some(warnings) => warnings,
+                    None => {
+                        return AgdaInteractionDiagnostics::Malformed {
+                            reason: "AllGoalsWarnings.warnings is not an array".into(),
+                        };
+                    }
+                };
+                for goal in visible {
+                    match normalise_agda_goal(goal, "visible") {
+                        Ok(goal) => goals.push(goal),
+                        Err(reason) => {
+                            return AgdaInteractionDiagnostics::Malformed { reason };
+                        }
+                    }
+                }
+                for goal in invisible {
+                    match normalise_agda_goal(goal, "invisible") {
+                        Ok(goal) => goals.push(goal),
+                        Err(reason) => {
+                            return AgdaInteractionDiagnostics::Malformed { reason };
+                        }
+                    }
+                }
+                warnings.extend(record_warnings.iter().cloned());
+            }
+            Some("GoalSpecific") => {
+                recognised += 1;
+                match normalise_agda_goal_specific(info) {
+                    Ok(goal) => goals.push(goal),
+                    Err(reason) => {
+                        return AgdaInteractionDiagnostics::Malformed { reason };
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        if info.contains_key("error") || info.contains_key("errors") {
+            recognised += 1;
+            if let Err(reason) = collect_agda_errors(info, &mut errors) {
+                return AgdaInteractionDiagnostics::Malformed { reason };
+            }
+        }
+    }
+
+    if records == 0 {
+        let reason = if non_json.is_empty() {
+            "interaction mode produced no diagnostics".to_string()
+        } else {
+            format!(
+                "interaction-json is unsupported or produced no JSON ({})",
+                non_json.join("; ")
+            )
+        };
+        return AgdaInteractionDiagnostics::Unsupported { reason };
+    }
+    if !non_json.is_empty() {
+        return AgdaInteractionDiagnostics::Malformed {
+            reason: format!(
+                "non-JSON output was interleaved with interaction records: {}",
+                non_json.join("; ")
+            ),
+        };
+    }
+    if recognised == 0 {
+        return AgdaInteractionDiagnostics::Unsupported {
+            reason: format!(
+                "parsed {records} JSON record(s), but this Agda version exposed no supported goal/error schema"
+            ),
+        };
+    }
+    AgdaInteractionDiagnostics::Ready {
+        records,
+        goals,
+        errors,
+        warnings,
+    }
+}
+
+/// Interpret the transport outcome without consulting its exit code. Agda's
+/// interaction protocol is diagnostic-only: launch/timeout/cap failures affect
+/// diagnostic availability, while the process status can neither validate nor
+/// invalidate the separately computed batch verdict.
+fn parse_agda_interaction_outcome(outcome: &exec::ExecOutcome) -> AgdaInteractionDiagnostics {
+    if !outcome.launched {
+        AgdaInteractionDiagnostics::Unsupported {
+            reason: format!("interaction process could not launch: {}", outcome.stderr),
+        }
+    } else if outcome.timed_out {
+        AgdaInteractionDiagnostics::Malformed {
+            reason: "interaction diagnostics timed out".into(),
+        }
+    } else if outcome.output_capped {
+        AgdaInteractionDiagnostics::Malformed {
+            reason: "interaction diagnostics exceeded the output cap".into(),
+        }
+    } else {
+        parse_agda_interaction_output(&outcome.stdout)
+    }
+}
+
+fn normalise_agda_goal(
+    goal: &serde_json::Value,
+    visibility: &str,
+) -> std::result::Result<serde_json::Value, String> {
+    let object = goal
+        .as_object()
+        .ok_or_else(|| format!("{visibility} goal is not an object"))?;
+    let constraint = object
+        .get("constraintObj")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| format!("{visibility} goal has no constraintObj object"))?;
+    let id = constraint
+        .get("id")
+        .or_else(|| constraint.get("name"))
+        .cloned()
+        .ok_or_else(|| format!("{visibility} goal has no id/name"))?;
+    let goal_type = object
+        .get("type")
+        .cloned()
+        .ok_or_else(|| format!("{visibility} goal has no type"))?;
+    Ok(json!({
+        "visibility": visibility,
+        "id": id,
+        "kind": object.get("kind").cloned().unwrap_or(serde_json::Value::Null),
+        "type": goal_type,
+        "range": constraint.get("range").cloned().unwrap_or(serde_json::Value::Null),
+    }))
+}
+
+fn normalise_agda_goal_specific(
+    info: &serde_json::Map<String, serde_json::Value>,
+) -> std::result::Result<serde_json::Value, String> {
+    let point = info
+        .get("interactionPoint")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| "GoalSpecific has no interactionPoint object".to_string())?;
+    let goal_info = info
+        .get("goalInfo")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| "GoalSpecific has no goalInfo object".to_string())?;
+    let id = point
+        .get("id")
+        .cloned()
+        .ok_or_else(|| "GoalSpecific interactionPoint has no id".to_string())?;
+    let goal_type = goal_info
+        .get("type")
+        .cloned()
+        .ok_or_else(|| "GoalSpecific goalInfo has no type".to_string())?;
+    Ok(json!({
+        "visibility": "specific",
+        "id": id,
+        "type": goal_type,
+        "range": point.get("range").cloned().unwrap_or(serde_json::Value::Null),
+        "context": goal_info.get("entries").cloned().unwrap_or_else(|| json!([])),
+    }))
+}
+
+fn collect_agda_errors(
+    info: &serde_json::Map<String, serde_json::Value>,
+    errors: &mut Vec<serde_json::Value>,
+) -> std::result::Result<(), String> {
+    if let Some(error) = info.get("error") {
+        errors.push(normalise_agda_error(error)?);
+    }
+    if let Some(many) = info.get("errors") {
+        let many = many
+            .as_array()
+            .ok_or_else(|| "DisplayInfo.errors is not an array".to_string())?;
+        for error in many {
+            errors.push(normalise_agda_error(error)?);
+        }
+    }
+    Ok(())
+}
+
+fn normalise_agda_error(
+    error: &serde_json::Value,
+) -> std::result::Result<serde_json::Value, String> {
+    let object = error
+        .as_object()
+        .ok_or_else(|| "Agda error is not an object".to_string())?;
+    let message = object
+        .get("message")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Agda error has no string message".to_string())?;
+    Ok(json!({
+        "message": message,
+        "range": object.get("range").cloned().unwrap_or(serde_json::Value::Null),
+    }))
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn interaction_process(
+    runner: &Runner,
+    argv: &[String],
+    workspace: &Path,
+) -> std::result::Result<Command, String> {
+    if argv.is_empty() {
+        return Err("empty interaction command".into());
+    }
+    match runner {
+        Runner::Native => {
+            let mut command = Command::new(&argv[0]);
+            command.args(&argv[1..]).current_dir(workspace);
+            Ok(command)
+        }
+        Runner::Wsl { distro } => {
+            let workspace = exec::to_wsl_path(workspace);
+            let command_line = argv
+                .iter()
+                .map(|arg| shell_quote(arg))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let script = format!("cd {} && {command_line}", shell_quote(&workspace));
+            let mut command = Command::new("wsl.exe");
+            command.args(["-d", distro.as_str(), "--", "bash", "-lc", script.as_str()]);
+            Ok(command)
+        }
+        Runner::Docker { image } => {
+            let mut host = workspace.to_string_lossy().replace('\\', "/");
+            if let Some(stripped) = host.strip_prefix("//?/") {
+                host = stripped.to_string();
+            }
+            let mut command = Command::new("docker");
+            command
+                .args(["run", "--rm", "-i", "-v"])
+                .arg(format!("{host}:/work"))
+                .args(["-w", "/work"])
+                .arg(image)
+                .args(argv);
+            Ok(command)
+        }
+    }
+}
+
+fn read_interaction_pipe<R: Read>(mut reader: R, cap: usize) -> (String, bool) {
+    let mut output = Vec::new();
+    let mut capped = false;
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => {
+                if output.len() < cap {
+                    let take = (cap - output.len()).min(count);
+                    output.extend_from_slice(&chunk[..take]);
+                    capped |= take < count;
+                } else {
+                    capped = true;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    (String::from_utf8_lossy(&output).into_owned(), capped)
+}
+
+/// Run an optional interaction command with stdin while retaining the same
+/// timeout/output caps as the authoritative batch runner. This is local to the
+/// external backend because the normal gate runner intentionally closes stdin.
+fn run_interaction_with_input(
+    runner: &Runner,
+    argv: &[String],
+    workspace: &Path,
+    input: &str,
+) -> exec::ExecOutcome {
+    let mut command = match interaction_process(runner, argv, workspace) {
+        Ok(command) => command,
+        Err(error) => {
+            return exec::ExecOutcome {
+                launched: false,
+                code: None,
+                stdout: String::new(),
+                stderr: error,
+                timed_out: false,
+                output_capped: false,
+            };
+        }
+    };
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return exec::ExecOutcome {
+                launched: false,
+                code: None,
+                stdout: String::new(),
+                stderr: error.to_string(),
+                timed_out: false,
+                output_capped: false,
+            };
+        }
+    };
+
+    let limits = exec::ResourceLimits::from_env();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
+    let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+    let cap = limits.max_output_bytes;
+    std::thread::spawn(move || {
+        let value = stdout
+            .map(|pipe| read_interaction_pipe(pipe, cap))
+            .unwrap_or_default();
+        let _ = stdout_tx.send(value);
+    });
+    std::thread::spawn(move || {
+        let value = stderr
+            .map(|pipe| read_interaction_pipe(pipe, cap))
+            .unwrap_or_default();
+        let _ = stderr_tx.send(value);
+    });
+
+    let input_error = child.stdin.take().and_then(|mut stdin| {
+        stdin
+            .write_all(input.as_bytes())
+            .err()
+            .map(|error| error.to_string())
+    });
+    let (timed_out, code) = match child.wait_timeout(limits.timeout) {
+        Ok(Some(status)) => (false, status.code()),
+        Ok(None) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            (true, None)
+        }
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return exec::ExecOutcome {
+                launched: true,
+                code: None,
+                stdout: String::new(),
+                stderr: error.to_string(),
+                timed_out: false,
+                output_capped: false,
+            };
+        }
+    };
+    let grace = Duration::from_secs(2);
+    let (stdout, stdout_capped) = stdout_rx
+        .recv_timeout(grace)
+        .unwrap_or_else(|_| ("[theoremata] interaction stdout did not drain".into(), true));
+    let (mut stderr, stderr_capped) = stderr_rx
+        .recv_timeout(grace)
+        .unwrap_or_else(|_| ("[theoremata] interaction stderr did not drain".into(), true));
+    if let Some(error) = input_error {
+        stderr.push_str(&format!(
+            "\n[theoremata] failed to write interaction request: {error}"
+        ));
+    }
+    if timed_out {
+        stderr.push_str(&format!(
+            "\n[theoremata] interaction diagnostics exceeded {}s resource limit",
+            limits.timeout.as_secs()
+        ));
+    }
+    exec::ExecOutcome {
+        launched: true,
+        code,
+        stdout,
+        stderr,
+        timed_out,
+        output_capped: stdout_capped || stderr_capped,
+    }
 }
 
 pub fn mock_enabled(config: &Config, system: FormalSystem) -> bool {
@@ -229,6 +748,41 @@ impl ExternalBackend {
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         exec::run(&self.runner, &refs, &ws.root)
     }
+
+    /// Run Agda's JSON interaction protocol strictly as an advisory enrichment.
+    /// The authoritative verdict remains the separate batch `agda --safe` run
+    /// in [`FormalBackend::compile`]. In particular, this function records but
+    /// never interprets the interaction process's exit status as success.
+    fn agda_interaction_diagnostics(&self, ws: &Workspace) -> serde_json::Value {
+        let filename = ws
+            .source_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Generated.agda");
+        let encoded_filename =
+            serde_json::to_string(filename).unwrap_or_else(|_| "\"Generated.agda\"".to_string());
+        let request =
+            format!("IOTCM {encoded_filename} None Direct (Cmd_load {encoded_filename} [])\nx\n");
+        let command = vec![
+            self.binary.clone(),
+            "--safe".into(),
+            "--interaction-json".into(),
+        ];
+        let outcome = run_interaction_with_input(&self.runner, &command, &ws.root, &request);
+        let parsed = parse_agda_interaction_outcome(&outcome);
+        let mut detail = parsed.to_json();
+        if let Some(object) = detail.as_object_mut() {
+            object.insert("authority".into(), json!("advisory_only"));
+            object.insert("verdict_source".into(), json!("batch_agda_safe"));
+            object.insert("exit_status_trusted".into(), json!(false));
+            object.insert("runner".into(), json!(self.runner.tag()));
+            object.insert("command".into(), json!(command));
+            object.insert("code".into(), json!(outcome.code));
+            object.insert("stderr".into(), json!(outcome.stderr));
+            object.insert("stdout".into(), json!(outcome.stdout));
+        }
+        detail
+    }
 }
 
 impl FormalBackend for ExternalBackend {
@@ -344,6 +898,24 @@ impl FormalBackend for ExternalBackend {
             &out.stdout,
             &out.stderr,
         );
+        // Optional structured feedback only. This is intentionally computed
+        // AFTER the batch verdict and is never folded back into `verified`.
+        // Unsupported interaction mode leaves the backend available; malformed
+        // interaction output is represented as a failed diagnostic response.
+        let interaction_diagnostics = if self.system == FormalSystem::Agda {
+            if agda_interaction_diagnostics_enabled() {
+                self.agda_interaction_diagnostics(ws)
+            } else {
+                json!({
+                    "status": "disabled",
+                    "authority": "advisory_only",
+                    "verdict_source": "batch_agda_safe",
+                    "enable_with": AGDA_INTERACTION_DIAGNOSTICS_ENV,
+                })
+            }
+        } else {
+            serde_json::Value::Null
+        };
         let errors = if verified {
             vec![]
         } else {
@@ -359,7 +931,7 @@ impl FormalBackend for ExternalBackend {
                 &errors,
             ),
             errors,
-            detail: json!({"runner": self.runner.tag(), "binary": self.binary.clone(), "command": command, "code": out.code, "verified": verified, "stdout": out.stdout, "stderr": out.stderr}),
+            detail: json!({"runner": self.runner.tag(), "binary": self.binary.clone(), "command": command, "code": out.code, "verified": verified, "stdout": out.stdout, "stderr": out.stderr, "interaction_diagnostics": interaction_diagnostics}),
         })
     }
 
@@ -542,6 +1114,95 @@ impl ProofSession for ExternalBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agda_interaction_parser_extracts_structured_goals_and_warnings() {
+        let output = r#"JSON> {"kind":"DisplayInfo","info":{"kind":"AllGoalsWarnings","visibleGoals":[{"constraintObj":{"id":7,"range":[{"start":{"line":3,"col":5}}]},"kind":"OfType","type":"Nat"}],"invisibleGoals":[{"constraintObj":{"name":"_8","range":[]},"kind":"OfType","type":"Bool"}],"warnings":[{"kind":"UnsolvedMetas","message":"Unsolved metas"}]}}"#;
+        let AgdaInteractionDiagnostics::Ready {
+            records,
+            goals,
+            errors,
+            warnings,
+        } = parse_agda_interaction_output(output)
+        else {
+            panic!("valid AllGoalsWarnings output must parse")
+        };
+        assert_eq!(records, 1);
+        assert_eq!(goals.len(), 2);
+        assert_eq!(goals[0]["visibility"], "visible");
+        assert_eq!(goals[0]["id"], 7);
+        assert_eq!(goals[0]["type"], "Nat");
+        assert_eq!(goals[1]["visibility"], "invisible");
+        assert_eq!(goals[1]["id"], "_8");
+        assert!(errors.is_empty());
+        assert_eq!(warnings[0]["kind"], "UnsolvedMetas");
+    }
+
+    #[test]
+    fn agda_interaction_parser_extracts_structured_errors() {
+        let output = r#"{"kind":"DisplayInfo","info":{"kind":"Error","error":{"message":"Not in scope: x","range":[{"start":{"line":4,"col":2}}]}}}"#;
+        let AgdaInteractionDiagnostics::Ready { errors, goals, .. } =
+            parse_agda_interaction_output(output)
+        else {
+            panic!("a structured Agda error is a well-formed diagnostic response")
+        };
+        assert!(goals.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["message"], "Not in scope: x");
+        assert_eq!(errors[0]["range"][0]["start"]["line"], 4);
+    }
+
+    #[test]
+    fn agda_interaction_parser_fails_closed_on_malformed_output() {
+        for output in [
+            "JSON> {not-json}",
+            r#"{"kind":"DisplayInfo","info":{"kind":"AllGoalsWarnings","visibleGoals":[],"invisibleGoals":[]}}"#,
+            "JSON> {\"kind\":\"DisplayInfo\",\"info\":{\"kind\":\"AllGoalsWarnings\",\"visibleGoals\":[],\"invisibleGoals\":[],\"warnings\":[]}}\nnot-json",
+        ] {
+            let parsed = parse_agda_interaction_output(output);
+            assert!(
+                matches!(parsed, AgdaInteractionDiagnostics::Malformed { .. }),
+                "malformed interaction output must expose no partial diagnostics: {parsed:?}"
+            );
+            let detail = parsed.to_json();
+            assert_eq!(detail["status"], "malformed");
+            assert_eq!(detail["fail_closed"], true);
+            assert_eq!(detail["goals"], json!([]));
+            assert_eq!(detail["errors"], json!([]));
+        }
+    }
+
+    #[test]
+    fn agda_interaction_parser_treats_unsupported_protocol_as_optional() {
+        for output in [
+            "agda: unrecognized option --interaction-json",
+            r#"{"kind":"Status","showImplicitArguments":false}"#,
+            "",
+        ] {
+            assert!(matches!(
+                parse_agda_interaction_output(output),
+                AgdaInteractionDiagnostics::Unsupported { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn agda_interaction_diagnostics_never_trust_exit_status() {
+        let stdout = r#"{"kind":"DisplayInfo","info":{"kind":"AllGoalsWarnings","visibleGoals":[],"invisibleGoals":[],"warnings":[]}}"#;
+        let outcome = |code| exec::ExecOutcome {
+            launched: true,
+            code: Some(code),
+            stdout: stdout.into(),
+            stderr: String::new(),
+            timed_out: false,
+            output_capped: false,
+        };
+        assert_eq!(
+            parse_agda_interaction_outcome(&outcome(0)),
+            parse_agda_interaction_outcome(&outcome(42)),
+            "interaction exit status must not participate in diagnostic parsing"
+        );
+    }
 
     // Metamath exit-code soundness: a failed `verify proof *` must NOT read as
     // verified even though the binary exits 0. Only the explicit success sentinel
