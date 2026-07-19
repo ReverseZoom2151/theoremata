@@ -259,7 +259,33 @@ pub struct LeanBackend {
     /// ([`VALIDATE_PROOF_TEMPLATE`]) into the kernel re-check
     /// (`Config::kernel_validate_proof`).
     pub kernel_validate: bool,
+    /// **Tier-0 layer-2d channel: the DESIGNATED INPUTS of the task** — the
+    /// hypotheses this backend's caller has declared to be legitimate antecedents,
+    /// named either by BINDER name (`hRH`) or by TYPE HEAD (`RiemannHypothesis`).
+    /// See [`FormalBackend::designated_inputs`] and [`DESIGNATED_INPUTS_ENV`].
+    ///
+    /// Empty by default, and empty is the only safe default: the allowlist is a
+    /// statement about the TASK, and nothing inside this backend knows the task.
+    pub designated_inputs: Vec<String>,
 }
+
+/// Env seam carrying the task's designated hypothesis inputs into
+/// [`LeanBackend::designated_inputs`], in the crate's existing default-empty
+/// env-override idiom (`THEOREMATA_LEAN_TOOLCHAIN`, `THEOREMATA_LEAN`, …).
+///
+/// Comma- / semicolon- / whitespace-separated, e.g.
+/// `THEOREMATA_LEAN_DESIGNATED_INPUTS="RiemannHypothesis,hGlaisher"`.
+///
+/// **Why an env var and not config:** there is no trusted-premise / designated-
+/// input field anywhere in `Config` today (it carries `lean_project`, `lean_bin`,
+/// runners, and gate booleans — nothing task-semantic), and `FormalProject`
+/// carries only `imports`, which are MODULE imports (`Mathlib`), not premises: an
+/// import grants access to *proved* lemmas, which need no allowlist. So there is
+/// no existing real source to read, and inventing one inside the backend would be
+/// exactly the hardcoded-mathematical-facts list this must not be. This env var
+/// is the honest minimum: a channel the party that defines the task can populate.
+/// The preferred home remains a `Config` field owned by `app/config.rs`.
+pub const DESIGNATED_INPUTS_ENV: &str = "THEOREMATA_LEAN_DESIGNATED_INPUTS";
 
 impl LeanBackend {
     /// The offline mock backend (canned layers; real source scan).
@@ -271,6 +297,8 @@ impl LeanBackend {
             lake: "lake".into(),
             toolchain: None,
             kernel_validate: false,
+            // A mock has no task context at all; never allowlist anything.
+            designated_inputs: Vec::new(),
         }
     }
 
@@ -285,6 +313,10 @@ impl LeanBackend {
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
             kernel_validate: cfg.kernel_validate_proof,
+            designated_inputs: std::env::var(DESIGNATED_INPUTS_ENV)
+                .ok()
+                .map(|raw| parse_designated_inputs(&raw))
+                .unwrap_or_default(),
         }
     }
 
@@ -337,6 +369,229 @@ fn parse_axioms(stdout: &str) -> Option<Vec<String>> {
         .filter(|s| !s.is_empty())
         .collect();
     Some(axioms)
+}
+
+// ===========================================================================
+// Tier-0 channels: designated inputs + hypothesis-bundle parsing
+// ===========================================================================
+
+/// Split the [`DESIGNATED_INPUTS_ENV`] value into allowlist entries.
+///
+/// Separators are `,`, `;` and whitespace; entries are trimmed, empties dropped,
+/// duplicates removed (first occurrence wins) so the JSON detail is stable. No
+/// validation is attempted: `hypothesis_audit` matches an entry against either a
+/// binder NAME or a type HEAD, and an entry matching neither is simply inert.
+fn parse_designated_inputs(raw: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for tok in raw.split(|c: char| c == ',' || c == ';' || c.is_whitespace()) {
+        let t = tok.trim();
+        if t.is_empty() || out.iter().any(|e| e == t) {
+            continue;
+        }
+        out.push(t.to_string());
+    }
+    out
+}
+
+/// One parsed Lean binder group: the names it binds and the type they share.
+///
+/// Mirrors `hypothesis_audit::parse_binder_groups` / `split_binders_conclusion`.
+/// Those helpers are PRIVATE to their modules (as is
+/// `statement_preservation::parse_first_decl` and its
+/// `split_binders_conclusion`), so this is a deliberate local re-implementation
+/// of the same idioms rather than a reuse. The one public reuse available is
+/// [`crate::prover::statement_preservation::check_statement_preserved`], whose
+/// `canonical` field exposes a parsed [`TheoremSig`] — that IS reused below for
+/// the outer `theorem NAME <binders> : <conclusion>` split, so only the binder
+/// region needs local parsing.
+///
+/// [`TheoremSig`]: crate::prover::statement_preservation::TheoremSig
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LeanBinder {
+    /// Names bound by the group. Empty for an anonymous group (`[Group G]`).
+    names: Vec<String>,
+    /// The shared type text, whitespace-normalized.
+    ty: String,
+}
+
+/// Split a binder region into its bracketed groups — `(h : P)`, `{n : Nat}`,
+/// `[Group G]`, `⦃x : α⦄`. Unbracketed trailing names carry no type ascription
+/// and are skipped (nothing can be said about their kind).
+fn parse_lean_binders(binders: &str) -> Vec<LeanBinder> {
+    let chars: Vec<char> = binders.chars().collect();
+    let mut out: Vec<LeanBinder> = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let open = chars[i];
+        let close = match open {
+            '(' => ')',
+            '{' => '}',
+            '[' => ']',
+            '⦃' => '⦄',
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let mut depth = 1i32;
+        let mut k = i + 1;
+        while k < chars.len() {
+            if chars[k] == open {
+                depth += 1;
+            } else if chars[k] == close {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            k += 1;
+        }
+        let inner = &chars[(i + 1).min(chars.len())..k.min(chars.len())];
+        let (name_part, ty_part) = split_at_top_colon(inner);
+        let (names, ty) = match ty_part {
+            // `[Group G]` / `[Fact (0 < n)]` — anonymous: the whole group is type.
+            None => (Vec::new(), name_part.iter().collect::<String>()),
+            Some(t) => (
+                split_lean_idents(name_part),
+                t.iter().collect::<String>(),
+            ),
+        };
+        out.push(LeanBinder {
+            names,
+            ty: norm_ws(&ty),
+        });
+        i = k + 1;
+    }
+    out
+}
+
+/// Split at the first bracket-depth-0 `:` that is not `:=`. `None` for the type
+/// half when there is none.
+fn split_at_top_colon(sig: &[char]) -> (&[char], Option<&[char]>) {
+    let mut depth = 0i32;
+    for i in 0..sig.len() {
+        match sig[i] {
+            '(' | '[' | '{' | '⟨' | '⦃' => depth += 1,
+            ')' | ']' | '}' | '⟩' | '⦄' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            ':' if depth == 0 && sig.get(i + 1) != Some(&'=') => {
+                return (&sig[..i], Some(&sig[i + 1..]));
+            }
+            _ => {}
+        }
+    }
+    (sig, None)
+}
+
+/// Whitespace-separated identifiers in a slice (`.` included, for namespaced
+/// names). `_` is preserved here — the caller renames it, because a bundle field
+/// needs a referable name.
+fn split_lean_idents(chars: &[char]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for &c in chars {
+        if c.is_alphanumeric() || c == '_' || c == '\'' || c == '.' {
+            cur.push(c);
+        } else if !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// The head identifier of a type expression, skipping leading punctuation.
+fn lean_head_ident(ty: &str) -> Option<String> {
+    let chars: Vec<char> = ty.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() && !(chars[i].is_alphabetic() || chars[i] == '_') {
+        i += 1;
+    }
+    let start = i;
+    while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '\'' || chars[i] == '.') {
+        i += 1;
+    }
+    if i == start {
+        None
+    } else {
+        Some(chars[start..i].iter().collect())
+    }
+}
+
+/// Relational / logical tokens whose presence in a binder's TYPE makes it a
+/// proposition. Every one of these is a `Prop`-former in Lean core: a comparison,
+/// a membership, a divisibility, or a logical connective.
+///
+/// **`→` and `∀` are deliberately ABSENT.** `(f : Nat → Nat)` and
+/// `(F : ∀ α, α → α)` are data, and including them would misclassify ordinary
+/// function/dependent-function binders as hypotheses. `∃` IS included: `Exists`
+/// is a `Prop` unconditionally.
+const PROP_TOKENS: &[&str] = &[
+    "=", "≠", "<", ">", "≤", "≥", "∈", "∉", "⊆", "⊂", "⊇", "∣", "∤", "∧", "∨",
+    "↔", "¬", "≡", "≅", "∃", "≫", "≪",
+];
+
+/// Type heads that are `Prop`-valued in Lean core / the logical prelude.
+///
+/// **This is a list of LOGICAL CONNECTIVES AND ORDER/ALGEBRA CLASS PROJECTIONS,
+/// not of mathematical facts.** Nothing domain-specific belongs here: a
+/// domain-specific opaque assumption (`RiemannHypothesis`) is the
+/// [`crate::prover::hypothesis_audit`] layer's business, allowlisted via
+/// [`DESIGNATED_INPUTS_ENV`], not something this bundle parser should guess at.
+const PROP_HEADS: &[&str] = &[
+    "Eq", "Ne", "Not", "And", "Or", "Iff", "Xor", "True", "False", "Exists",
+    "LT.lt", "LE.le", "GT.gt", "GE.ge", "Dvd.dvd", "Membership.mem", "Nonempty",
+];
+
+/// The split heuristic: is this binder type `Prop`-shaped (a hypothesis) rather
+/// than type-shaped (a datum)?
+///
+/// **Honest description of the heuristic, and it IS a heuristic — there is no
+/// elaborator here, so this cannot ask Lean whether a type's sort is `Prop`.**
+/// It answers `true` in exactly two cases:
+///
+/// 1. the type text contains one of [`PROP_TOKENS`] — a relation or connective
+///    applied to something (`n > 0`, `p ∣ n`, `a = b`, `¬ P`, `∃ k, …`); or
+/// 2. the type's HEAD identifier is one of [`PROP_HEADS`].
+///
+/// Everything else is a [`FieldKind::Datum`]. That default is deliberate and
+/// matches the brief: with `THEOREMATA_VACUITY_GATE` set, a binder wrongly called
+/// a Hypothesis makes the bundle non-trivial, which demands a witness we cannot
+/// produce, which fails a perfectly good proof. A binder wrongly called a Datum
+/// merely under-reports. So the parser is biased toward Datum.
+///
+/// Known, accepted misclassifications (all in the Datum direction):
+///
+/// * a bare named proposition — `(hRH : RiemannHypothesis)`, `(h : Glaisher3)` —
+///   reads as a Datum here. It is NOT lost: that is precisely mechanism (a)/(b)
+///   of [`crate::prover::hypothesis_audit`], which catches it on the other gate.
+/// * a `Prop`-valued application with no operator and an unrecognized head —
+///   `(hp : Nat.Prime p)`, `(hc : Nat.Coprime a b)` — reads as a Datum. Adding
+///   these by name would be the hardcoded-mathematical-facts list this must not
+///   become; resolving them properly needs the elaborator.
+/// * `(h : P → Q)`, an implication hypothesis, reads as a Datum because `→` is
+///   excluded for the function-type reason above.
+///
+/// [`FieldKind::Datum`]: crate::prover::vacuity::FieldKind::Datum
+fn is_prop_shaped(ty: &str) -> bool {
+    let t = norm_ws(ty);
+    if t.is_empty() {
+        return false;
+    }
+    if PROP_TOKENS.iter().any(|tok| t.contains(tok)) {
+        return true;
+    }
+    lean_head_ident(&t).map_or(false, |h| PROP_HEADS.iter().any(|p| *p == h))
+}
+
+/// Collapse whitespace runs to one space and trim.
+fn norm_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 impl FormalBackend for LeanBackend {
@@ -539,6 +794,129 @@ impl FormalBackend for LeanBackend {
             detail: json!({"system": SYSTEM.as_str(), "fallback": true}),
         })
     }
+
+    /// Tier-0 layer 2d channel — see [`LeanBackend::designated_inputs`] (the
+    /// field) and [`DESIGNATED_INPUTS_ENV`].
+    ///
+    /// Sourced from the caller-populated field, which `live()` fills from
+    /// [`DESIGNATED_INPUTS_ENV`] and `mock()` leaves empty. **There is no other
+    /// real source in this crate today** — `Config` has no trusted-premise field,
+    /// and `FormalProject::imports` are module imports (access to *proved*
+    /// lemmas), not assumed premises, so they are NOT read here. With nothing
+    /// configured this returns empty, exactly as the trait default does, and every
+    /// genuine antecedent of a conditional theorem will read as `Unaccounted` if
+    /// `THEOREMATA_HYPOTHESIS_GATE` is switched on without populating it.
+    fn designated_inputs(&self) -> Vec<String> {
+        self.designated_inputs.clone()
+    }
+
+    /// Vacuity channel (1/2): parse the Lean theorem signature in `stmt` into a
+    /// [`HypothesisBundle`], splitting data binders from propositional ones.
+    ///
+    /// Returns `None` — "this backend does not model the bundle", which
+    /// [`FormalBackend::verify_with_gates`] reports as NOT DECLARED and never as a
+    /// failure — when `stmt` does not parse into a `theorem`/`lemma`/`example`
+    /// signature. **A wrong bundle is strictly worse than no bundle**, so every
+    /// parse doubt yields `None`.
+    ///
+    /// The outer `theorem NAME <binders> : <conclusion>` split reuses the public
+    /// [`check_statement_preserved`] (its `canonical` field is the parsed
+    /// signature; passing an empty submission means only the canonical side is
+    /// parsed). The binder region is then split locally — see [`LeanBinder`] for
+    /// why that could not be reused.
+    ///
+    /// The Datum/Hypothesis split heuristic is [`is_prop_shaped`]; read its docs
+    /// before turning `THEOREMATA_VACUITY_GATE` on, because that heuristic decides
+    /// which goals are required to carry a witness.
+    ///
+    /// Naming rules, so a witness can always reference a field:
+    ///
+    /// * `_` and anonymous groups get a synthesized `_b{index}` name;
+    /// * an ANONYMOUS group whose type is `Prop`-shaped (`[Fact (0 < n)]`) is kept
+    ///   as a Hypothesis. This is the one place the parser does NOT err toward
+    ///   Datum: dropping it would let a genuinely constrained bundle look trivial,
+    ///   which is the exact hole the vacuity module exists to close.
+    ///
+    /// [`HypothesisBundle`]: crate::prover::vacuity::HypothesisBundle
+    /// [`check_statement_preserved`]: crate::prover::statement_preservation::check_statement_preserved
+    fn hypothesis_bundle(&self, stmt: &str) -> Option<crate::prover::vacuity::HypothesisBundle> {
+        use crate::prover::vacuity::{HypothesisBundle, HypothesisField};
+
+        let sig = crate::prover::statement_preservation::check_statement_preserved(stmt, "")
+            .canonical?;
+        // Only a proposition-bearing declaration has a hypothesis bundle. A `def`
+        // (or anything else the signature parser accepts) is not our business.
+        if !matches!(sig.kind.as_str(), "theorem" | "lemma" | "example") {
+            return None;
+        }
+
+        let mut fields: Vec<HypothesisField> = Vec::new();
+        for (idx, binder) in parse_lean_binders(&sig.binders).into_iter().enumerate() {
+            if binder.ty.is_empty() {
+                continue;
+            }
+            let prop = is_prop_shaped(&binder.ty);
+            let names: Vec<String> = if binder.names.is_empty() {
+                vec![format!("_b{idx}")]
+            } else {
+                binder
+                    .names
+                    .iter()
+                    .enumerate()
+                    .map(|(k, n)| {
+                        if n == "_" {
+                            format!("_b{idx}_{k}")
+                        } else {
+                            n.clone()
+                        }
+                    })
+                    .collect()
+            };
+            for name in names {
+                fields.push(if prop {
+                    HypothesisField::hypothesis(name, binder.ty.clone())
+                } else {
+                    HypothesisField::datum(name, binder.ty.clone())
+                });
+            }
+        }
+
+        Some(HypothesisBundle::new(sig.name, fields))
+    }
+
+    /// Vacuity channel (2/2): **always `None`, and that is the correct answer
+    /// here.**
+    ///
+    /// A [`SatisfiabilityWitness`] is a concrete instance claimed to meet every
+    /// field of the bundle. Fabricating one would defeat the entire vacuous-
+    /// success guard: `check_vacuity` audits a witness only as far as a syntactic
+    /// pass can, and takes any hypothesis it cannot evaluate on the supplier's
+    /// word. A witness invented by the backend under audit is therefore a
+    /// rubber stamp on exactly the proofs the gate exists to reject.
+    ///
+    /// This backend cannot produce one soundly. Real witness production needs one
+    /// of:
+    ///
+    /// * a NUMERIC SEARCH — enumerate candidate values for the data binders and
+    ///   evaluate the hypotheses (only decides the small decidable fragment, and
+    ///   needs an evaluator this backend does not have); or
+    /// * a MODEL-SUPPLIED INSTANCE — the party that stated the goal exhibits `n :=
+    ///   7` and asserts it meets each hypothesis, which is what the vacuity module
+    ///   was designed around.
+    ///
+    /// Returning `None` keeps the gate FAIL-CLOSED: for a non-trivial bundle
+    /// `check_vacuity` yields `WitnessMissing` and `clean == false`. With
+    /// `THEOREMATA_VACUITY_GATE` unset (the default) that is observational only.
+    /// A bundle with no propositional field is `is_trivial()` and is already clean
+    /// with no witness, so no witness is manufactured for that case either.
+    ///
+    /// [`SatisfiabilityWitness`]: crate::prover::vacuity::SatisfiabilityWitness
+    fn satisfiability_witness(
+        &self,
+        _stmt: &str,
+    ) -> Option<crate::prover::vacuity::SatisfiabilityWitness> {
+        None
+    }
 }
 
 /// Lean warm-driver session (repl in Phase 3). Supports both `submit_unit` and
@@ -572,6 +950,151 @@ impl ProofSession for LeanBackend {
             goals: vec!["True".into()],
             detail: json!({"mock": self.mock}),
         })
+    }
+}
+
+#[cfg(test)]
+mod tier0_tests {
+    use super::*;
+    use crate::prover::vacuity::{check_vacuity, FieldKind};
+
+    fn bundle(stmt: &str) -> Option<crate::prover::vacuity::HypothesisBundle> {
+        LeanBackend::mock().hypothesis_bundle(stmt)
+    }
+
+    /// A signature with a `Prop`-valued hypothesis yields a bundle that CONTAINS
+    /// it, classified as a hypothesis, with the data binder kept as a datum.
+    #[test]
+    fn prop_valued_hypothesis_is_in_the_bundle() {
+        let b = bundle("theorem pos (n : Nat) (hn : n > 0) : n ≠ 0")
+            .expect("a well-formed Lean signature must parse");
+        assert_eq!(b.goal, "pos");
+        assert!(!b.is_trivial(), "a Prop hypothesis makes the bundle non-trivial");
+
+        let hyps: Vec<_> = b.hypotheses().collect();
+        assert_eq!(hyps.len(), 1, "fields: {:?}", b.fields);
+        assert_eq!(hyps[0].binder, "hn");
+        assert_eq!(hyps[0].text, "n > 0");
+        assert_eq!(hyps[0].kind, FieldKind::Hypothesis);
+
+        let data: Vec<_> = b.data().collect();
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].binder, "n");
+        assert_eq!(data[0].text, "Nat");
+
+        // And with no witness the guard fails CLOSED, as designed.
+        assert!(!check_vacuity(&b, None).clean);
+    }
+
+    /// A pure-data signature yields a TRIVIAL bundle — nothing to witness, and
+    /// the vacuity check is clean without one.
+    #[test]
+    fn pure_data_signature_is_a_trivial_bundle() {
+        let b = bundle("theorem id_eq (α : Type) (f : Nat → Nat) (x : α) : x = x")
+            .expect("must parse");
+        assert!(b.is_trivial(), "no Prop binder here: {:?}", b.fields);
+        assert_eq!(b.fields.len(), 3);
+        assert!(b.fields.iter().all(|f| f.kind == FieldKind::Datum));
+        // `→` must not be read as a Prop token, or `f` would be a hypothesis.
+        assert!(check_vacuity(&b, None).clean);
+    }
+
+    /// An unparseable signature yields `None` — NEVER a wrong bundle.
+    #[test]
+    fn unparseable_signature_yields_none() {
+        for stmt in [
+            "",
+            "-- just a comment",
+            "not a declaration at all",
+            "∀ n : Nat, n = n",
+        ] {
+            assert!(bundle(stmt).is_none(), "must not guess a bundle for `{stmt}`");
+        }
+        // A `def` is not a proposition-bearing declaration either.
+        assert!(bundle("def twice (n : Nat) : Nat := n + n").is_none());
+    }
+
+    /// A binder group binding several names yields one field per name.
+    #[test]
+    fn grouped_binders_yield_one_field_each() {
+        let b = bundle("theorem t (a b : Nat) (h1 h2 : a < b) : a ≤ b").expect("must parse");
+        let names: Vec<&str> = b.fields.iter().map(|f| f.binder.as_str()).collect();
+        assert_eq!(names, vec!["a", "b", "h1", "h2"]);
+        assert_eq!(b.hypotheses().count(), 2);
+    }
+
+    /// The documented conservative bias: a bare named proposition reads as a
+    /// DATUM here rather than risking a false failure. It is not lost — that
+    /// shape is `hypothesis_audit`'s `Opaque` mechanism on the other gate.
+    #[test]
+    fn bare_named_proposition_errs_toward_datum() {
+        let b = bundle("theorem cond (hR : RiemannHypothesis) (n : Nat) : n = n")
+            .expect("must parse");
+        assert!(b.is_trivial(), "bias is toward Datum: {:?}", b.fields);
+        assert!(check_vacuity(&b, None).clean, "must not fail a good proof");
+    }
+
+    /// An anonymous instance binder carrying a proposition is kept — the one
+    /// deliberate exception to the Datum bias.
+    #[test]
+    fn anonymous_prop_instance_binder_is_kept() {
+        let b = bundle("theorem t (n : Nat) [Fact (0 < n)] : n ≠ 0").expect("must parse");
+        assert!(!b.is_trivial(), "fields: {:?}", b.fields);
+        assert_eq!(b.hypotheses().count(), 1);
+        // A plain typeclass binder is data, not a hypothesis.
+        let g = bundle("theorem u (G : Type) [Group G] : True").expect("must parse");
+        assert!(g.is_trivial(), "fields: {:?}", g.fields);
+    }
+
+    /// A contradictory bundle parsed straight off the signature is REFUTED — the
+    /// gate can now actually fire on the motivating example.
+    #[test]
+    fn contradictory_signature_is_refuted() {
+        let b = bundle("theorem hollow (x : Nat) (h1 : x > 5) (h2 : x < 3) : False")
+            .expect("must parse");
+        let r = check_vacuity(&b, None);
+        assert!(!r.clean);
+        assert!(
+            r.contradictions.iter().any(|c| c.rule == "numeric_bounds"),
+            "{:?}",
+            r.contradictions
+        );
+    }
+
+    /// No witness is ever fabricated: a fabricated one would rubber-stamp the
+    /// proofs this gate exists to reject.
+    #[test]
+    fn no_witness_is_ever_fabricated() {
+        let backend = LeanBackend::mock();
+        assert!(backend
+            .satisfiability_witness("theorem pos (n : Nat) (hn : n > 0) : n ≠ 0")
+            .is_none());
+    }
+
+    /// The allowlist is empty unless a caller populates it — never invented.
+    #[test]
+    fn designated_inputs_default_to_empty() {
+        assert!(LeanBackend::mock().designated_inputs().is_empty());
+    }
+
+    #[test]
+    fn designated_inputs_env_value_parses() {
+        assert_eq!(
+            parse_designated_inputs(" RiemannHypothesis, hGlaisher ;RiemannHypothesis\nFoo "),
+            vec![
+                "RiemannHypothesis".to_string(),
+                "hGlaisher".to_string(),
+                "Foo".to_string()
+            ]
+        );
+        assert!(parse_designated_inputs("  , ; ").is_empty());
+    }
+
+    /// Deterministic: no clock, no RNG, no IO on this path.
+    #[test]
+    fn bundle_parsing_is_deterministic() {
+        let stmt = "theorem t (n : Nat) (hn : 0 < n) (hp : Nat.Prime n) : n ≠ 0";
+        assert_eq!(bundle(stmt), bundle(stmt));
     }
 }
 
