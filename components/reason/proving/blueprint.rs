@@ -28,7 +28,8 @@
 //!
 //! This module (a) EMITs a project's graph as a `content.tex` plus the flat
 //! `blueprint/lean_decls` manifest, and (b) INGESTs a `content.tex` back into
-//! nodes+edges. EMIT→INGEST is a graph-preserving round-trip.
+//! nodes+edges. `\\leanok` remains presentation metadata on import: only the
+//! verifier pipeline may set `Node::stmt_formalized` or `Node::proof_done`.
 
 use crate::{
     db::Store,
@@ -282,15 +283,9 @@ pub fn import(store: &Store, project_id: &str, tex: &str) -> Result<BlueprintImp
         if !bnode.lean.is_empty() {
             store.set_lean_decls(project_id, &node.id, &bnode.lean, "blueprint:import")?;
         }
-        if bnode.statement_leanok || bnode.proof_leanok {
-            store.set_verification_flags(
-                project_id,
-                &node.id,
-                bnode.statement_leanok,
-                bnode.proof_leanok,
-                "blueprint:import",
-            )?;
-        }
+        // `\\leanok` is untrusted interchange metadata. It may describe what an
+        // upstream project claims, but it is not a verifier receipt and must not
+        // grant local formalization/proof-completion state.
         label_to_id.insert(bnode.label.clone(), node.id);
     }
 
@@ -996,7 +991,8 @@ mod tests {
 
         let exported = export(&store, &p.id).unwrap();
 
-        // Ingest into a fresh project and compare the reconstructed graph.
+        // Ingest into a fresh project and compare the reconstructed graph. The
+        // imported `\\leanok` claims do not carry verifier authority.
         let q = store.create_project("q", "t").unwrap();
         let summary = import(&store, &q.id, &exported.content_tex).unwrap();
         assert_eq!(summary.nodes_created, 3);
@@ -1007,10 +1003,10 @@ mod tests {
         assert_eq!(qnodes.len(), 3);
         let qmain = qnodes.iter().find(|n| n.title == "Main theorem").unwrap();
         assert_eq!(qmain.lean_decls, vec!["Erdos1196.main", "Erdos1196.main'"]);
-        assert!(qmain.stmt_formalized && !qmain.proof_done);
+        assert!(!qmain.stmt_formalized && !qmain.proof_done);
         let qa = qnodes.iter().find(|n| n.title == "Alpha bound").unwrap();
         assert_eq!(qa.lean_decls, vec!["PrimitiveSetsAboveX.mertens"]);
-        assert!(qa.stmt_formalized && qa.proof_done);
+        assert!(!qa.stmt_formalized && !qa.proof_done);
 
         let qedges = store.edges(&q.id).unwrap();
         let to_a = qedges.iter().find(|e| e.target_id == qa.id).unwrap();
@@ -1018,6 +1014,18 @@ mod tests {
         let qb = qnodes.iter().find(|n| n.title == "Beta bound").unwrap();
         let to_b = qedges.iter().find(|e| e.target_id == qb.id).unwrap();
         assert_eq!(to_b.dep_scope, DepScope::Proof);
+    }
+
+    #[test]
+    fn import_never_trusts_leanok_flags() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "t").unwrap();
+        let tex = "\\begin{lemma}\\label{lem:claimed}\\n\\leanok\\nClaim.\\n\\end{lemma}\\n\\
+                   \\begin{proof}\\n\\leanok\\nArbitrary prose.\\n\\end{proof}\\n";
+
+        import(&store, &project.id, tex).unwrap();
+        let node = store.nodes(&project.id).unwrap().pop().unwrap();
+        assert!(!node.stmt_formalized && !node.proof_done);
     }
 
     #[test]
