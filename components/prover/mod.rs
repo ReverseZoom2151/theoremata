@@ -14,6 +14,7 @@ pub mod proof_job;
 pub mod proof_log;
 pub mod session;
 pub mod statement_preservation;
+pub mod witness_search;
 pub mod subgoal_extract;
 pub mod vacuity;
 
