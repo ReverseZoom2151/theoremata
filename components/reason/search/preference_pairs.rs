@@ -44,6 +44,15 @@
 //! Pair extraction is fully offline; only *training* the critic on the emitted
 //! Bradley–Terry pairs is GPU-gated and lives behind the Python trainer.
 
+use super::proof_pool::PoolVerdict;
+use crate::db::Store;
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+/// Event type under which a mined pair batch is persisted.
+const EVENT_TYPE: &str = "search.preference_pairs";
+
 /// One node in a minimal proof-search tree annotated for critic-pair extraction.
 ///
 /// This is the smallest shape the path/sibling math needs — decoupled from the
@@ -268,9 +277,152 @@ pub fn extract_preference_pairs<S: Clone + PartialEq>(
     out
 }
 
+/// One search branch offered to [`mine_critic_pairs`]: the proof states from the
+/// root down to the branch's last state, plus the verifier's verdict on it.
+///
+/// The verdict is the load-bearing field. [`CriticNode::on_winning_path`] carries
+/// no provenance of its own, so nothing downstream can tell a genuinely verified
+/// path from one a caller merely believed in. This adapter therefore refuses to
+/// infer "winning" from search structure and derives it only from
+/// [`PoolVerdict::Passing`], the repo's existing all-pass verifier verdict.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CriticBranch {
+    /// Proof states root-first, one per node along this branch. States are matched
+    /// by string equality, so branches sharing a prefix merge into one path and the
+    /// point where they diverge becomes the branch point sibling pairs need.
+    pub states: Vec<String>,
+    /// The verifier's verdict on this branch.
+    pub verdict: PoolVerdict,
+}
+
+/// CLI entry point: mine Bradley-Terry critic preference pairs from a set of
+/// verified and unverified search branches, and persist the batch.
+///
+/// A thin adapter: it merges the branches into the [`PreferenceTree`] shape and
+/// hands that to the existing [`extract_preference_pairs`]. The pairing math is
+/// untouched.
+///
+/// **Only a [`PoolVerdict::Passing`] branch is treated as a winning path.** This
+/// output is training data, so a preferred state that was never actually verified
+/// would teach the critic that an unverified proof is good. Anything else
+/// (`Pending`, `Suspect`, `Failing`) contributes only as a possible *negative* and
+/// is counted in `dropped_unverified`. When no branch passes, no pairs are emitted
+/// at all rather than pairs backed by nothing.
+///
+/// Offline and deterministic: pairs follow input order, no model, no wall-clock.
+pub fn mine_critic_pairs(
+    store: &Store,
+    project_id: &str,
+    branches: &[CriticBranch],
+) -> Result<serde_json::Value> {
+    // A flat arena built first so a node's on-path flag is final before the
+    // PreferenceTree is constructed (the tree takes the flag at insertion time).
+    struct Raw {
+        state: String,
+        parent: Option<usize>,
+        on_path: bool,
+    }
+    let mut raw: Vec<Raw> = Vec::new();
+    let mut children: Vec<Vec<usize>> = Vec::new();
+
+    let mut verified = 0usize;
+    let mut dropped_unverified = 0usize;
+    let mut dropped_empty = 0usize;
+    let mut dropped_root_mismatch = 0usize;
+
+    for branch in branches {
+        if branch.states.is_empty() {
+            dropped_empty += 1;
+            continue;
+        }
+        // One tree needs one root: branches from a different initial goal belong to
+        // a different search and would fabricate sibling pairs across problems.
+        if let Some(root) = raw.first() {
+            if root.state != branch.states[0] {
+                dropped_root_mismatch += 1;
+                continue;
+            }
+        }
+        let is_verified = branch.verdict == PoolVerdict::Passing;
+        if is_verified {
+            verified += 1;
+        } else {
+            dropped_unverified += 1;
+        }
+
+        if raw.is_empty() {
+            raw.push(Raw {
+                state: branch.states[0].clone(),
+                parent: None,
+                on_path: is_verified,
+            });
+            children.push(Vec::new());
+        } else if is_verified {
+            raw[0].on_path = true;
+        }
+
+        let mut cur = 0usize;
+        for state in &branch.states[1..] {
+            cur = match children[cur].iter().copied().find(|&c| raw[c].state == *state) {
+                Some(shared) => shared,
+                None => {
+                    let id = raw.len();
+                    raw.push(Raw {
+                        state: state.clone(),
+                        parent: Some(cur),
+                        on_path: false,
+                    });
+                    children.push(Vec::new());
+                    children[cur].push(id);
+                    id
+                }
+            };
+            if is_verified {
+                raw[cur].on_path = true;
+            }
+        }
+    }
+
+    // Parents are always created before their children, so arena ids and tree ids
+    // coincide and `add_child` can take the raw parent id directly.
+    let mut tree: PreferenceTree<String> = PreferenceTree::new();
+    for node in &raw {
+        match node.parent {
+            None => tree.add_root(node.state.clone(), node.on_path),
+            Some(p) => tree.add_child(p, node.state.clone(), node.on_path),
+        };
+    }
+
+    let pairs = extract_preference_pairs(&tree);
+    let summary = json!({
+        "project_id": project_id,
+        "branches_total": branches.len(),
+        "branches_verified": verified,
+        "dropped_unverified": dropped_unverified,
+        "dropped_empty": dropped_empty,
+        "dropped_root_mismatch": dropped_root_mismatch,
+        "tree_nodes": tree.nodes().len(),
+        "pair_count": pairs.len(),
+        "pairs": pairs.iter().map(|p| json!({
+            "positive_state": p.positive_state,
+            "negative_state": p.negative_state,
+            "bradley_terry_target": p.bradley_terry_target(),
+        })).collect::<Vec<_>>(),
+    });
+    store.event(
+        Some(project_id),
+        None,
+        EVENT_TYPE,
+        "preference_pairs",
+        summary.clone(),
+    )?;
+    Ok(summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     /// A table-driven proof state identified by a label; equality is by label so
     /// [`extract_preference_pairs`] can dedup deterministically.
@@ -409,6 +561,94 @@ mod tests {
         // The pair IS the BT target: P(positive ≻ negative) trained toward 1.
         let pair = PreferencePair::new(MockState("closer"), MockState("farther"));
         assert_eq!(pair.bradley_terry_target(), 1.0);
+    }
+
+    /// A verified branch `root->A->C->G` and an unverified sibling branch
+    /// `root->A->D` (D failed the gate). Only the verified path may seed positives.
+    fn mixed_branches() -> Vec<CriticBranch> {
+        vec![
+            CriticBranch {
+                states: vec!["root".into(), "A".into(), "C".into(), "G".into()],
+                verdict: PoolVerdict::Passing,
+            },
+            CriticBranch {
+                states: vec!["root".into(), "A".into(), "D".into()],
+                verdict: PoolVerdict::Failing,
+            },
+        ]
+    }
+
+    #[test]
+    fn entry_point_mines_only_from_verified_branches() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "a solved search").unwrap();
+
+        let summary = mine_critic_pairs(&store, &project.id, &mixed_branches()).unwrap();
+        assert_eq!(summary["branches_verified"], 1);
+        assert_eq!(summary["dropped_unverified"], 1);
+        // Path pairs A>root, C>A, G>C on the verified path, plus sibling C>D at the
+        // branch point. D never appears as a positive.
+        let pairs = summary["pairs"].as_array().unwrap();
+        assert_eq!(summary["pair_count"], 4);
+        assert!(pairs.iter().all(|p| p["positive_state"] != "D"));
+        assert!(pairs
+            .iter()
+            .any(|p| p["positive_state"] == "C" && p["negative_state"] == "D"));
+
+        let events = store.events(&project.id, 50).unwrap();
+        assert!(events
+            .iter()
+            .any(|e| e.event_type == "search.preference_pairs"));
+    }
+
+    #[test]
+    fn entry_point_emits_no_pairs_when_nothing_is_verified() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "an unsolved search").unwrap();
+
+        // A suspect branch is merely attempted, not verified: it must not seed a
+        // single preferred state.
+        let branches = vec![CriticBranch {
+            states: vec!["root".into(), "A".into(), "B".into()],
+            verdict: PoolVerdict::Suspect,
+        }];
+        let summary = mine_critic_pairs(&store, &project.id, &branches).unwrap();
+        assert_eq!(summary["branches_verified"], 0);
+        assert_eq!(summary["dropped_unverified"], 1);
+        assert_eq!(summary["pair_count"], 0);
+        assert!(summary["pairs"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn entry_point_rejects_branches_from_a_different_root() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "two searches").unwrap();
+
+        let branches = vec![
+            CriticBranch {
+                states: vec!["root".into(), "A".into()],
+                verdict: PoolVerdict::Passing,
+            },
+            // Different initial goal: must not merge into the first tree.
+            CriticBranch {
+                states: vec!["other".into(), "Z".into()],
+                verdict: PoolVerdict::Passing,
+            },
+        ];
+        let summary = mine_critic_pairs(&store, &project.id, &branches).unwrap();
+        assert_eq!(summary["dropped_root_mismatch"], 1);
+        // Only the first branch's single edge survives: A > root.
+        assert_eq!(summary["pair_count"], 1);
+        assert_eq!(summary["pairs"][0]["positive_state"], "A");
+    }
+
+    #[test]
+    fn entry_point_is_deterministic() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "determinism").unwrap();
+        let a = mine_critic_pairs(&store, &project.id, &mixed_branches()).unwrap();
+        let b = mine_critic_pairs(&store, &project.id, &mixed_branches()).unwrap();
+        assert_eq!(a["pairs"], b["pairs"]);
     }
 
     #[test]
