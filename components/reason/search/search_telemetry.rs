@@ -231,6 +231,102 @@ pub fn round_over_round(rounds: &[Vec<Vec<String>>]) -> Vec<ProofStats> {
     rounds.iter().map(|r| proof_length_stats(r)).collect()
 }
 
+// ===========================================================================
+// CLI entry point.
+// ===========================================================================
+
+/// Serialize a [`ProofStats`] to JSON. Done by hand rather than via a derive so
+/// the struct's public shape is left exactly as callers already rely on it.
+fn stats_to_json(s: &ProofStats) -> serde_json::Value {
+    let histogram: serde_json::Map<String, serde_json::Value> = s
+        .length_histogram
+        .iter()
+        .map(|(len, n)| (len.to_string(), serde_json::json!(n)))
+        .collect();
+    serde_json::json!({
+        "count": s.count,
+        "mean_length": s.mean_length,
+        "median_length": s.median_length,
+        "min_length": s.min_length,
+        "max_length": s.max_length,
+        "length_histogram": histogram,
+    })
+}
+
+/// Serialize a [`DiversityReport`] to JSON (see [`stats_to_json`] for why this is
+/// by hand).
+fn diversity_to_json(d: &DiversityReport) -> serde_json::Value {
+    serde_json::json!({
+        "distinct_ratio": d.distinct_ratio,
+        "mean_pairwise_jaccard": d.mean_pairwise_jaccard,
+        "distinct_tactics": d.distinct_tactics,
+    })
+}
+
+/// Compute the search health telemetry for a supplied bag of proofs and return a
+/// JSON report. This is the CLI-reachable surface over [`proof_length_stats`],
+/// [`diversity`], and [`round_over_round`]; it computes no numbers of its own.
+///
+/// The telemetry is a pure function of tactic strings (see the module docs), and
+/// nothing in the store persists these bags, so the proofs are supplied in the
+/// `request`, not read back from a run. The request carries:
+///
+/// * `proofs`: an array of tactic sequences (each an array of strings): the flat
+///   bag fed to [`proof_length_stats`] and [`diversity`].
+/// * `rounds`: an array of such bags, one per search / flywheel round, fed to
+///   [`round_over_round`].
+///
+/// Both are optional and reported independently. The key honesty distinction:
+///
+/// * a key that is **absent** means that telemetry was never recorded for this
+///   run (the feature was off, or this driver does not emit it). The report says
+///   `recorded: false` for that section and returns no numbers, because zeros
+///   here would read as a real measurement of an empty search.
+/// * a key **present but empty** (`[]`) means a run recorded and found nothing.
+///   The report says `recorded: true` with the honest zero stats, so an empty
+///   search and an unrecorded one never render the same.
+///
+/// Returns `Err` only when a present key does not deserialize into tactic
+/// sequences, since that is a malformed request rather than an absence of data.
+pub fn report(request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    use anyhow::Context as _;
+
+    // `proofs`: the flat bag for length + diversity telemetry.
+    let proofs_section = match request.get("proofs") {
+        None => serde_json::json!({ "recorded": false }),
+        Some(value) => {
+            let proofs: Vec<Vec<String>> = serde_json::from_value(value.clone())
+                .context("`proofs` must be an array of tactic sequences (arrays of strings)")?;
+            serde_json::json!({
+                "recorded": true,
+                "length_stats": stats_to_json(&proof_length_stats(&proofs)),
+                "diversity": diversity_to_json(&diversity(&proofs)),
+            })
+        }
+    };
+
+    // `rounds`: per-round length stats for the deepening trend.
+    let rounds_section = match request.get("rounds") {
+        None => serde_json::json!({ "recorded": false }),
+        Some(value) => {
+            let rounds: Vec<Vec<Vec<String>>> = serde_json::from_value(value.clone())
+                .context("`rounds` must be an array of round bags (arrays of tactic sequences)")?;
+            let per_round: Vec<serde_json::Value> =
+                round_over_round(&rounds).iter().map(stats_to_json).collect();
+            serde_json::json!({
+                "recorded": true,
+                "rounds": per_round.len(),
+                "per_round_length_stats": per_round,
+            })
+        }
+    };
+
+    Ok(serde_json::json!({
+        "proofs": proofs_section,
+        "rounds": rounds_section,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,6 +518,79 @@ mod tests {
         let stats = round_over_round(&rounds);
         assert_eq!(stats[0], ProofStats::empty());
         assert_eq!(stats[1].count, 1);
+    }
+
+    // ---- report (CLI entry point) --------------------------------------------
+
+    /// A request carrying a proof bag reports length stats and diversity, and its
+    /// numbers match a direct call on the same bag.
+    #[test]
+    fn report_computes_proof_telemetry_from_a_bag() {
+        let bag = vec![proof(&["intro", "simp"]), proof(&["intro", "ring", "omega"])];
+        let request = serde_json::json!({
+            "proofs": [["intro", "simp"], ["intro", "ring", "omega"]],
+        });
+        let out = report(&request).unwrap();
+
+        assert_eq!(out["proofs"]["recorded"], true);
+        let stats = proof_length_stats(&bag);
+        assert_eq!(out["proofs"]["length_stats"]["count"], stats.count);
+        assert_eq!(out["proofs"]["length_stats"]["max_length"], stats.max_length);
+        let div = diversity(&bag);
+        assert_eq!(
+            out["proofs"]["diversity"]["distinct_tactics"],
+            div.distinct_tactics
+        );
+        // No rounds key supplied: that section is honestly not recorded.
+        assert_eq!(out["rounds"]["recorded"], false);
+    }
+
+    /// An ABSENT `proofs` key means telemetry was never recorded, and must NOT
+    /// render as a zero-count measurement of an empty search.
+    #[test]
+    fn report_absent_key_is_not_recorded_not_zero() {
+        let out = report(&serde_json::json!({})).unwrap();
+        assert_eq!(out["proofs"]["recorded"], false);
+        assert_eq!(out["rounds"]["recorded"], false);
+        // Crucially, no stats block that could be misread as "measured, all zero".
+        assert!(out["proofs"].get("length_stats").is_none());
+    }
+
+    /// A PRESENT-but-empty `proofs` bag is recorded: a search that found nothing
+    /// reports honest zero stats, distinct from the absent case above.
+    #[test]
+    fn report_empty_bag_is_recorded_with_zero_stats() {
+        let out = report(&serde_json::json!({ "proofs": [] })).unwrap();
+        assert_eq!(out["proofs"]["recorded"], true);
+        assert_eq!(out["proofs"]["length_stats"]["count"], 0);
+        // Empty bag => diversity distinct_ratio 0.0 (matches DiversityReport::empty).
+        assert_eq!(out["proofs"]["diversity"]["distinct_ratio"], 0.0);
+    }
+
+    /// Rounds report per-round stats parallel to the input rounds.
+    #[test]
+    fn report_rounds_give_per_round_stats() {
+        let request = serde_json::json!({
+            "rounds": [
+                [["t"], ["t"]],
+                [["t", "t"], ["t", "t"]],
+            ],
+        });
+        let out = report(&request).unwrap();
+        assert_eq!(out["rounds"]["recorded"], true);
+        assert_eq!(out["rounds"]["rounds"], 2);
+        let per = out["rounds"]["per_round_length_stats"].as_array().unwrap();
+        assert_eq!(per.len(), 2);
+        assert_eq!(per[0]["mean_length"], 1.0);
+        assert_eq!(per[1]["mean_length"], 2.0);
+    }
+
+    /// A malformed present key is a request error, not a silent absence.
+    #[test]
+    fn report_malformed_proofs_is_an_error() {
+        // `proofs` must be an array of arrays of strings, not numbers.
+        let request = serde_json::json!({ "proofs": [1, 2, 3] });
+        assert!(report(&request).is_err());
     }
 
     // ---- determinism ---------------------------------------------------------
