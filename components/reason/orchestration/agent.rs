@@ -1957,7 +1957,10 @@ mod tests {
         agent
             .formalize_once(&node, 0, goal_states)
             .unwrap();
-        provider.0.borrow().clone().expect("request recorded")
+        // Bound to a local first: as a tail expression the `Ref` temporary would
+        // outlive `provider` and fail to borrow-check.
+        let recorded = provider.0.borrow().clone();
+        recorded.expect("request recorded")
     }
 
     #[test]
