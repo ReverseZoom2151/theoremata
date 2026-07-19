@@ -671,10 +671,10 @@ mod tests {
         let run = BlueprintRun::from_tex(chain_tex()).unwrap();
         run.drive(&adapter).unwrap();
 
-        // Every proposition the generator saw is exactly the item's clean
-        // statement — no "-- Available" comment lines, no dependency bodies.
+        // A failed live verification blocks dependencies. The independent
+        // first item still reaches the generator with its clean statement.
         let seen = subgoals.borrow();
-        assert_eq!(seen.as_slice(), &["A holds.", "B holds.", "C holds."]);
+        assert_eq!(seen.as_slice(), &["A holds."]);
         assert!(
             seen.iter().all(|s| !s.contains("Available") && !s.contains("--")),
             "context leaked into the goal proposition: {seen:?}"
@@ -701,9 +701,10 @@ mod tests {
         let run = BlueprintRun::from_tex(chain_tex()).unwrap();
         let report = run.drive(&adapter).unwrap();
 
-        // Every item drove through sketch → splice → certification and passed.
-        assert_eq!(report.n_proved, 3, "all three certified offline");
-        assert!(report.fully_proved());
+        // Offline output is evidence only: without a live verifier, no item
+        // may be certified and dependent items are blocked fail-closed.
+        assert_eq!(report.n_proved, 0, "offline sketches cannot certify");
+        assert!(!report.fully_proved());
         assert_eq!(report.order, vec!["lem:a", "lem:b", "thm:c"]);
 
         // The sketch pipeline materialised obligation nodes on the proof-DAG.
