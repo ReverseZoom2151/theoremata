@@ -3,6 +3,7 @@
 pub mod attempt_run;
 pub mod axiom_audit;
 pub mod backends;
+pub mod error_feedback;
 pub mod formal;
 pub mod model;
 pub mod proof_job;
