@@ -529,6 +529,257 @@ pub fn saturate(
     }
 }
 
+// ---------------------------------------------------------------------------
+// CLI entry point
+// ---------------------------------------------------------------------------
+
+/// A caller-supplied forward rule, in the only shape a CLI can express: "when a
+/// known clause has conclusion `trigger`, the clauses in `emit` follow".
+///
+/// The engine's [`InferenceRule`] trait is injectable precisely so a rule set can
+/// come from outside; this is the data-driven instance used by [`saturate_spec`].
+/// The rules are **assumptions supplied by the caller**: nothing here checks that
+/// they are valid inferences in any calculus, which is a large part of why a run's
+/// output is never a proof (see [`SaturationSummary::needs_verification`]).
+pub struct RuleSpec {
+    name: String,
+    trigger: String,
+    emit: Vec<Clause>,
+    invertible: bool,
+}
+
+impl RuleSpec {
+    /// Parse `name : trigger => emit1 ; emit2`. A `*` prefix on the name marks the
+    /// rule invertible, so [`saturate`] folds it into a [`focus`] macro-step.
+    pub fn parse(spec: &str) -> anyhow::Result<RuleSpec> {
+        let (head, body) = spec
+            .split_once("=>")
+            .ok_or_else(|| anyhow::anyhow!("rule spec needs `=>`: {spec}"))?;
+        let (name, trigger) = head
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("rule spec needs `name : trigger`: {spec}"))?;
+        let name = name.trim();
+        let (invertible, name) = match name.strip_prefix('*') {
+            Some(rest) => (true, rest.trim()),
+            None => (false, name),
+        };
+        if name.is_empty() {
+            anyhow::bail!("rule spec has an empty name: {spec}");
+        }
+        let trigger = trigger.trim();
+        if trigger.is_empty() {
+            anyhow::bail!("rule spec has an empty trigger: {spec}");
+        }
+        let emit: Vec<Clause> = body
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(Clause::parse)
+            .collect();
+        if emit.is_empty() {
+            anyhow::bail!("rule spec emits nothing: {spec}");
+        }
+        Ok(RuleSpec {
+            name: name.to_string(),
+            trigger: trigger.to_string(),
+            emit,
+            invertible,
+        })
+    }
+}
+
+impl InferenceRule for RuleSpec {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn is_invertible(&self) -> bool {
+        self.invertible
+    }
+
+    fn apply(&self, premises: &[Clause]) -> Vec<Clause> {
+        if premises.iter().any(|p| p.conclusion() == self.trigger) {
+            self.emit.clone()
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+/// The JSON summary of a saturation run.
+///
+/// Every field that could be mistaken for a verification verdict is stated
+/// negatively on purpose: a forward derivation under caller-supplied rules is a
+/// *search outcome*, and nothing downstream may treat it as a checked proof.
+#[derive(Debug, serde::Serialize)]
+pub struct SaturationSummary {
+    pub project_id: String,
+    pub node_id: String,
+    pub evidence_id: String,
+    pub goal: String,
+    /// `"goal_derived"`, `"step_bound_reached"` or `"saturated"`.
+    pub outcome: String,
+    /// A stored clause subsumed the goal. This is a search hit, not a proof.
+    pub goal_derived: bool,
+    /// Always `false`: this engine checks nothing against a formal system.
+    pub verified: bool,
+    /// Always `true`: any derivation below must be re-checked by a prover backend
+    /// before it may be relied on.
+    pub needs_verification: bool,
+    /// The run stopped because `max_steps` was hit, so the search space was left
+    /// partly unexplored and no conclusion at all may be drawn from a miss.
+    pub hit_step_bound: bool,
+    /// The passive set emptied before the bound. Note this is *not* a proof that
+    /// the goal is underivable: it only means the caller's rule set derived
+    /// nothing further, and that rule set is not known to be complete for
+    /// anything.
+    pub saturated: bool,
+    pub steps: usize,
+    pub max_steps: usize,
+    pub max_clauses: usize,
+    pub macro_steps: usize,
+    pub derived_count: usize,
+    pub forward_subsumed: usize,
+    pub backward_subsumed: usize,
+    /// The derivation witness when `goal_derived`, as `rule | clause | premises`
+    /// lines. Unchecked.
+    pub derivation: Vec<String>,
+    pub caveats: Vec<String>,
+}
+
+/// Run forward saturation from textual axioms toward a textual goal under the
+/// caller's [`RuleSpec`] rule set, recording the outcome as node evidence.
+///
+/// Thin adapter over [`saturate`]: it parses the surface text, calls the engine
+/// unchanged, and reports the result. It never sets a node status, because a
+/// forward search hit is not a verification result and the graph's status field
+/// is reserved for things that are.
+pub fn saturate_spec(
+    store: &crate::db::Store,
+    project_id: &str,
+    node_id: &str,
+    axioms: &[String],
+    goal: &str,
+    rule_specs: &[String],
+    cfg: &SaturationConfig,
+) -> anyhow::Result<SaturationSummary> {
+    if goal.trim().is_empty() {
+        anyhow::bail!("goal clause is empty");
+    }
+    let parsed_axioms: Vec<Clause> = axioms
+        .iter()
+        .map(|a| a.trim())
+        .filter(|a| !a.is_empty())
+        .map(Clause::parse)
+        .collect();
+    let goal_clause = Clause::parse(goal);
+    let rules: Vec<Box<dyn InferenceRule>> = rule_specs
+        .iter()
+        .map(|s| RuleSpec::parse(s).map(|r| Box::new(r) as Box<dyn InferenceRule>))
+        .collect::<anyhow::Result<_>>()?;
+
+    let res = saturate(&parsed_axioms, &goal_clause, &rules, cfg);
+
+    let hit_step_bound = !res.proved && res.steps >= cfg.max_steps;
+    let saturated = !res.proved && !hit_step_bound;
+    let outcome = if res.proved {
+        "goal_derived"
+    } else if hit_step_bound {
+        "step_bound_reached"
+    } else {
+        "saturated"
+    };
+
+    let mut caveats = vec![
+        "search outcome only: no formal system checked this derivation".to_string(),
+        "the inference rules were supplied by the caller and were not validated"
+            .to_string(),
+    ];
+    if hit_step_bound {
+        caveats.push(format!(
+            "stopped at the max_steps bound ({}); the search was not exhaustive",
+            cfg.max_steps
+        ));
+    }
+    if saturated {
+        caveats.push(
+            "saturation exhausted this rule set, which is not a completeness claim: \
+             the goal may still be derivable under other rules"
+                .to_string(),
+        );
+    }
+    // The engine reports no flag for the store cap, so a run that silently stopped
+    // storing clauses is indistinguishable from one that did not. Say so rather
+    // than imply the cap was not reached.
+    caveats.push(format!(
+        "clauses may also have been dropped at the max_clauses cap ({}), which the \
+         engine does not report",
+        cfg.max_clauses
+    ));
+
+    let derivation: Vec<String> = res
+        .derivation
+        .as_ref()
+        .map(|steps| {
+            steps
+                .iter()
+                .map(|s| format!("{} | {} | {}", s.rule, s.clause, s.premises.join(" , ")))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let payload = serde_json::json!({
+        "goal": goal_clause.text(),
+        "outcome": outcome,
+        "goal_derived": res.proved,
+        "verified": false,
+        "needs_verification": true,
+        "hit_step_bound": hit_step_bound,
+        "saturated": saturated,
+        "steps": res.steps,
+        "max_steps": cfg.max_steps,
+        "max_clauses": cfg.max_clauses,
+        "macro_steps": res.macro_steps,
+        "derived_count": res.derived_count,
+        "forward_subsumed": res.forward_subsumed,
+        "backward_subsumed": res.backward_subsumed,
+        "derivation": derivation,
+        "caveats": caveats,
+    });
+    // Verdict is "unverified" even on a hit, so an evidence scan can never read a
+    // forward derivation as a pass.
+    let evidence_id = store.add_evidence(
+        project_id,
+        node_id,
+        "inverse_method_search",
+        "inverse_method",
+        "unverified",
+        payload,
+    )?;
+
+    Ok(SaturationSummary {
+        project_id: project_id.to_string(),
+        node_id: node_id.to_string(),
+        evidence_id,
+        goal: goal_clause.text().to_string(),
+        outcome: outcome.to_string(),
+        goal_derived: res.proved,
+        verified: false,
+        needs_verification: true,
+        hit_step_bound,
+        saturated,
+        steps: res.steps,
+        max_steps: cfg.max_steps,
+        max_clauses: cfg.max_clauses,
+        macro_steps: res.macro_steps,
+        derived_count: res.derived_count,
+        forward_subsumed: res.forward_subsumed,
+        backward_subsumed: res.backward_subsumed,
+        derivation,
+        caveats,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,5 +1014,141 @@ mod tests {
         assert_eq!(r1.derived_count, r2.derived_count);
         assert_eq!(r1.subsumed_count, r2.subsumed_count);
         assert_eq!(r1.derivation, r2.derivation);
+    }
+
+    // ---- entry point ----
+
+    use crate::db::Store;
+    use crate::model::{NodeKind, NodeTier};
+    use std::path::Path;
+
+    /// An in-memory store with one project and one node to hang evidence on.
+    fn fixture() -> (Store, String, String) {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "a toy claim").unwrap();
+        let node = store
+            .add_node_detailed(
+                &project.id,
+                NodeKind::Conjecture,
+                NodeTier::Spine,
+                None,
+                "target",
+                "goal",
+                None,
+                &[],
+                "test",
+            )
+            .unwrap();
+        (store, project.id, node.id)
+    }
+
+    #[test]
+    fn rule_spec_parses_name_trigger_and_invertibility() {
+        let r = RuleSpec::parse("* step : a => ⊢ b ; ⊢ c").unwrap();
+        assert_eq!(r.name(), "step");
+        assert!(r.is_invertible());
+        let fired = r.apply(&[Clause::parse("⊢ a")]);
+        assert_eq!(fired.len(), 2);
+        // Not triggered by an unrelated conclusion.
+        assert!(r.apply(&[Clause::parse("⊢ z")]).is_empty());
+        assert!(RuleSpec::parse("no arrow here").is_err());
+        assert!(RuleSpec::parse("r : a =>").is_err());
+    }
+
+    #[test]
+    fn entry_point_reports_a_hit_as_unverified_with_a_derivation() {
+        let (store, project, node) = fixture();
+        let summary = saturate_spec(
+            &store,
+            &project,
+            &node,
+            &["⊢ a".to_string()],
+            "⊢ goal",
+            &[
+                "r1 : a => ⊢ b".to_string(),
+                "r2 : b => ⊢ goal".to_string(),
+            ],
+            &cfg(),
+        )
+        .unwrap();
+        assert!(summary.goal_derived);
+        assert_eq!(summary.outcome, "goal_derived");
+        // A hit must never present itself as checked.
+        assert!(!summary.verified);
+        assert!(summary.needs_verification);
+        assert!(!summary.derivation.is_empty());
+        assert!(!summary.hit_step_bound);
+
+        // Evidence is recorded against the node with an unverified verdict.
+        let evidence = store.evidence(&project, &node).unwrap();
+        let row = evidence
+            .iter()
+            .find(|e| e.evidence_type == "inverse_method_search")
+            .expect("the run must be recorded");
+        assert_eq!(row.verdict, "unverified");
+        assert_eq!(row.payload["verified"], serde_json::json!(false));
+        assert_eq!(row.payload["needs_verification"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn entry_point_distinguishes_a_bound_stop_from_saturation() {
+        let (store, project, node) = fixture();
+        // No rule fires, so the passive set empties: saturated, not bounded out.
+        let saturated = saturate_spec(
+            &store,
+            &project,
+            &node,
+            &["⊢ a".to_string()],
+            "⊢ goal",
+            &["r : zzz => ⊢ nope".to_string()],
+            &cfg(),
+        )
+        .unwrap();
+        assert!(!saturated.goal_derived);
+        assert_eq!(saturated.outcome, "saturated");
+        assert!(saturated.saturated);
+        assert!(!saturated.hit_step_bound);
+        // Saturation must still refuse to claim anything.
+        assert!(saturated
+            .caveats
+            .iter()
+            .any(|c| c.contains("not a completeness claim")));
+
+        // A one-step budget on an endlessly generating rule set stops at the bound.
+        let bounded = saturate_spec(
+            &store,
+            &project,
+            &node,
+            &["⊢ a".to_string()],
+            "⊢ goal",
+            &["r : a => ⊢ b".to_string(), "r2 : b => ⊢ c".to_string()],
+            &SaturationConfig {
+                max_steps: 1,
+                ..cfg()
+            },
+        )
+        .unwrap();
+        assert!(!bounded.goal_derived);
+        assert_eq!(bounded.outcome, "step_bound_reached");
+        assert!(bounded.hit_step_bound);
+        assert!(!bounded.saturated);
+        assert!(bounded.derivation.is_empty());
+        assert!(bounded.caveats.iter().any(|c| c.contains("max_steps")));
+    }
+
+    #[test]
+    fn entry_point_rejects_malformed_input() {
+        let (store, project, node) = fixture();
+        assert!(saturate_spec(&store, &project, &node, &[], "  ", &[], &cfg()).is_err());
+        assert!(saturate_spec(
+            &store,
+            &project,
+            &node,
+            &["⊢ a".to_string()],
+            "⊢ goal",
+            &["broken".to_string()],
+            &cfg()
+        )
+        .is_err());
     }
 }
