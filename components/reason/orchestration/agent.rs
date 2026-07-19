@@ -1245,10 +1245,27 @@ impl AgentLoop<'_> {
     ) -> Result<()> {
         let validator = ToolStatementValidator::new(self.config);
         self.validate_statement(&validator, project_id, Some(run), node_id, informal, formal)?;
-        // Second, independent screen: the statement-VALIDITY filter stack. No
-        // seams are wired here yet, so every check reports `Skipped` and the
-        // verdict is `Indeterminate` — behavior-preserving by construction.
-        let screen = StatementValidity::default();
+        // Second, independent screen: the statement-VALIDITY filter stack.
+        //
+        // Two of the three seams are wired: a multi-sample model judge and the
+        // negation prover backed by the existing falsifier. Both need only
+        // `self.provider`. The TRIVIALITY seam is deliberately left unwired here:
+        // `BackendCheapProof` needs a `&dyn FormalBackend`, and this function has
+        // no `FormalSystem` in scope — screening (say) a Rocq statement against a
+        // Lean backend would fail to compile, report NotProved, and silently pass
+        // the check, which is a false negative dressed up as a result. Threading
+        // the system through the three call sites is the follow-up.
+        //
+        // Still record-only: `screen_statement_validity` persists the verdict and
+        // never gates, and the whole stage is behind `config.validate_statements`.
+        let judge = crate::validity_seams::ModelJudge::new(self.provider);
+        let falsifier = crate::falsification::Falsifier {
+            provider: self.provider,
+        };
+        let negation = crate::validity_seams::FalsifierNegation::new(&falsifier);
+        let screen = StatementValidity::default()
+            .with_judge(&judge)
+            .with_negation_prover(&negation);
         self.screen_statement_validity(
             &screen,
             project_id,
