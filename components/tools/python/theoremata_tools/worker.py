@@ -656,6 +656,32 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.difficulty import run as difficulty_run
 
         return difficulty_run(request["request"])
+    # Wolfram tools are UNTRUSTED ORACLES, kept in their own block and
+    # deliberately away from the `cert_*` arms above so no reader mistakes them
+    # for a certification path. Nothing here certifies: wolfram_link/wolfram_alpha
+    # return raw oracle output marked untrusted, wolfram_falsify only ever emits a
+    # refutation it rechecked itself, and wolfram_cert emits a `cert` only when one
+    # of the existing independent checkers accepted the document on that run.
+    # Imports stay lazy like the surrounding arms so a machine without sympy or
+    # without the wolfram modules still loads the worker.
+    if tool == "wolfram_link":
+        from theoremata_tools.wolfram_link import run as wolfram_link_run
+
+        return wolfram_link_run(request)
+    if tool == "wolfram_alpha":
+        from theoremata_tools.wolfram_alpha import run as wolfram_alpha_run
+
+        return wolfram_alpha_run(request)
+    if tool == "wolfram_falsify":
+        from theoremata_tools.wolfram_falsify import run as wolfram_falsify_run
+
+        return wolfram_falsify_run(request)
+    if tool == "wolfram_cert":
+        # Lives under components/verify/python, resolved through the shared
+        # `theoremata_tools` namespace package rather than a relative import.
+        from theoremata_tools.wolfram_cert import run as wolfram_cert_run
+
+        return wolfram_cert_run(request)
     raise ValueError(f"unknown tool: {tool}")
 
 
