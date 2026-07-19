@@ -5,6 +5,10 @@ description = "Deterministic mathematical workers for Theoremata (split across c
 requires-python = ">=3.11"
 dependencies = ["sympy>=1.13", "litellm>=1.0"]
 
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
 # Optional accelerators. Every one is a soft, runtime-gated import: the workers
@@ -20,15 +24,13 @@ all = [
     "scikit-learn>=1.3",
 ]
 
-# The importable code is the PEP-420 namespace package `theoremata_tools`, split
-# across `components/*/python/theoremata_tools/`, and is resolved from the source
-# tree by the root `conftest.py` (which puts each `components/*/python` on
-# sys.path) — it is NOT built into a single wheel. So `pip install -e .` installs
-# only this project's DEPENDENCIES; declare no packages/modules to build, which
-# also stops setuptools from trying to auto-discover the top-level `app/`,
-# `assets/`, `components/` dirs (the "Multiple top-level packages" error).
+# The importable code is split across component roots. The custom ``build_py``
+# hook in ``setup.py`` assembles those fragments into one installable package
+# instead of relying on the test-only ``conftest.py`` sys.path mutation.
 [tool.setuptools]
-py-modules = []
+include-package-data = true
+packages = ["theoremata_tools"]
+package-dir = {theoremata_tools = "python_src/theoremata_tools"}
 
 [tool.pytest.ini_options]
 testpaths = ["components"]
