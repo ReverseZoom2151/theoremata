@@ -126,11 +126,26 @@ def _line_starts(text: str) -> list[int]:
 def check(text: str) -> dict[str, Any]:
     """Scan a Lean source string for soundness violations.
 
-    Returns ``{"clean": bool, "issues": [...]}`` where each issue is
-    ``{"severity": "critical"|"info", "kind": str, "line": int, "column": int,
-    ...}`` (placeholders carry ``"token"``; declarations carry ``"name"``).
-    ``clean`` is True iff there are zero ``critical`` issues. Line numbers are
-    1-based; columns are 0-based offsets from the start of the line.
+    Returns ``{"pregate_clean": bool, "sufficient": False, "clean": bool,
+    "issues": [...]}`` where each issue is ``{"severity": "critical"|"info",
+    "kind": str, "line": int, "column": int, ...}`` (placeholders carry
+    ``"token"``; declarations carry ``"name"``). Line numbers are 1-based;
+    columns are 0-based offsets from the start of the line.
+
+    ``pregate_clean`` is True iff there are zero ``critical`` issues. The name
+    is deliberately not ``clean``: this check shares an MCP surface with the
+    authoritative ``check_axioms`` (``#print axioms`` over the transitive
+    closure), and a bare ``clean`` invited callers to read a purely lexical,
+    fail-open result as a soundness verdict. It is not one — a ``sorry``
+    synthesised by a macro or inherited through an ``import`` is invisible
+    here, so ``pregate_clean: true`` is *necessary, not sufficient*. The
+    constant ``sufficient: False`` states that on the wire, for consumers that
+    never read the docstring.
+
+    ``clean`` is retained as a deprecated alias of ``pregate_clean`` so that no
+    consumer outside this package can silently read ``None`` and mis-gate
+    (``theoremata soundness`` prints this payload verbatim to callers we do not
+    control). New consumers must read ``pregate_clean``.
     """
     masked = mask_comments_and_strings(text)
     starts = _line_starts(masked)
@@ -176,8 +191,15 @@ def check(text: str) -> dict[str, Any]:
         })
 
     issues.sort(key=lambda i: (i["line"], i["column"]))
-    clean = not any(i["severity"] == "critical" for i in issues)
-    return {"clean": clean, "issues": issues}
+    pregate_clean = not any(i["severity"] == "critical" for i in issues)
+    return {
+        "pregate_clean": pregate_clean,
+        # Never true: a lexical scan cannot discharge the soundness question.
+        "sufficient": False,
+        # Deprecated alias of `pregate_clean`; see the docstring.
+        "clean": pregate_clean,
+        "issues": issues,
+    }
 
 
 def main() -> None:
@@ -188,7 +210,7 @@ def main() -> None:
         text = sys.stdin.read()
     result = check(text)
     print(json.dumps(result, indent=2))
-    raise SystemExit(0 if result["clean"] else 1)
+    raise SystemExit(0 if result["pregate_clean"] else 1)
 
 
 if __name__ == "__main__":
