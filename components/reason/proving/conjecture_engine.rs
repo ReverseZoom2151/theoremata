@@ -45,6 +45,7 @@ use crate::library::{Lemma, LemmaLibrary};
 use crate::model::ModelRequest;
 use crate::portfolio::{portfolio_prove, PortfolioResult};
 use crate::provider::ModelProvider;
+use crate::symmetry_dedup::{dedup_candidates, SymmetryGroup};
 use anyhow::Result;
 use serde_json::json;
 
@@ -164,6 +165,12 @@ pub struct ConjectureReport {
     pub rounds: usize,
     /// Candidates the proposer produced across all rounds.
     pub n_proposed: usize,
+    /// Candidates set aside as exact duplicates of an earlier candidate in the
+    /// same round's batch, before any falsify/prove effort was spent on them. A
+    /// pure efficiency screen: these are never counted as refuted, failed, proved
+    /// or subsumed, and the survivor they collapsed onto is still processed
+    /// normally. Additive field, so existing counters keep their exact meaning.
+    pub n_deduped: usize,
     /// Candidates dropped by the falsify-first screen (a counterexample found).
     pub n_refuted: usize,
     /// Survivors the prover proved.
@@ -240,6 +247,30 @@ impl<'a, P: Proposer, V: Prover, F: Falsifier> ConjectureEngine<'a, P, V, F> {
             }
             report.rounds = round + 1;
             report.n_proposed += batch.len();
+
+            // Dedup BEFORE the expensive falsify/prove step: never pay twice to
+            // decide the same conjecture. We use the EMPTY symmetry group on the
+            // conjecture's statement string, which makes `dedup_candidates`
+            // degrade to exact statement-string equality (identical statements
+            // only). That is the one equivalence sound to assert here: in
+            // verification software a wrong symmetry generator could merge two
+            // genuinely different conjectures and set aside the one that would
+            // have graduated, whereas identical statement strings are provably the
+            // same proof obligation. Anything cleverer (variable relabelling,
+            // reflections) is NOT justified for arbitrary goal strings, so we
+            // deliberately do not supply generators. Graduation's own subsumption
+            // dedup in the library is untouched; this is only an upstream screen.
+            let outcome = dedup_candidates(
+                batch,
+                &SymmetryGroup::<String>::new(),
+                |c: &Conjecture| c.statement.clone(),
+                |c: &Conjecture| c.provenance.clone(),
+            );
+            // Surface the count so no candidate is silently discarded: the deduper
+            // retains every dropped candidate in `outcome.dropped` (recoverable),
+            // and we fold its size into the report.
+            report.n_deduped += outcome.report.dropped_count;
+            let batch = outcome.into_kept();
 
             for conjecture in &batch {
                 // Falsify FIRST: a refuted candidate is dropped before the prover
@@ -472,6 +503,7 @@ pub fn run(
         "model": provider.name(),
         "rounds": report.rounds,
         "n_proposed": report.n_proposed,
+        "n_deduped": report.n_deduped,
         "n_refuted": report.n_refuted,
         "n_proved": report.n_proved,
         "n_graduated": report.n_graduated,
@@ -679,6 +711,96 @@ mod tests {
         let report = engine.run(&pid).unwrap();
         assert_eq!(report.rounds, 1, "stopped as soon as the proposer emptied");
         assert_eq!(report.n_graduated, 1);
+    }
+
+    /// A prover that records every statement it is asked to prove, so a test can
+    /// assert an exact-duplicate candidate reached the prover only once.
+    struct CountingProver {
+        seen: std::cell::RefCell<Vec<String>>,
+    }
+    impl Prover for CountingProver {
+        fn attempt(&self, conjecture: &Conjecture, _premises: &[Lemma]) -> ProveOutcome {
+            self.seen.borrow_mut().push(conjecture.statement.clone());
+            ProveOutcome::proved("qed")
+        }
+    }
+
+    #[test]
+    fn exact_duplicate_in_batch_is_deduped_before_proving() {
+        // Two candidates with an identical statement string are the same proof
+        // obligation: the pre-prove dedup must drop the second so the prover is
+        // charged for it once, and the drop must be reported (not lost).
+        let (store, pid) = store_with_project();
+        let lib = LemmaLibrary::with_subsumption_dedup(&store, qed_verifier());
+        let prover = CountingProver {
+            seen: std::cell::RefCell::new(Vec::new()),
+        };
+        let proposer = ScriptedProposer {
+            rounds: vec![vec![
+                Conjecture::new("⊢ dup", "first"),
+                Conjecture::new("⊢ dup", "second"),
+                Conjecture::new("⊢ other", "third"),
+            ]],
+        };
+        let engine = ConjectureEngine::new(
+            lib,
+            proposer,
+            prover,
+            PatternFalsifier,
+            ConjectureConfig {
+                rounds: 1,
+                batch_size: 8,
+            },
+        );
+
+        let report = engine.run(&pid).unwrap();
+        assert_eq!(report.n_proposed, 3, "all three were proposed");
+        assert_eq!(report.n_deduped, 1, "the exact duplicate was set aside");
+        // The prover saw the duplicate statement exactly once, plus the distinct one.
+        let seen = engine.prover.seen.borrow();
+        assert_eq!(
+            seen.iter().filter(|s| s.as_str() == "⊢ dup").count(),
+            1,
+            "the prover is charged for the duplicate statement only once"
+        );
+        assert_eq!(seen.len(), 2, "prover ran on the two distinct statements");
+        // The survivor (first-seen provenance) is what graduated for that orbit.
+        let pool = engine.library().lemmas(&pid).unwrap();
+        let dup = pool.iter().find(|l| l.statement == "⊢ dup").unwrap();
+        assert_eq!(dup.provenance, "first", "the first member of the orbit survives");
+    }
+
+    #[test]
+    fn all_distinct_batch_is_untouched_by_the_dedup_screen() {
+        // Guard against a future over-eager equivalence: when every statement is
+        // distinct, the screen must drop NOTHING and leave every downstream count
+        // exactly as it was before this screen existed.
+        let (store, pid) = store_with_project();
+        let lib = LemmaLibrary::with_subsumption_dedup(&store, qed_verifier());
+        let proposer = ScriptedProposer {
+            rounds: vec![vec![
+                Conjecture::new("⊢ a", "s"),
+                Conjecture::new("⊢ b", "s"),
+                Conjecture::new("⊢ c", "s"),
+            ]],
+        };
+        let engine = ConjectureEngine::new(
+            lib,
+            proposer,
+            PatternProver,
+            PatternFalsifier,
+            ConjectureConfig {
+                rounds: 1,
+                batch_size: 8,
+            },
+        );
+
+        let report = engine.run(&pid).unwrap();
+        assert_eq!(report.n_deduped, 0, "nothing collapses when all are distinct");
+        assert_eq!(report.n_proposed, 3);
+        assert_eq!(report.n_proved, 3);
+        assert_eq!(report.n_graduated, 3);
+        assert_eq!(engine.library().lemmas(&pid).unwrap().len(), 3);
     }
 
     #[test]
