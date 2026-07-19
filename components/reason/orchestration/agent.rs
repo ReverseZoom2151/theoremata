@@ -846,8 +846,8 @@ impl AgentLoop<'_> {
         // compiler + axiom gate; the compiler is the acceptance predicate.
         let selection = sampling::best_of_n(
             n,
-            |_i| -> Result<Formalization> {
-                let lean = self.formalize_once(node)?;
+            |attempt| -> Result<Formalization> {
+                let lean = self.formalize_once(node, attempt)?;
                 let (compiles, axioms_clean) =
                     self.verify_source(&lean, extract_theorem(&lean).as_deref(), session)?;
                 Ok(Formalization {
@@ -1197,7 +1197,7 @@ impl AgentLoop<'_> {
         Ok(())
     }
 
-    fn formalize_once(&self, node: &Node) -> Result<String> {
+    fn formalize_once(&self, node: &Node, attempt: usize) -> Result<String> {
         let retrieval = node
             .suggested_lemmas
             .iter()
@@ -1232,7 +1232,18 @@ impl AgentLoop<'_> {
         // structured, versioned context used by newer model endpoints.
         request.context["statement"] = Value::String(node.statement.clone());
         request.context["node_id"] = Value::String(node.id.clone());
-        let response = self.provider.complete(&request)?;
+        let response = if let Some(plan) = self.config.model_routing_plan() {
+            crate::model_router::execute_with_fallback(
+                self.provider,
+                &request,
+                &plan,
+                node_model_difficulty(node),
+                attempt,
+            )?
+            .response
+        } else {
+            self.provider.complete(&request)?
+        };
         Ok(response.content["lean"]
             .as_str()
             .context("missing lean")?
@@ -1509,6 +1520,17 @@ fn screen_node_input(guardrails: &Guardrails, node: &Node) -> crate::guardrails:
     guardrails.screen_untrusted(&text)
 }
 
+/// Stable difficulty proxy for endpoint routing. Failed formalization samples
+/// supply attempt escalation; the node kind supplies the initial tier.
+fn node_model_difficulty(node: &Node) -> f64 {
+    match node.kind {
+        NodeKind::Computation | NodeKind::Evidence => 0.15,
+        NodeKind::Conjecture | NodeKind::Definition => 0.8,
+        NodeKind::Lemma | NodeKind::Obligation | NodeKind::FormalProof => 0.55,
+        _ => 0.35,
+    }
+}
+
 /// Persist full live-plan state as a run-scoped trace artifact. This is kept
 /// separate from plan history: history is cross-run strategy memory read into
 /// decomposition prompts, while these snapshots are execution telemetry.
@@ -1614,7 +1636,7 @@ mod tests {
         };
 
         assert_eq!(
-            agent.formalize_once(&node).unwrap(),
+            agent.formalize_once(&node, 0).unwrap(),
             "theorem t : True := trivial"
         );
         let request = provider.0.borrow().clone().expect("request recorded");
