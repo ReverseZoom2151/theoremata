@@ -7,6 +7,7 @@
 
 use crate::{
     config::Config,
+    context_assembly::{AssemblyInput, PromptAssembler, RetrievalItem},
     critic::Critic,
     db::Store,
     hardening,
@@ -69,6 +70,11 @@ struct Formalization {
     compiles: bool,
     axioms_clean: bool,
 }
+
+/// Per-call budget for Lean formalization prompts. The assembler keeps the
+/// theorem query and system invariants even when the surrounding context must
+/// be trimmed.
+const FORMALIZATION_PROMPT_BUDGET: usize = 12_000;
 
 impl AgentLoop<'_> {
     pub fn run(&self, project_id: &str) -> Result<AgentSummary> {
@@ -662,7 +668,7 @@ impl AgentLoop<'_> {
         let selection = sampling::best_of_n(
             n,
             |_i| -> Result<Formalization> {
-                let lean = self.formalize_once(&node.statement)?;
+                let lean = self.formalize_once(node)?;
                 let (compiles, axioms_clean) =
                     self.verify_source(&lean, extract_theorem(&lean).as_deref(), session)?;
                 Ok(Formalization {
@@ -1012,13 +1018,42 @@ impl AgentLoop<'_> {
         Ok(())
     }
 
-    fn formalize_once(&self, statement: &str) -> Result<String> {
-        let response = self.provider.complete(&ModelRequest {
-            role: "lean_formalizer".into(),
-            task: "Produce a complete, self-contained Lean 4 file proving the statement. Never use sorry, admit, axioms, or unsafe declarations.".into(),
-            context: json!({ "statement": statement }),
-            output_schema: json!({"type":"object","required":["lean"],"properties":{"lean":{"type":"string"}}}),
-        })?;
+    fn formalize_once(&self, node: &Node) -> Result<String> {
+        let retrieval = node
+            .suggested_lemmas
+            .iter()
+            .enumerate()
+            .map(|(index, lemma)| {
+                RetrievalItem::new(
+                    format!("lemma:{index}"),
+                    crate::guard::wrap_untrusted("retrieved_lemma", lemma),
+                    1.0 / (index + 1) as f64,
+                )
+            })
+            .collect();
+        let memory = node
+            .strategy_hint
+            .as_deref()
+            .map(|hint| vec![crate::guard::wrap_untrusted("strategy_hint", hint)])
+            .unwrap_or_default();
+        let assembled = PromptAssembler::new(FORMALIZATION_PROMPT_BUDGET).assemble(
+            &AssemblyInput::new("lean_formalizer", &node.statement)
+                .with_memory(memory)
+                .with_tools(vec![
+                    "Lean kernel compilation and axiom audit run after generation; output must be a complete proof file."
+                        .to_owned(),
+                ])
+                .with_retrieval(retrieval),
+        );
+        let mut request: ModelRequest = assembled.to_model_request(
+            "Produce a complete, self-contained Lean 4 file proving the statement. Never use sorry, admit, axioms, or unsafe declarations.",
+            json!({"type":"object","required":["lean"],"properties":{"lean":{"type":"string"}}}),
+        );
+        // Preserve the pre-assembler provider contract while adding the
+        // structured, versioned context used by newer model endpoints.
+        request.context["statement"] = Value::String(node.statement.clone());
+        request.context["node_id"] = Value::String(node.id.clone());
+        let response = self.provider.complete(&request)?;
         Ok(response.content["lean"]
             .as_str()
             .context("missing lean")?
@@ -1304,6 +1339,69 @@ mod tests {
         fn name(&self) -> &str {
             "command"
         }
+    }
+
+    struct RecordingProvider(std::cell::RefCell<Option<ModelRequest>>);
+    impl ModelProvider for RecordingProvider {
+        fn complete(&self, request: &ModelRequest) -> Result<ModelResponse> {
+            self.0.replace(Some(request.clone()));
+            Ok(ModelResponse {
+                content: json!({"lean":"theorem t : True := trivial"}),
+                model: "recording".into(),
+                provider: "recording".into(),
+            })
+        }
+
+        fn name(&self) -> &str {
+            "recording"
+        }
+    }
+
+    #[test]
+    fn formalize_once_assembles_versioned_bounded_context() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let config = Config::default();
+        let project = store.create_project("p", "True").unwrap();
+        let node = store
+            .add_node(&project.id, NodeKind::Lemma, "n", "True", "test")
+            .unwrap();
+        store
+            .set_suggested_lemmas(&project.id, &node.id, &["Nat.add_comm".into()], "test")
+            .unwrap();
+        store
+            .set_strategy_hint(&project.id, &node.id, Some("use induction"), "test")
+            .unwrap();
+        let node = store
+            .nodes(&project.id)
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == node.id)
+            .unwrap();
+        let provider = RecordingProvider(std::cell::RefCell::new(None));
+        let agent = AgentLoop {
+            store: &store,
+            config: &config,
+            provider: &provider,
+        };
+
+        assert_eq!(
+            agent.formalize_once(&node).unwrap(),
+            "theorem t : True := trivial"
+        );
+        let request = provider.0.borrow().clone().expect("request recorded");
+        assert_eq!(request.role, "lean_formalizer");
+        assert_eq!(request.context["statement"], "True");
+        assert_eq!(request.context["query"], "True");
+        assert_eq!(request.context["system_version"], "v1");
+        assert_eq!(request.context["budget"], FORMALIZATION_PROMPT_BUDGET);
+        assert_eq!(request.context["over_budget"], false);
+        assert!(request.context["system_invariants"]
+            .as_str()
+            .unwrap()
+            .contains("verification gate"));
+        assert!(request.context["sections"].as_array().unwrap().len() >= 5);
+        assert!(request.context.to_string().contains("Nat.add_comm"));
+        assert!(request.context.to_string().contains("use induction"));
     }
 
     #[test]
