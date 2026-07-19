@@ -637,7 +637,9 @@ impl GoalState for GraphGoal {
 
 /// A tactic edge in the goal graph: applying `tactic` (with weight `prior`) to the
 /// goal `from` yields the goal `to`.
-#[derive(Debug, Clone)]
+///
+/// `Deserialize` so a CLI dispatch arm can accept a goal graph as JSON.
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct GraphEdge {
     pub from: String,
     pub tactic: String,
