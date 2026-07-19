@@ -121,23 +121,65 @@ Ecosystem signals corroborate rather than contradict:
   `add/assoc`, no `comm`. No real mathematics has been formalized in Kind.
 
 The corpus question deserves hard numbers, since "is there anything to harvest"
-is the only reason a dead system would still be worth touching. `Kindex` at HEAD
-is 1,088 `.kind2` files, but the distribution is decisive:
+is the only reason a dead system would still be worth touching. Measured against
+the local checkout, `Kindex` is 1,088 `.kind2` files:
 
 | Namespace | `.kind2` files | What it is |
 |---|---:|---|
-| `Data/` | 713 | integers, strings, lists, IO — programming stdlib |
-| `Apps/` | 325 | application code, not mathematics |
-| `Math/` | **29** | actual mathematics |
-| `Prop/` | **15** | proposition formers |
-| `Trait/` | 6 | typeclass-style dictionaries |
+| `Data/` | 717 | stdlib — and where the actual theorems live |
+| `Apps/` | 325 | application code (322 of them the Kind compiler itself) |
+| `Math/` | 29 | algebraic structure records — proves almost nothing |
+| `Prop/` | 15 | the equality/logic kernel |
+| `Trait/` | 7 | typeclass-style dictionaries |
 
-So roughly **44 files of mathematical content**, and reading the paths shows it
-is the first two pages of an algebra textbook: `Math/Algebra/{Magma, Semigroup,
-Monoid, Group}`, a handful of laws (`left_identity`, `right_inverse`,
-`associativity`), and `Math/Relation/{Antisymmetric, TotalOrder}`. For
-calibration, mathlib4 is >200,000 theorems. There is nothing here to harvest as
-training or eval data.
+The namespace names mislead. `Math/Algebra/{Magma, Semigroup, Monoid, Group}` is
+26 files of **record declarations, type aliases, and one-line field
+projections** — not one of them proves anything, and the hierarchy stops dead at
+Group (no ring, no field, no module, no homomorphism). The whole `Math/` tree
+contains exactly **one** real proof: `Antisymmetric.to_Antisymmetric_alt`.
+
+The genuine mathematics is under `Data/`: `Nat.add.{assoc,comm,identity}`,
+`Nat.mul.{comm,distr}`, `Nat.Le.{transitive,antisymmetric}`, decidable equality,
+constructor injectivity/disjointness, `List.{concat.assoc, reverse.involutive,
+map.length}`, `String.concat.assoc`.
+
+Correct totals: **~56 files that state and discharge a proposition, ~85 proved
+statements, or 5.1% of the corpus.** The remaining 94.9% is executable code.
+
+Three things make it worse than the raw count suggests:
+
+- **The ceiling is `mul.comm` on unary naturals.** There is no ℤ, no ℚ, no ℝ, no
+  number theory beyond `mod`/`div`, no analysis, no combinatorics. `gcd`,
+  `lcm`, and `factorial` exist as functions with no theorems attached; `Prime`
+  is a record definition with no instance and no result about it.
+- **Eight axioms are formatted exactly like theorems.** Every file under
+  `Data/U120/` (`mod.is_less_than`, `shift_right.pass_or`, …) carries a
+  signature and doc comment with **no proof body**. They are postulates about
+  120-bit arithmetic, asserted and never discharged, syntactically
+  indistinguishable from proved results. Against ~85 real theorems that is ~9%
+  contamination that any naive extractor would ingest as ground truth.
+- **It does not typecheck as shipped.** Kindex's own README, frozen at the final
+  commit three years ago: *"Kindex is being reorganized right now (May 9,
+  2023)... many types will not type-check over the next few days."*
+
+There is also no tactic language — every proof is a hand-built term of
+`Equal.{refl, apply, chain, mirror, rewrite}` — so there is no signal here for
+tactic prediction, proof search, or premise selection, which are the three
+things we would actually want data for.
+
+`kindbook` (988 `.kind` files, the post-refactor syntax) is strictly worse: it
+**dropped the theorem layer entirely**. Only ~7 files state a proposition, all of
+them the equality kernel (`refl`, `sym`, `trans`, `subst`), with nothing built on
+top. What it has instead is 2,140 `#test:` ground-term assertions — checking
+`Nat/add #3 #4 == Nat/add #4 #3` is not proving commutativity. It is also
+**unlicensed**, hence all-rights-reserved.
+
+For calibration: mathlib4 is >200,000 theorems and miniF2F is 488 competition
+problems. Kindex is ~0.04% of mathlib4, and its ~85 statements are `a+b=b+a`
+and `rev(rev xs)=xs` rather than AMC/AIME problems. Nothing here is harvestable
+as training or eval data, and every statement in it already exists in mathlib4,
+Agda's stdlib, and Coq's stdlib, proved more generally in a syntax with orders
+of magnitude more training representation.
 - Type theory is self types with `Set` as the sole universe (no visible
   hierarchy), a single ~130KB Haskell implementation, no formal metatheory.
 
