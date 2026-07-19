@@ -83,14 +83,23 @@ actually proves is checked against the statement that was asked. See
 A compiler's exit code is never trusted on its own. Each backend declares how it
 signals success (a non-zero exit that is honest, or a required stdout sentinel
 plus a forbidden one), because a checker that reports success by exit status
-alone can be made to pass a proof it did not accept. This finding came out of the
-[Higher Order Co ecosystem audit](docs/resource-mining/new/higher-order-co.md):
-that ecosystem (HVM / Bend / Kind) was evaluated as a possible backend and
+alone can be made to pass a proof it did not accept. Every system also carries a
+`FoundationProfile` recording its logical foundation and trusted base, so the
+gate reasons about what it is actually trusting rather than treating all six
+alike.
+
+That exit-code discipline is one of several mechanisms adopted from the
+[Higher Order Co ecosystem audit](docs/resource-mining/new/higher-order-co.md).
+The dependency itself (HVM / Bend / Kind) was evaluated as a possible backend and
 deliberately NOT adopted, for licensing and because it could not enter the
-trusted path, but the exit-code lesson and a search-priority idea were worth
-keeping. Every system also carries a `FoundationProfile` recording its logical
-foundation and trusted base, so the gate reasons about what it is actually
-trusting rather than treating all six alike.
+trusted path; three of its ecosystem's systems return exit 0 even on failure,
+which is where the discipline above came from. What was worth keeping is the
+ideas, not the code: the per-backend success signal, a hash-consed "share rather
+than recompute" cache of already-verified subproofs (the sound form of HVM's
+sharing principle), an inline search-priority nudge on the proof frontier (the
+shape of HVM3's `CInc`/`CDec`), and advisory Agda `--interaction-json`
+diagnostics kept strictly separate from the pass/fail verdict. See
+[`docs/build-plan-hoc.md`](docs/build-plan-hoc.md) for the item-by-item plan.
 
 ### The six formal systems
 
@@ -183,6 +192,9 @@ log is the toolchain-gated upgrade.
   node, so a search hit can never be mistaken for a checked proof.
 - Negation-augmented search where a disproof competes for the same budget, AND/OR
   minimax selection, empirical sampled-action priors, and symmetry-orbit dedup.
+- An inline priority nudge the generator can emit alongside a tactic (the shape of
+  HVM3's `CInc`/`CDec`), folded into the frontier ordering so a producer's own
+  confidence steers the search without overriding the scorer.
 - First-order term rewriting primitives: true unification with occurs-check,
   LPO/KBO term orderings, and bounded Knuth-Bendix completion.
 - An informal-sketch to autoformalize-holes to splice pipeline: decompose a proof
@@ -199,9 +211,12 @@ log is the toolchain-gated upgrade.
   `unknown identifier` is resolved against a declaration index that separates
   "no such name" (abandon it) from "real but unimported" (add this import), and
   when a warm Lean REPL is running, the actual goal state at the error is
-  recovered from the elaboration infotree and attached to the feedback. The
-  lifted obligations always enter the graph unproved; a failed compile is never
-  read as evidence that any of them holds.
+  recovered from the elaboration infotree and attached to the feedback. Agda has
+  the parallel path: `--interaction-json` goals and errors are parsed as advisory
+  enrichment, deliberately kept out of the `agda --safe` pass/fail verdict so the
+  richer feedback can never soften the gate. The lifted obligations always enter
+  the graph unproved; a failed compile is never read as evidence that any of them
+  holds.
 - Proof minimization: a solved tactic sequence is shrunk to a shorter one that is
   RE-CHECKED against the gate, never merely guessed. A shrink is accepted only
   when it still verifies; otherwise the original stands.
@@ -218,6 +233,12 @@ log is the toolchain-gated upgrade.
   gate.
 - A global goal cache that reuses proofs across runs via subsumption, so a proof
   of a more-general goal discharges a more-specific one.
+- A hash-consed checker-result cache: once a sub-goal has cleared the gate, its
+  verdict is memoized on the full verification input (system, canonical statement,
+  ordered context, exact source, checker identity, gate policy) and not
+  re-verified across candidates that share it. This is the sound form of "share
+  rather than recompute": a verdict is reused only when every one of those fields
+  matches, so caching never launders a result across a changed premise or policy.
 
 **Retrieval**
 
