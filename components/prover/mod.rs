@@ -8,6 +8,7 @@ pub mod declaration_lookup;
 pub mod error_feedback;
 pub mod formal;
 pub mod hypothesis_audit;
+pub mod infotree;
 pub mod model;
 pub mod proof_job;
 pub mod proof_log;
