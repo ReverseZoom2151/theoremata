@@ -29,6 +29,11 @@
 //!   between the best-first side and the critic-guided-driver side from cheap goal
 //!   features. A [`super::ttc::TtcController`] is the intended caller (see the
 //!   wiring note on [`route`]).
+//! * [`run_alpha_sweep_search`] — the production entry point. It is the only item
+//!   here that talks to the outside world: it builds a model-backed scorer, runs
+//!   the sweep, optionally runs the minimizer behind a real
+//!   [`GateReplay`](crate::prover::session::replay::GateReplay), records a store
+//!   event, and returns a JSON summary. Everything below it stays pure.
 //! * [`run_split`] — a tiny driver-agnostic combinator that runs the best-first
 //!   side, then the MCGS side, on their respective budget shares and unions the
 //!   outcome. The MCGS side is passed in as a **closure seam** so this module
@@ -43,9 +48,24 @@
 //! into a [`BTreeSet`] so its enumeration is sorted and stable. Given the same
 //! scorer, root, alphas, and budget it returns byte-identical results.
 
-use super::best_first::{best_first_search, BestFirstConfig, BestFirstOutcome, TacticScorer};
+use super::best_first::{
+    best_first_search, BestFirstConfig, BestFirstOutcome, ExpanderScorer, TacticScorer,
+};
+use super::driver::{GoalState, TacticExpander, TacticStep};
 use super::minimize::MinimizeOutcome;
-use std::collections::BTreeSet;
+use crate::{
+    config::Config,
+    db::Store,
+    model::ModelRequest,
+    prover::{
+        formal::{backend_for, FormalBackend, FormalSystem},
+        session::replay::{self, GateReplay},
+    },
+    provider::ModelProvider,
+};
+use anyhow::{bail, Result};
+use serde_json::{json, Value};
+use std::collections::{BTreeSet, HashMap};
 
 // ---------------------------------------------------------------------------
 // Multi-alpha accumulative union (over the value-free best-first search)
@@ -413,6 +433,374 @@ where
         proof_tactics: Vec::new(),
         source: HybridSource::None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Production entry point: model-backed sweep, optionally gated by a real checker
+// ---------------------------------------------------------------------------
+
+/// Default alpha sweep when a caller supplies none: maximal depth penalty,
+/// the best-first default, and no depth penalty. Three passes that pop visibly
+/// different frontiers, which is the whole point of the union.
+pub const DEFAULT_ALPHAS: [f64; 3] = [0.0, 0.5, 1.0];
+
+/// Hard ceiling on model calls in one sweep. Each distinct goal state costs one
+/// provider round trip (results are memoized, so an alpha re-visiting a state is
+/// free), and a runaway search would otherwise bill an unbounded number of them.
+/// Hitting the cap turns further states into dead ends, which can only make the
+/// search report LESS than it otherwise would, never more, so it is safe. It is
+/// surfaced in the summary so a truncated run is never mistaken for an exhausted
+/// one.
+const MAX_MODEL_CALLS: usize = 64;
+
+/// A goal state in the model-driven search: the goal text (which doubles as the
+/// transposition key) plus the model's own claim about whether it is closed.
+///
+/// `closed` is a CLAIM, not a verdict. Nothing in this type has executed a
+/// tactic, so a `true` here means only "the proposer said this discharges the
+/// goal". That is exactly why the search output is a candidate and why the
+/// minimizer's gate is a separate, checker-backed component.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderGoal {
+    key: String,
+    closed: bool,
+}
+
+impl GoalState for ProviderGoal {
+    fn dedup_key(&self) -> String {
+        self.key.clone()
+    }
+    fn is_closed(&self) -> bool {
+        self.closed
+    }
+}
+
+/// A [`TacticExpander`] backed by a [`ModelProvider`]: ask the model for the next
+/// tactics from a goal, each with a prior and the goal text it claims results.
+///
+/// This is the same shape as [`crate::search::mcts::TacticMcts::propose_tactics`]
+/// (the established model-driven-search pattern in this codebase), extended with
+/// the resulting goal, because a *search* needs successor states and a flat tactic
+/// list does not provide them. Wrapping it in
+/// [`ExpanderScorer`](super::best_first::ExpanderScorer) turns the `[0,1]` priors
+/// into the log-probabilities best-first orders its frontier by, so no new scorer
+/// type is needed.
+///
+/// Not deterministic in the strict sense the rest of this module is: the provider
+/// is an external process. The memo makes it *consistent within one sweep* (a
+/// state is asked about exactly once, so every alpha pass sees the same edges out
+/// of it), which is what makes the union across alphas meaningful.
+pub struct ProviderExpander<'a> {
+    provider: &'a dyn ModelProvider,
+    /// The root statement, passed as context on every call so the proposer keeps
+    /// sight of what is ultimately being proved.
+    statement: String,
+    system: FormalSystem,
+    /// goal key -> the steps out of it. One provider call per distinct state.
+    memo: HashMap<String, Vec<TacticStep<ProviderGoal>>>,
+    /// Provider round trips actually made.
+    pub calls: usize,
+    /// Provider round trips that failed. A failure is a dead end, never a proof.
+    pub errors: usize,
+    /// Whether [`MAX_MODEL_CALLS`] cut the search short.
+    pub call_cap_hit: bool,
+}
+
+impl<'a> ProviderExpander<'a> {
+    pub fn new(provider: &'a dyn ModelProvider, statement: &str, system: FormalSystem) -> Self {
+        Self {
+            provider,
+            statement: statement.to_string(),
+            system,
+            memo: HashMap::new(),
+            calls: 0,
+            errors: 0,
+            call_cap_hit: false,
+        }
+    }
+
+    /// One provider round trip for `goal`. Errors and malformed responses become
+    /// an empty step list (a dead end), so a flaky model degrades the search
+    /// rather than corrupting it.
+    fn ask(&mut self, goal: &str) -> Vec<TacticStep<ProviderGoal>> {
+        let request = ModelRequest {
+            role: "tactic_step_proposer".into(),
+            task: format!(
+                "Propose the next candidate {} tactics for the current goal. For each, give a \
+                 prior weight in [0,1] (higher = more promising), the goal text that remains \
+                 after applying it, and whether it closes the goal outright. Order most \
+                 promising first.",
+                self.system.as_str()
+            ),
+            context: json!({
+                "statement": self.statement,
+                "goal": goal,
+                "system": self.system.as_str(),
+            }),
+            output_schema: json!({
+                "type": "object",
+                "required": ["steps"],
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["tactic", "weight", "next_goal", "closes_goal"],
+                            "properties": {
+                                "tactic": {"type": "string"},
+                                "weight": {"type": "number"},
+                                "next_goal": {"type": "string"},
+                                "closes_goal": {"type": "boolean"}
+                            }
+                        }
+                    }
+                }
+            }),
+        };
+        self.calls += 1;
+        let response = match self.provider.complete(&request) {
+            Ok(r) => r,
+            Err(_) => {
+                self.errors += 1;
+                return Vec::new();
+            }
+        };
+        let mut steps = Vec::new();
+        let Some(items) = response.content["steps"].as_array() else {
+            return steps;
+        };
+        for item in items {
+            let Some(tactic) = item["tactic"].as_str() else {
+                continue;
+            };
+            if tactic.trim().is_empty() {
+                continue;
+            }
+            let closed = item["closes_goal"].as_bool().unwrap_or(false);
+            let next_goal = item["next_goal"].as_str().unwrap_or("").trim().to_string();
+            // A closing step often has no residual goal text. Key it on the edge
+            // that produced it so two different closing tactics stay two states
+            // rather than collapsing onto one via an empty key.
+            let key = if next_goal.is_empty() {
+                format!("{goal}|{tactic}")
+            } else {
+                next_goal
+            };
+            let prior = item["weight"].as_f64().unwrap_or(0.5).clamp(0.0, 1.0);
+            steps.push(TacticStep::new(
+                tactic.to_string(),
+                prior,
+                ProviderGoal { key, closed },
+            ));
+        }
+        steps
+    }
+}
+
+impl TacticExpander for ProviderExpander<'_> {
+    type State = ProviderGoal;
+
+    fn expand(&mut self, state: &ProviderGoal, _seed: u64) -> Vec<TacticStep<ProviderGoal>> {
+        if let Some(hit) = self.memo.get(&state.key) {
+            return hit.clone();
+        }
+        if self.calls >= MAX_MODEL_CALLS {
+            self.call_cap_hit = true;
+            return Vec::new();
+        }
+        let steps = self.ask(&state.key);
+        self.memo.insert(state.key.clone(), steps.clone());
+        steps
+    }
+}
+
+/// Run the multi-alpha sweep over a model-backed scorer and, when `minimize` is
+/// set AND a live checker exists, shrink the winning line behind a real
+/// [`GateReplay`]. Returns a JSON summary and records a `hybrid_search.swept`
+/// store event.
+///
+/// # What the result means
+///
+/// The sweep itself proves NOTHING. Its "solved" means the proposer's own claimed
+/// successor chain reached a state the proposer marked closed; no formal system
+/// was consulted. That is why `formally_verified` is `false` and `status` is
+/// `"candidate"` for every run in which the gate did not accept something.
+///
+/// When the gate DOES accept, the claim is precise and it is not nothing:
+/// [`GateReplay`] assembled that exact tactic sequence into a source file under
+/// this statement and ran the full [`crate::prover::formal::FormalBackend::verify`]
+/// gate over it (compile, axiom whitelist, kernel re-check, source scan, statement
+/// preservation) on a live, non-mock backend. So `verified_tactics` is a checked
+/// proof of `statement` in `system`, and only that field ever is. The sweep's own
+/// `candidate_tactics` stays a candidate even then, because it is a different
+/// (longer) sequence that was never submitted to the checker.
+///
+/// # "Did not run" is not "was rejected"
+///
+/// `GateReplay` refuses every sequence when it has no evidence: mock backend,
+/// missing toolchain, unassemblable statement. Reporting that as a rejection would
+/// slander a possibly-correct shrink and would read as a search failure. So this
+/// function probes the backend FIRST and, with no live checker, never constructs
+/// the gate at all: `minimization.ran` is `false` and `skipped_reason` says which
+/// precondition was missing. `minimization.status` is populated only when the gate
+/// really ran, and `"rejected_by_gate"` therefore always means a live checker
+/// looked at the shrink and said no.
+///
+/// # Cost
+///
+/// Two separate expenses, both opt-in by the caller:
+/// * the sweep spends up to [`MAX_MODEL_CALLS`] provider round trips;
+/// * `minimize = true` additionally spends one real checker pass (a full compile)
+///   when the search solved and a live backend exists. Pass `false` for a
+///   model-only exploration.
+#[allow(clippy::too_many_arguments)]
+pub fn run_alpha_sweep_search(
+    store: &Store,
+    config: &Config,
+    provider: &dyn ModelProvider,
+    project_id: Option<&str>,
+    statement: &str,
+    system: FormalSystem,
+    alphas: &[f64],
+    per_alpha_budget: usize,
+    minimize: bool,
+) -> Result<Value> {
+    let statement = statement.trim();
+    if statement.is_empty() {
+        bail!("hybrid alpha sweep needs a non-empty statement");
+    }
+    let alphas: Vec<f64> = if alphas.is_empty() {
+        DEFAULT_ALPHAS.to_vec()
+    } else {
+        alphas.to_vec()
+    };
+    let budget = per_alpha_budget.max(1);
+
+    // Probe the backend before deciding whether the gate can mean anything. A
+    // mock or an absent toolchain is a MISSING PRECONDITION, not a verdict, so it
+    // must be detected here rather than inferred from a refusal downstream.
+    let backend = backend_for(config, system, config.prover_mock);
+    let checker_live = !backend.is_mock() && backend.available();
+    drop(backend);
+
+    let root = ProviderGoal {
+        key: statement.to_string(),
+        closed: false,
+    };
+    let mut scorer = ExpanderScorer(ProviderExpander::new(provider, statement, system));
+
+    // `skipped_reason` is set on every path that does not run the gate, so the
+    // summary can always say WHY rather than leaving a reader to guess.
+    let (outcome, minimized, mut skipped_reason) = if !minimize {
+        (
+            multi_alpha_union(&mut scorer, root, &alphas, budget),
+            None,
+            Some("not_requested"),
+        )
+    } else if !checker_live {
+        (
+            multi_alpha_union(&mut scorer, root, &alphas, budget),
+            None,
+            Some("no_live_checker"),
+        )
+    } else {
+        let mut gate = GateReplay::for_system(config, system, statement);
+        let (outcome, minimized) = multi_alpha_union_minimized(
+            &mut scorer,
+            root,
+            &alphas,
+            budget,
+            replay::as_closure(&mut gate),
+        );
+        // `None` here means the sweep never solved, so there was no arena to
+        // shrink and the gate was deliberately never consulted.
+        let reason = minimized.is_none().then_some("search_found_no_proof");
+        (outcome, minimized, reason)
+    };
+
+    let gate_ran = minimized.is_some();
+    if gate_ran {
+        skipped_reason = None;
+    }
+    let accepted = minimized.as_ref().and_then(|m| m.accepted.clone());
+    let formally_verified = accepted.is_some();
+
+    let runs: Vec<Value> = outcome
+        .runs
+        .iter()
+        .map(|r| {
+            json!({
+                "alpha": r.alpha,
+                "solved": r.solved,
+                "steps": r.steps,
+                "proof_len": r.proof_len,
+                "visited": r.visited,
+            })
+        })
+        .collect();
+
+    // Computed outside the `json!` so the fallible conversions are plain
+    // statements rather than `?` buried inside a macro argument.
+    let minimize_status = match &minimized {
+        Some(m) => serde_json::to_value(m.status)?,
+        None => Value::Null,
+    };
+    let minimize_report = match &minimized {
+        Some(m) => serde_json::to_value(&m.report)?,
+        None => Value::Null,
+    };
+    let minimization = json!({
+        "requested": minimize,
+        "checker_live": checker_live,
+        "ran": gate_ran,
+        "skipped_reason": skipped_reason,
+        "status": minimize_status,
+        "shrink_accepted": formally_verified,
+        "accepted_tactics": accepted.clone(),
+        "report": minimize_report,
+    });
+
+    let expander = &scorer.0;
+    let summary = json!({
+        "kind": "hybrid_alpha_sweep",
+        // These two keys are the guard against a reader promoting a model-driven
+        // search outcome to a proof. They flip only when the real gate accepted.
+        "status": if formally_verified { "gate_verified" } else { "candidate" },
+        "formally_verified": formally_verified,
+        "statement": statement,
+        "system": system.as_str(),
+        "alphas": alphas,
+        "per_alpha_budget": budget,
+        "solved": outcome.solved,
+        // Always a candidate: this is the proposer's own chain, unchecked.
+        "candidate_tactics": outcome.proof_tactics,
+        "best_alpha": outcome.best_alpha,
+        "union_coverage": outcome.union_keys.len(),
+        "runs": runs,
+        // The ONLY field that may be emitted as a proof, and only when non-null.
+        "verified_tactics": accepted,
+        "minimization": minimization,
+        "model": {
+            "provider": provider.name(),
+            "calls": expander.calls,
+            "errors": expander.errors,
+            "call_cap_hit": expander.call_cap_hit,
+        },
+        "note": "Search over model-proposed tactics and model-claimed successor \
+                 goals. 'solved' means the proposer's chain reached a state it \
+                 claimed closed; no formal system verified that. Only \
+                 'verified_tactics' (non-null) was re-checked by a live backend \
+                 through the full verify gate under this statement.",
+    });
+
+    store.event(
+        project_id,
+        None,
+        "hybrid_search.swept",
+        "hybrid_search",
+        summary.clone(),
+    )?;
+    Ok(summary)
 }
 
 #[cfg(test)]
@@ -830,5 +1218,291 @@ mod tests {
         );
         assert!(!bf_called.get(), "a zero-budget arm must not be invoked");
         assert_eq!(sol.source, HybridSource::Mcgs);
+    }
+
+    // ---- Production entry point ---------------------------------------------
+
+    use crate::model::ModelResponse;
+    use std::path::Path;
+
+    const STMT: &str = "theorem t : True";
+
+    /// A proposer that closes `STMT` in one step and knows nothing else. Enough
+    /// to drive a solving sweep with zero external dependencies.
+    struct ClosingProposer;
+    impl ModelProvider for ClosingProposer {
+        fn complete(&self, request: &ModelRequest) -> Result<ModelResponse> {
+            let goal = request.context["goal"].as_str().unwrap_or("");
+            let content = if goal == STMT {
+                json!({"steps":[
+                    {"tactic":"trivial","weight":0.9,"next_goal":"","closes_goal":true}
+                ]})
+            } else {
+                json!({"steps": []})
+            };
+            Ok(ModelResponse {
+                content,
+                model: "test".into(),
+                provider: "test".into(),
+            })
+        }
+        fn name(&self) -> &str {
+            "test"
+        }
+    }
+
+    /// A proposer that never closes anything: every goal is a dead end.
+    struct StuckProposer;
+    impl ModelProvider for StuckProposer {
+        fn complete(&self, _request: &ModelRequest) -> Result<ModelResponse> {
+            Ok(ModelResponse {
+                content: json!({"steps": []}),
+                model: "test".into(),
+                provider: "test".into(),
+            })
+        }
+        fn name(&self) -> &str {
+            "test"
+        }
+    }
+
+    fn memory_store() -> Store {
+        Store::open(Path::new(":memory:")).expect("in-memory store")
+    }
+
+    /// A config whose backend is a mock, so no test can ever depend on a Lean or
+    /// Rocq toolchain being installed on the host.
+    fn mocked_config() -> Config {
+        let mut cfg = Config::default();
+        cfg.prover_mock = true;
+        cfg
+    }
+
+    #[test]
+    fn entry_reports_a_candidate_not_a_proof() {
+        let store = memory_store();
+        let summary = run_alpha_sweep_search(
+            &store,
+            &mocked_config(),
+            &ClosingProposer,
+            None,
+            STMT,
+            FormalSystem::Lean,
+            &[0.0, 1.0],
+            20,
+            false,
+        )
+        .expect("the sweep runs offline");
+
+        assert_eq!(summary["solved"], true);
+        assert_eq!(summary["candidate_tactics"], json!(["trivial"]));
+        // The search closed a goal the MODEL called closed. That is a candidate.
+        assert_eq!(summary["status"], "candidate");
+        assert_eq!(summary["formally_verified"], false);
+        assert!(
+            summary["verified_tactics"].is_null(),
+            "nothing may be emittable as a proof without a gate verdict"
+        );
+        // The expensive path was not asked for, and says so.
+        assert_eq!(summary["minimization"]["ran"], false);
+        assert_eq!(summary["minimization"]["skipped_reason"], "not_requested");
+    }
+
+    #[test]
+    fn no_live_checker_reports_minimization_as_not_run_rather_than_rejected() {
+        // A mock backend makes GateReplay refuse everything BY DESIGN. That is a
+        // missing precondition, not a verdict on the shrink, and never a failure
+        // of the search, so the summary must not say "rejected".
+        let store = memory_store();
+        let summary = run_alpha_sweep_search(
+            &store,
+            &mocked_config(),
+            &ClosingProposer,
+            None,
+            STMT,
+            FormalSystem::Lean,
+            &[0.0],
+            20,
+            true,
+        )
+        .expect("a missing checker is not an error");
+
+        assert_eq!(summary["solved"], true, "the search itself still succeeded");
+        let m = &summary["minimization"];
+        assert_eq!(m["requested"], true);
+        assert_eq!(m["checker_live"], false);
+        assert_eq!(m["ran"], false);
+        assert_eq!(m["skipped_reason"], "no_live_checker");
+        assert!(
+            m["status"].is_null(),
+            "no gate ran, so there is no gate status to report"
+        );
+        assert_ne!(m["status"], "rejected_by_gate");
+        assert_eq!(m["shrink_accepted"], false);
+        assert!(m["accepted_tactics"].is_null());
+        assert_eq!(summary["formally_verified"], false);
+    }
+
+    #[test]
+    fn an_unsolved_sweep_is_reported_without_tactics() {
+        let store = memory_store();
+        let summary = run_alpha_sweep_search(
+            &store,
+            &mocked_config(),
+            &StuckProposer,
+            None,
+            STMT,
+            FormalSystem::Lean,
+            &[0.0, 0.5, 1.0],
+            10,
+            true,
+        )
+        .expect("an unsolved sweep is not an error");
+
+        assert_eq!(summary["solved"], false);
+        assert_eq!(summary["candidate_tactics"], json!([]));
+        assert!(summary["best_alpha"].is_null());
+        assert_eq!(summary["formally_verified"], false);
+        assert_eq!(summary["minimization"]["ran"], false);
+    }
+
+    #[test]
+    fn the_summary_shape_is_stable() {
+        let store = memory_store();
+        let summary = run_alpha_sweep_search(
+            &store,
+            &mocked_config(),
+            &ClosingProposer,
+            None,
+            STMT,
+            FormalSystem::Lean,
+            &[0.0, 1.0],
+            20,
+            true,
+        )
+        .expect("sweep runs");
+
+        for key in [
+            "kind",
+            "status",
+            "formally_verified",
+            "statement",
+            "system",
+            "alphas",
+            "per_alpha_budget",
+            "solved",
+            "candidate_tactics",
+            "best_alpha",
+            "union_coverage",
+            "runs",
+            "verified_tactics",
+            "minimization",
+            "model",
+            "note",
+        ] {
+            assert!(summary.get(key).is_some(), "summary must carry `{key}`");
+        }
+        assert_eq!(summary["kind"], "hybrid_alpha_sweep");
+        assert_eq!(summary["system"], "lean");
+        assert_eq!(summary["alphas"], json!([0.0, 1.0]));
+        assert_eq!(summary["runs"].as_array().unwrap().len(), 2);
+        for key in [
+            "requested",
+            "checker_live",
+            "ran",
+            "skipped_reason",
+            "status",
+            "shrink_accepted",
+            "accepted_tactics",
+            "report",
+        ] {
+            assert!(
+                summary["minimization"].get(key).is_some(),
+                "minimization must carry `{key}`"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_alpha_list_falls_back_to_the_default_sweep() {
+        let store = memory_store();
+        let summary = run_alpha_sweep_search(
+            &store,
+            &mocked_config(),
+            &ClosingProposer,
+            None,
+            STMT,
+            FormalSystem::Lean,
+            &[],
+            10,
+            false,
+        )
+        .expect("sweep runs");
+        assert_eq!(summary["alphas"], json!(DEFAULT_ALPHAS.to_vec()));
+    }
+
+    #[test]
+    fn an_empty_statement_is_rejected() {
+        let store = memory_store();
+        assert!(run_alpha_sweep_search(
+            &store,
+            &mocked_config(),
+            &ClosingProposer,
+            None,
+            "   ",
+            FormalSystem::Lean,
+            &[0.0],
+            10,
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn each_distinct_goal_costs_at_most_one_provider_call() {
+        // Three alpha passes revisit the same root. The memo must keep that at one
+        // round trip, both to bound spend and so every pass sees the same edges.
+        let mut expander = ProviderExpander::new(&ClosingProposer, STMT, FormalSystem::Lean);
+        let root = ProviderGoal {
+            key: STMT.to_string(),
+            closed: false,
+        };
+        for _ in 0..3 {
+            let steps = expander.expand(&root, 0);
+            assert_eq!(steps.len(), 1);
+            assert_eq!(steps[0].tactic, "trivial");
+            assert!(steps[0].next.is_closed(), "the model claimed a close");
+        }
+        assert_eq!(expander.calls, 1);
+        assert_eq!(expander.errors, 0);
+    }
+
+    #[test]
+    fn a_failing_provider_is_a_dead_end_not_a_proof() {
+        struct Failing;
+        impl ModelProvider for Failing {
+            fn complete(&self, _r: &ModelRequest) -> Result<ModelResponse> {
+                Err(anyhow::anyhow!("model unavailable"))
+            }
+            fn name(&self) -> &str {
+                "failing"
+            }
+        }
+        let store = memory_store();
+        let summary = run_alpha_sweep_search(
+            &store,
+            &mocked_config(),
+            &Failing,
+            None,
+            STMT,
+            FormalSystem::Lean,
+            &[0.0],
+            10,
+            true,
+        )
+        .expect("a model failure degrades the search, it does not abort it");
+        assert_eq!(summary["solved"], false);
+        assert_eq!(summary["formally_verified"], false);
+        assert!(summary["model"]["errors"].as_u64().unwrap() >= 1);
     }
 }
