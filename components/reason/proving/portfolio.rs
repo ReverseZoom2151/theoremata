@@ -8,8 +8,12 @@
 //! passes the verification gate. Mock/source-scan successes remain useful
 //! diagnostics, but are never certification.
 //!
-//! It is sequential and deterministic by default. An explicitly enabled owned
-//! verification stage can run already-generated candidates on worker threads;
+//! It is sequential and deterministic by default. Two stages are opt-in via the
+//! environment and off otherwise: a cheap refutation pre-filter
+//! (`THEOREMATA_PORTFOLIO_FAST_REFUTE`) that can skip the whole fan-out when the
+//! statement is provably false, and an owned verification stage
+//! (`THEOREMATA_PORTFOLIO_VERIFY_THREADS`) that can run already-generated
+//! candidates on worker threads;
 //! provider calls, database writes, result order, and winner selection remain
 //! deterministic on the caller thread. A system whose toolchain is absent
 //! contributes an `available: false` entry, and a system that errors out records
@@ -31,7 +35,7 @@ use crate::{
     provider::ModelProvider,
     verification_ladder::{
         CheapRung, KernelRung, KernelVerdict, LadderConfig, LadderOutcome, RefutationWitness,
-        RungBudget, RungVerdict, VerificationLadder,
+        RungBudget, RungConfig, RungVerdict, VerificationLadder,
     },
 };
 use anyhow::Result;
@@ -83,7 +87,13 @@ pub struct PortfolioResult {
     ///
     /// `None` on every default run: both cheap tiers are disabled by
     /// [`LadderConfig::default`], so this field is only ever populated when a
-    /// caller has explicitly opted in to pre-filtering.
+    /// caller has explicitly opted in to pre-filtering — either by setting
+    /// `THEOREMATA_PORTFOLIO_FAST_REFUTE` (see [`portfolio_ladder_config`]) or
+    /// by calling [`portfolio_prove_with_ladder`] with an enabled tier.
+    ///
+    /// **Shape note for consumers:** when this is `Some`, `per_system` is
+    /// EMPTY — not N entries marked unavailable. Code that assumes
+    /// `per_system.len() == systems.len()` must check `refutation` first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refutation: Option<RefutationWitness>,
 }
@@ -98,6 +108,12 @@ pub struct PortfolioResult {
 ///   decides whether it verified; mock source-scan results remain diagnostics.
 /// * A generation/backend error is recorded on the entry, not propagated — one
 ///   failing system never aborts the others.
+///
+/// The cheap pre-filter is **off** unless `THEOREMATA_PORTFOLIO_FAST_REFUTE` opts
+/// in (see [`portfolio_ladder_config`]); with it unset this is exactly the
+/// sequential portfolio and `refutation` is always `None`. When it IS enabled and
+/// the statement is refuted, `per_system` comes back EMPTY — see
+/// [`PortfolioResult::refutation`].
 pub fn portfolio_prove(
     store: &Store,
     config: &Config,
@@ -112,7 +128,7 @@ pub fn portfolio_prove(
         statement,
         systems,
         &[],
-        LadderConfig::default(),
+        portfolio_ladder_config(),
     )
 }
 
@@ -217,7 +233,17 @@ impl CheapRung<str> for FalsifierRung<'_> {
 /// With `ladder_config` at its default both cheap tiers are disabled, no rung is
 /// invoked (registration alone never enables a tier), and this is byte-identical
 /// to the sequential portfolio.
-fn portfolio_prove_with_ladder(
+///
+/// Callers that only want the environment's policy should use [`portfolio_prove`];
+/// this entry point exists for callers injecting their *own* tier-1 rungs (a
+/// domain-specific numeric sweep, an SMT probe) alongside the built-in falsifier.
+///
+/// # Result shape under a refutation
+///
+/// A refutation returns `per_system: Vec::new()` and `refutation: Some(_)` — see
+/// [`PortfolioResult::refutation`]. Consumers must not assume
+/// `per_system.len() == systems.len()` once a cheap tier is enabled.
+pub fn portfolio_prove_with_ladder(
     store: &Store,
     config: &Config,
     provider: &dyn ModelProvider,
@@ -363,6 +389,43 @@ fn portfolio_prove_with_ladder(
         // returns above, before any system is attempted.
         refutation: None,
     })
+}
+
+/// The ladder policy [`portfolio_prove`] runs under.
+///
+/// `THEOREMATA_PORTFOLIO_FAST_REFUTE` is the explicit, environment-only opt-in to
+/// the tier-1 pre-filter. Absent it, this is [`LadderConfig::default`] and
+/// [`portfolio_prove`] is exactly the sequential portfolio: the registered
+/// falsifier rung is never invoked, because registering a rung does not enable
+/// its tier. There is deliberately no implicit default — the established API
+/// pays for N backends unless an operator opts out of that.
+///
+/// Tier 2 (`cheap_decide`) stays disabled: the portfolio registers no tier-2
+/// rung, so enabling it would only add an empty pass.
+fn portfolio_ladder_config() -> LadderConfig {
+    ladder_config_from_value(
+        std::env::var("THEOREMATA_PORTFOLIO_FAST_REFUTE")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Falsey (absent, empty, `0`, `false`, `off`, `no`) and every unrecognized value
+/// leave the ladder at its kernel-only default; only `1`/`true`/`on`/`yes` enable
+/// tier 1. Unrecognized input is treated as *off* rather than as an error: a
+/// typo'd variable must not silently start skipping backend attempts.
+fn ladder_config_from_value(value: Option<&str>) -> LadderConfig {
+    let Some(value) = value.map(str::trim) else {
+        return LadderConfig::default();
+    };
+    let normalized = value.to_ascii_lowercase();
+    if matches!(normalized.as_str(), "1" | "true" | "on" | "yes") {
+        return LadderConfig {
+            fast_refute: RungConfig::enabled(RungBudget::default()),
+            ..LadderConfig::default()
+        };
+    }
+    LadderConfig::default()
 }
 
 /// Parse the explicit environment-only opt-in for owned verifier workers.
@@ -624,7 +687,7 @@ mod tests {
         }
     }
 
-    use crate::verification_ladder::{RungConfig, WitnessKind};
+    use crate::verification_ladder::WitnessKind;
     use std::cell::Cell;
 
     /// A tier-1 rung that always refutes, counting its invocations.
@@ -674,11 +737,10 @@ mod tests {
     }
 
     /// Only tier 1 enabled — the shape a caller opting in to fast refutation uses.
+    /// Derived from the production parser so the tests below exercise exactly the
+    /// config an operator gets, not a hand-rolled look-alike.
     fn fast_refute_enabled() -> LadderConfig {
-        LadderConfig {
-            fast_refute: RungConfig::enabled(RungBudget::default()),
-            ..LadderConfig::default()
-        }
+        ladder_config_from_value(Some("1"))
     }
 
     /// The observable content of a portfolio run, for parity comparisons.
@@ -721,6 +783,15 @@ mod tests {
         // Registering a rung must NOT enable its tier: the default path has to
         // stay exactly today's portfolio — same winner, same order, same
         // SystemAttempt records — even with a rung that would refute everything.
+        //
+        // The config compared against below IS the one `portfolio_prove` uses when
+        // the opt-in env var is unset, so this parity claim covers the real
+        // default path and not just a hand-written `LadderConfig::default()`.
+        assert_eq!(
+            ladder_config_from_value(None),
+            LadderConfig::default(),
+            "an unset opt-in must resolve to the kernel-only default"
+        );
         for &(name, use_escape_hatch) in &[("offline", false), ("escape-hatch", true)] {
             let provider: &dyn ModelProvider = if use_escape_hatch {
                 &EscapeHatchProvider
@@ -983,6 +1054,88 @@ mod tests {
             );
         }
         assert_eq!(concurrency_from_value(Some("3")).max_threads, 3);
+    }
+
+    #[test]
+    fn fast_refute_opt_in_is_disabled_unless_explicitly_enabled() {
+        // Absent / empty / falsey / unrecognized all leave the ladder kernel-only.
+        // A typo'd variable must never silently start skipping backend attempts.
+        for value in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("no"),
+            Some("bogus"),
+            Some("2"),
+        ] {
+            let config = ladder_config_from_value(value);
+            assert_eq!(
+                config,
+                LadderConfig::default(),
+                "{value:?} must preserve the kernel-only default"
+            );
+            assert!(!config.fast_refute.enabled, "{value:?} must not enable tier 1");
+        }
+        // Only the explicit truthy set opts in, case- and whitespace-insensitively.
+        for value in [
+            Some("1"),
+            Some("true"),
+            Some("TRUE"),
+            Some("on"),
+            Some("yes"),
+            Some(" 1 "),
+        ] {
+            let config = ladder_config_from_value(value);
+            assert!(
+                config.fast_refute.enabled,
+                "{value:?} must enable the fast_refute tier"
+            );
+            // Tier 2 is never enabled: the portfolio registers no tier-2 rung.
+            assert!(!config.cheap_decide.enabled, "{value:?} must not enable tier 2");
+            assert_eq!(config.fast_refute.budget, RungBudget::default());
+        }
+    }
+
+    #[test]
+    fn the_env_derived_opt_in_actually_fires_a_refuting_rung() {
+        // The bug this closes: before the opt-in existed, `portfolio_prove` always
+        // passed `LadderConfig::default()`, so no registered rung could ever fire.
+        // With the enabled config the ladder reaches tier 1 and short-circuits.
+        let refuter = MockRefuter::new();
+        let result = portfolio_prove_with_ladder(
+            &store(),
+            &mock_config(),
+            &OfflineProvider,
+            "every integer is even",
+            &[],
+            &[&refuter],
+            ladder_config_from_value(Some("true")),
+        )
+        .unwrap();
+
+        assert_eq!(refuter.calls.get(), 1, "the enabled tier ran the rung");
+        assert!(result.refutation.is_some(), "the refutation is surfaced");
+        assert!(result.per_system.is_empty(), "no backend call was paid for");
+
+        // ...and the same rung under the unset-env config stays untouched, which is
+        // what keeps `portfolio_prove` byte-identical to today by default.
+        let quiet = MockRefuter::new();
+        let unchanged = portfolio_prove_with_ladder(
+            &store(),
+            &mock_config(),
+            &OfflineProvider,
+            "every integer is even",
+            &[],
+            &[&quiet],
+            ladder_config_from_value(None),
+        )
+        .unwrap();
+        assert_eq!(quiet.calls.get(), 0, "the unset env must not invoke a rung");
+        assert!(unchanged.refutation.is_none());
+        assert_eq!(unchanged.per_system.len(), 3, "all three still attempted");
     }
 
     #[test]
