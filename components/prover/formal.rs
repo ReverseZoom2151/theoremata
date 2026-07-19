@@ -399,14 +399,23 @@ impl TierZeroGates {
     /// * `THEOREMATA_HYPOTHESIS_GATE` — hypothesis-discharge audit.
     /// * `THEOREMATA_VACUITY_GATE` — vacuous-success guard.
     ///
-    /// These are a temporary seam. `app/config.rs` is owned elsewhere, so this
-    /// reads the process env the way `agent::abstain_threshold` does; the
-    /// preferred home is a pair of `Config` fields (see the module-level note in
-    /// the handover report). Deterministic per call: no clock, no RNG.
+    /// Superseded by [`TierZeroGates::from_config`]: the flags now live on
+    /// `Config` (`hypothesis_gate` / `vacuity_gate`), which is race-free under
+    /// the parallel test harness and visible to a config file. Retained for
+    /// callers with no `Config` in hand. Deterministic per call: no clock, no RNG.
     pub fn from_env() -> Self {
         Self {
             hypothesis_discharge: env_gate_on("THEOREMATA_HYPOTHESIS_GATE"),
             vacuity: env_gate_on("THEOREMATA_VACUITY_GATE"),
+        }
+    }
+
+    /// Read the gate flags from [`Config`] — the authoritative source. Prefer
+    /// this over [`TierZeroGates::from_env`] wherever a `Config` is in scope.
+    pub fn from_config(cfg: &Config) -> Self {
+        Self {
+            hypothesis_discharge: cfg.hypothesis_gate,
+            vacuity: cfg.vacuity_gate,
         }
     }
 
@@ -550,7 +559,7 @@ pub trait FormalBackend {
     /// re-check → source scan). Fail-closed: the proof is trusted only when all
     /// four layers pass. Reuses the existing [`VerificationReport`] fields.
     fn verify(&self, cfg: &Config, code: &str, stmt: &str) -> Result<VerificationReport> {
-        self.verify_with_gates(cfg, code, stmt, TierZeroGates::from_env())
+        self.verify_with_gates(cfg, code, stmt, TierZeroGates::from_config(cfg))
     }
 
     /// [`verify`](FormalBackend::verify) with the Tier-0 gate switches passed
