@@ -28,12 +28,180 @@
 //!   existing [`ModelRequest`] shape (no changes to that struct or the provider
 //!   seam required).
 //!
+//! Trimming is content-referenced: a section that loses content emits a
+//! [`ContentRef`] (field, content hash, byte counts, resume offset) and the full
+//! text stays reachable through [`AssembledPrompt::page_trimmed`], so "we dropped
+//! 8 kb" is a retrievable handle rather than a hole. Diagnostics get a floor: a
+//! [`DIAGNOSTIC_HEAD_BYTES`] head of the most recent one is inlined even when the
+//! budget is exhausted.
+//!
+//! Telemetry is four-valued about sources: [`SectionSource`] keeps "consulted,
+//! found nothing" distinct from "never consulted", so no counter reports an
+//! unmeasured section as a measured zero.
+//!
 //! Determinism: the estimator is a pure function of its input text; retrieval
 //! ordering breaks relevance ties by item id; no wall-clock, RNG, or ambient
 //! state is read. Same input → same [`AssembledPrompt`].
 
 use crate::model::ModelRequest;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+
+// --------------------------------------------------------------------------- //
+// Content-referenced truncation
+// --------------------------------------------------------------------------- //
+
+/// Lowercase hex of a byte slice. sha2 0.11's digest output no longer implements
+/// `LowerHex`, so we format the bytes explicitly.
+fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
+    use std::fmt::Write as _;
+    let bytes = bytes.as_ref();
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// SHA-256 of `text`, lowercase hex.
+///
+/// SECURITY NOTE: this digest is a CONTENT ADDRESS, not an integrity or
+/// authenticity check. It exists so a consumer can tell "the bytes I am paging
+/// are the same bytes the assembler trimmed" and so identical trimmed content
+/// dedupes to one key. It is computed over data this process already holds and
+/// is never checked against an adversary-supplied digest, so a MATCHING HASH IS
+/// NOT A TRUST SIGNAL: trimmed content is still untrusted data and must be
+/// treated as such no matter which hash it carries.
+fn sha256_hex(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    hex_lower(hasher.finalize())
+}
+
+/// A handle to content that was trimmed out of the prompt.
+///
+/// Counting what was dropped tells a consumer only that something is missing; it
+/// cannot get any of it back. A handle instead names the field, content-addresses
+/// its FULL text, and says exactly how much made it in and where to resume, so
+/// the dropped bytes stay reachable through
+/// [`AssembledPrompt::page_trimmed`] instead of vanishing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentRef {
+    /// The section this handle belongs to ([`SectionKind::label`]).
+    pub field: String,
+    /// SHA-256 (lowercase hex) of the FULL field content. Content addressing and
+    /// retrieval only (see [`sha256_hex`]); never a trust signal.
+    pub sha256: String,
+    /// Byte length of the full field content.
+    pub total_bytes: usize,
+    /// Bytes of that content actually placed in the prompt. This counts item
+    /// bodies only (no headers or separators), so it is comparable to
+    /// `total_bytes`.
+    pub included_bytes: usize,
+    /// Byte offset into the full field content at which paging should resume.
+    ///
+    /// Everything before this offset is guaranteed to already be in the prompt.
+    /// The converse does not hold: greedy inclusion can keep an item after a
+    /// dropped one, so content at or after `next_offset` may include a little
+    /// that was already shown. Conservative in the safe direction (a consumer
+    /// may see a repeat, never a silent hole).
+    pub next_offset: usize,
+}
+
+impl ContentRef {
+    /// JSON view for observability output.
+    pub fn to_json(&self) -> Value {
+        json!({
+            "field": self.field,
+            "sha256": self.sha256,
+            "total_bytes": self.total_bytes,
+            "included_bytes": self.included_bytes,
+            "next_offset": self.next_offset,
+        })
+    }
+}
+
+/// One slice of trimmed field content returned by
+/// [`AssembledPrompt::page_trimmed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentPage {
+    /// The section this slice came from.
+    pub field: String,
+    /// Content address of the full field content this slice belongs to. Same
+    /// non-trust caveat as [`ContentRef::sha256`].
+    pub sha256: String,
+    /// Byte offset this slice starts at (snapped to a UTF-8 boundary).
+    pub offset: usize,
+    /// The slice itself.
+    pub text: String,
+    /// Where the next call should start, or `None` when this was the last slice.
+    pub next_offset: Option<usize>,
+    /// Byte length of the full field content.
+    pub total_bytes: usize,
+}
+
+/// Build the handle for a trimmed field plus the canonical full content the
+/// pager serves.
+///
+/// `canonical` is the field's items in the order the assembler CONSIDERED them
+/// for inclusion (not the order they are laid out in the prompt), because that
+/// is the order in which content survives budget pressure: keeping the leading
+/// run of considered items is the common case, which makes `next_offset` land
+/// just past what the prompt already carries.
+fn content_ref(
+    field: &str,
+    canonical: &[&str],
+    kept_flags: &[bool],
+    partial_head_bytes: usize,
+) -> (ContentRef, String) {
+    let full = canonical.join("\n");
+    let total_bytes = full.len();
+    let included_bytes: usize = canonical
+        .iter()
+        .zip(kept_flags)
+        .filter(|(_, kept)| **kept)
+        .map(|(item, _)| item.len())
+        .sum::<usize>()
+        + partial_head_bytes;
+
+    // Leading run of fully-included items, then any partial head of the next one.
+    let mut next_offset = 0usize;
+    let mut leading = 0usize;
+    while leading < canonical.len() && kept_flags[leading] {
+        // +1 for the "\n" the join places after this item.
+        next_offset += canonical[leading].len() + 1;
+        leading += 1;
+    }
+    if leading < canonical.len() {
+        next_offset += partial_head_bytes;
+    }
+    let next_offset = next_offset.min(total_bytes);
+
+    (
+        ContentRef {
+            field: field.to_owned(),
+            sha256: sha256_hex(&full),
+            total_bytes,
+            included_bytes,
+            next_offset,
+        },
+        full,
+    )
+}
+
+/// Largest prefix of `text` that is at most `max_bytes` long and ends on a UTF-8
+/// character boundary.
+fn head_slice(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
 
 // --------------------------------------------------------------------------- //
 // Token-estimation seam
@@ -181,7 +349,8 @@ pub fn role_body(role: &str) -> Option<&'static str> {
 // --------------------------------------------------------------------------- //
 
 /// Which composed block a [`Section`] belongs to. The `Concat` order is exactly
-/// the declaration order below: System, Memory, Tools, Retrieval, Query.
+/// the declaration order below: System, Memory, Tools, Retrieval, Diagnostics,
+/// Query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SectionKind {
     /// Shared invariants + role body. Never trimmed.
@@ -192,6 +361,10 @@ pub enum SectionKind {
     Tools,
     /// Retrieved lemmas / passages (untrusted data); most relevant nearest query.
     Retrieval,
+    /// Recent failure output (untrusted data): checker errors, stderr, refuted
+    /// counterexamples. Most recent nearest the query, and a head of the most
+    /// recent one is inlined even when the budget is exhausted.
+    Diagnostics,
     /// The actual task / goal. Never trimmed.
     Query,
 }
@@ -204,6 +377,7 @@ impl SectionKind {
             SectionKind::Memory => "memory",
             SectionKind::Tools => "tools",
             SectionKind::Retrieval => "retrieval",
+            SectionKind::Diagnostics => "diagnostics",
             SectionKind::Query => "query",
         }
     }
@@ -215,6 +389,7 @@ impl SectionKind {
             SectionKind::Memory => "## Memory (untrusted data — reference only)",
             SectionKind::Tools => "## Available tools",
             SectionKind::Retrieval => "## Retrieved context (untrusted data — most relevant last)",
+            SectionKind::Diagnostics => "## Recent diagnostics (untrusted data, most recent last)",
             SectionKind::Query => "## Query",
         }
     }
@@ -229,18 +404,97 @@ pub struct Section {
     pub text: String,
     /// Estimated tokens of `text` under the assembler's estimator.
     pub tokens: usize,
-    /// How many source items this section had before trimming.
-    pub items_total: usize,
+    /// How many source items this section had before trimming, or `None` when
+    /// the source was never consulted.
+    ///
+    /// `Some(0)` and `None` are DIFFERENT facts: `Some(0)` means we asked and the
+    /// source had nothing; `None` means nobody asked, and reporting that as `0`
+    /// would be a measurement we never took. See [`SectionSource`].
+    pub items_total: Option<usize>,
+    /// Why `items_total` is `None`, when it is. Carried so a consumer reading
+    /// telemetry can tell an un-wired source from a deliberately disabled one.
+    pub not_measured_reason: Option<String>,
     /// How many source items survived into `text`.
     pub items_kept: usize,
-    /// True if at least one item was dropped to fit the budget.
+    /// True if at least one item was dropped to fit the budget. Never true for an
+    /// unmeasured section: we cannot claim a drop we did not observe.
     pub trimmed: bool,
+    /// Handle to the full field content when something was trimmed, so the
+    /// dropped bytes stay retrievable via [`AssembledPrompt::page_trimmed`].
+    /// `None` when nothing was trimmed.
+    pub trim_ref: Option<ContentRef>,
 }
 
 impl Section {
     /// Whether any content from this section made it into the prompt.
     pub fn included(&self) -> bool {
         self.items_kept > 0 || !self.text.is_empty()
+    }
+
+    /// Whether this section's source was actually consulted.
+    pub fn measured(&self) -> bool {
+        self.items_total.is_some()
+    }
+}
+
+/// A trimmable section's source: either the items it yielded, or an explicit
+/// statement that it was never consulted.
+///
+/// A bare `Vec` cannot tell "the memory subsystem returned nothing" apart from
+/// "no memory subsystem was wired into this assembly", and both then surface as
+/// `items_total: 0`, a measurement the assembler never made. Same failure mode
+/// as a declaration lookup that collapses "absent" into "not found". Making the
+/// unmeasured case its own variant keeps assembly telemetry honest.
+#[derive(Debug, Clone)]
+pub enum SectionSource<T> {
+    /// The source was consulted and returned exactly these items (possibly none).
+    Measured(Vec<T>),
+    /// The source was never consulted, so nothing about its size is known.
+    NotInstrumented {
+        /// Why it was not consulted, for the telemetry reader.
+        reason: String,
+    },
+}
+
+impl<T> Default for SectionSource<T> {
+    /// Unwired is the default: a caller that never set this source has, by
+    /// definition, not measured it.
+    fn default() -> Self {
+        SectionSource::NotInstrumented {
+            reason: "source not wired into this assembly".to_owned(),
+        }
+    }
+}
+
+impl<T> SectionSource<T> {
+    /// The items, or an empty slice when unmeasured. Use [`Self::measured_len`]
+    /// when the difference matters.
+    pub fn items(&self) -> &[T] {
+        match self {
+            SectionSource::Measured(items) => items,
+            SectionSource::NotInstrumented { .. } => &[],
+        }
+    }
+
+    /// `Some(count)` when consulted, `None` when not.
+    pub fn measured_len(&self) -> Option<usize> {
+        match self {
+            SectionSource::Measured(items) => Some(items.len()),
+            SectionSource::NotInstrumented { .. } => None,
+        }
+    }
+
+    /// The stated reason this source was not consulted, if it was not.
+    pub fn missing_reason(&self) -> Option<&str> {
+        match self {
+            SectionSource::Measured(_) => None,
+            SectionSource::NotInstrumented { reason } => Some(reason),
+        }
+    }
+
+    /// Whether the source was consulted.
+    pub fn is_measured(&self) -> bool {
+        matches!(self, SectionSource::Measured(_))
     }
 }
 
@@ -264,9 +518,18 @@ pub struct AssembledPrompt {
     pub total_tokens: usize,
     /// The budget this was assembled under.
     pub budget: usize,
-    /// True if the system + query alone exceeded the budget (they are still kept,
-    /// so `total_tokens` may exceed `budget` — the honest overflow signal).
+    /// True if the mandatory content (system + query, plus the guaranteed
+    /// diagnostic head) exceeded the budget. It is still kept, so `total_tokens`
+    /// may exceed `budget` — the honest overflow signal.
     pub over_budget: bool,
+    /// One handle per section that lost content, in `Concat` order. Empty when
+    /// nothing was trimmed.
+    pub trimmed_refs: Vec<ContentRef>,
+    /// Full content of each trimmed field, keyed by field name, so
+    /// [`Self::page_trimmed`] can serve the dropped bytes. Only populated for
+    /// fields that actually lost content, so an untrimmed assembly holds nothing
+    /// extra.
+    pub trimmed_content: BTreeMap<String, String>,
 }
 
 impl AssembledPrompt {
@@ -275,13 +538,62 @@ impl AssembledPrompt {
         self.sections.iter().find(|s| s.kind == kind)
     }
 
+    /// The handle for a field that lost content, if it lost any.
+    pub fn trim_ref(&self, field: &str) -> Option<&ContentRef> {
+        self.trimmed_refs.iter().find(|r| r.field == field)
+    }
+
+    /// Pager over the content trimmed out of `field`: returns the slice starting
+    /// at `offset`, at most `max_bytes` long, plus where to resume.
+    ///
+    /// Returns `None` when the field kept everything (nothing to page) or when
+    /// `offset` is at or past the end, so `while let Some(page) = …` driven by
+    /// `page.next_offset` always terminates. Slice ends are snapped OUTWARD to a
+    /// UTF-8 boundary so every call makes progress even if `max_bytes` lands
+    /// mid-character or is 0.
+    pub fn page_trimmed(
+        &self,
+        field: &str,
+        offset: usize,
+        max_bytes: usize,
+    ) -> Option<ContentPage> {
+        let full = self.trimmed_content.get(field)?;
+        let total_bytes = full.len();
+        if offset >= total_bytes {
+            return None;
+        }
+        // Snap the start inward to a boundary so slicing cannot panic on a caller
+        // supplied offset.
+        let mut start = offset;
+        while start > 0 && !full.is_char_boundary(start) {
+            start -= 1;
+        }
+        let mut end = start.saturating_add(max_bytes.max(1)).min(total_bytes);
+        while end < total_bytes && !full.is_char_boundary(end) {
+            end += 1;
+        }
+        Some(ContentPage {
+            field: field.to_owned(),
+            sha256: sha256_hex(full),
+            offset: start,
+            text: full[start..end].to_owned(),
+            next_offset: if end >= total_bytes { None } else { Some(end) },
+            total_bytes,
+        })
+    }
+
     /// Structured, observability-friendly JSON view of the assembly.
+    ///
+    /// The extra keys below are emitted ONLY when they carry information (a
+    /// trimmed section, an unmeasured source). An assembly that trimmed nothing
+    /// and measured every source serializes exactly as it did before content
+    /// handles existed, so existing log consumers keep parsing it unchanged.
     pub fn to_context(&self) -> Value {
         let sections: Vec<Value> = self
             .sections
             .iter()
             .map(|s| {
-                json!({
+                let mut obj = json!({
                     "kind": s.kind.label(),
                     "tokens": s.tokens,
                     "items_total": s.items_total,
@@ -289,10 +601,20 @@ impl AssembledPrompt {
                     "trimmed": s.trimmed,
                     "included": s.included(),
                     "text": s.text,
-                })
+                });
+                if s.items_total.is_none() {
+                    // `items_total` is null here; spell out that this is an
+                    // absence of measurement rather than a measured zero.
+                    obj["items_total_measured"] = json!(false);
+                    obj["not_measured_reason"] = json!(s.not_measured_reason);
+                }
+                if let Some(r) = &s.trim_ref {
+                    obj["trim_ref"] = r.to_json();
+                }
+                obj
             })
             .collect();
-        json!({
+        let mut out = json!({
             "system_version": self.system_version,
             "system_invariants": self.system,
             "query": self.query,
@@ -300,7 +622,16 @@ impl AssembledPrompt {
             "total_tokens": self.total_tokens,
             "budget": self.budget,
             "over_budget": self.over_budget,
-        })
+        });
+        if !self.trimmed_refs.is_empty() {
+            out["trimmed_refs"] = Value::Array(
+                self.trimmed_refs
+                    .iter()
+                    .map(ContentRef::to_json)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        out
     }
 
     /// Drop the assembled prompt into the existing [`ModelRequest`] shape — the
@@ -357,11 +688,14 @@ pub struct AssemblyInput {
     pub query: String,
     /// Episodic / working-memory lines (e.g. from
     /// [`EpisodicMemory::snapshot`](crate::memory::EpisodicMemory::snapshot)).
-    pub memory: Vec<String>,
+    pub memory: SectionSource<String>,
     /// Tool schema descriptions.
-    pub tools: Vec<String>,
+    pub tools: SectionSource<String>,
     /// Retrieved lemmas / passages.
-    pub retrieval: Vec<RetrievalItem>,
+    pub retrieval: SectionSource<RetrievalItem>,
+    /// Recent failure output, OLDEST FIRST. The most recent entry is the one
+    /// protected by the guaranteed head (see [`DIAGNOSTIC_HEAD_BYTES`]).
+    pub diagnostics: SectionSource<String>,
 }
 
 impl AssemblyInput {
@@ -374,21 +708,45 @@ impl AssemblyInput {
         }
     }
 
-    /// Set the memory lines (builder style).
+    /// Set the memory lines (builder style). An empty vec here means "consulted,
+    /// found nothing". Leave the field alone to mean "never consulted".
     pub fn with_memory(mut self, memory: Vec<String>) -> Self {
-        self.memory = memory;
+        self.memory = SectionSource::Measured(memory);
         self
     }
 
     /// Set the tool descriptions (builder style).
     pub fn with_tools(mut self, tools: Vec<String>) -> Self {
-        self.tools = tools;
+        self.tools = SectionSource::Measured(tools);
         self
     }
 
     /// Set the retrieval items (builder style).
     pub fn with_retrieval(mut self, retrieval: Vec<RetrievalItem>) -> Self {
-        self.retrieval = retrieval;
+        self.retrieval = SectionSource::Measured(retrieval);
+        self
+    }
+
+    /// Set the recent diagnostics, OLDEST FIRST (builder style).
+    pub fn with_diagnostics(mut self, diagnostics: Vec<String>) -> Self {
+        self.diagnostics = SectionSource::Measured(diagnostics);
+        self
+    }
+
+    /// Record that a source was deliberately not consulted, and why. Use this
+    /// instead of passing an empty vec, which would claim a measurement of zero.
+    pub fn without_memory(mut self, reason: impl Into<String>) -> Self {
+        self.memory = SectionSource::NotInstrumented {
+            reason: reason.into(),
+        };
+        self
+    }
+
+    /// Record that retrieval was deliberately not consulted, and why.
+    pub fn without_retrieval(mut self, reason: impl Into<String>) -> Self {
+        self.retrieval = SectionSource::NotInstrumented {
+            reason: reason.into(),
+        };
         self
     }
 }
@@ -397,10 +755,11 @@ impl AssemblyInput {
 // The assembler
 // --------------------------------------------------------------------------- //
 
-/// Composes `Concat(System, Memory, Tools, Retrieval, Query)` under a token
-/// budget. System + Query are always kept; the trimmable sections are filled in
-/// keep-priority order (Tools, then Retrieval, then Memory) so Memory is trimmed
-/// first and Retrieval before Tools — leaving system + query intact.
+/// Composes `Concat(System, Memory, Tools, Retrieval, Diagnostics, Query)` under
+/// a token budget. System + Query are always kept; the trimmable sections are
+/// filled in keep-priority order (Diagnostics, Tools, Retrieval, Memory) so
+/// Memory is trimmed first and Diagnostics last, leaving system + query intact.
+/// Whatever is trimmed leaves a [`ContentRef`] behind so it stays retrievable.
 pub struct PromptAssembler {
     estimator: Box<dyn TokenEstimator>,
     budget: usize,
@@ -408,12 +767,24 @@ pub struct PromptAssembler {
 
 /// Keep-priority for the trimmable sections: earlier = kept longer under
 /// pressure. Memory is last, so it is the first to be dropped; Retrieval next;
-/// Tools are the most protected of the trimmables.
-const KEEP_PRIORITY: [SectionKind; 3] = [
+/// Tools next; Diagnostics are the most protected of the trimmables because a
+/// fresh checker error is the single most actionable thing in the prompt.
+const KEEP_PRIORITY: [SectionKind; 4] = [
+    SectionKind::Diagnostics,
     SectionKind::Tools,
     SectionKind::Retrieval,
     SectionKind::Memory,
 ];
+
+/// How much of the most recent diagnostic is inlined even when the budget is
+/// already exhausted.
+///
+/// Dropping the freshest error entirely is the worst possible trim: the model is
+/// then asked to fix a failure it cannot see, and the next attempt repeats it.
+/// A head is enough, because the useful part of a checker error (the message and
+/// the first failing goal) is at the front; the tail is retrievable through the
+/// section's [`ContentRef`].
+pub const DIAGNOSTIC_HEAD_BYTES: usize = 512;
 
 impl PromptAssembler {
     /// Assembler with the default [`CharsPerToken`] estimator.
@@ -443,13 +814,17 @@ impl PromptAssembler {
     ///    [`KEEP_PRIORITY`] order, greedily including whole items whose token
     ///    cost (item + section header on first inclusion) still fits. Retrieval
     ///    items are considered most-relevant first so the best survive.
-    /// 3. Render every section in `Concat` order. Retrieved items are emitted
+    /// 3. If every diagnostic was dropped, inline a [`DIAGNOSTIC_HEAD_BYTES`]
+    ///    head of the most recent one regardless of the budget.
+    /// 4. Render every section in `Concat` order. Retrieved items are emitted
     ///    ascending by relevance so the most relevant sits adjacent to the query.
+    /// 5. Give every section that lost content a [`ContentRef`] handle and keep
+    ///    that field's full text for [`AssembledPrompt::page_trimmed`].
     ///
     /// Because the running total is the SUM of per-piece estimates and the
     /// estimator is superadditive over concatenation, `total_tokens <= budget`
-    /// holds whenever the mandatory system + query fit; otherwise `over_budget`
-    /// is set and both are kept anyway.
+    /// holds whenever the mandatory content fits; otherwise `over_budget` is set
+    /// and the mandatory content is kept anyway.
     pub fn assemble(&self, input: &AssemblyInput) -> AssembledPrompt {
         let block = SystemBlock::for_role(&input.role);
         let system_text = block.text;
@@ -461,28 +836,40 @@ impl PromptAssembler {
         let query_tokens = self.est(&query_rendered);
 
         let mut running = sys_tokens + query_tokens;
-        let over_budget = running > self.budget;
+        let mut over_budget = running > self.budget;
+
+        let memory_items = input.memory.items();
+        let tools_items = input.tools.items();
+        let retrieval_items = input.retrieval.items();
+        let diagnostic_items = input.diagnostics.items();
 
         // Decide inclusion for each trimmable section.
         let mut kept_memory: Vec<usize> = Vec::new();
         let mut kept_tools: Vec<usize> = Vec::new();
         let mut kept_retrieval: Vec<usize> = Vec::new();
+        let mut kept_diagnostics: Vec<usize> = Vec::new();
         // Track whether each section's header has been charged yet.
-        let mut header_charged: [bool; 3] = [false; 3];
+        let mut header_charged: [bool; KEEP_PRIORITY.len()] = [false; KEEP_PRIORITY.len()];
 
-        for &kind in &KEEP_PRIORITY {
-            let slot = KEEP_PRIORITY.iter().position(|k| *k == kind).unwrap();
+        // Consideration orders. These double as the canonical order of a field's
+        // content in its [`ContentRef`], so paging resumes where the budget ran
+        // out rather than at an unrelated item.
+        let retrieval_order = Self::retrieval_by_relevance_desc(retrieval_items);
+        // Newest diagnostic first: under pressure the fresh error survives.
+        let diagnostic_order: Vec<usize> = (0..diagnostic_items.len()).rev().collect();
+
+        for (slot, &kind) in KEEP_PRIORITY.iter().enumerate() {
             let header = kind.header();
             match kind {
                 SectionKind::Memory => {
-                    for (i, item) in input.memory.iter().enumerate() {
+                    for (i, item) in memory_items.iter().enumerate() {
                         if self.try_take(item, header, &mut running, &mut header_charged[slot]) {
                             kept_memory.push(i);
                         }
                     }
                 }
                 SectionKind::Tools => {
-                    for (i, item) in input.tools.iter().enumerate() {
+                    for (i, item) in tools_items.iter().enumerate() {
                         if self.try_take(item, header, &mut running, &mut header_charged[slot]) {
                             kept_tools.push(i);
                         }
@@ -491,10 +878,18 @@ impl PromptAssembler {
                 SectionKind::Retrieval => {
                     // Consider most-relevant first so the best items survive a
                     // tight budget; final placement is reordered below.
-                    for i in Self::retrieval_by_relevance_desc(&input.retrieval) {
-                        let item = &input.retrieval[i].text;
+                    for &i in &retrieval_order {
+                        let item = &retrieval_items[i].text;
                         if self.try_take(item, header, &mut running, &mut header_charged[slot]) {
                             kept_retrieval.push(i);
+                        }
+                    }
+                }
+                SectionKind::Diagnostics => {
+                    for &i in &diagnostic_order {
+                        let item = &diagnostic_items[i];
+                        if self.try_take(item, header, &mut running, &mut header_charged[slot]) {
+                            kept_diagnostics.push(i);
                         }
                     }
                 }
@@ -502,57 +897,177 @@ impl PromptAssembler {
             }
         }
 
+        // The guaranteed head: if the budget swallowed every diagnostic, inline
+        // the front of the most recent one anyway and let the total run over.
+        // An honest overflow beats a prompt that hides the error being debugged.
+        let mut diagnostic_head: Option<&str> = None;
+        if kept_diagnostics.is_empty() {
+            if let Some(newest) = diagnostic_items.last() {
+                let head = head_slice(newest, DIAGNOSTIC_HEAD_BYTES);
+                if !head.is_empty() {
+                    diagnostic_head = Some(head);
+                    running += self.est(&Self::render_diagnostic_head(head, newest.len()));
+                    over_budget = over_budget || running > self.budget;
+                }
+            }
+        }
+
         // ---- render sections in Concat order --------------------------------
         let mut sections: Vec<Section> = Vec::new();
+        // Canonical (consideration-order) view of each trimmable field, used to
+        // build its handle if it lost content. Collected alongside rendering so
+        // the two views cannot drift.
+        let mut canon: Vec<(SectionKind, Vec<&str>, Vec<bool>, usize)> = Vec::new();
+
+        kept_memory.sort_unstable();
+        kept_tools.sort_unstable();
+        kept_diagnostics.sort_unstable();
 
         // System (never trimmed).
         sections.push(Section {
             kind: SectionKind::System,
             tokens: sys_tokens,
             text: system_text.clone(),
-            items_total: 1,
+            items_total: Some(1),
+            not_measured_reason: None,
             items_kept: 1,
             trimmed: false,
+            trim_ref: None,
         });
 
         // Memory — preserve input order.
-        kept_memory.sort_unstable();
         sections.push(self.render_list(
             SectionKind::Memory,
             &kept_memory,
-            &input.memory,
-            input.memory.len(),
+            memory_items,
+            input.memory.measured_len(),
+            input.memory.missing_reason(),
+        ));
+        canon.push((
+            SectionKind::Memory,
+            memory_items.iter().map(String::as_str).collect(),
+            (0..memory_items.len())
+                .map(|i| kept_memory.binary_search(&i).is_ok())
+                .collect(),
+            0,
         ));
 
         // Tools — preserve input order.
-        kept_tools.sort_unstable();
         sections.push(self.render_list(
             SectionKind::Tools,
             &kept_tools,
-            &input.tools,
-            input.tools.len(),
+            tools_items,
+            input.tools.measured_len(),
+            input.tools.missing_reason(),
+        ));
+        canon.push((
+            SectionKind::Tools,
+            tools_items.iter().map(String::as_str).collect(),
+            (0..tools_items.len())
+                .map(|i| kept_tools.binary_search(&i).is_ok())
+                .collect(),
+            0,
         ));
 
         // Retrieval — most relevant LAST (nearest the query).
-        let retrieval_texts: Vec<String> = input.retrieval.iter().map(|r| r.text.clone()).collect();
+        let retrieval_texts: Vec<String> = retrieval_items.iter().map(|r| r.text.clone()).collect();
         let mut kept_ret_sorted = kept_retrieval.clone();
-        kept_ret_sorted.sort_by(|&a, &b| Self::relevance_cmp_asc(&input.retrieval, a, b));
+        kept_ret_sorted.sort_by(|&a, &b| Self::relevance_cmp_asc(retrieval_items, a, b));
         sections.push(self.render_list(
             SectionKind::Retrieval,
             &kept_ret_sorted,
             &retrieval_texts,
-            input.retrieval.len(),
+            input.retrieval.measured_len(),
+            input.retrieval.missing_reason(),
         ));
+        canon.push((
+            SectionKind::Retrieval,
+            retrieval_order
+                .iter()
+                .map(|&i| retrieval_items[i].text.as_str())
+                .collect(),
+            retrieval_order
+                .iter()
+                .map(|i| kept_retrieval.contains(i))
+                .collect(),
+            0,
+        ));
+
+        // Diagnostics: most recent LAST (nearest the query), so the freshest
+        // error sits where the model attends best. Emitted only when the caller
+        // consulted the source at all; an absent section says "not wired", never
+        // "there were no failures".
+        if input.diagnostics.is_measured() {
+            let section = match diagnostic_head {
+                Some(head) => {
+                    let newest = diagnostic_items.last().expect("a head implies an item");
+                    let text = Self::render_diagnostic_head(head, newest.len());
+                    Section {
+                        kind: SectionKind::Diagnostics,
+                        tokens: self.est(&text),
+                        text,
+                        items_total: Some(diagnostic_items.len()),
+                        not_measured_reason: None,
+                        // No whole item fit; what is inlined is a partial head,
+                        // which `trim_ref.included_bytes` accounts for exactly.
+                        items_kept: 0,
+                        trimmed: true,
+                        trim_ref: None,
+                    }
+                }
+                None => self.render_list(
+                    SectionKind::Diagnostics,
+                    &kept_diagnostics,
+                    diagnostic_items,
+                    input.diagnostics.measured_len(),
+                    input.diagnostics.missing_reason(),
+                ),
+            };
+            sections.push(section);
+            canon.push((
+                SectionKind::Diagnostics,
+                diagnostic_order
+                    .iter()
+                    .map(|&i| diagnostic_items[i].as_str())
+                    .collect(),
+                diagnostic_order
+                    .iter()
+                    .map(|i| kept_diagnostics.binary_search(i).is_ok())
+                    .collect(),
+                diagnostic_head.map(str::len).unwrap_or(0),
+            ));
+        }
 
         // Query (never trimmed).
         sections.push(Section {
             kind: SectionKind::Query,
             tokens: query_tokens,
             text: query_rendered,
-            items_total: 1,
+            items_total: Some(1),
+            not_measured_reason: None,
             items_kept: 1,
             trimmed: false,
+            trim_ref: None,
         });
+
+        // Attach a handle to every section that lost content, so the trimmed
+        // bytes are addressable instead of gone.
+        let mut trimmed_refs: Vec<ContentRef> = Vec::new();
+        let mut trimmed_content: BTreeMap<String, String> = BTreeMap::new();
+        for section in sections.iter_mut() {
+            if !section.trimmed {
+                continue;
+            }
+            let Some((_, canonical, kept_flags, partial)) =
+                canon.iter().find(|(kind, ..)| *kind == section.kind)
+            else {
+                continue;
+            };
+            let (handle, full) = content_ref(section.kind.label(), canonical, kept_flags, *partial);
+            trimmed_content.insert(handle.field.clone(), full);
+            trimmed_refs.push(handle.clone());
+            section.trim_ref = Some(handle);
+        }
 
         // Concatenate non-empty section texts in order.
         let prompt = sections
@@ -573,7 +1088,19 @@ impl PromptAssembler {
             total_tokens,
             budget: self.budget,
             over_budget,
+            trimmed_refs,
+            trimmed_content,
         }
+    }
+
+    /// The inlined head of the most recent diagnostic, with an explicit marker so
+    /// the model knows it is reading a truncated error rather than a short one.
+    fn render_diagnostic_head(head: &str, full_bytes: usize) -> String {
+        let header = SectionKind::Diagnostics.header();
+        let shown = head.len();
+        format!(
+            "{header}\n{head}\n[truncated: {shown} of {full_bytes} bytes of the most recent diagnostic shown]"
+        )
     }
 
     /// Try to charge `item` (plus its section header if not yet charged) against
@@ -600,22 +1127,30 @@ impl PromptAssembler {
     }
 
     /// Render a trimmable list section from the kept indices into `items`.
+    ///
+    /// `items_total` is `None` when the source was never consulted; the section
+    /// then reports `trimmed: false`, because a drop we never observed is not a
+    /// drop we may claim.
     fn render_list(
         &self,
         kind: SectionKind,
         kept: &[usize],
         items: &[String],
-        items_total: usize,
+        items_total: Option<usize>,
+        not_measured_reason: Option<&str>,
     ) -> Section {
         let items_kept = kept.len();
+        let not_measured_reason = not_measured_reason.map(str::to_owned);
         if items_kept == 0 {
             return Section {
                 kind,
                 text: String::new(),
                 tokens: 0,
                 items_total,
+                not_measured_reason,
                 items_kept: 0,
-                trimmed: items_total > 0,
+                trimmed: items_total.is_some_and(|total| total > 0),
+                trim_ref: None,
             };
         }
         let mut text = kind.header().to_owned();
@@ -629,8 +1164,10 @@ impl PromptAssembler {
             text,
             tokens,
             items_total,
+            not_measured_reason,
             items_kept,
-            trimmed: items_kept < items_total,
+            trimmed: items_total.is_some_and(|total| items_kept < total),
+            trim_ref: None,
         }
     }
 
@@ -880,6 +1417,257 @@ mod tests {
             .unwrap()
             .contains("Falsify before you prove"));
         assert!(req.context["sections"].is_array());
+    }
+
+    /// The exact `running` total the assembler starts from for `role` / `query`,
+    /// so a test can size a budget to the token rather than guess slack.
+    fn mandatory_tokens(role: &str, query: &str) -> usize {
+        let e = CharsPerToken::default();
+        let sys = SystemBlock::for_role(role).text;
+        let q = format!("{}\n{}", SectionKind::Query.header(), query);
+        e.estimate(&sys) + e.estimate(&q)
+    }
+
+    #[test]
+    fn nothing_trimmed_leaves_output_byte_identical() {
+        // Pins the exact bytes of the untrimmed prompt and the exact key set of
+        // the observability JSON, so content handles cannot leak into the
+        // no-trim path.
+        let asm = PromptAssembler::new(100_000);
+        let input = AssemblyInput::new("lean_proof_generator", "Prove.")
+            .with_memory(vec!["mem1".to_owned()])
+            .with_tools(vec!["tool1".to_owned()])
+            .with_retrieval(sample_retrieval());
+        let out = asm.assemble(&input);
+
+        let expected = format!(
+            "{sys}\n\n{mem}\nmem1\n\n{tools}\ntool1\n\n{ret}\nleast relevant lemma\nsomewhat relevant lemma\nmost relevant lemma\n\n{query}\nProve.",
+            sys = SystemBlock::for_role("lean_proof_generator").text,
+            mem = SectionKind::Memory.header(),
+            tools = SectionKind::Tools.header(),
+            ret = SectionKind::Retrieval.header(),
+            query = SectionKind::Query.header(),
+        );
+        assert_eq!(out.prompt, expected);
+
+        // No handles, no paging store, no diagnostics section.
+        assert!(out.trimmed_refs.is_empty());
+        assert!(out.trimmed_content.is_empty());
+        assert!(out.section(SectionKind::Diagnostics).is_none());
+        assert!(out.sections.iter().all(|s| s.trim_ref.is_none()));
+
+        let ctx = out.to_context();
+        let mut top: Vec<&str> = ctx
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        top.sort_unstable();
+        assert_eq!(
+            top,
+            vec![
+                "budget",
+                "over_budget",
+                "query",
+                "sections",
+                "system_invariants",
+                "system_version",
+                "total_tokens",
+            ]
+        );
+        for section in ctx["sections"].as_array().unwrap() {
+            let mut keys: Vec<&str> = section
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                vec![
+                    "included",
+                    "items_kept",
+                    "items_total",
+                    "kind",
+                    "text",
+                    "tokens",
+                    "trimmed",
+                ],
+                "no extra keys when nothing was trimmed"
+            );
+            assert!(section["items_total"].is_number());
+        }
+    }
+
+    #[test]
+    fn trimmed_field_emits_handle_with_correct_byte_counts() {
+        let e = CharsPerToken::default();
+        let item = "m".repeat(100);
+        let items = vec![item.clone(), item.clone(), item.clone()];
+        // Room for the memory header plus exactly one item, and no more.
+        let budget = mandatory_tokens("critic", "Q")
+            + e.estimate(SectionKind::Memory.header())
+            + e.estimate(&format!("\n{item}"));
+        let out = PromptAssembler::new(budget)
+            .assemble(&AssemblyInput::new("critic", "Q").with_memory(items.clone()));
+
+        let mem = out.section(SectionKind::Memory).unwrap();
+        assert_eq!(mem.items_kept, 1);
+        assert!(mem.trimmed);
+        let handle = mem
+            .trim_ref
+            .as_ref()
+            .expect("trimmed section carries a handle");
+        assert_eq!(handle.field, "memory");
+        // Full content is the items joined by newlines: 3 * 100 + 2 separators.
+        assert_eq!(handle.total_bytes, 302);
+        assert_eq!(handle.included_bytes, 100);
+        // Item 0 was kept, so paging resumes just past it and its separator.
+        assert_eq!(handle.next_offset, 101);
+        assert_eq!(handle.sha256, sha256_hex(&items.join("\n")));
+        assert_eq!(out.trim_ref("memory"), Some(handle));
+
+        // The handle also shows up in the observability JSON.
+        let ctx = out.to_context();
+        assert_eq!(ctx["trimmed_refs"][0]["field"], json!("memory"));
+        assert_eq!(ctx["trimmed_refs"][0]["total_bytes"], json!(302));
+    }
+
+    #[test]
+    fn pager_returns_the_next_slice_and_terminates() {
+        let e = CharsPerToken::default();
+        let item = "m".repeat(100);
+        let items = vec![
+            item.clone(),
+            "second item".to_owned(),
+            "third item".to_owned(),
+        ];
+        let budget = mandatory_tokens("critic", "Q")
+            + e.estimate(SectionKind::Memory.header())
+            + e.estimate(&format!("\n{item}"));
+        let out = PromptAssembler::new(budget)
+            .assemble(&AssemblyInput::new("critic", "Q").with_memory(items.clone()));
+        let handle = out.trim_ref("memory").expect("memory was trimmed").clone();
+
+        // Walk the whole field from byte 0 and reassemble it.
+        let mut rebuilt = String::new();
+        let mut offset = Some(0usize);
+        let mut guard = 0;
+        while let Some(start) = offset {
+            let Some(page) = out.page_trimmed("memory", start, 7) else {
+                break;
+            };
+            assert_eq!(page.sha256, handle.sha256);
+            rebuilt.push_str(&page.text);
+            offset = page.next_offset;
+            guard += 1;
+            assert!(guard < 1_000, "pager must terminate");
+        }
+        assert_eq!(rebuilt, items.join("\n"));
+
+        // Resuming at the handle's offset yields only content past what the
+        // prompt already carried.
+        let next = out
+            .page_trimmed("memory", handle.next_offset, 1_000)
+            .expect("content remains past next_offset");
+        assert!(next.text.starts_with("second item"));
+        assert_eq!(next.next_offset, None, "one page covered the remainder");
+
+        // Past the end terminates, and an untrimmed field has nothing to page.
+        assert!(out.page_trimmed("memory", handle.total_bytes, 10).is_none());
+        assert!(out.page_trimmed("tools", 0, 10).is_none());
+    }
+
+    #[test]
+    fn latest_diagnostic_head_survives_an_exhausted_budget() {
+        let older = "older failure: ".to_owned() + &"o".repeat(600);
+        let newest = "newest failure: unsolved goal ".to_owned() + &"n".repeat(600);
+        // Budget of 1 token cannot fit even the invariants, let alone a
+        // diagnostic; the freshest error is inlined anyway.
+        let out = PromptAssembler::new(1).assemble(
+            &AssemblyInput::new("critic", "Fix it.")
+                .with_diagnostics(vec![older.clone(), newest.clone()]),
+        );
+
+        assert!(out.over_budget);
+        assert!(out.prompt.contains("newest failure: unsolved goal"));
+        assert!(!out.prompt.contains(&older), "only the newest is inlined");
+        assert!(out.prompt.contains("[truncated:"), "the cut is disclosed");
+
+        let diag = out.section(SectionKind::Diagnostics).unwrap();
+        assert_eq!(diag.items_kept, 0, "no whole diagnostic fit");
+        assert!(diag.trimmed);
+        let handle = diag.trim_ref.as_ref().expect("head implies a handle");
+        assert_eq!(handle.included_bytes, DIAGNOSTIC_HEAD_BYTES);
+        // Canonical order is newest-first, so paging resumes inside the newest
+        // diagnostic, right after the inlined head.
+        assert_eq!(handle.next_offset, DIAGNOSTIC_HEAD_BYTES);
+        assert_eq!(handle.total_bytes, older.len() + 1 + newest.len());
+        let page = out
+            .page_trimmed("diagnostics", handle.next_offset, 32)
+            .expect("the tail is retrievable");
+        assert!(page.text.starts_with('n'));
+
+        // A caller that never wired diagnostics gets no diagnostics section at
+        // all, rather than an invented empty one.
+        let bare = PromptAssembler::new(1).assemble(&AssemblyInput::new("critic", "Fix it."));
+        assert!(bare.section(SectionKind::Diagnostics).is_none());
+    }
+
+    #[test]
+    fn not_measured_is_distinguishable_from_measured_zero() {
+        let asm = PromptAssembler::new(10_000);
+        let out = asm.assemble(
+            &AssemblyInput::new("critic", "Q")
+                .with_memory(vec![])
+                .without_retrieval("dense index disabled for this run"),
+        );
+
+        let mem = out.section(SectionKind::Memory).unwrap();
+        assert!(mem.measured(), "we asked memory and it had nothing");
+        assert_eq!(mem.items_total, Some(0));
+        assert!(!mem.trimmed);
+
+        let ret = out.section(SectionKind::Retrieval).unwrap();
+        assert!(!ret.measured(), "nobody asked retrieval");
+        assert_eq!(ret.items_total, None);
+        assert!(!ret.trimmed, "an unobserved section cannot report a drop");
+        assert_eq!(
+            ret.not_measured_reason.as_deref(),
+            Some("dense index disabled for this run")
+        );
+
+        // Tools were never set at all: still not measured, with the default
+        // reason rather than a fabricated zero.
+        let tools = out.section(SectionKind::Tools).unwrap();
+        assert_eq!(tools.items_total, None);
+        assert!(tools.not_measured_reason.is_some());
+
+        let ctx = out.to_context();
+        let by_kind = |kind: &str| -> Value {
+            ctx["sections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["kind"] == json!(kind))
+                .unwrap()
+                .clone()
+        };
+        let memory_json = by_kind("memory");
+        assert_eq!(memory_json["items_total"], json!(0));
+        assert!(
+            memory_json.get("items_total_measured").is_none(),
+            "a measured zero stays a plain zero"
+        );
+        let retrieval_json = by_kind("retrieval");
+        assert!(retrieval_json["items_total"].is_null());
+        assert_eq!(retrieval_json["items_total_measured"], json!(false));
+        assert_eq!(
+            retrieval_json["not_measured_reason"],
+            json!("dense index disabled for this run")
+        );
     }
 
     #[test]
