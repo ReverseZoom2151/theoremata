@@ -607,7 +607,11 @@ fn norm_ws(s: &str) -> String {
 /// passed online. This LOOSENS the gate with respect to commented text ONLY —
 /// a real `sorry` in code is untouched by stripping and still fails here.
 fn fallback_source_scan(code: &str) -> ScanReport {
-    let low = crate::prover::formal::strip_comments(code).to_lowercase();
+    // Whitespace is normalized as well as comments stripped, so a pattern made of
+    // two words matches however the source broke the line between them
+    // (`open\n  private foo in …`). Every single-token pattern is unaffected: a
+    // token cannot span whitespace in the first place.
+    let low = norm_ws(&crate::prover::formal::strip_comments(code).to_lowercase());
     let patterns = [
         "sorry",
         "sorryax",
@@ -615,6 +619,16 @@ fn fallback_source_scan(code: &str) -> ScanReport {
         "native_decide",
         "ofreducebool",
         "trustcompiler",
+        // `open private f in …` pulls a PRIVATE declaration into scope under its
+        // real name. Private is Lean's only encapsulation boundary, so this is
+        // the way to reach an internal lemma a module deliberately did not
+        // export, or to shadow a name the surrounding proof is read as using.
+        // Neither the kernel nor `#print axioms` says anything about it: the
+        // resulting term is perfectly well-typed and axiom-free, which is why it
+        // belongs on this lexical list next to the other escape hatches.
+        // Not covered by any existing pattern above (none mentions `open` or
+        // `private`), and `open Foo` on its own is ordinary and stays allowed.
+        "open private",
     ];
     let findings: Vec<String> = patterns
         .iter()
@@ -1010,6 +1024,31 @@ mod tier0_tests {
         let real2 = fallback_source_scan("theorem t : P := by native_decide\n");
         assert!(!real2.clean);
         assert!(real2.findings.iter().any(|f| f == "native_decide"));
+    }
+
+    /// `open private` reaches a declaration a module deliberately did not
+    /// export, and nothing in the kernel or the axiom audit reports it.
+    #[test]
+    fn open_private_is_flagged() {
+        let report = fallback_source_scan("open private secretLemma in\ntheorem t : P := by\n  exact secretLemma\n");
+        assert!(!report.clean);
+        assert!(report.findings.iter().any(|f| f == "open private"));
+        // Line-broken between the two words: whitespace normalization means the
+        // pattern still bites.
+        let split = fallback_source_scan("open\n  private secretLemma in\ntheorem t : P := trivial\n");
+        assert!(split.findings.iter().any(|f| f == "open private"));
+    }
+
+    /// It inherits the comment policy of the scan it lives in: a MENTION of the
+    /// hatch in a comment is never seen by the kernel and must not gate. A plain
+    /// `open` of a public namespace is ordinary Lean and stays allowed.
+    #[test]
+    fn commented_or_plain_open_is_not_flagged() {
+        let commented =
+            fallback_source_scan("-- open private secretLemma in\ntheorem t : True := trivial\n");
+        assert!(commented.clean, "findings: {:?}", commented.findings);
+        let plain = fallback_source_scan("open Nat Finset\ntheorem t : True := trivial\n");
+        assert!(plain.clean, "findings: {:?}", plain.findings);
     }
 
     fn bundle(stmt: &str) -> Option<crate::prover::vacuity::HypothesisBundle> {
