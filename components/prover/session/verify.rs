@@ -35,16 +35,21 @@ pub fn verify_lean_round_trip(
     let lexical = if py.available() {
         let resp = py.run(json!({"tool": "lean_soundness", "text": after_src}))?;
         let parsed: serde_json::Value =
-            serde_json::from_str(&resp.stdout).unwrap_or(json!({"pregate_clean": false}));
-        // `lean_soundness` returns `pregate_clean` (with `clean` as a deprecated
-        // alias). It has NEVER returned `ok`, which is what this read asked for
-        // before, so `lexical` was permanently false and this pre-screen was dead
-        // for every external-prover adapter. Absent/unparseable still means false.
-        parsed
-            .get("pregate_clean")
-            .or_else(|| parsed.get("clean"))
+            serde_json::from_str(&resp.stdout).unwrap_or(json!({"ok": false}));
+        // The worker envelope is `{"ok": bool, "output": <payload>}`. Reading
+        // top-level `ok` alone (as this did) only asked "did the worker run",
+        // never "is the source clean" -- so the pre-screen passed on any
+        // successful invocation regardless of what the scan found. Require BOTH:
+        // the call succeeded, and the payload's verdict is clean.
+        // `lean_soundness` returns `pregate_clean`, with `clean` as a deprecated
+        // alias. Absent or unparseable still means false (fail closed).
+        let call_ok = parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        let scan_clean = parsed
+            .get("output")
+            .and_then(|o| o.get("pregate_clean").or_else(|| o.get("clean")))
             .and_then(|v| v.as_bool())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        call_ok && scan_clean
     } else {
         false
     };
