@@ -11,6 +11,7 @@ pub mod proof_job;
 pub mod proof_log;
 pub mod session;
 pub mod statement_preservation;
+pub mod vacuity;
 
 // Re-export every leaf module flat at the component root so existing paths
 // (`prover::aristotle`, hence `crate::prover::aristotle`, and sibling

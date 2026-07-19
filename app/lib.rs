@@ -20,7 +20,7 @@ mod verify;
 pub use graph::{db, model, scheduler};
 pub use prover::{
     aristotle, attempt_run, axiom_audit, error_feedback, exec, formal, goal_state,
-    hypothesis_audit, isabelle, lean, proof_job, proof_log, rocq, statement_preservation,
+    hypothesis_audit, isabelle, lean, proof_job, proof_log, rocq, statement_preservation, vacuity,
 };
 pub use reason::{
     agent, best_first, blueprint, blueprint_generate, blueprint_run, certification, chat,
