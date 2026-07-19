@@ -32,7 +32,8 @@ pub use reason::{
     minimize, model_elimination, model_router, observe, optimize, plan_history, portfolio,
     preference_pairs, process_reward, progress, proof_import, proof_pool, refine_ops, repair,
     research, retry, rewriting, router, sampler, sampling, search_telemetry, skest, sketch,
-    statement_validation, subsumption, symmetry_dedup, tactic_outcome, taint, team, trace, ttc,
+    statement_validation, statement_validity, subsumption, symmetry_dedup, tactic_outcome, taint,
+    team, trace, ttc,
 };
 pub use verify::{hardening, lean_session};
 

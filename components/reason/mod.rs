@@ -8,7 +8,9 @@ pub mod search;
 // Re-export every leaf module flat at the component root so existing paths
 // (`reason::mcts`, hence `crate::mcts` via app/main.rs, and sibling references
 // like `crate::mcts`) continue to resolve after the subgroup reorganization.
-pub use critique::{critic, guard, guardrails, memory, plan_history, taint};
+pub use critique::{
+    critic, guard, guardrails, memory, plan_history, statement_validity, taint,
+};
 pub use orchestration::{
     agent, blueprint_generate, blueprint_run, certification, chat, consolidate, context_assembly,
     live_plan, meta_tools, method_transfer, observe, proof_import, research, statement_validation,
