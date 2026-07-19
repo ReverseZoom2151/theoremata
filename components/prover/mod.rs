@@ -3,6 +3,7 @@
 pub mod attempt_run;
 pub mod axiom_audit;
 pub mod backends;
+pub mod decl_index_adapter;
 pub mod declaration_lookup;
 pub mod error_feedback;
 pub mod formal;
