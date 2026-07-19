@@ -197,6 +197,24 @@ impl Store {
               created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_goal_cache_project_key ON goal_cache(project_id, canonical_key);
+
+            CREATE TABLE IF NOT EXISTS trace_spans (
+              id TEXT PRIMARY KEY,
+              project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+              run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+              span_id INTEGER NOT NULL,
+              parent INTEGER,
+              kind TEXT NOT NULL,
+              label TEXT NOT NULL,
+              start_seq INTEGER NOT NULL,
+              end_seq INTEGER,
+              status TEXT NOT NULL,
+              detail TEXT,
+              failure_class TEXT,
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_trace_spans_run ON trace_spans(run_id, start_seq);
+            CREATE INDEX IF NOT EXISTS idx_trace_spans_project ON trace_spans(project_id);
             "#,
         )?;
         // Idempotent column additions so databases created before these fields
@@ -1261,6 +1279,67 @@ impl Store {
                 payload.to_string(),
                 Utc::now().to_rfc3339()
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Persist a finished [`RunTrace`](crate::trace::RunTrace): one row per span,
+    /// with each failed span's [`FailureClass`](crate::trace::FailureClass) folded
+    /// in. Flushed once at run end. Also mirrors the whole tree onto the event log
+    /// under `run.trace`, so the existing observe/replay path keeps working with no
+    /// reader change.
+    pub fn record_trace(
+        &self,
+        project_id: &str,
+        run_id: &str,
+        trace: &crate::trace::RunTrace,
+        failures: &std::collections::HashMap<u64, crate::trace::FailureClass>,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        for span in trace.spans() {
+            // SpanKind/SpanStatus serialize (serde) to their snake_case tag; they
+            // have no Display/as_str, so round-trip through serde_json to a String.
+            let kind = serde_json::to_value(span.kind)?
+                .as_str()
+                .unwrap_or("other")
+                .to_owned();
+            let status = serde_json::to_value(span.status)?
+                .as_str()
+                .unwrap_or("open")
+                .to_owned();
+            let failure_class = failures.get(&span.id).map(|c| c.as_str());
+            let id = Uuid::new_v4().to_string();
+            let span_id = span.id as i64;
+            let parent = span.parent.map(|p| p as i64);
+            let start_seq = span.start_seq as i64;
+            let end_seq = span.end_seq.map(|e| e as i64);
+            self.conn.execute(
+                "INSERT INTO trace_spans(id,project_id,run_id,span_id,parent,kind,label,\
+                 start_seq,end_seq,status,detail,failure_class,created_at) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                params![
+                    id,
+                    project_id,
+                    run_id,
+                    span_id,
+                    parent,
+                    kind,
+                    span.label,
+                    start_seq,
+                    end_seq,
+                    status,
+                    span.detail,
+                    failure_class,
+                    now,
+                ],
+            )?;
+        }
+        self.event(
+            Some(project_id),
+            Some(run_id),
+            "run.trace",
+            "orchestrator",
+            trace.to_tree(),
         )?;
         Ok(())
     }

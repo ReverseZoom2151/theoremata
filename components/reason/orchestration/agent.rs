@@ -21,10 +21,13 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 // Statement VALIDATION as a first-class pipeline stage (sibling module).
 use crate::statement_validation::{StatementValidator, ToolStatementValidator, ValidationOutcome};
+use crate::trace::{
+    ErrorContext, FailureClass, FailureTaxonomy, Layer, RunTrace, SpanKind, SpanStatus,
+};
 
 pub struct AgentLoop<'a> {
     pub store: &'a Store,
@@ -73,6 +76,11 @@ impl AgentLoop<'_> {
         let run = self.store.begin_run(project_id, "autonomous_agent")?;
         let mut notes = Vec::new();
         let mut steps = Vec::new();
+        // Observability: a per-run span tree plus failure classifications, flushed
+        // to the store at run end (and on the hard-error path).
+        let mut trace = RunTrace::new();
+        let root_span = trace.open_span(SpanKind::Root, "autonomous_agent", None);
+        let mut failures: HashMap<u64, FailureClass> = HashMap::new();
         // Ensure the theorem itself is a node so it can be routed and decomposed.
         if !self
             .store
@@ -102,13 +110,31 @@ impl AgentLoop<'_> {
         self.store
             .update_run(project_id, &run, "running", "research", 0)?;
         if tools.model {
+            let rspan = trace.open_span(SpanKind::Plan, "research", Some(root_span));
             let engine = ResearchEngine {
                 store: self.store,
                 provider: self.provider,
             };
             match engine.run(project_id) {
-                Ok(s) => steps.push(json!({"phase":"research","created":s.created_nodes})),
-                Err(e) => notes.push(format!("research phase failed: {e}")),
+                Ok(s) => {
+                    steps.push(json!({"phase":"research","created":s.created_nodes}));
+                    trace.close_span(
+                        rspan,
+                        SpanStatus::Ok,
+                        Some(format!("created {}", s.created_nodes)),
+                    );
+                }
+                Err(e) => {
+                    notes.push(format!("research phase failed: {e}"));
+                    failures.insert(
+                        rspan,
+                        FailureTaxonomy::classify(&ErrorContext::from_layer(
+                            Layer::Plan,
+                            e.to_string(),
+                        )),
+                    );
+                    trace.close_span(rspan, SpanStatus::Failed, Some(e.to_string()));
+                }
             }
         } else {
             notes.push("no model provider: research phase skipped".into());
@@ -177,7 +203,9 @@ impl AgentLoop<'_> {
                 }
                 let tier =
                     crate::guard::model_tier(node.kind, attempts, node.strategy_hint.as_deref());
-                let outcome = self.act(
+                let span =
+                    trace.open_span(route_span_kind(route), node.title.clone(), Some(root_span));
+                let outcome = match self.act(
                     project_id,
                     &run,
                     &node,
@@ -188,7 +216,28 @@ impl AgentLoop<'_> {
                     &mut decomposed,
                     &mut certified,
                     &mut abstained,
-                )?;
+                ) {
+                    Ok(o) => {
+                        let (status, class) = classify_outcome(route, o);
+                        if let Some(c) = class {
+                            failures.insert(span, c);
+                        }
+                        trace.close_span(span, status, Some(o.to_string()));
+                        o
+                    }
+                    Err(e) => {
+                        failures.insert(
+                            span,
+                            FailureTaxonomy::classify(&ErrorContext::from_layer(
+                                route_layer(route),
+                                e.to_string(),
+                            )),
+                        );
+                        trace.close_span(span, SpanStatus::Failed, Some(e.to_string()));
+                        let _ = self.store.record_trace(project_id, &run, &trace, &failures);
+                        return Err(e);
+                    }
+                };
                 steps.push(json!({
                     "node":node.id,"title":node.title,"route":route,
                     "tier":crate::guard::tier_env_suffix(tier),"outcome":outcome
@@ -207,6 +256,7 @@ impl AgentLoop<'_> {
             .update_run(project_id, &run, "running", "critique", 0)?;
         let mut critique_findings = 0;
         if tools.model {
+            let cspan = trace.open_span(SpanKind::Verify, "critique", Some(root_span));
             let critic = Critic {
                 store: self.store,
                 provider: self.provider,
@@ -215,8 +265,23 @@ impl AgentLoop<'_> {
                 Ok(report) => {
                     critique_findings = report.findings.len();
                     steps.push(json!({"phase":"critique","findings":critique_findings}));
+                    trace.close_span(
+                        cspan,
+                        SpanStatus::Ok,
+                        Some(format!("{critique_findings} findings")),
+                    );
                 }
-                Err(e) => notes.push(format!("critique failed: {e}")),
+                Err(e) => {
+                    notes.push(format!("critique failed: {e}"));
+                    failures.insert(
+                        cspan,
+                        FailureTaxonomy::classify(&ErrorContext::from_layer(
+                            Layer::Verify,
+                            e.to_string(),
+                        )),
+                    );
+                    trace.close_span(cspan, SpanStatus::Failed, Some(e.to_string()));
+                }
             }
         }
 
@@ -228,6 +293,18 @@ impl AgentLoop<'_> {
         };
         self.store
             .update_run(project_id, &run, state, "complete", 0)?;
+        let root_status = if certified > 0 {
+            SpanStatus::Ok
+        } else {
+            SpanStatus::Failed
+        };
+        trace.close_span(
+            root_span,
+            root_status,
+            Some(format!("certified {certified}, abstained {abstained}")),
+        );
+        self.store
+            .record_trace(project_id, &run, &trace, &failures)?;
         Ok(AgentSummary {
             project_id: project_id.into(),
             run_id: run,
@@ -976,6 +1053,54 @@ impl AgentLoop<'_> {
 /// Fold an obligation's typed-claim / transfer-schema tags into a strategy hint
 /// (or `None` when the model tagged neither), so the prover sees how the claim
 /// should be approached.
+/// Map a router [`Route`] to the span kind that best describes the work it drives.
+fn route_span_kind(route: Route) -> SpanKind {
+    match route {
+        Route::Decompose => SpanKind::Plan,
+        Route::Retrieve => SpanKind::Retrieve,
+        Route::Falsify => SpanKind::Falsify,
+        Route::Formalize => SpanKind::ModelCall,
+        Route::Prove => SpanKind::Search,
+        Route::Verify => SpanKind::Verify,
+        _ => SpanKind::Other,
+    }
+}
+
+/// The failure-taxonomy [`Layer`] a route's failures are attributed to.
+fn route_layer(route: Route) -> Layer {
+    match route {
+        Route::Decompose => Layer::Plan,
+        Route::Retrieve | Route::Falsify | Route::Prove => Layer::Tool,
+        Route::Formalize => Layer::Model,
+        Route::Verify => Layer::Verify,
+        _ => Layer::Unknown,
+    }
+}
+
+/// Turn an `act` outcome string into a span status and, on a failure-shaped
+/// outcome, its [`FailureClass`]. `noop` is a routed-but-idle step (Aborted, no
+/// class); the `_unverified`/`_drift` outcomes are verifier rejections that carry
+/// the `kernel_rejected` signal.
+fn classify_outcome(route: Route, outcome: &str) -> (SpanStatus, Option<FailureClass>) {
+    if outcome == "noop" {
+        return (SpanStatus::Aborted, None);
+    }
+    let kernel_rejected = matches!(
+        outcome,
+        "prove_unverified" | "formal_generate_unverified" | "prove_statement_drift"
+    );
+    if kernel_rejected {
+        let mut ctx = ErrorContext::from_layer(route_layer(route), outcome);
+        ctx.kernel_rejected = true;
+        return (SpanStatus::Failed, Some(FailureTaxonomy::classify(&ctx)));
+    }
+    if outcome == "prove_failed" {
+        let ctx = ErrorContext::from_layer(route_layer(route), outcome);
+        return (SpanStatus::Failed, Some(FailureTaxonomy::classify(&ctx)));
+    }
+    (SpanStatus::Ok, None)
+}
+
 fn decompose_hint(ob: &crate::decompose::Obligation) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(kind) = ob.claim_kind {
