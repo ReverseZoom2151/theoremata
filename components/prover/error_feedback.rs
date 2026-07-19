@@ -262,8 +262,12 @@ fn parse_lean(raw: &str) -> Vec<Diagnostic> {
             let (line_no, col_start, col_end) = match head.rsplit_once(':') {
                 Some((rest, col_field)) => {
                     let (c0, c1) = parse_span(col_field);
+                    // Lean 4 reports 1-based LINES but 0-based COLUMNS, while
+                    // `Diagnostic` stores 1-based columns. Convert, or every
+                    // `<error>` span opens one character early (e.g. on the space
+                    // before the offending token).
                     let l = rest.rsplit_once(':').and_then(|(_, l)| l.trim().parse().ok());
-                    (l, c0, c1)
+                    (l, c0.map(|c| c + 1), c1.map(|c| c + 1))
                 }
                 None => (None, None, None),
             };
@@ -682,8 +686,9 @@ mod tests {
 
     #[test]
     fn single_lean_error_renders_context_and_delimiters() {
-        // Line 6 is `  | succ k ih => exact bogus`; `bogus` starts at column 24.
-        let raw = "Generated.lean:6:24: error: unknown identifier 'bogus'";
+        // Line 6 is `  | succ k ih => exact bogus`. `bogus` starts at 1-based
+        // column 24, which Lean reports as 0-based column 23.
+        let raw = "Generated.lean:6:23: error: unknown identifier 'bogus'";
         let r = render_feedback(FormalSystem::Lean, raw, SRC, &FeedbackConfig::default());
         assert!(r.parsed, "a standard Lean header must parse");
         assert_eq!(r.diagnostics.len(), 1);
