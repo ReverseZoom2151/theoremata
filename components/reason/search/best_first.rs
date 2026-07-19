@@ -55,8 +55,9 @@
 //! [`TacticScorer`] seam.
 
 use super::driver::{GoalState, TacticExpander};
+use super::minimize::{minimize_proof_checked, AdjacencyGraph, MinimizeOutcome};
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 /// Smallest prior treated as non-zero when converting a `[0,1]` prior to a
 /// log-probability (avoids `ln(0) = -∞`).
@@ -341,6 +342,69 @@ impl<S: GoalState> BestFirstOutcome<S> {
         }
         out
     }
+
+    /// Project the *whole* search arena into a [`ProofGraph`], collapsing arena
+    /// nodes that share a [`dedup_key`](GoalState::dedup_key) onto one graph node.
+    ///
+    /// Best-first grows a tree (one parent per arena node), but two arena nodes can
+    /// hold the same goal state reached by different-length routes: a transposition
+    /// the frontier discovered but only expanded once. Merging by dedup_key turns
+    /// that tree back into the DAG those transpositions imply, which is precisely
+    /// where a *shorter* closing path than the log-prob-ordered line best-first
+    /// closed on can live. The projection is edges the scorer actually emitted and
+    /// closed flags from [`is_closed`](GoalState::is_closed); it is only a record of
+    /// the search, so any path read out of it is a guess until the gate re-checks it.
+    ///
+    /// First-seen id assignment over the ordered arena (root is index `0`) keeps the
+    /// mapping, and therefore the downstream BFS, deterministic.
+    fn proof_graph(&self) -> AdjacencyGraph {
+        let mut ids: HashMap<String, usize> = HashMap::new();
+        for node in &self.arena {
+            let next = ids.len();
+            ids.entry(node.state.dedup_key()).or_insert(next);
+        }
+        // The root is arena index 0, so it is the first key seen and holds id 0.
+        let mut graph = AdjacencyGraph::new(ids[&self.arena[0].state.dedup_key()]);
+        for node in &self.arena {
+            let id = ids[&node.state.dedup_key()];
+            if node.state.is_closed() {
+                graph = graph.close(id);
+            }
+            // A node carries its incoming edge (parent, tactic) except at the root;
+            // re-key the parent so transposed parents fold together too.
+            if let (Some(parent), Some(tactic)) = (node.parent, node.tactic_in.as_ref()) {
+                let parent_id = ids[&self.arena[parent].state.dedup_key()];
+                graph = graph.edge(parent_id, tactic, id);
+            }
+        }
+        graph
+    }
+
+    /// Shrink the found proof to a shorter, **gate-re-checked** tactic sequence.
+    ///
+    /// The soundness boundary is `replay`: it must return `true` only when replaying
+    /// that exact tactic subsequence from the root actually closes the goal. This
+    /// method never decides solvedness itself: it hands BFS's shortest closing path
+    /// (a guess drawn from the recorded arena) to `replay` and returns the
+    /// [`MinimizeOutcome`] verbatim, so `accepted`/[`Verified`](super::minimize::MinimizeStatus::Verified)
+    /// is populated only when the caller's re-check confirmed the shrink. On an
+    /// unsolved search it returns a
+    /// [`NoProofFound`](super::minimize::MinimizeStatus::NoProofFound) outcome
+    /// without ever consulting `replay`, so no proof is fabricated where none was
+    /// found.
+    pub fn minimized_proof<F>(&self, replay: F) -> MinimizeOutcome
+    where
+        F: FnMut(&[String]) -> bool,
+    {
+        if !self.solved {
+            // No solution: hand the checked entry point a graph with no closed node
+            // so it reports NoProofFound and leaves the gate untouched. Nothing is
+            // ever marked accepted for a search that did not close a goal.
+            return minimize_proof_checked(&AdjacencyGraph::new(0), &[], replay);
+        }
+        let original = self.proof_tactics();
+        minimize_proof_checked(&self.proof_graph(), &original, replay)
+    }
 }
 
 /// Run value-free best-first search from `root`, expanding states in descending
@@ -491,6 +555,7 @@ fn mix_seed(base: u64, key: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::super::driver::TacticStep;
+    use super::super::minimize::MinimizeStatus;
     use super::*;
     use std::collections::HashMap;
 
@@ -896,5 +961,99 @@ mod tests {
         );
         assert!(!out.solved);
         assert!(dpo_pairs(&out).is_empty());
+    }
+
+    // ---- Gate-re-checked proof minimization ----------------------------------
+
+    /// A solved search whose arena hides a shorter closing route than the line
+    /// best-first actually closed on. The high-log-prob two-step line
+    /// root -t1-> A -t3-> G(closed) wins the frontier race, but the frontier also
+    /// discovered root -t2-> C(closed), a length-one close. Projecting the arena to
+    /// a DAG exposes that shortcut to the minimizer's BFS.
+    fn shortcut_scorer() -> TableScorer {
+        TableScorer::new()
+            .edge("root", "t1", 0.99f64.ln(), MockGoal::open("A"))
+            .edge("root", "t2", 0.5f64.ln(), MockGoal::closed("C"))
+            .edge("A", "t3", 0.99f64.ln(), MockGoal::closed("G"))
+    }
+
+    #[test]
+    fn minimized_proof_accepts_a_gate_checked_shortcut() {
+        let mut scorer = shortcut_scorer();
+        let out = best_first_search(
+            &mut scorer,
+            MockGoal::open("root"),
+            &BestFirstConfig::default(),
+        );
+        assert!(out.solved);
+        // Best-first closed on the high-log-prob two-step line, not the shortcut.
+        assert_eq!(out.proof_tactics(), vec!["t1", "t3"]);
+        let original = out.proof_tactics();
+
+        // A gate that re-checks and accepts the shorter route shrinks the proof;
+        // the gate is what makes the shrink emittable, and it saw the candidate.
+        let mut seen: Vec<Vec<String>> = Vec::new();
+        let outcome = out.minimized_proof(|cand| {
+            seen.push(cand.to_vec());
+            true
+        });
+        assert_eq!(outcome.status, MinimizeStatus::Verified);
+        assert_eq!(outcome.accepted, Some(vec!["t2".to_string()]));
+        assert_eq!(
+            seen,
+            vec![vec!["t2".to_string()]],
+            "the gate must be handed the exact shrunk sequence to re-check"
+        );
+        assert!(
+            outcome.best_safe(&original).len() < original.len(),
+            "the accepted shrink is strictly shorter than the closed line"
+        );
+        assert_eq!(outcome.best_safe(&original), ["t2".to_string()]);
+    }
+
+    #[test]
+    fn minimized_proof_keeps_the_original_when_the_gate_rejects() {
+        let mut scorer = shortcut_scorer();
+        let out = best_first_search(
+            &mut scorer,
+            MockGoal::open("root"),
+            &BestFirstConfig::default(),
+        );
+        let original = out.proof_tactics();
+
+        // A gate that rejects every shorter candidate leaves `accepted` empty, so
+        // the caller falls back to the original line that passed a gate upstream.
+        let outcome = out.minimized_proof(|_| false);
+        assert_eq!(outcome.status, MinimizeStatus::RejectedByGate);
+        assert_eq!(outcome.accepted, None);
+        assert_eq!(outcome.best_safe(&original), original.as_slice());
+    }
+
+    #[test]
+    fn minimized_proof_fabricates_nothing_for_an_unsolved_search() {
+        // A chain that never closes within budget: the minimizer must report
+        // NoProofFound and never consult the gate, so no proof is invented for a
+        // search that did not close a goal.
+        let mut scorer =
+            TableScorer::new().edge("root", "t", 0.9f64.ln(), MockGoal::open("stuck"));
+        let out = best_first_search(
+            &mut scorer,
+            MockGoal::open("root"),
+            &BestFirstConfig {
+                max_steps: 5,
+                ..BestFirstConfig::default()
+            },
+        );
+        assert!(!out.solved);
+
+        let mut gate_calls = 0;
+        let outcome = out.minimized_proof(|_| {
+            gate_calls += 1;
+            true
+        });
+        assert_eq!(gate_calls, 0, "an unsolved search must not consult the gate");
+        assert_eq!(outcome.status, MinimizeStatus::NoProofFound);
+        assert_eq!(outcome.accepted, None);
+        assert_eq!(outcome.candidate, None);
     }
 }
