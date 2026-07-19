@@ -1,9 +1,9 @@
 mod api;
 mod config;
-#[path = "../components/prover/mod.rs"]
-mod prover;
 #[path = "../components/graph/mod.rs"]
 mod graph;
+#[path = "../components/prover/mod.rs"]
+mod prover;
 #[path = "../components/provider/mod.rs"]
 mod provider;
 #[path = "../components/reason/mod.rs"]
@@ -18,21 +18,21 @@ mod verify;
 // keeps its flat `crate::model` / `crate::workflow` / `crate::lean_session`
 // paths unchanged — the physical layout is by component, the namespace is flat.
 pub use graph::{db, model, scheduler};
-pub use reason::{
-    agent, best_first, blueprint, blueprint_generate, blueprint_run, certification, chat, checker_cache, concurrent,
-    consolidate, conjecture_engine, context_assembly, critic, critic_scorer, dag_projection, decompose,
-    definition_synthesis, discovery_game, distance_critic, driver, evolve_sketch, falsification, fitness,
-    graph_rag, guardrails, hybrid_search,
-    formal_generate, formalize_modes, formalize_portfolio, goal_cache, guard, inverse_method, library, live_plan,
-    mathlib_export, mcts, memory, meta_tools, method_transfer, minimize, model_elimination, model_router,
-    observe, optimize, plan_history, portfolio,
-    preference_pairs, process_reward, progress, proof_import, proof_pool, refine_ops, repair, research, retry, rewriting, router, sampler, search_telemetry,
-    sampling, sketch, skest, statement_validation, subsumption, symmetry_dedup, tactic_outcome, trace,
-    taint, team, ttc,
-};
 pub use prover::{
     aristotle, attempt_run, axiom_audit, exec, formal, goal_state, isabelle, lean, proof_job,
     proof_log, rocq, statement_preservation,
+};
+pub use reason::{
+    agent, best_first, blueprint, blueprint_generate, blueprint_run, certification, chat,
+    checker_cache, concurrent, conjecture_engine, consolidate, context_assembly, critic,
+    critic_scorer, dag_projection, decompose, definition_synthesis, discovery_game,
+    distance_critic, driver, evolve_sketch, falsification, fitness, formal_generate,
+    formalize_modes, formalize_portfolio, goal_cache, graph_rag, guard, guardrails, hybrid_search,
+    inverse_method, library, live_plan, mathlib_export, mcts, memory, meta_tools, method_transfer,
+    minimize, model_elimination, model_router, observe, optimize, plan_history, portfolio,
+    preference_pairs, process_reward, progress, proof_import, proof_pool, refine_ops, repair,
+    research, retry, rewriting, router, sampler, sampling, search_telemetry, skest, sketch,
+    statement_validation, subsumption, symmetry_dedup, tactic_outcome, taint, team, trace, ttc,
 };
 pub use verify::{hardening, lean_session};
 
@@ -229,6 +229,11 @@ enum Command {
     /// `{"op":"list_projects"}`). See `api::ApiRequest` for the schema.
     Api {
         request: String,
+        /// Exact database to open for a process bridge. Kept hidden because
+        /// normal CLI callers should use the configured database; `mcp` uses
+        /// this to pass its already-resolved Store context to Python safely.
+        #[arg(long, hide = true)]
+        database: Option<PathBuf>,
     },
     /// Export a project's proof-DAG to a leanblueprint `content.tex` + `lean_decls`.
     BlueprintExport {
@@ -414,7 +419,16 @@ enum Command {
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let config = Config::load(cli.config.as_deref())?;
-    let store = Store::open(&config.database)?;
+    // A subprocess bridge must use the same Store selected by `mcp`, rather
+    // than re-resolving a potentially different default configuration.
+    let database = match &cli.command {
+        Command::Api {
+            database: Some(database),
+            ..
+        } => database,
+        _ => &config.database,
+    };
+    let store = Store::open(database)?;
     let provider: Box<dyn ModelProvider> = match &config.model_command {
         Some(c) => Box::new(CommandProvider::new(c)),
         None => Box::new(OfflineProvider),
@@ -431,12 +445,23 @@ pub fn run() -> Result<()> {
         Command::Mcp => {
             // Launch the MCP stdio server: it speaks JSON-RPC over inherited
             // stdin/stdout, so an MCP client drives the Python tool workers.
+            // Give it an explicit, narrow Rust API bridge context. Python
+            // invokes this binary for Store-backed meta-tools; it never opens
+            // or writes SQLite directly.
             let python = tools::python_command()
                 .ok_or_else(|| anyhow::anyhow!("no python interpreter found"))?;
             let bootstrap = tools::python_bootstrap("mcp_server");
-            let status = std::process::Command::new(python)
+            let executable = std::env::current_exe()?;
+            let database = absolute_path(&config.database)?;
+            let mut command = std::process::Command::new(python);
+            command
                 .args(["-E", "-c", &bootstrap])
-                .status()?;
+                .env("THEOREMATA_MCP_API_COMMAND", executable)
+                .env("THEOREMATA_MCP_DATABASE", database);
+            if let Some(path) = cli.config.as_deref() {
+                command.env("THEOREMATA_MCP_CONFIG", absolute_path(path)?);
+            }
+            let status = command.status()?;
             std::process::exit(status.code().unwrap_or(1));
         }
         Command::New { name, theorem } => {
@@ -713,7 +738,7 @@ pub fn run() -> Result<()> {
             let request: serde_json::Value = serde_json::from_str(&request)?;
             print_value(true, &PythonCheck::new().run(request)?)?
         }
-        Command::Api { request } => println!("{}", api::handle_json(&store, &request)),
+        Command::Api { request, .. } => println!("{}", api::handle_json(&store, &request)),
         Command::BlueprintExport { project, out_dir } => {
             let export = blueprint::export(&store, &project)?;
             std::fs::create_dir_all(&out_dir)?;
@@ -1076,20 +1101,13 @@ pub fn run() -> Result<()> {
                 &config,
             );
             task.backend = backend;
-            print_value(
-                true,
-                &proof_job::submit(&store, &config, task, None)?,
-            )?
+            print_value(true, &proof_job::submit(&store, &config, task, None)?)?
         }
         Command::ProofPoll { job } => {
             print_value(true, &proof_job::poll(&store, &config, &job, None)?)?
         }
-        Command::ProofCancel { job } => {
-            print_value(true, &proof_job::cancel(&store, &job)?)?
-        }
-        Command::ProofResult { job } => {
-            print_value(true, &proof_job::result(&store, &job)?)?
-        }
+        Command::ProofCancel { job } => print_value(true, &proof_job::cancel(&store, &job)?)?,
+        Command::ProofResult { job } => print_value(true, &proof_job::result(&store, &job)?)?,
         Command::ProofJobs { project, limit } => {
             print_value(true, &store.list_proof_jobs(&project, limit)?)?
         }
@@ -1108,22 +1126,13 @@ pub fn run() -> Result<()> {
             print_value(true, &attempt_run::cancel(&store, &attempt)?)?
         }
         Command::AttemptResult { attempt } => {
-            print_value(
-                true,
-                &attempt_run::result(&store, &config, &attempt, None)?,
-            )?
+            print_value(true, &attempt_run::result(&store, &config, &attempt, None)?)?
         }
         Command::AttemptRun { attempt, max_polls } => {
             std::env::set_var("THEOREMATA_ARISTOTLE_MOCK", "1");
             print_value(
                 true,
-                &attempt_run::run_to_completion(
-                    &store,
-                    &config,
-                    &attempt,
-                    max_polls,
-                    None,
-                )?,
+                &attempt_run::run_to_completion(&store, &config, &attempt, max_polls, None)?,
             )?
         }
         Command::Lean { file } => print_value(
@@ -1132,6 +1141,17 @@ pub fn run() -> Result<()> {
         )?,
     }
     Ok(())
+}
+
+/// Resolve a caller-selected file path once before passing it across a process
+/// boundary. This does not canonicalize, so SQLite's normal path semantics and
+/// a not-yet-created database file remain intact.
+fn absolute_path(path: &std::path::Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
 }
 fn print_value<T: serde::Serialize + std::fmt::Debug>(json: bool, value: &T) -> Result<()> {
     if json {

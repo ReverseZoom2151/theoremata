@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
+from theoremata_tools import worker
 from theoremata_tools.mcp_server import (
     METHOD_NOT_FOUND,
     handle,
@@ -156,3 +158,115 @@ def test_serve_malformed_line_returns_parse_error():
     serve(stdin, stdout)
     resp = json.loads(stdout.getvalue().strip())
     assert resp["error"]["code"] == -32700
+
+
+def test_rust_meta_bridge_uses_explicit_context_and_never_invents_accepted(monkeypatch):
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        request = json.loads(command[-1])
+        if request["op"] == "list_meta_tools":
+            response = {
+                "version": "1",
+                "result": "meta_tools",
+                "tools": [
+                    {
+                        "name": "plan",
+                        "description": "Plan a proof.",
+                        "inputSchema": {"type": "object", "properties": {}},
+                    }
+                ],
+            }
+        else:
+            assert request == {
+                "op": "invoke_meta_tool",
+                "tool": "plan",
+                "arguments": {"statement": "P"},
+            }
+            response = {
+                "version": "1",
+                "result": "meta_tool_invoked",
+                "tool": "plan",
+                "output": {"accepted": True, "worker_op": "meta_plan"},
+            }
+        return SimpleNamespace(returncode=0, stdout=json.dumps(response), stderr="")
+
+    monkeypatch.setenv("THEOREMATA_MCP_API_COMMAND", "/opt/theoremata")
+    monkeypatch.setenv("THEOREMATA_MCP_DATABASE", "/tmp/theoremata.db")
+    monkeypatch.setenv("THEOREMATA_MCP_CONFIG", "/tmp/theoremata.toml")
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+    descriptors = worker.meta_tool_descriptors()
+    assert descriptors == [
+        {
+            "name": "meta_plan",
+            "description": "Store-backed Rust orchestration API. Certification is forbidden. Plan a proof.",
+            "inputSchema": {"type": "object", "properties": {}},
+        }
+    ]
+    output = worker.dispatch({"tool": "meta_plan", "statement": "P"})
+    assert output["result"] == "meta_tool_invoked"
+    assert output["tool"] == "meta_plan"
+    assert output["output"] == {"worker_op": "meta_plan"}
+    assert output["bridge"] == {
+        "backend": "rust_api",
+        "store_backed": True,
+        "certification": "forbidden",
+    }
+    assert all(
+        command[:6]
+        == [
+            "/opt/theoremata",
+            "--config",
+            "/tmp/theoremata.toml",
+            "api",
+            "--database",
+            "/tmp/theoremata.db",
+        ]
+        for command, _ in calls
+    )
+    assert all(kwargs.get("shell", False) is False for _, kwargs in calls)
+
+
+def test_meta_bridge_rejects_certification_before_spawning(monkeypatch):
+    monkeypatch.setenv("THEOREMATA_MCP_API_COMMAND", "/opt/theoremata")
+    monkeypatch.setenv("THEOREMATA_MCP_DATABASE", "/tmp/theoremata.db")
+    monkeypatch.setattr(
+        worker.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not spawn")),
+    )
+
+    try:
+        worker.dispatch(
+            {"tool": "meta_self_review", "candidate": {"status": "formally_verified"}}
+        )
+    except ValueError as exc:
+        assert "certification requires proof evidence" in str(exc)
+    else:
+        raise AssertionError("certification-shaped meta input must be rejected")
+
+
+def test_mcp_meta_api_error_is_a_tool_error_not_success(monkeypatch):
+    descriptor = {
+        "name": "meta_plan",
+        "description": "Store-backed Rust orchestration API.",
+        "inputSchema": {"type": "object", "properties": {}},
+    }
+    monkeypatch.setattr(worker, "meta_tool_descriptors", lambda: [descriptor])
+    monkeypatch.setattr(
+        worker,
+        "dispatch",
+        lambda request: {
+            "version": "1",
+            "result": "error",
+            "code": "forbidden",
+            "message": "certification requires proof evidence",
+        },
+    )
+
+    response = handle(_rpc("tools/call", {"name": "meta_plan", "arguments": {}}))
+    assert response["result"]["isError"] is True
+    payload = _parse_tool_text(response["result"])
+    assert payload["code"] == "forbidden"

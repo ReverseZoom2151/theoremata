@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 from typing import Any
 
@@ -25,8 +27,193 @@ from .stages import run as stages_run
 from .symbolic import run as symbolic_run
 
 
+# Rust owns the graph Store and the stable JSON API.  These meta-tool aliases
+# are deliberately disjoint from the Python workers: Python forwards the
+# request to the configured `theoremata api` subprocess and never opens SQLite.
+_META_TOOL_OPS = {
+    "meta_plan": "plan",
+    "meta_update_plan": "update_plan",
+    "meta_critique": "critique",
+    "meta_redecompose": "redecompose",
+    "meta_recall": "recall",
+    "meta_spend": "spend",
+    "meta_budget": "budget",
+    "meta_self_review": "self_review",
+    "meta_abstain": "abstain",
+}
+_META_BRIDGE_TIMEOUT_SECONDS = 30.0
+_MAX_META_BRIDGE_BYTES = 256 * 1024
+
+
+def is_meta_tool_op(tool: str) -> bool:
+    """Whether ``tool`` is a Rust-owned orchestration meta-tool alias."""
+    return tool in _META_TOOL_OPS
+
+
+def _contains_formally_verified(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.casefold() == "formally_verified"
+    if isinstance(value, dict):
+        return any(_contains_formally_verified(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_formally_verified(item) for item in value)
+    return False
+
+
+def _without_accepted_markers(value: Any) -> Any:
+    """Remove registry-dispatch acknowledgements from a meta-tool response."""
+    if isinstance(value, dict):
+        return {
+            key: _without_accepted_markers(item)
+            for key, item in value.items()
+            if key != "accepted"
+        }
+    if isinstance(value, list):
+        return [_without_accepted_markers(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_without_accepted_markers(item) for item in value)
+    return value
+
+
+def _meta_bridge_command() -> list[str]:
+    """Build the exact Store-backed Rust API command from MCP-owned context."""
+    executable = os.environ.get("THEOREMATA_MCP_API_COMMAND", "").strip()
+    database = os.environ.get("THEOREMATA_MCP_DATABASE", "").strip()
+    if not executable or not database:
+        raise RuntimeError(
+            "meta-tools require the theoremata MCP bridge context; "
+            "start this server with `theoremata mcp`"
+        )
+    command = [executable]
+    config = os.environ.get("THEOREMATA_MCP_CONFIG", "").strip()
+    if config:
+        command.extend(["--config", config])
+    command.extend(["api", "--database", database])
+    return command
+
+
+def _meta_bridge_timeout() -> float:
+    raw = os.environ.get("THEOREMATA_MCP_BRIDGE_TIMEOUT_SECONDS", "")
+    if not raw:
+        return _META_BRIDGE_TIMEOUT_SECONDS
+    try:
+        return min(60.0, max(1.0, float(raw)))
+    except ValueError:
+        return _META_BRIDGE_TIMEOUT_SECONDS
+
+
+def _call_meta_api(request: dict[str, Any]) -> dict[str, Any]:
+    """Call the versioned Rust API and fail closed on malformed responses."""
+    payload = json.dumps(request, separators=(",", ":"))
+    if len(payload.encode("utf-8")) > _MAX_META_BRIDGE_BYTES:
+        raise ValueError("meta-tool request exceeds the Rust API size limit")
+    try:
+        completed = subprocess.run(
+            [*_meta_bridge_command(), payload],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_meta_bridge_timeout(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Rust meta-tool API timed out") from exc
+    except OSError as exc:
+        raise RuntimeError(f"could not start Rust meta-tool API: {exc}") from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise RuntimeError(f"Rust meta-tool API exited {completed.returncode}: {detail[:512]}")
+    stdout = completed.stdout.strip()
+    if len(stdout.encode("utf-8")) > _MAX_META_BRIDGE_BYTES:
+        raise RuntimeError("Rust meta-tool API response exceeds the size limit")
+    try:
+        response = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Rust meta-tool API returned invalid JSON") from exc
+    if not isinstance(response, dict) or response.get("version") != "1":
+        raise RuntimeError("Rust meta-tool API returned an unsupported response envelope")
+    return response
+
+
+def meta_tool_descriptors() -> list[dict[str, Any]]:
+    """Return MCP descriptors from Rust, or none when the bridge is unavailable.
+
+    The MCP server only advertises these tools after its parent `theoremata mcp`
+    process supplied an executable and database. A failed discovery is treated
+    as unavailable rather than advertising a callable-looking stub.
+    """
+    try:
+        response = _call_meta_api({"op": "list_meta_tools"})
+    except (RuntimeError, ValueError):
+        return []
+    if response.get("result") != "meta_tools":
+        return []
+    tools = response.get("tools")
+    if not isinstance(tools, list):
+        return []
+    descriptors: list[dict[str, Any]] = []
+    for descriptor in tools:
+        if not isinstance(descriptor, dict):
+            return []
+        name = descriptor.get("name")
+        description = descriptor.get("description")
+        schema = descriptor.get("inputSchema")
+        if not isinstance(name, str) or name not in _META_TOOL_OPS.values():
+            return []
+        if not isinstance(description, str) or not isinstance(schema, dict):
+            return []
+        descriptors.append(
+            {
+                "name": f"meta_{name}",
+                "description": (
+                    "Store-backed Rust orchestration API. Certification is forbidden. "
+                    + description
+                ),
+                "inputSchema": schema,
+            }
+        )
+    return descriptors
+
+
+def _dispatch_meta_tool(request: dict[str, Any]) -> dict[str, Any]:
+    tool = request.get("tool")
+    if not isinstance(tool, str) or tool not in _META_TOOL_OPS:
+        raise ValueError("unknown Rust meta-tool")
+    arguments = {key: value for key, value in request.items() if key != "tool"}
+    if _contains_formally_verified(arguments):
+        raise ValueError(
+            "meta-tools cannot assign formally_verified; certification requires proof evidence"
+        )
+    response = _call_meta_api(
+        {
+            "op": "invoke_meta_tool",
+            "tool": _META_TOOL_OPS[tool],
+            "arguments": arguments,
+        }
+    )
+    if response.get("result") == "error":
+        return response
+    if response.get("result") != "meta_tool_invoked" or response.get("tool") != _META_TOOL_OPS[tool]:
+        raise RuntimeError("Rust meta-tool API returned an unexpected invocation response")
+    output = response.get("output")
+    if _contains_formally_verified(output):
+        raise RuntimeError("Rust meta-tool API attempted to return a certification result")
+    # The current Rust API's registry exposes a dispatch description, not a
+    # completed orchestration action. Do not turn that description into a fake
+    # acknowledgement for MCP clients.
+    output = _without_accepted_markers(output)
+    return {
+        "version": response["version"],
+        "result": "meta_tool_invoked",
+        "tool": tool,
+        "output": output,
+        "bridge": {"backend": "rust_api", "store_backed": True, "certification": "forbidden"},
+    }
+
+
 def dispatch(request: dict[str, Any]) -> dict[str, Any]:
     tool = request.get("tool", "evaluate")
+    if isinstance(tool, str) and is_meta_tool_op(tool):
+        return _dispatch_meta_tool(request)
     if tool == "evaluate":
         return {"result": evaluate(request["expression"], request.get("variables"))}
     if tool == "falsify":

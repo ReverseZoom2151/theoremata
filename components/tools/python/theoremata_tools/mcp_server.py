@@ -352,7 +352,18 @@ _TOOLS: list[dict[str, Any]] = [
     },
 ]
 
-_TOOLS_BY_NAME = {t["name"]: t for t in _TOOLS}
+def _tool_catalog() -> list[dict[str, Any]]:
+    """Return Python tools plus Rust-backed meta-tools when their bridge is live.
+
+    Discovery is intentionally fail-closed: a server launched outside
+    ``theoremata mcp`` gets the historical Python-only catalog rather than a
+    callable-looking meta-tool that would return a fabricated acknowledgement.
+    """
+    return [*_TOOLS, *worker.meta_tool_descriptors()]
+
+
+def _tools_by_name() -> dict[str, dict[str, Any]]:
+    return {tool["name"]: tool for tool in _tool_catalog()}
 
 
 def _build_request(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -363,7 +374,7 @@ def _build_request(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     fields ``dispatch`` reads). Unknown tool names raise ``KeyError`` so the
     caller can surface an isError result.
     """
-    if name not in _TOOLS_BY_NAME:
+    if name not in _tools_by_name():
         raise KeyError(f"unknown tool: {name}")
     request: dict[str, Any] = {"tool": name}
     request.update(arguments)
@@ -412,7 +423,7 @@ def _handle_tools_call(msg_id: Any, params: dict[str, Any]) -> dict[str, Any]:
         arguments = {}
     if not isinstance(arguments, dict):
         return _err(msg_id, INVALID_PARAMS, "tools/call 'arguments' must be an object")
-    if name not in _TOOLS_BY_NAME:
+    if name not in _tools_by_name():
         # An unknown tool is a tool-level error, not a protocol error, so the
         # model can recover rather than the call crashing.
         return _ok(msg_id, _tool_error(f"unknown tool: {name}"))
@@ -421,6 +432,11 @@ def _handle_tools_call(msg_id: Any, params: dict[str, Any]) -> dict[str, Any]:
         output = worker.dispatch(request)
     except Exception as exc:  # noqa: BLE001 - report any tool failure as isError.
         return _ok(msg_id, _tool_error(f"{type(exc).__name__}: {exc}"))
+    # Rust API failures are valid JSON envelopes, but at the MCP boundary they
+    # remain tool failures. Returning them as a successful content result would
+    # let a caller mistake an unavailable/forbidden action for completion.
+    if isinstance(output, dict) and output.get("result") == "error":
+        return _ok(msg_id, _tool_error(json.dumps(output, default=repr)))
     return _ok(msg_id, _tool_result(output))
 
 
@@ -467,7 +483,7 @@ def handle(message: dict[str, Any]) -> Optional[dict[str, Any]]:
     if method == "ping":
         return _ok(msg_id, {})
     if method == "tools/list":
-        return _ok(msg_id, {"tools": _TOOLS})
+        return _ok(msg_id, {"tools": _tool_catalog()})
     if method == "tools/call":
         return _handle_tools_call(msg_id, params)
 
