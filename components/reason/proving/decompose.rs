@@ -132,6 +132,42 @@ impl Decomposer<'_> {
     /// otherwise refuse every single decomposition — turning the flag into a
     /// kill switch rather than a gate. Absence of evidence is not enforced here;
     /// a probe that *did* run and failed to qualify **is**.
+    ///
+    /// # Why the suppression is still here (audited, not assumed)
+    ///
+    /// The evidence a [`DischargeProbe`] needs does not exist anywhere in the
+    /// system yet — it cannot be mined out of `store.attempts` or handed down by
+    /// the `Route::Decompose` caller in `orchestration/agent.rs`, because:
+    ///
+    /// * **Nothing runs a bounded discharge attempt before decomposing.** The
+    ///   `Route::Decompose` arm calls [`Decomposer::run`] directly on
+    ///   `node.statement`. There is no pre-decomposition prove attempt whose
+    ///   outcome could be classified, so `ran` has no truthful value but `false`.
+    /// * **No recorded attempt carries the probe's signals.** The three per-node
+    ///   attempt rows that exist (`external_prover`, `formalizer`,
+    ///   `formal_generator`) record a serialized `AttemptRunResult` and pass/fail
+    ///   booleans. None carries `independent_unsolved_goals`,
+    ///   `semantic_attempts`, `same_goal_hash_survived`, `timeouts` or
+    ///   `syntax_errors`. `session::goal_state::LeanGoalStateExtractor` can
+    ///   produce the goal counts, but its output is never persisted.
+    /// * **The timeout bit is dropped upstream.** `ExecOutcome::timed_out` (and
+    ///   thus `is_deterministic_failure`) never leaves the backend layer:
+    ///   `ProofResult` / `VerificationReport` / `AttemptRunRecord` have no field
+    ///   for it, so `DischargeProbe::timeouts` cannot be counted even in
+    ///   principle. The only surviving trace is English in `stderr`, and
+    ///   `orchestration/trace.rs` deliberately classifies on signals, not strings.
+    /// * **`run` has no node identity anyway.** It is handed a bare `statement`,
+    ///   so even a per-node probe record could not be looked up from here.
+    ///
+    /// So this is *absence of evidence*, not evidence of a probe that failed to
+    /// qualify, and refusing on it would be a kill switch. Threading a real probe
+    /// requires, upstream and in that order: (1) `timed_out` surfaced onto
+    /// `ProofResult`; (2) a bounded discharge attempt in the `Route::Decompose`
+    /// arm that persists a structured probe record per node; (3) that record
+    /// passed into [`Decomposer::run_admitted`] in place of
+    /// `DischargeProbe::default()`. Once (3) lands, delete this filter — the
+    /// `probe.ran` guard becomes dead and `Unearned` should be enforced like the
+    /// other six checks.
     fn enforceable_violations(report: &AdmissionReport, probe: &DischargeProbe) -> Vec<String> {
         report
             .violations
@@ -145,8 +181,13 @@ impl Decomposer<'_> {
     /// bounded by the QED retry policy. Each model attempt is recorded (with the
     /// hidden-helper budget). Empty vec when offline or after the retry budget.
     ///
-    /// Admission control runs with no probe evidence and enforcement taken from
-    /// [`admission_enforced`] (env, default OFF).
+    /// Admission control runs with **no probe evidence** — no bounded discharge
+    /// attempt is made anywhere before this call, so `DischargeProbe::default()`
+    /// (`ProbeVerdict::NoProbe`) is the only truthful value available. That means
+    /// the `Unearned` check is structurally inert at this call site; see
+    /// [`Decomposer::enforceable_violations`] for the audit of what is missing
+    /// and what has to be produced upstream to close it. Enforcement is taken
+    /// from [`admission_enforced`] (env, default OFF).
     pub fn run(
         &self,
         project_id: &str,
@@ -349,6 +390,7 @@ impl Decomposer<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decomposition_admission::ProbeVerdict;
     use crate::model::ModelResponse;
     use std::path::Path;
 
@@ -643,6 +685,79 @@ mod tests {
         let report = decomposition_admission::admit(&proposal);
         assert!(!report.admitted, "admit() itself still fails closed");
         assert!(Decomposer::enforceable_violations(&report, &none).is_empty());
+    }
+
+    /// PINS THE OPEN `Unearned` HOLE. A decomposition that passes all six other
+    /// checks is still `admitted == false` — solely because no discharge probe
+    /// ran — yet `enforceable_violations` returns nothing, so even with the flag
+    /// ON the split proceeds.
+    ///
+    /// This is deliberate today (absence of evidence must not be a kill switch;
+    /// see [`Decomposer::enforceable_violations`]). When real probe evidence is
+    /// threaded in, this test SHOULD fail — that failure is the signal to delete
+    /// the `probe.ran` suppression rather than to relax the assertion.
+    #[test]
+    fn no_probe_leaves_unearned_reported_but_unenforced() {
+        let children = [
+            Obligation {
+                title: "Left".into(),
+                statement: "hA ⊢ f x".into(),
+                claim_kind: None,
+                ingredients: Vec::new(),
+            },
+            Obligation {
+                title: "Right".into(),
+                statement: "hB ⊢ g x".into(),
+                claim_kind: None,
+                ingredients: Vec::new(),
+            },
+        ];
+        let none = DischargeProbe::default();
+        assert_eq!(none.verdict(), ProbeVerdict::NoProbe);
+
+        let report =
+            decomposition_admission::admit(&Decomposer::admission_proposal(PARENT, &children, &none));
+
+        // Unearned is the ONLY thing wrong with this proposal...
+        assert!(
+            report.violations.iter().all(
+                |v| matches!(v, Violation::Unearned { verdict } if *verdict == ProbeVerdict::NoProbe)
+            ),
+            "expected only a NoProbe Unearned violation, got {:?}",
+            report.violations
+        );
+        assert!(!report.admitted, "admit() fails closed on NoProbe");
+
+        // ...and it is exactly what this call site declines to refuse on.
+        assert!(Decomposer::enforceable_violations(&report, &none).is_empty());
+    }
+
+    /// The suppression is scoped to `Unearned` alone: a proposal that is ALSO
+    /// structurally broken is still refused with no probe, so the guard cannot
+    /// be mistaken for "no probe disables admission control".
+    #[test]
+    fn no_probe_does_not_suppress_non_unearned_violations() {
+        let none = DischargeProbe::default();
+        let report = decomposition_admission::admit(&Decomposer::admission_proposal(
+            PARENT,
+            // A single child restating the parent: SelfChild + ChildCount.
+            &[Obligation {
+                title: "The theorem".into(),
+                statement: PARENT.into(),
+                claim_kind: None,
+                ingredients: Vec::new(),
+            }],
+            &none,
+        ));
+        let refused = Decomposer::enforceable_violations(&report, &none);
+        assert!(
+            refused.iter().any(|v| v.contains("SelfChild")),
+            "{refused:?}"
+        );
+        assert!(
+            !refused.iter().any(|v| v.contains("Unearned")),
+            "only Unearned is suppressed: {refused:?}"
+        );
     }
 
     #[test]

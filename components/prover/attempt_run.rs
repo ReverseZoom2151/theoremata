@@ -123,6 +123,31 @@ pub fn cancel(store: &Store, attempt_id: &str) -> Result<AttemptRunRecord> {
     Ok(record)
 }
 
+/// Poll an attempt to a terminal state and project it into an [`AttemptRunResult`].
+///
+/// # Known gap: no deterministic-failure bit crosses this boundary
+///
+/// [`ExecOutcome::is_deterministic_failure`](crate::prover::session::exec::ExecOutcome::is_deterministic_failure)
+/// exists (it is exactly `timed_out`), and
+/// [`RetryState::resolve_outcome`](crate::retry::RetryState::resolve_outcome)
+/// exists to consume it, but the bit is **dropped before it reaches this
+/// function** and so cannot be surfaced on `AttemptRunResult` from here.
+///
+/// The chain is `ExecOutcome` -> backend -> `ProofResult` -> `ProofJob` ->
+/// `AttemptRunRecord` -> `AttemptRunResult`. `timed_out` is consumed inside the
+/// backends (`prover::session::exec`, `prover::backends::external`) and folded
+/// into `ExecOutcome::success() == false`; neither `ProofResult` nor
+/// `VerificationReport` nor `AttemptRunRecord` has a field to carry it. All this
+/// function ever sees is `job.status` (`Failed`/`Error`), which cannot
+/// distinguish a wall-clock kill — the one deterministic failure — from a
+/// semantic rejection, the very failure retries exist for.
+///
+/// Closing this needs a field on `ProofResult` (`prover/model.rs`, serde-default
+/// `false`) populated by each backend from `ExecOutcome::is_deterministic_failure()`,
+/// after which this function can project it onto `AttemptRunResult`. Recovering
+/// it here instead by matching the timeout wording in `stderr` would be
+/// string-driven classification, which `orchestration/trace.rs` rejects on
+/// purpose — so it is deliberately NOT done.
 pub fn result(
     store: &Store,
     config: &Config,
