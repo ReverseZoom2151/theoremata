@@ -62,7 +62,11 @@ const PARENT_ID: &str = "decomposition-parent";
 
 /// One decomposed obligation, optionally typed and reduced to transfer-schema
 /// ingredients.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize` only, deliberately: obligations are written into evidence
+/// payloads, but nothing should be able to reconstruct one by deserializing
+/// attacker- or checker-controlled JSON back into the claim DAG.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Obligation {
     pub title: String,
     pub statement: String,

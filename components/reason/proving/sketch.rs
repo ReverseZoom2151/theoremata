@@ -22,7 +22,7 @@
 
 use crate::{
     db::Store,
-    informal_defect_prior::{analyze, RiskReport, RoutingHints},
+    informal_defect_prior::{analyze, RiskRegion, RiskReport, RoutingHints},
     model::{EdgeKind, NodeKind, NodeStatus, NodeTier},
     prover::{formal::FormalSystem, model::VerificationReport},
     provider::ModelProvider,
