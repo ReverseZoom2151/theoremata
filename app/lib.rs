@@ -505,6 +505,22 @@ enum Command {
     SearchTelemetry {
         request: String,
     },
+    /// Consult a Wolfram Engine or Wolfram|Alpha as an UNTRUSTED oracle.
+    ///
+    /// Nothing here certifies anything. A generated certificate is only returned
+    /// when one of our own checkers accepts it, and a proposed counterexample
+    /// only after we re-verify it in exact arithmetic. Both are opt-in and both
+    /// report a clean "unavailable" when nothing is configured.
+    Wolfram {
+        /// `probe` | `evaluate` | `alpha` | `recognize` | `falsify` | `cert`
+        op: String,
+        /// Wolfram Language source for `evaluate`, the query text for `alpha`
+        /// and `recognize`, or a JSON request for `falsify` and `cert`.
+        input: String,
+        /// Certificate kind for `cert`: `sos` | `nullstellensatz` | `sturm`.
+        #[arg(long, default_value = "sos")]
+        kind: String,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -1406,6 +1422,41 @@ pub fn run() -> Result<()> {
         }
         Command::ProofLogCheck { file } => {
             print_value(true, &proof_log::check_log_file(&file)?)?
+        }
+        Command::Wolfram { op, input, kind } => {
+            // One command over the five oracle tools, because they share a trust
+            // posture: every one of them is untrusted, and grouping them keeps
+            // that visible rather than scattering them among the verbs that do
+            // certify something.
+            let request = match op.as_str() {
+                "probe" => serde_json::json!({"tool": "wolfram_link", "op": "available"}),
+                "evaluate" => serde_json::json!({"tool": "wolfram_link", "op": "evaluate", "code": input}),
+                "alpha" => serde_json::json!({"tool": "wolfram_alpha", "op": "query", "input": input}),
+                "recognize" => {
+                    serde_json::json!({"tool": "wolfram_recognizer", "op": "recognize", "text": input})
+                }
+                // falsify and cert take a JSON payload, since their inputs are
+                // structured (variables, claim, polynomial) rather than one string.
+                "falsify" => {
+                    let mut payload: serde_json::Value = serde_json::from_str(&input)?;
+                    payload["tool"] = serde_json::json!("wolfram_falsify");
+                    payload["op"] = serde_json::json!("falsify");
+                    payload
+                }
+                "cert" => {
+                    let mut payload: serde_json::Value = serde_json::from_str(&input)?;
+                    payload["tool"] = serde_json::json!("wolfram_cert");
+                    payload["op"] = serde_json::json!(kind);
+                    payload
+                }
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "unknown wolfram op: {other} (expected probe, evaluate, alpha, \
+                         recognize, falsify, or cert)"
+                    ))
+                }
+            };
+            print_value(true, &PythonCheck::new().run(request)?)?
         }
         Command::SearchTelemetry { request } => {
             let request: serde_json::Value = serde_json::from_str(&request)?;
