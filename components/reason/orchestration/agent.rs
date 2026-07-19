@@ -12,6 +12,7 @@ use crate::{
     db::Store,
     hardening,
     lean_session::LeanSession,
+    live_plan::{LivePlan, StepStatus, MAX_STEPS},
     model::{Edge, EdgeKind, ModelRequest, Node, NodeKind, NodeStatus, NodeTier},
     prover::{attempt_run, formal::FormalSystem, proof_job},
     provider::ModelProvider,
@@ -87,6 +88,22 @@ impl AgentLoop<'_> {
         let mut trace = RunTrace::new();
         let root_span = trace.open_span(SpanKind::Root, "autonomous_agent", None);
         let mut failures: HashMap<u64, FailureClass> = HashMap::new();
+        // Keep a small, durable execution plan alongside the append-only
+        // strategy log. The meta-tool/API can revise this type; the loop owns
+        // the phase transitions it actually executes.
+        let mut live_plan = LivePlan::new();
+        let research_plan_step = live_plan.add_step("research claim graph")?;
+        let solve_plan_step = live_plan.add_step("route and solve obligations")?;
+        let critique_plan_step = live_plan.add_step("critique resulting proof graph")?;
+        live_plan.mark_in_progress(research_plan_step)?;
+        record_live_plan_snapshot(
+            self.store,
+            project_id,
+            &run,
+            &live_plan,
+            "research_started",
+            &mut notes,
+        );
         // Ensure the theorem itself is a node so it can be routed and decomposed.
         if !self
             .store
@@ -115,7 +132,7 @@ impl AgentLoop<'_> {
         // Phase 1 — research: seed the claim DAG.
         self.store
             .update_run(project_id, &run, "running", "research", 0)?;
-        if tools.model {
+        let research_ok = if tools.model {
             let rspan = trace.open_span(SpanKind::Plan, "research", Some(root_span));
             let engine = ResearchEngine {
                 store: self.store,
@@ -129,6 +146,7 @@ impl AgentLoop<'_> {
                         SpanStatus::Ok,
                         Some(format!("created {}", s.created_nodes)),
                     );
+                    true
                 }
                 Err(e) => {
                     notes.push(format!("research phase failed: {e}"));
@@ -140,11 +158,32 @@ impl AgentLoop<'_> {
                         )),
                     );
                     trace.close_span(rspan, SpanStatus::Failed, Some(e.to_string()));
+                    false
                 }
             }
         } else {
             notes.push("no model provider: research phase skipped".into());
-        }
+            false
+        };
+        live_plan.update_status(
+            research_plan_step,
+            if research_ok {
+                StepStatus::Done
+            } else if tools.model {
+                StepStatus::Failed
+            } else {
+                StepStatus::Skipped
+            },
+        )?;
+        live_plan.mark_in_progress(solve_plan_step)?;
+        record_live_plan_snapshot(
+            self.store,
+            project_id,
+            &run,
+            &live_plan,
+            "solve_started",
+            &mut notes,
+        );
 
         // Warm Lean session (falls back to cold LeanCheck on failure). Only
         // warm it when a model can actually produce proofs to check.
@@ -173,6 +212,7 @@ impl AgentLoop<'_> {
         let mut certified = 0usize;
         let mut abstained = 0usize;
         let mut loop_guard = crate::guard::LoopGuard::new(64);
+        let mut plan_tracking_truncated = false;
         for _pass in 0..max_attempts {
             let nodes = self.store.nodes(project_id)?;
             let edges = self.store.edges(project_id)?;
@@ -209,6 +249,44 @@ impl AgentLoop<'_> {
                 }
                 let tier =
                     crate::guard::model_tier(node.kind, attempts, node.strategy_hint.as_deref());
+                let route_plan_step = if live_plan.len() < MAX_STEPS {
+                    match live_plan.add_step(format!("{route:?}: {}", node.title)) {
+                        Ok(step) => {
+                            if let Err(error) = live_plan.mark_in_progress(step) {
+                                notes
+                                    .push(format!("live plan could not start route step: {error}"));
+                                None
+                            } else {
+                                record_live_plan_snapshot(
+                                    self.store,
+                                    project_id,
+                                    &run,
+                                    &live_plan,
+                                    "route_started",
+                                    &mut notes,
+                                );
+                                Some(step)
+                            }
+                        }
+                        Err(error) => {
+                            notes.push(format!("live plan could not add route step: {error}"));
+                            None
+                        }
+                    }
+                } else {
+                    if !plan_tracking_truncated {
+                        plan_tracking_truncated = true;
+                        record_live_plan_snapshot(
+                            self.store,
+                            project_id,
+                            &run,
+                            &live_plan,
+                            "truncated",
+                            &mut notes,
+                        );
+                    }
+                    None
+                };
                 let span =
                     trace.open_span(route_span_kind(route), node.title.clone(), Some(root_span));
                 let outcome = match self.act(
@@ -229,6 +307,27 @@ impl AgentLoop<'_> {
                             failures.insert(span, c);
                         }
                         trace.close_span(span, status, Some(o.to_string()));
+                        if let Some(plan_step) = route_plan_step {
+                            let plan_status = match status {
+                                SpanStatus::Ok => StepStatus::Done,
+                                SpanStatus::Failed => StepStatus::Failed,
+                                SpanStatus::Aborted => StepStatus::Skipped,
+                                SpanStatus::Open => StepStatus::InProgress,
+                            };
+                            if let Err(error) = live_plan.update_status(plan_step, plan_status) {
+                                notes.push(format!(
+                                    "live plan could not finish route step: {error}"
+                                ));
+                            }
+                            record_live_plan_snapshot(
+                                self.store,
+                                project_id,
+                                &run,
+                                &live_plan,
+                                "route_finished",
+                                &mut notes,
+                            );
+                        }
                         o
                     }
                     Err(e) => {
@@ -240,6 +339,21 @@ impl AgentLoop<'_> {
                             )),
                         );
                         trace.close_span(span, SpanStatus::Failed, Some(e.to_string()));
+                        if let Some(plan_step) = route_plan_step {
+                            if let Err(error) =
+                                live_plan.update_status(plan_step, StepStatus::Failed)
+                            {
+                                notes.push(format!("live plan could not fail route step: {error}"));
+                            }
+                            record_live_plan_snapshot(
+                                self.store,
+                                project_id,
+                                &run,
+                                &live_plan,
+                                "route_failed",
+                                &mut notes,
+                            );
+                        }
                         let _ = self.store.record_trace(project_id, &run, &trace, &failures);
                         return Err(e);
                     }
@@ -256,6 +370,23 @@ impl AgentLoop<'_> {
                 break;
             }
         }
+        live_plan.update_status(
+            solve_plan_step,
+            if certified > 0 {
+                StepStatus::Done
+            } else {
+                StepStatus::Failed
+            },
+        )?;
+        live_plan.mark_in_progress(critique_plan_step)?;
+        record_live_plan_snapshot(
+            self.store,
+            project_id,
+            &run,
+            &live_plan,
+            "critique_started",
+            &mut notes,
+        );
 
         // Phase 3 — critique the resulting DAG.
         self.store
@@ -290,6 +421,22 @@ impl AgentLoop<'_> {
                 }
             }
         }
+        live_plan.update_status(
+            critique_plan_step,
+            if tools.model {
+                StepStatus::Done
+            } else {
+                StepStatus::Skipped
+            },
+        )?;
+        record_live_plan_snapshot(
+            self.store,
+            project_id,
+            &run,
+            &live_plan,
+            "run_finished",
+            &mut notes,
+        );
 
         drop(session);
         let state = if certified > 0 {
@@ -1307,6 +1454,33 @@ fn parse_lemma_names(stdout: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Persist full live-plan state as a run-scoped trace artifact. This is kept
+/// separate from plan history: history is cross-run strategy memory read into
+/// decomposition prompts, while these snapshots are execution telemetry.
+fn record_live_plan_snapshot(
+    store: &Store,
+    project_id: &str,
+    run_id: &str,
+    plan: &LivePlan,
+    transition: &str,
+    notes: &mut Vec<String>,
+) {
+    if let Err(error) = store.event(
+        Some(project_id),
+        Some(run_id),
+        "run.plan.snapshot",
+        "orchestrator",
+        json!({
+            "schema_version": 1,
+            "transition": transition,
+            "plan": plan,
+            "projection": plan.snapshot(),
+        }),
+    ) {
+        notes.push(format!("live plan snapshot was not persisted: {error}"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1714,5 +1888,54 @@ mod tests {
         };
         let summary = agent.run(&project.id).unwrap();
         assert_eq!(summary.state, "no_certificate");
+        let snapshots: Vec<Value> = store
+            .events(&project.id, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == "run.plan.snapshot")
+            .map(|event| {
+                assert_eq!(event.run_id.as_deref(), Some(summary.run_id.as_str()));
+                event.payload
+            })
+            .collect();
+        assert!(
+            snapshots.len() >= 4,
+            "phase transitions and routed obligations are persisted"
+        );
+        let final_snapshot = snapshots
+            .iter()
+            .find(|snapshot| snapshot["transition"] == "run_finished")
+            .unwrap();
+        let descriptions: Vec<_> = final_snapshot["plan"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step["description"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            &descriptions[..3],
+            vec![
+                "research claim graph",
+                "route and solve obligations",
+                "critique resulting proof graph",
+            ]
+        );
+        assert!(
+            descriptions.len() > 3,
+            "each routed obligation contributes a live-plan step"
+        );
+        assert!(final_snapshot["plan"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|step| step["status"] != "InProgress"));
+        assert!(
+            store
+                .events(&project.id, 100)
+                .unwrap()
+                .into_iter()
+                .all(|event| event.event_type != "plan_history.entry"),
+            "execution telemetry must not contaminate cross-run strategy memory"
+        );
     }
 }
