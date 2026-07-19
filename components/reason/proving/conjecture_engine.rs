@@ -39,8 +39,14 @@
 //! untrusted data: it is only ever stored and handed to the injected seams and to
 //! the library verifier — never executed here.
 
+use crate::config::Config;
+use crate::db::Store;
 use crate::library::{Lemma, LemmaLibrary};
+use crate::model::ModelRequest;
+use crate::portfolio::{portfolio_prove, PortfolioResult};
+use crate::provider::ModelProvider;
 use anyhow::Result;
+use serde_json::json;
 
 /// A candidate lemma the [`Proposer`] emits — the same `(statement, provenance)`
 /// shape the library admits, minus the proof (which the [`Prover`] supplies).
@@ -269,10 +275,229 @@ impl<'a, P: Proposer, V: Prover, F: Falsifier> ConjectureEngine<'a, P, V, F> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// CLI entry point: model-backed seams over the deterministic engine
+// ---------------------------------------------------------------------------
+
+/// A [`Proposer`] that asks an injected model for conjectures seeded from the
+/// current pool. An offline or erroring provider proposes nothing, so the engine
+/// terminates immediately with an empty report: no conjecture is invented without
+/// a model.
+struct ModelProposer<'a> {
+    provider: &'a dyn ModelProvider,
+}
+
+impl Proposer for ModelProposer<'_> {
+    fn propose(&self, seeds: &[Lemma], round: usize, batch_size: usize) -> Vec<Conjecture> {
+        // Skip the model call entirely when offline; the engine treats an empty
+        // batch as deterministic early termination.
+        if self.provider.name() == "offline" {
+            return Vec::new();
+        }
+        let pool: Vec<&str> = seeds.iter().map(|l| l.statement.as_str()).collect();
+        let request = ModelRequest {
+            role: "conjecture_proposer".into(),
+            task: "Propose auxiliary lemmas worth proving next, seeded from the \
+                   current pool. Each is a goal-string statement (H |- C form) plus \
+                   a short provenance tag naming the seed or mutation it came from. \
+                   Do not prove them."
+                .into(),
+            context: json!({ "pool": pool, "round": round, "batch_size": batch_size }),
+            output_schema: json!({
+                "type":"object","required":["conjectures"],"properties":{
+                    "conjectures":{"type":"array","items":{"type":"object",
+                        "required":["statement","provenance"],
+                        "properties":{
+                            "statement":{"type":"string"},
+                            "provenance":{"type":"string"}}}}}
+            }),
+        };
+        let Ok(response) = self.provider.complete(&request) else {
+            return Vec::new();
+        };
+        response.content["conjectures"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .take(batch_size)
+                    .map(|c| {
+                        Conjecture::new(
+                            c["statement"].as_str().unwrap_or("").trim(),
+                            c["provenance"].as_str().unwrap_or("conjecture_proposer"),
+                        )
+                    })
+                    // Drop empty statements: an unparseable proposal is no
+                    // proposal, not a blank conjecture handed to the prover.
+                    .filter(|c| !c.statement.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// A [`Falsifier`] backed by the model-derived bounded numeric check
+/// ([`crate::falsification`]). Only a real counterexample refutes; every other
+/// verdict (including a clean bounded sweep, which proves nothing) abstains so the
+/// conjecture proceeds to the prover. Mirrors the portfolio's `FalsifierRung`.
+struct NumericFalsifier<'a> {
+    provider: &'a dyn ModelProvider,
+}
+
+impl Falsifier for NumericFalsifier<'_> {
+    fn refute(&self, conjecture: &Conjecture) -> Refutation {
+        let falsifier = crate::falsification::Falsifier {
+            provider: self.provider,
+        };
+        match falsifier.falsify(&conjecture.statement) {
+            Ok(verdict) if verdict.verdict == "counterexample" => {
+                let witness = verdict
+                    .assignment
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "counterexample".into());
+                Refutation::refuted(witness)
+            }
+            // A failed probe, or any non-refuting verdict, is not evidence that
+            // the conjecture is false: abstain and let the prover decide.
+            _ => Refutation::Unknown,
+        }
+    }
+}
+
+/// A [`Prover`] that dispatches each survivor through the existing portfolio
+/// prove path and admits a proof ONLY when a live, fully clean 3+1-layer gate
+/// closed it (identical discipline to sketch's `PortfolioHoleProver`). A mock or
+/// lexical-only pass is never a proof here. The pool `premises` are not yet
+/// threaded into the portfolio call; premise reuse is a future enhancement whose
+/// absence only makes proving harder, never unsound.
+struct PortfolioProver<'a> {
+    store: &'a Store,
+    config: &'a Config,
+    provider: &'a dyn ModelProvider,
+}
+
+impl Prover for PortfolioProver<'_> {
+    fn attempt(&self, conjecture: &Conjecture, _premises: &[Lemma]) -> ProveOutcome {
+        match portfolio_prove(
+            self.store,
+            self.config,
+            self.provider,
+            &conjecture.statement,
+            &crate::portfolio::ALL_SYSTEMS,
+        ) {
+            Ok(result) => match live_closed_proof(&result) {
+                Some(code) => ProveOutcome::proved(code),
+                None => ProveOutcome::Failed,
+            },
+            // A backend/generation fault is not a proof.
+            Err(_) => ProveOutcome::Failed,
+        }
+    }
+}
+
+/// The verified proof source from the first system whose report is a LIVE, fully
+/// clean gate pass, if any. This is the trust boundary for graduation: nothing
+/// else counts as proved, so a mock or lexical-only pass never grows the library.
+fn live_closed_proof(result: &PortfolioResult) -> Option<String> {
+    result
+        .per_system
+        .iter()
+        .find(|attempt| {
+            attempt.code.is_some()
+                && attempt.report.as_ref().is_some_and(|report| {
+                    report.live
+                        && report.lexically_verified
+                        && report.axioms_clean
+                        && report.statement_preserved
+                        && report.lexical_clean
+                        && report.hardening_clean != Some(false)
+                })
+        })
+        .and_then(|attempt| attempt.code.clone())
+}
+
+/// Run the conjecture-and-prove loop for `project_id` with model-backed seams,
+/// growing the project's verified-lemma library, and return a JSON tally.
+///
+/// Seams: the [`Proposer`] is the model; the [`Falsifier`] is the model-derived
+/// bounded numeric check; the [`Prover`] is the existing portfolio path, which
+/// yields a proof ONLY on a live, fully clean formal gate. The library is built
+/// with subsumption dedup.
+///
+/// Trust boundary: graduation is gated upstream by that live formal verification
+/// in the [`Prover`] seam (via [`live_closed_proof`]). The library's own
+/// [`VerifierFn`](crate::library::VerifierFn) is a secondary floor that only
+/// rejects an empty proof; it is deliberately NOT the sole authority, because the
+/// string-only verifier seam cannot re-run a system-specific formal check. If the
+/// [`Prover`] seam ever returned a non-live proof, that would be the bug to fix.
+///
+/// Offline (no model) the proposer is empty, so the loop runs zero rounds, calls
+/// no backend, and admits nothing.
+///
+/// Emits a `conjecture_engine.completed` store event and closes a run row.
+pub fn run(
+    store: &Store,
+    config: &Config,
+    provider: &dyn ModelProvider,
+    project_id: &str,
+) -> Result<serde_json::Value> {
+    let run_id = store.begin_run(project_id, "conjecture_engine")?;
+
+    // The authoritative proof gate lives in the Prover seam; this verifier is a
+    // defensive floor that rejects an empty proof and nothing more.
+    let verifier: crate::library::VerifierFn = Box::new(|_stmt, proof: &str| !proof.trim().is_empty());
+    let library = LemmaLibrary::with_subsumption_dedup(store, verifier);
+
+    let engine = ConjectureEngine::new(
+        library,
+        ModelProposer { provider },
+        PortfolioProver {
+            store,
+            config,
+            provider,
+        },
+        NumericFalsifier { provider },
+        ConjectureConfig::default(),
+    );
+    let report = engine.run(project_id)?;
+
+    let state = if provider.name() == "offline" {
+        "completed_no_model"
+    } else {
+        "completed"
+    };
+    let summary = json!({
+        "project_id": project_id,
+        "run_id": run_id,
+        "model": provider.name(),
+        "rounds": report.rounds,
+        "n_proposed": report.n_proposed,
+        "n_refuted": report.n_refuted,
+        "n_proved": report.n_proved,
+        "n_graduated": report.n_graduated,
+        "n_subsumed": report.n_subsumed,
+        "n_failed": report.n_failed,
+        "pool_size": engine.library().lemmas(project_id)?.len(),
+    });
+
+    store.event(
+        Some(project_id),
+        Some(&run_id),
+        "conjecture_engine.completed",
+        "conjecture_engine",
+        json!({
+            "rounds": report.rounds,
+            "n_graduated": report.n_graduated,
+            "model": provider.name(),
+        }),
+    )?;
+    store.update_run(project_id, &run_id, state, "complete", 0)?;
+    Ok(summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::Store;
     use crate::library::VerifierFn;
     use std::path::Path;
 
@@ -536,5 +761,93 @@ mod tests {
         };
 
         assert_eq!(run(), run(), "same seams + inputs -> same report");
+    }
+
+    #[test]
+    fn offline_run_grows_nothing_and_reports_zero() {
+        use crate::provider::OfflineProvider;
+        let (store, pid) = store_with_project();
+        let config = Config::default();
+        // Offline: the model proposer yields nothing, so the loop terminates in
+        // zero rounds without ever touching a backend, and admits nothing.
+        let summary = super::run(&store, &config, &OfflineProvider, &pid).unwrap();
+        assert_eq!(summary["rounds"], 0);
+        assert_eq!(summary["n_proposed"], 0);
+        assert_eq!(summary["n_graduated"], 0);
+        assert_eq!(summary["pool_size"], 0);
+        assert_eq!(summary["model"], "offline");
+
+        let events = store.events(&pid, 100).unwrap();
+        assert!(events
+            .iter()
+            .any(|e| e.event_type == "conjecture_engine.completed"));
+    }
+
+    /// Build a [`VerificationReport`](crate::prover::model::VerificationReport)
+    /// with the given liveness, all other layers clean.
+    fn report(live: bool) -> crate::prover::model::VerificationReport {
+        crate::prover::model::VerificationReport {
+            lexically_verified: true,
+            axioms_clean: true,
+            statement_preserved: true,
+            lexical_clean: true,
+            hardening_clean: None,
+            live,
+            detail: serde_json::Value::Null,
+        }
+    }
+
+    fn attempt(
+        code: Option<&str>,
+        report: Option<crate::prover::model::VerificationReport>,
+    ) -> crate::portfolio::SystemAttempt {
+        crate::portfolio::SystemAttempt {
+            system: crate::prover::formal::FormalSystem::Lean,
+            verified: report.as_ref().is_some_and(|r| r.live && r.lexically_verified),
+            available: true,
+            code: code.map(str::to_owned),
+            report,
+            duration_ms: 0,
+            error: None,
+        }
+    }
+
+    fn result(attempts: Vec<crate::portfolio::SystemAttempt>) -> PortfolioResult {
+        PortfolioResult {
+            statement: "s".into(),
+            winner: None,
+            any_verified: false,
+            per_system: attempts,
+            refutation: None,
+        }
+    }
+
+    #[test]
+    fn only_a_live_clean_attempt_counts_as_a_closed_proof() {
+        // A live, clean, code-bearing attempt is the only thing that graduates.
+        let live = result(vec![attempt(Some("theorem t := by decide"), Some(report(true)))]);
+        assert_eq!(
+            live_closed_proof(&live).as_deref(),
+            Some("theorem t := by decide")
+        );
+
+        // A mock (live=false) pass is NOT a proof, even though every other layer
+        // is clean and code is present.
+        let mock = result(vec![attempt(Some("mock proof"), Some(report(false)))]);
+        assert!(live_closed_proof(&mock).is_none(), "a mock pass never graduates");
+
+        // A live pass with no code cannot graduate (nothing to admit).
+        let no_code = result(vec![attempt(None, Some(report(true)))]);
+        assert!(live_closed_proof(&no_code).is_none());
+
+        // A failed hardening layer vetoes it even when live.
+        let mut hardened = report(true);
+        hardened.hardening_clean = Some(false);
+        let vetoed = result(vec![attempt(Some("code"), Some(hardened))]);
+        assert!(live_closed_proof(&vetoed).is_none());
+
+        // An unavailable-toolchain run (no report) is neither a win nor an error.
+        let unavailable = result(vec![attempt(None, None)]);
+        assert!(live_closed_proof(&unavailable).is_none());
     }
 }
