@@ -440,23 +440,13 @@ pub trait FormalBackend {
             .any(|h| matches!(h.rule, "apply?" | "exact?" | "rfl?"));
         let lexical_clean = scan.clean && !suggestion_hatch;
         let kernel_clean = compile.compiled && recheck.rechecked;
-        // Anti-cheat: the existing mention check, tightened to reject a proof
-        // spliced onto a WEAKENED/renamed/trivially-restated statement -- but only
-        // on positively-detected weakening, so a non-parsable canonical falls back
-        // to the mention check unchanged. `check_entry_signature` dispatches per
-        // system: Lean/Rocq/Isabelle/Candle keep the theorem-signature parse, while
-        // Agda (`name : Type`) and Metamath (`$p … $=`) gain a real per-system
-        // signature check so a proof of a DIFFERENT theorem no longer slips through
-        // on the weak lexical `statement_mentioned` substring fallback alone.
-        let statement_preserved = statement_mentioned(stmt, code)
-            && !matches!(
-                crate::prover::statement_preservation::check_entry_signature(system, stmt, code)
-                    .verdict,
-                crate::prover::statement_preservation::PreservationVerdict::Renamed
-                    | crate::prover::statement_preservation::PreservationVerdict::BindersChanged
-                    | crate::prover::statement_preservation::PreservationVerdict::ConclusionChanged
-                    | crate::prover::statement_preservation::PreservationVerdict::TriviallyRestated
-            );
+        // The signature checker is the authority: a lexical mention can be
+        // smuggled into a string literal while the submitted declaration proves
+        // something else. An unparsable or missing declaration is therefore not
+        // evidence of preservation.
+        let preservation =
+            crate::prover::statement_preservation::check_entry_signature(system, stmt, code);
+        let statement_preserved = preservation.preserved && statement_mentioned(stmt, code);
         let lexically_verified =
             kernel_clean && axioms_clean && lexical_clean && statement_preserved;
 
@@ -477,6 +467,7 @@ pub trait FormalBackend {
                 "axioms": axioms,
                 "kernel_recheck": recheck,
                 "source_scan": scan,
+                "statement_preservation": preservation,
                 "whitelist": whitelist,
             }),
         })
@@ -1146,6 +1137,25 @@ mod tests {
         assert!(!statement_mentioned(stmt, "// theorem foo : goal\n"));
         assert!(!statement_mentioned(stmt, "/- theorem foo : goal -/\n"));
         assert!(!statement_mentioned(stmt, "{- theorem foo : goal -}\n"));
+    }
+
+    #[test]
+    fn verification_rejects_a_statement_smuggled_only_into_a_string() {
+        let cfg = Config::default();
+        let backend = backend_for(&cfg, FormalSystem::Lean, true);
+        let report = backend
+            .verify(
+                &cfg,
+                "theorem decoy : True := trivial\n#check \"theorem wanted : False\"\n",
+                "theorem wanted : False",
+            )
+            .unwrap();
+
+        assert!(
+            !report.statement_preserved,
+            "a string literal must not establish statement preservation: {report:?}"
+        );
+        assert!(!report.lexically_verified);
     }
 
     #[test]
