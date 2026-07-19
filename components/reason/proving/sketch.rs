@@ -23,6 +23,7 @@
 use crate::{
     db::Store,
     model::{EdgeKind, NodeKind, NodeStatus, NodeTier},
+    prover::{formal::FormalSystem, model::VerificationReport},
     provider::ModelProvider,
 };
 use anyhow::Result;
@@ -121,7 +122,11 @@ impl SketchGenerator for WholeStatementGenerator {
     fn generate(&self, statement: &str) -> Result<InformalSketch> {
         Ok(InformalSketch::new(
             statement,
-            vec![SketchStep::hole("goal", "Prove the statement directly.", statement)],
+            vec![SketchStep::hole(
+                "goal",
+                "Prove the statement directly.",
+                statement,
+            )],
         ))
     }
 }
@@ -148,10 +153,89 @@ pub struct HoleProof {
     pub proof: String,
 }
 
-/// Attempts to close a single hole (the per-obligation prove path seam).
-/// `Ok(Some(proof))` = closed; `Ok(None)` = the hole remains open (unproven).
+/// A proof candidate plus the verifier result that authorizes it for use as a
+/// certified sketch hole. Proof text alone is deliberately insufficient: a
+/// model, mock backend, or lexical screen can produce text that looks valid
+/// without a live checker ever accepting it.
+#[derive(Debug, Clone)]
+pub struct HoleVerification {
+    pub system: FormalSystem,
+    pub verification: VerificationReport,
+}
+
+impl HoleVerification {
+    fn is_live_certification(&self) -> bool {
+        let report = &self.verification;
+        report.live
+            && report.lexically_verified
+            && report.axioms_clean
+            && report.statement_preserved
+            && report.lexical_clean
+            && report.hardening_clean != Some(false)
+    }
+}
+
+/// One prover attempt. Candidate text is retained for auditability even when
+/// the optional verification is absent or fails the live-certification policy.
+#[derive(Debug, Clone)]
+pub struct HoleAttempt {
+    pub proof: HoleProof,
+    pub verification: Option<HoleVerification>,
+}
+
+impl HoleAttempt {
+    fn is_live_certification(&self) -> bool {
+        self.verification
+            .as_ref()
+            .is_some_and(HoleVerification::is_live_certification)
+    }
+}
+
+/// A verifier result for the final spliced proof. Individual verified holes do
+/// not prove that their composition parses, preserves the parent statement, or
+/// has a clean kernel dependency set, so the root needs its own live check.
+#[derive(Debug, Clone)]
+pub struct VerifiedAssembly {
+    pub system: FormalSystem,
+    pub verification: VerificationReport,
+}
+
+impl VerifiedAssembly {
+    fn is_live_certification(&self) -> bool {
+        let report = &self.verification;
+        report.live
+            && report.lexically_verified
+            && report.axioms_clean
+            && report.statement_preserved
+            && report.lexical_clean
+            && report.hardening_clean != Some(false)
+    }
+}
+
+/// Attempts to produce a candidate for one hole (the per-obligation prove-path
+/// seam). Candidate text is not a closed hole until `prove_verified` attaches a
+/// live, system-native verification report.
 pub trait HoleProver {
     fn prove(&self, ctx: &HoleContext) -> Result<Option<HoleProof>>;
+
+    /// Produce a hole proof together with a system-native verifier report.
+    ///
+    /// The default deliberately treats the legacy [`Self::prove`] result as an
+    /// unverified candidate. This preserves deterministic mock/test provers,
+    /// but prevents them from becoming `FormallyVerified` by accident.
+    fn prove_verified(&self, ctx: &HoleContext) -> Result<Option<HoleAttempt>> {
+        Ok(self.prove(ctx)?.map(|proof| HoleAttempt {
+            proof,
+            verification: None,
+        }))
+    }
+
+    /// Verify the final source after all hole proofs have been spliced. The
+    /// default is fail-closed because no existing injected interface can infer
+    /// that independently checked fragments form a valid parent theorem.
+    fn verify_assembled(&self, _statement: &str, _proof: &str) -> Result<Option<VerifiedAssembly>> {
+        Ok(None)
+    }
 
     /// The last failed attempt text for `ctx` — a failed proof term or the raw
     /// verifier error — used to drive goal-state extraction on a retry. Defaults
@@ -196,6 +280,8 @@ pub struct HoleResult {
     pub step_id: String,
     pub node_id: String,
     pub subgoal: String,
+    /// Whether a live system-native verifier certified this hole. A returned
+    /// candidate without that report is intentionally represented as open.
     pub closed: bool,
     pub proof: Option<String>,
     /// The last goal state threaded into this hole's (retried) context, if any.
@@ -203,22 +289,24 @@ pub struct HoleResult {
     pub goal_state: Option<String>,
 }
 
-/// The outcome of running a sketch: the sub-DAG root, every hole's result, and —
-/// only when EVERY hole closed — the spliced assembled proof.
+/// The outcome of running a sketch: the sub-DAG root, every hole's result, and
+/// the spliced proof only when every hole and the final composition have a live
+/// system-native verification result.
 #[derive(Debug, Clone)]
 pub struct SketchAssembly {
     /// The root `informal_proof` node the holes hang under.
     pub sketch_node_id: String,
     /// Per-hole results in sketch order.
     pub hole_results: Vec<HoleResult>,
-    /// `Some` iff all holes closed — the spliced proof. `None` when refused.
+    /// `Some` iff every hole and the final spliced source were live-verified.
+    /// `None` when either the hole or root certification boundary rejects it.
     pub assembled_proof: Option<String>,
     /// Step ids of holes left open (empty iff assembled).
     pub open_holes: Vec<String>,
 }
 
 impl SketchAssembly {
-    /// Whether assembly succeeded (all holes closed and a proof was spliced).
+    /// Whether a live verifier certified the complete assembled proof.
     pub fn is_assembled(&self) -> bool {
         self.assembled_proof.is_some()
     }
@@ -339,7 +427,8 @@ impl<G: SketchGenerator, P: HoleProver> SketchPipeline<'_, G, P> {
         }
 
         // 4. Dispatch every hole to the per-hole prover, recording the outcome on
-        //    its node. A closed hole is certified; an open hole is left blocked.
+        //    its node. Candidate text is only certified after a live verifier
+        //    report; otherwise it is retained as evidence and left blocked.
         let mut hole_results = Vec::new();
         let mut open_holes = Vec::new();
         for step in sketch.holes() {
@@ -351,7 +440,7 @@ impl<G: SketchGenerator, P: HoleProver> SketchPipeline<'_, G, P> {
                 subgoal: subgoal.clone(),
                 goal_state: None,
             };
-            let mut proved = self.prover.prove(&ctx)?;
+            let mut proved = self.prover.prove_verified(&ctx)?;
 
             // Chain-of-states retry: while the hole is open and a retry budget
             // remains, dump the ground-truth goal state from the last failed
@@ -376,13 +465,17 @@ impl<G: SketchGenerator, P: HoleProver> SketchPipeline<'_, G, P> {
                         json!({ "step_id": step.id, "goal_state": state }),
                     )?;
                     retries_left -= 1;
-                    proved = self.prover.prove(&ctx)?;
+                    proved = self.prover.prove_verified(&ctx)?;
                 }
             }
 
             let goal_state = ctx.goal_state.clone();
-            match &proved {
-                Some(HoleProof { proof }) => {
+            let certified = proved
+                .as_ref()
+                .is_some_and(HoleAttempt::is_live_certification);
+            let candidate = proved.as_ref().map(|attempt| &attempt.proof.proof);
+            match (candidate, certified) {
+                (Some(proof), true) => {
                     self.store
                         .set_formal_statement(project_id, &node_id, proof, "sketch:hole")?;
                     self.store.add_evidence(
@@ -390,8 +483,12 @@ impl<G: SketchGenerator, P: HoleProver> SketchPipeline<'_, G, P> {
                         &node_id,
                         "sketch_hole",
                         "sketch_prover",
-                        "closed",
-                        json!({ "step_id": step.id }),
+                        "live_verified",
+                        json!({
+                            "step_id": step.id,
+                            "system": proved.as_ref().and_then(|attempt| attempt.verification.as_ref()).map(|verification| verification.system.as_str()),
+                            "verification": proved.as_ref().and_then(|attempt| attempt.verification.as_ref()).map(|verification| &verification.verification.detail),
+                        }),
                     )?;
                     self.store.set_node_status(
                         project_id,
@@ -400,7 +497,28 @@ impl<G: SketchGenerator, P: HoleProver> SketchPipeline<'_, G, P> {
                         "sketch_prover",
                     )?;
                 }
-                None => {
+                (Some(proof), false) => {
+                    self.store.add_evidence(
+                        project_id,
+                        &node_id,
+                        "sketch_hole",
+                        "sketch_prover",
+                        "unverified_candidate",
+                        json!({
+                            "step_id": step.id,
+                            "proof": proof,
+                            "verification_present": proved.as_ref().and_then(|attempt| attempt.verification.as_ref()).is_some(),
+                        }),
+                    )?;
+                    self.store.set_node_status(
+                        project_id,
+                        &node_id,
+                        NodeStatus::Blocked,
+                        "sketch_prover_unverified",
+                    )?;
+                    open_holes.push(step.id.clone());
+                }
+                (None, _) => {
                     self.store.add_evidence(
                         project_id,
                         &node_id,
@@ -422,32 +540,69 @@ impl<G: SketchGenerator, P: HoleProver> SketchPipeline<'_, G, P> {
                 step_id: step.id.clone(),
                 node_id,
                 subgoal,
-                closed: proved.is_some(),
-                proof: proved.map(|p| p.proof),
+                closed: certified,
+                proof: proved.map(|attempt| attempt.proof.proof),
                 goal_state,
             });
         }
 
-        // 5. Splice — but only when every hole closed. Otherwise refuse and
-        //    surface the open holes (no partial/fake assembly).
+        // 5. Splice only after every hole was live-certified, then verify the
+        //    complete source independently. Otherwise retain evidence but refuse
+        //    certification (no partial/fake assembly).
         let assembled_proof = if open_holes.is_empty() {
             let proof = self.splice(sketch, &hole_results);
-            self.store
-                .set_formal_statement(project_id, &root.id, &proof, "sketch:assembly")?;
-            self.store.set_node_status(
-                project_id,
-                &root.id,
-                NodeStatus::FormallyVerified,
-                "sketch_assembly",
-            )?;
-            self.store.event(
-                Some(project_id),
-                None,
-                "sketch.assembled",
-                "sketch_assembly",
-                json!({ "sketch_node": root.id, "holes": hole_results.len() }),
-            )?;
-            Some(proof)
+            let assembly_verification = self.prover.verify_assembled(&sketch.statement, &proof)?;
+            if assembly_verification
+                .as_ref()
+                .is_some_and(VerifiedAssembly::is_live_certification)
+            {
+                self.store
+                    .set_formal_statement(project_id, &root.id, &proof, "sketch:assembly")?;
+                self.store.set_node_status(
+                    project_id,
+                    &root.id,
+                    NodeStatus::FormallyVerified,
+                    "sketch_assembly",
+                )?;
+                self.store.event(
+                    Some(project_id),
+                    None,
+                    "sketch.assembled",
+                    "sketch_assembly",
+                    json!({
+                        "sketch_node": root.id,
+                        "holes": hole_results.len(),
+                        "system": assembly_verification.as_ref().map(|verification| verification.system.as_str()),
+                    }),
+                )?;
+                Some(proof)
+            } else {
+                self.store.add_evidence(
+                    project_id,
+                    &root.id,
+                    "sketch_assembly",
+                    "sketch_assembly",
+                    "unverified_candidate",
+                    json!({
+                        "proof": proof,
+                        "verification_present": assembly_verification.is_some(),
+                    }),
+                )?;
+                self.store.set_node_status(
+                    project_id,
+                    &root.id,
+                    NodeStatus::Blocked,
+                    "sketch_assembly_unverified",
+                )?;
+                self.store.event(
+                    Some(project_id),
+                    None,
+                    "sketch.assembly_unverified",
+                    "sketch_assembly",
+                    json!({ "sketch_node": root.id, "holes": hole_results.len() }),
+                )?;
+                None
+            }
         } else {
             self.store.event(
                 Some(project_id),
@@ -506,6 +661,10 @@ pub struct PortfolioHoleProver<'a> {
 
 impl HoleProver for PortfolioHoleProver<'_> {
     fn prove(&self, ctx: &HoleContext) -> Result<Option<HoleProof>> {
+        Ok(self.prove_verified(ctx)?.map(|attempt| attempt.proof))
+    }
+
+    fn prove_verified(&self, ctx: &HoleContext) -> Result<Option<HoleAttempt>> {
         let result = crate::portfolio::portfolio_prove(
             self.store,
             self.config,
@@ -513,13 +672,27 @@ impl HoleProver for PortfolioHoleProver<'_> {
             &ctx.subgoal,
             &self.systems,
         )?;
-        // Take the winning system's verified source, if any.
-        let closed = result
-            .per_system
-            .into_iter()
-            .find(|a| a.verified)
-            .and_then(|a| a.code);
-        Ok(closed.map(|proof| HoleProof { proof }))
+        // A portfolio's lexical/mock win is never a sketch certification. Only
+        // an explicitly live, fully clean report may close a hole here.
+        let closed = result.per_system.into_iter().find(|attempt| {
+            attempt.report.as_ref().is_some_and(|report| {
+                report.live
+                    && report.lexically_verified
+                    && report.axioms_clean
+                    && report.statement_preserved
+                    && report.lexical_clean
+                    && report.hardening_clean != Some(false)
+            }) && attempt.code.is_some()
+        });
+        Ok(closed.map(|attempt| HoleAttempt {
+            proof: HoleProof {
+                proof: attempt.code.expect("filtered to a code-bearing attempt"),
+            },
+            verification: attempt.report.map(|verification| HoleVerification {
+                system: attempt.system,
+                verification,
+            }),
+        }))
     }
 }
 
@@ -530,6 +703,35 @@ mod tests {
     use std::cell::RefCell;
     use std::path::Path;
 
+    fn live_report() -> VerificationReport {
+        VerificationReport {
+            lexically_verified: true,
+            axioms_clean: true,
+            statement_preserved: true,
+            lexical_clean: true,
+            hardening_clean: Some(true),
+            live: true,
+            detail: json!({"fixture": "live-system-native"}),
+        }
+    }
+
+    fn live_attempt(proof: HoleProof) -> HoleAttempt {
+        HoleAttempt {
+            proof,
+            verification: Some(HoleVerification {
+                system: FormalSystem::Lean,
+                verification: live_report(),
+            }),
+        }
+    }
+
+    fn live_assembly() -> Option<VerifiedAssembly> {
+        Some(VerifiedAssembly {
+            system: FormalSystem::Lean,
+            verification: live_report(),
+        })
+    }
+
     /// A generator that returns a fixed 3-step sketch with 2 holes (step `s2`
     /// uses `s1`).
     struct FixedGenerator;
@@ -539,7 +741,8 @@ mod tests {
                 statement,
                 vec![
                     SketchStep::hole("s1", "Establish the base case", "base : P 0"),
-                    SketchStep::hole("s2", "Induction step", "step : ∀ n, P n → P (n+1)").using(["s1"]),
+                    SketchStep::hole("s2", "Induction step", "step : ∀ n, P n → P (n+1)")
+                        .using(["s1"]),
                     SketchStep::prose("s3", "Conclude by induction"),
                 ],
             ))
@@ -553,6 +756,18 @@ mod tests {
             Ok(Some(HoleProof {
                 proof: format!("theorem {} := by decide", ctx.step_id),
             }))
+        }
+
+        fn prove_verified(&self, ctx: &HoleContext) -> Result<Option<HoleAttempt>> {
+            Ok(self.prove(ctx)?.map(live_attempt))
+        }
+
+        fn verify_assembled(
+            &self,
+            _statement: &str,
+            _proof: &str,
+        ) -> Result<Option<VerifiedAssembly>> {
+            Ok(live_assembly())
         }
     }
 
@@ -569,6 +784,10 @@ mod tests {
                     proof: format!("theorem {} := by decide", ctx.step_id),
                 }))
             }
+        }
+
+        fn prove_verified(&self, ctx: &HoleContext) -> Result<Option<HoleAttempt>> {
+            Ok(self.prove(ctx)?.map(live_attempt))
         }
     }
 
@@ -614,6 +833,90 @@ mod tests {
         // The `\uses` edge (s2 → s1) plus the two root→hole edges = 3 edges.
         let edges = store.edges(&project.id).unwrap();
         assert_eq!(edges.len(), 3);
+    }
+
+    #[test]
+    fn mock_hole_text_never_directly_certifies_a_hole_or_root() {
+        struct TextOnlyProver;
+        impl HoleProver for TextOnlyProver {
+            fn prove(&self, _ctx: &HoleContext) -> Result<Option<HoleProof>> {
+                Ok(Some(HoleProof {
+                    proof: "by exact True.intro".into(),
+                }))
+            }
+        }
+
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "True").unwrap();
+        let pipeline = SketchPipeline {
+            store: &store,
+            generator: &OneHoleGenerator,
+            prover: &TextOnlyProver,
+        };
+        let assembly = pipeline.run(&project.id, "True").unwrap();
+
+        assert!(!assembly.is_assembled());
+        assert_eq!(assembly.open_holes, vec!["h1"]);
+        assert_eq!(
+            assembly.hole_results[0].proof.as_deref(),
+            Some("by exact True.intro")
+        );
+        assert!(!assembly.hole_results[0].closed);
+        assert!(store
+            .nodes(&project.id)
+            .unwrap()
+            .iter()
+            .all(|node| node.status != NodeStatus::FormallyVerified));
+    }
+
+    #[test]
+    fn verified_holes_do_not_certify_an_unverified_spliced_root() {
+        struct HolesOnlyProver;
+        impl HoleProver for HolesOnlyProver {
+            fn prove(&self, _ctx: &HoleContext) -> Result<Option<HoleProof>> {
+                Ok(Some(HoleProof {
+                    proof: "by exact True.intro".into(),
+                }))
+            }
+
+            fn prove_verified(&self, ctx: &HoleContext) -> Result<Option<HoleAttempt>> {
+                Ok(self.prove(ctx)?.map(live_attempt))
+            }
+        }
+
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "True").unwrap();
+        let pipeline = SketchPipeline {
+            store: &store,
+            generator: &OneHoleGenerator,
+            prover: &HolesOnlyProver,
+        };
+        let assembly = pipeline.run(&project.id, "True").unwrap();
+
+        assert!(!assembly.is_assembled());
+        assert!(assembly.open_holes.is_empty());
+        let nodes = store.nodes(&project.id).unwrap();
+        assert_eq!(
+            nodes
+                .iter()
+                .find(|node| node.kind == NodeKind::Obligation)
+                .unwrap()
+                .status,
+            NodeStatus::FormallyVerified
+        );
+        assert_eq!(
+            nodes
+                .iter()
+                .find(|node| node.id == assembly.sketch_node_id)
+                .unwrap()
+                .status,
+            NodeStatus::Blocked
+        );
+        assert!(store
+            .events(&project.id, 100)
+            .unwrap()
+            .iter()
+            .any(|event| event.event_type == "sketch.assembly_unverified"));
     }
 
     #[test]
@@ -679,7 +982,10 @@ mod tests {
             prover: &prover,
         };
         pipeline.run(&project.id, "t").unwrap();
-        assert_eq!(prover.seen.into_inner(), vec!["s1".to_string(), "s2".to_string()]);
+        assert_eq!(
+            prover.seen.into_inner(),
+            vec!["s1".to_string(), "s2".to_string()]
+        );
     }
 
     /// A generator with a single hole (keeps the goal-state tests focused).
@@ -710,6 +1016,19 @@ mod tests {
                 None => Ok(None),
             }
         }
+
+        fn prove_verified(&self, ctx: &HoleContext) -> Result<Option<HoleAttempt>> {
+            Ok(self.prove(ctx)?.map(live_attempt))
+        }
+
+        fn verify_assembled(
+            &self,
+            _statement: &str,
+            _proof: &str,
+        ) -> Result<Option<VerifiedAssembly>> {
+            Ok(live_assembly())
+        }
+
         fn last_attempt(&self, _ctx: &HoleContext) -> Option<String> {
             Some("by simp -- failed: unsolved goals".into())
         }
@@ -722,7 +1041,10 @@ mod tests {
     }
     impl GoalStateExtractor for MockGoalStateExtractor {
         fn extract(&self, _subgoal: &str, attempt: &str) -> Option<String> {
-            assert!(!attempt.is_empty(), "the failed attempt is threaded to the extractor");
+            assert!(
+                !attempt.is_empty(),
+                "the failed attempt is threaded to the extractor"
+            );
             Some(self.state.clone())
         }
     }
