@@ -82,6 +82,85 @@ struct Formalization {
 /// be trimmed.
 const FORMALIZATION_PROMPT_BUDGET: usize = 12_000;
 
+/// How many recovered goal states a retry prompt may carry, and how many
+/// characters they may occupy in total.
+///
+/// A single Lean goal state can run to hundreds of lines (a large local context
+/// plus an unfolded target), and a failed file usually yields one per error
+/// position. Unbounded, they would crowd out the statement and the retrieved
+/// lemmas inside [`FORMALIZATION_PROMPT_BUDGET`]: the assembler would trim the
+/// parts that actually matter. The first goal states are also the useful ones:
+/// later errors are typically cascades of the first. So keep a couple, keep them
+/// short, and truncate VISIBLY so the model is never led to believe it is
+/// reading a complete context.
+const MAX_PROMPT_GOAL_STATES: usize = 2;
+const MAX_PROMPT_GOAL_STATE_CHARS: usize = 1_200;
+
+/// Render the goal states recovered from a failed check into the advisory prompt
+/// fragment the next attempt sees, or `None` when nothing was recovered.
+///
+/// `None` is load-bearing: on the cold path, without a warm session, or on a
+/// passing check the caller has no goal state, and the prompt must then be
+/// exactly what it was before this feedback existed. We never substitute a
+/// placeholder, because inventing "unknown goal" would fabricate a proof state.
+///
+/// This is generation context ONLY. It is never consulted by a gate, never
+/// recorded as evidence that anything was proved, and carries no verdict.
+fn goal_state_feedback(goal_states: &[String]) -> Option<String> {
+    let kept: Vec<&str> = goal_states
+        .iter()
+        .map(|state| state.trim())
+        .filter(|state| !state.is_empty())
+        .take(MAX_PROMPT_GOAL_STATES)
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    let available = goal_states
+        .iter()
+        .filter(|state| !state.trim().is_empty())
+        .count();
+
+    // "goal state:" matches the heading `prover::error_feedback::render_feedback`
+    // emits for a populated `Diagnostic::goal_state_slot`, so a model sees one
+    // shape regardless of which path produced the feedback.
+    let mut out = String::from(
+        "Your previous attempt did not compile. The checker reported these proof \
+         states at the failure positions:\n",
+    );
+    let mut budget = MAX_PROMPT_GOAL_STATE_CHARS;
+    let mut rendered = 0usize;
+    for state in kept {
+        // Char-wise, not byte-wise: goal states are full of multi-byte Unicode
+        // (turnstiles, subscripts), and slicing bytes would panic mid-codepoint.
+        let len = state.chars().count();
+        if budget == 0 {
+            break;
+        }
+        out.push_str("goal state:\n");
+        rendered += 1;
+        if len > budget {
+            let head: String = state.chars().take(budget).collect();
+            out.push_str(&head);
+            out.push_str("\n... [truncated]\n");
+            budget = 0;
+        } else {
+            budget -= len;
+            out.push_str(state);
+            out.push('\n');
+        }
+    }
+    let omitted = available - rendered;
+    if omitted > 0 {
+        out.push_str(&format!("... [{omitted} further goal state(s) omitted]\n"));
+    }
+    out.push_str(
+        "Close these goals. Do not weaken or restate the theorem, and do not use \
+         sorry.",
+    );
+    Some(out)
+}
+
 impl AgentLoop<'_> {
     pub fn run(&self, project_id: &str) -> Result<AgentSummary> {
         let project = self.store.project(project_id)?;
@@ -862,14 +941,21 @@ impl AgentLoop<'_> {
             return Ok("noop");
         }
         let n = 3usize;
+        // Goal states recovered from the attempt just rejected, carried into the
+        // next one. Empty until a warm-session check actually recovers something,
+        // so the first attempt is always the unmodified prompt.
+        let mut last_goal_states: Vec<String> = Vec::new();
         // Best-of-N: each candidate is a model formalization checked by the
         // compiler + axiom gate; the compiler is the acceptance predicate.
         let selection = sampling::best_of_n(
             n,
             |attempt| -> Result<Formalization> {
-                let lean = self.formalize_once(node, attempt)?;
-                let (compiles, axioms_clean, _goals) =
+                let lean = self.formalize_once(node, attempt, &last_goal_states)?;
+                let (compiles, axioms_clean, goals) =
                     self.verify_source(&lean, extract_theorem(&lean).as_deref(), session)?;
+                // Feedback only. `goals` never touches the two gate booleans below;
+                // it exists so attempt N+1 sees where attempt N got stuck.
+                last_goal_states = goals;
                 Ok(Formalization {
                     lean,
                     compiles,
@@ -1360,7 +1446,18 @@ impl AgentLoop<'_> {
         Ok(Some(report))
     }
 
-    fn formalize_once(&self, node: &Node, attempt: usize) -> Result<String> {
+    /// Build and run one formalization attempt.
+    ///
+    /// `goal_states` are the states the previous attempt got stuck on. With an
+    /// empty slice this assembles byte-identical prompt material to the
+    /// pre-feedback code path, so the common case (cold check, no warm session,
+    /// first attempt) is unchanged.
+    fn formalize_once(
+        &self,
+        node: &Node,
+        attempt: usize,
+        goal_states: &[String],
+    ) -> Result<String> {
         let retrieval = node
             .suggested_lemmas
             .iter()
@@ -1373,11 +1470,18 @@ impl AgentLoop<'_> {
                 )
             })
             .collect();
-        let memory = node
+        let mut memory = node
             .strategy_hint
             .as_deref()
             .map(|hint| vec![crate::guard::wrap_untrusted("strategy_hint", hint)])
             .unwrap_or_default();
+        // Advisory retry context. The checker is trusted for verdicts, but its
+        // output is still text entering a model prompt, so it is wrapped exactly
+        // like the retrieved lemmas and the strategy hint above. Appended last so
+        // that with no recovered goal state `memory` is untouched.
+        if let Some(feedback) = goal_state_feedback(goal_states) {
+            memory.push(crate::guard::wrap_untrusted("lean_goal_state", &feedback));
+        }
         let assembled = PromptAssembler::new(FORMALIZATION_PROMPT_BUDGET).assemble(
             &AssemblyInput::new("lean_formalizer", &node.statement)
                 .with_memory(memory)
@@ -1807,7 +1911,7 @@ mod tests {
         };
 
         assert_eq!(
-            agent.formalize_once(&node, 0).unwrap(),
+            agent.formalize_once(&node, 0, &[]).unwrap(),
             "theorem t : True := trivial"
         );
         let request = provider.0.borrow().clone().expect("request recorded");
@@ -1824,6 +1928,91 @@ mod tests {
         assert!(request.context["sections"].as_array().unwrap().len() >= 5);
         assert!(request.context.to_string().contains("Nat.add_comm"));
         assert!(request.context.to_string().contains("use induction"));
+    }
+
+    /// Build the prompt for one formalization attempt with the given goal states
+    /// and hand back the request the provider saw.
+    fn recorded_formalize_request(goal_states: &[String]) -> ModelRequest {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let config = Config::default();
+        let project = store.create_project("p", "True").unwrap();
+        let node = store
+            .add_node(&project.id, NodeKind::Lemma, "n", "True", "test")
+            .unwrap();
+        store
+            .set_strategy_hint(&project.id, &node.id, Some("use induction"), "test")
+            .unwrap();
+        let node = store
+            .nodes(&project.id)
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == node.id)
+            .unwrap();
+        let provider = RecordingProvider(std::cell::RefCell::new(None));
+        let agent = AgentLoop {
+            store: &store,
+            config: &config,
+            provider: &provider,
+        };
+        agent
+            .formalize_once(&node, 0, goal_states)
+            .unwrap();
+        provider.0.borrow().clone().expect("request recorded")
+    }
+
+    #[test]
+    fn no_recovered_goal_state_leaves_the_prompt_untouched() {
+        // The default path (cold check / no warm session / passing check) must be
+        // exactly what it was before goal-state feedback existed.
+        assert!(goal_state_feedback(&[]).is_none());
+        // Blank strings are not a goal state either; never fabricate one.
+        assert!(goal_state_feedback(&["".into(), "   \n".into()]).is_none());
+
+        let mut baseline = recorded_formalize_request(&[]);
+        let mut blanks = recorded_formalize_request(&["".into(), "  ".into()]);
+        // Each call gets a fresh in-memory store, so the node id is the one field
+        // that legitimately differs between the two requests.
+        for request in [&mut baseline, &mut blanks] {
+            assert!(request.context["node_id"].is_string());
+            request.context["node_id"] = Value::Null;
+        }
+        assert_eq!(baseline.role, blanks.role);
+        assert_eq!(baseline.task, blanks.task);
+        assert_eq!(baseline.context, blanks.context);
+        assert!(!baseline.context.to_string().contains("goal state"));
+    }
+
+    #[test]
+    fn recovered_goal_state_reaches_the_next_attempt() {
+        let request = recorded_formalize_request(&["n : Nat\n⊢ n + 0 = n".into()]);
+        let context = request.context.to_string();
+        assert!(context.contains("goal state"));
+        assert!(context.contains("n + 0 = n"));
+        // Wrapped like every other external text fed into a prompt in this file.
+        assert!(context.contains("lean_goal_state"));
+        // Existing context survives alongside it.
+        assert!(context.contains("use induction"));
+    }
+
+    #[test]
+    fn goal_state_feedback_truncates_visibly_under_the_caps() {
+        let big = "h : True\n".repeat(4_000);
+        let states: Vec<String> = vec![big, "⊢ False".into(), "⊢ True".into()];
+        let text = goal_state_feedback(&states).expect("feedback rendered");
+        assert!(text.contains("... [truncated]"), "truncation is announced");
+        // The char cap is what bounds the output, not the count cap alone.
+        assert!(text.chars().count() < MAX_PROMPT_GOAL_STATE_CHARS + 500);
+        // The third state is beyond MAX_PROMPT_GOAL_STATES and is declared missing
+        // rather than silently dropped.
+        assert!(text.contains("further goal state(s) omitted"));
+        assert!(!text.contains("⊢ True"));
+
+        // The count cap alone also reports what it left out.
+        let many: Vec<String> = vec!["⊢ A".into(), "⊢ B".into(), "⊢ C".into()];
+        let short = goal_state_feedback(&many).expect("feedback rendered");
+        assert!(short.contains("⊢ A") && short.contains("⊢ B"));
+        assert!(!short.contains("⊢ C"));
+        assert!(short.contains("[1 further goal state(s) omitted]"));
     }
 
     #[test]
