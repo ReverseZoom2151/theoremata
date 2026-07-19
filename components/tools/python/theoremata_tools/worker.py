@@ -426,6 +426,14 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.trajectory_eval import run as trajectory_eval_run
 
         return trajectory_eval_run(request)
+    if tool == "eval_integrity":
+        from theoremata_tools.eval_integrity import run as eval_integrity_run
+
+        return eval_integrity_run(request)
+    if tool == "formalization_meta":
+        from theoremata_tools.formalization_meta import run as formalization_meta_run
+
+        return formalization_meta_run(request)
     if tool == "query_rewrite":
         from theoremata_tools.query_rewrite import run as query_rewrite_run
 
