@@ -27,6 +27,8 @@ pub enum Route {
 pub struct ToolAvailability {
     pub python: bool,
     pub lean: bool,
+    /// Whether the configured target formal system has a live verifier.
+    pub formal_verifier: bool,
     pub mathlib_search: bool,
     pub model: bool,
     pub external_prover: bool,
@@ -93,13 +95,17 @@ pub fn route(
         return Route::Decompose;
     }
 
-    // 6. Has a formal statement → verify it with Lean.
-    if (signals.has_formal_statement || node.formal_statement.is_some()) && tools.lean {
+    // 6. Has a formal statement → verify it with the configured native backend.
+    if (signals.has_formal_statement || node.formal_statement.is_some()) && tools.formal_verifier {
         return Route::Verify;
     }
 
-    // 7. Informal leaf but not yet formal → formalize (needs Lean + a model).
-    if !signals.has_formal_statement && node.formal_statement.is_none() && tools.lean && tools.model
+    // 7. Informal leaf but not yet formal → formalize against the configured
+    //    native verifier (not necessarily Lean).
+    if !signals.has_formal_statement
+        && node.formal_statement.is_none()
+        && tools.formal_verifier
+        && tools.model
     {
         return Route::Formalize;
     }
@@ -147,6 +153,7 @@ mod tests {
     const ALL: ToolAvailability = ToolAvailability {
         python: true,
         lean: true,
+        formal_verifier: true,
         mathlib_search: true,
         model: true,
         external_prover: true,
@@ -213,5 +220,21 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(route(&n, &sig, &ALL, 5), Route::Formalize);
+    }
+
+    #[test]
+    fn formal_statement_verifies_without_lean_when_native_backend_exists() {
+        let n = node(NodeKind::FormalStatement, Some("Theorem t : True. Proof. exact I. Qed."));
+        let sig = NodeSignals {
+            falsified: true,
+            retrieved: true,
+            has_formal_statement: true,
+            ..Default::default()
+        };
+        let tools = ToolAvailability {
+            lean: false,
+            ..ALL
+        };
+        assert_eq!(route(&n, &sig, &tools, 5), Route::Verify);
     }
 }

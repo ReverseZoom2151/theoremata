@@ -123,9 +123,16 @@ impl AgentLoop<'_> {
         }
 
         let model_ready = self.config.model_command.is_some();
+        let target_verifier = crate::formal::backend_for(
+            self.config,
+            self.config.target_system,
+            false,
+        )
+        .available();
         let tools = ToolAvailability {
             python: PythonCheck::new().available(),
             lean: LeanCheck::new(self.config).available(),
+            formal_verifier: target_verifier,
             mathlib_search: MathlibSearch::new(self.config).available(),
             model: model_ready,
             external_prover: proof_job::any_prover_available(self.config, model_ready),
@@ -189,7 +196,7 @@ impl AgentLoop<'_> {
 
         // Warm Lean session (falls back to cold LeanCheck on failure). Only
         // warm it when a model can actually produce proofs to check.
-        let mut session = if tools.lean && tools.model {
+        let mut session = if self.config.target_system == FormalSystem::Lean && tools.lean && tools.model {
             match LeanSession::start(self.config, &["Mathlib".to_string()]) {
                 Ok(s) => {
                     notes.push("warm Lean session active".into());
@@ -654,7 +661,9 @@ impl AgentLoop<'_> {
                 self.formalize(project_id, run, node, session, certified, abstained)
             }
             Route::Verify => {
-                if let Some(formal) = &node.formal_statement {
+                if self.config.target_system != FormalSystem::Lean {
+                    self.verify_existing_target(project_id, node, certified)
+                } else if let Some(formal) = &node.formal_statement {
                     let theorem = extract_theorem(formal);
                     let (compiles, axioms_clean) =
                         self.verify_source(formal, theorem.as_deref(), session)?;
@@ -895,6 +904,44 @@ impl AgentLoop<'_> {
             )?;
         }
         Ok("formalize")
+    }
+
+    /// Verify an already-stored source with the configured non-Lean backend.
+    /// Stored Rocq/Isabelle/Candle/Agda/Metamath text must never be rewritten
+    /// through Lean merely because Lean happens to be installed.
+    fn verify_existing_target(
+        &self,
+        project_id: &str,
+        node: &Node,
+        certified: &mut usize,
+    ) -> Result<&'static str> {
+        let Some(source) = node.formal_statement.as_deref() else {
+            return Ok("noop");
+        };
+        let system = self.config.target_system;
+        let backend = crate::formal::backend_for(self.config, system, false);
+        let report = backend.verify(self.config, source, source)?;
+        let accepted = report.live && report.lexically_verified;
+        self.store.add_evidence(
+            project_id,
+            &node.id,
+            "formal_verify",
+            "verifier",
+            if accepted { "pass" } else { "fail" },
+            serde_json::to_value(&report)?,
+        )?;
+        if accepted {
+            self.store.set_node_status(
+                project_id,
+                &node.id,
+                NodeStatus::FormallyVerified,
+                "verifier",
+            )?;
+            *certified += 1;
+            Ok("verify")
+        } else {
+            Ok("verify_unverified")
+        }
     }
 
     /// Route a Rocq/Isabelle target through the per-system proof generator: emit

@@ -948,6 +948,12 @@ pub fn run() -> Result<()> {
             let tools = router::ToolAvailability {
                 python: PythonCheck::new().available(),
                 lean: LeanCheck::new(&config).available(),
+                formal_verifier: prover::formal::backend_for(
+                    &config,
+                    config.target_system,
+                    false,
+                )
+                .available(),
                 mathlib_search: MathlibSearch::new(&config).available(),
                 model: model_ready,
                 external_prover: proof_job::any_prover_available(&config, model_ready),

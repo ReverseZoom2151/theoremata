@@ -15,6 +15,7 @@ use std::path::PathBuf;
 const TOOLS: ToolAvailability = ToolAvailability {
     python: true,
     lean: true,
+    formal_verifier: true,
     mathlib_search: true,
     model: true,
     external_prover: true,
