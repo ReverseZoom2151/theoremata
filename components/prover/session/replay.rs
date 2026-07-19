@@ -32,7 +32,7 @@
 //! file under the original statement and runs the full 3+1-layer gate
 //! ([`FormalBackend::verify`]: compile, axioms subset of whitelist, kernel
 //! re-check, source scan, statement preservation). That gate really compiles, and
-//! a Lean/Rocq declaration whose tactic block leaves a goal open does not compile.
+//! a Lean declaration whose tactic block leaves a goal open does not compile.
 //! It is coarser and slower than per-tactic stepping, but it is the only path here
 //! whose `true` means what the minimizer needs it to mean. When a real
 //! `step_tactic` lands, a second [`TacticReplay`] impl can be added beside this
@@ -214,10 +214,17 @@ impl TacticReplay for GateReplay<'_> {
 /// The default preamble for a system: one import/require directive per line.
 /// Kept minimal on purpose. Every extra dependency is another way for a correct
 /// shrink to be rejected because the PREAMBLE failed rather than the proof.
+///
+/// Only Lean has one, because Lean is the only system [`assemble_source`] renders.
+/// Note that this is NOT `FormalSystem::default_imports()`: that list is the
+/// RETRIEVAL corpus (the premises a model may draw on), and the only thing in the
+/// tree that turns it into source lines is the Python search helper
+/// (`components/retrieval/python/theoremata_tools/rocq_retrieval.py::_require_lines`),
+/// which builds a throwaway `Search` file, not a proof. Reusing a retrieval corpus
+/// as a proof preamble would silently add dependencies the checker must resolve.
 fn default_preamble(system: FormalSystem) -> String {
     match system {
         FormalSystem::Lean => "import Mathlib\n".to_string(),
-        FormalSystem::Rocq => "Require Import Stdlib.\n".to_string(),
         // Every other system is refused by `assemble_source` anyway, so there is
         // nothing honest to put here.
         _ => String::new(),
@@ -232,8 +239,11 @@ fn default_preamble(system: FormalSystem) -> String {
 /// * the system is not one whose tactic-block syntax is rendered here. Isabelle,
 ///   Candle, Agda and Metamath are all whole-unit checkers whose `step_tactic`
 ///   returns `Unsupported`, and their proof languages are not a list of tactic
-///   lines under a `by`/`Proof.` block. Guessing a rendering for them would mean
+///   lines under a `by` block. Guessing a rendering for them would mean
 ///   asking the checker about something that is not the sequence under test;
+/// * the system is Rocq. See the `FormalSystem::Rocq` arm below: the gate cannot
+///   presently certify ANY Rocq source, so a rendering would be untestable
+///   decoration;
 /// * the statement does not parse as a declaration header for the system;
 /// * the statement already carries a `:=` body, so appending a proof would either
 ///   produce a second body or silently reuse the old one.
@@ -277,35 +287,58 @@ fn assemble_source(
             }
             Some(src)
         }
-        FormalSystem::Rocq => {
-            if statement.contains(":=") {
-                return None;
-            }
-            let head = statement.trim_end_matches('.').trim_end();
-            let mut src = String::new();
-            src.push_str(preamble);
-            if !preamble.is_empty() && !preamble.ends_with('\n') {
-                src.push('\n');
-            }
-            src.push('\n');
-            src.push_str(head);
-            src.push_str(".\nProof.\n");
-            for tactic in tactics {
-                let t = tactic.trim();
-                src.push_str("  ");
-                src.push_str(t);
-                // Rocq tactics are period-terminated; a caller-supplied tactic may
-                // or may not already carry it.
-                if !t.ends_with('.') {
-                    src.push('.');
-                }
-                src.push('\n');
-            }
-            src.push_str("Qed.\n");
-            Some(src)
-        }
+        // Rocq: DECLINED, on evidence rather than on caution.
+        //
+        // Rendering a `Theorem <name> : <stmt>. Proof. <tactics> Qed.` file here
+        // would be dead decoration, because the gate this replay runs cannot
+        // return `lexically_verified` for a live Rocq backend at all:
+        //
+        // * `verify_with_gates` conjoins `statement_preserved`, which for a LIVE
+        //   backend requires `check_entry_signature(system, stmt, code).preserved`
+        //   (`formal.rs`, the `mentioned && (preservation.preserved || is_mock())`
+        //   line);
+        // * `check_entry_signature` routes Rocq into `check_statement_preserved`,
+        //   whose `parse_all_decls` recognizes only the LOWERCASE Lean keywords
+        //   `theorem` / `lemma` / `example` / `def`. Rocq vernacular is
+        //   capitalized (`Theorem`, `Lemma`, ...), so the canonical statement never
+        //   parses and the verdict is always `CanonicalUnparsable`, whose
+        //   `preserved` is `false`.
+        //
+        // So every Rocq source, correct or not, fails the gate. A rendering here
+        // would therefore be untestable against a real verdict, and the only thing
+        // it could do is invite a future reader to "fix the preamble" and conclude
+        // that Rocq shrinks are being checked when they are being rejected for an
+        // unrelated reason.
+        //
+        // The preamble question is unresolvable here for the same reason there is
+        // nothing to match: the Rocq backend does NOT own a preamble convention.
+        // `RocqBackend::scaffold` writes the submitted `code` verbatim and appends
+        // only `Print Assumptions <entry>.`; the sole Rocq source the backend
+        // itself emits (`mock_rocq_solution`) carries no `Require` line at all and
+        // leans on the auto-loaded Prelude. And `FormalSystem::Rocq::default_imports()`
+        // (`["Stdlib", "mathcomp.ssreflect.ssreflect"]`) is a retrieval corpus, not
+        // a source preamble: `Stdlib` is the stdlib's dotted NAMESPACE root
+        // (`Stdlib.Arith.Arith`, per `docs/formal-systems/rocq.md`), not a module
+        // that `Require Import Stdlib.` resolves to, and mathcomp is an opam
+        // package that need not be installed. Both a too-thin and a too-fat
+        // preamble reject correct shrinks; neither is a convention to copy.
+        //
+        // TO ADD ROCQ BACK, all three must hold:
+        // 1. `statement_preservation::parse_all_decls` (or a Rocq-specific parser
+        //    behind `check_entry_signature`) understands capitalized Rocq
+        //    vernacular and period-terminated declarations, so a correct Rocq proof
+        //    can reach `preserved == true`;
+        // 2. the Rocq backend (or `FormalProject`) exposes the preamble it
+        //    actually compiles against, so this module copies a convention instead
+        //    of inventing one;
+        // 3. a test asserts an assembled source is byte-comparable with what the
+        //    backend compiles, the way `lean_assembly_...` does for Lean.
+        //
+        // Until then, declining is free: a refused shrink keeps the original proof,
+        // which already passed a gate upstream.
+        FormalSystem::Rocq
         // See the doc comment: no guessed rendering for the whole-unit systems.
-        FormalSystem::Isabelle
+        | FormalSystem::Isabelle
         | FormalSystem::Candle
         | FormalSystem::Agda
         | FormalSystem::Metamath => None,
@@ -566,20 +599,48 @@ mod tests {
     }
 
     #[test]
-    fn rocq_assembly_wraps_the_sequence_in_proof_qed_with_periods() {
-        let src = assemble_source(
+    fn rocq_is_declined_rather_than_rendered() {
+        // A well-formed Rocq header, which `entry_name` DOES recognize, still gets
+        // no rendering: see the `FormalSystem::Rocq` arm of `assemble_source`.
+        assert!(
+            crate::prover::formal::entry_name(FormalSystem::Rocq, "Theorem t : True").is_some(),
+            "the refusal must come from the Rocq arm, not from an unrecognized header"
+        );
+        assert!(
+            assemble_source(
+                FormalSystem::Rocq,
+                "Require Import Stdlib.\n",
+                "Theorem t : True",
+                &seq(&["auto", "trivial"])
+            )
+            .is_none(),
+            "Rocq shrinks are declined, so the original proof is kept"
+        );
+        // Also declined through the public seam (whose backend really is Rocq),
+        // with whatever preamble a caller supplies: no preamble can rescue it.
+        let cfg = Config::default();
+        let mut r = GateReplay::for_system(&cfg, FormalSystem::Rocq, "Theorem t : True")
+            .with_preamble("From mathcomp Require Import ssreflect.\n");
+        assert!(r.assemble(&seq(&["auto"])).is_none());
+        assert!(!r.replays_closed(&seq(&["auto"])));
+    }
+
+    /// Pins the REASON Rocq is declined, so this stops being true loudly rather
+    /// than silently: the preservation layer the gate conjoins parses only
+    /// lowercase Lean vernacular, so a live Rocq report can never be
+    /// `lexically_verified`. When this assertion flips, revisit the Rocq arm of
+    /// `assemble_source` (its comment lists what else must land).
+    #[test]
+    fn the_gate_still_cannot_certify_any_rocq_source() {
+        let report = crate::prover::statement_preservation::check_entry_signature(
             FormalSystem::Rocq,
-            "Require Import Stdlib.\n",
             "Theorem t : True",
-            &seq(&["auto", "trivial."]),
-        )
-        .expect("a Rocq header assembles");
-        assert!(src.contains("Theorem t : True.\nProof.\n"));
-        assert!(src.contains("  auto.\n"));
-        // An already-terminated tactic does not get a second period.
-        assert!(src.contains("  trivial.\n"));
-        assert!(!src.contains("trivial.."));
-        assert!(src.trim_end().ends_with("Qed."));
+            "Theorem t : True.\nProof.\n  exact I.\nQed.\n",
+        );
+        assert!(
+            !report.preserved,
+            "Rocq preservation now parses; `assemble_source` may be able to gate Rocq"
+        );
     }
 
     #[test]
