@@ -373,11 +373,18 @@ def _build_request(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     is taken verbatim from ``arguments`` (the schema names them to match the
     fields ``dispatch`` reads). Unknown tool names raise ``KeyError`` so the
     caller can surface an isError result.
+
+    Keys whose value is an explicit JSON ``null`` are dropped: models routinely
+    emit ``{"timeout": null}`` for an optional parameter they do not want to
+    set, and consumers read those fields with ``request.get(key, default)``,
+    which returns the ``None`` rather than the default whenever the key is
+    present. Treating an explicit null as absent makes the two forms behave
+    identically, which is what the schema's "optional" already promises.
     """
     if name not in _tools_by_name():
         raise KeyError(f"unknown tool: {name}")
     request: dict[str, Any] = {"tool": name}
-    request.update(arguments)
+    request.update({k: v for k, v in arguments.items() if v is not None})
     return request
 
 

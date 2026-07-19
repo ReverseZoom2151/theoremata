@@ -115,6 +115,44 @@ def test_tools_call_tool_exception_becomes_error_result():
     assert resp["result"]["isError"] is True
 
 
+def test_explicit_null_optional_arguments_fall_back_to_defaults():
+    # Models routinely emit `"max_cases": null` / `"assumptions": null` to mean
+    # "leave this optional parameter unset". Before nulls were stripped, the
+    # null reached `int(request.get("max_cases", 100_000))` and raised
+    # TypeError, surfacing as a tool error that read like a model failure.
+    base = {
+        "name": "falsify",
+        "arguments": {"variables": {"x": {"start": 0, "stop": 3}}, "claim": "x >= 0"},
+    }
+    with_nulls = {
+        "name": "falsify",
+        "arguments": {
+            "variables": {"x": {"start": 0, "stop": 3}},
+            "claim": "x >= 0",
+            "assumptions": None,
+            "max_cases": None,
+        },
+    }
+    omitted = handle(_rpc("tools/call", base))["result"]
+    explicit_null = handle(_rpc("tools/call", with_nulls))["result"]
+    assert omitted["isError"] is False
+    assert explicit_null["isError"] is False, explicit_null["content"][0]["text"]
+    # An absent key and a key present with null must behave identically.
+    assert _parse_tool_text(explicit_null) == _parse_tool_text(omitted)
+
+
+def test_explicit_null_is_stripped_before_the_worker_sees_it():
+    from theoremata_tools.mcp_server import _build_request
+
+    request = _build_request(
+        "falsify",
+        {"variables": {"x": {"start": 0, "stop": 1}}, "claim": "x >= 0", "max_cases": None},
+    )
+    assert "max_cases" not in request
+    assert request["tool"] == "falsify"
+    assert request["claim"] == "x >= 0"
+
+
 def test_unknown_method_returns_minus_32601():
     resp = handle(_rpc("no/such/method"))
     assert "error" in resp

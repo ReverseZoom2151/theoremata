@@ -187,6 +187,40 @@ fn validate_meta_arguments(kind: MetaToolKind, arguments: &Value) -> Result<(), 
     validate_schema_value(&kind.input_schema(), arguments, "arguments")
 }
 
+/// Drop top-level `arguments` keys carrying an explicit JSON `null` for any
+/// property whose schema does not admit `null`.
+///
+/// Models emit `{"max_rounds": null}` to mean "leave this optional parameter
+/// unset", but the schema's scalar type check rejects null, so the call failed
+/// with a type error that reads like a model failure. Removing the key makes an
+/// explicit null behave exactly like an absent key. Nulls the schema *does*
+/// permit (`{"type": ["string","null"]}`, or a property with no declared type)
+/// are preserved, as are nulls on unknown properties so those still fail the
+/// unknown-field check rather than being silently accepted.
+fn strip_permitted_nulls(schema: &Value, arguments: &mut Value) {
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return;
+    };
+    let Some(object) = arguments.as_object_mut() else {
+        return;
+    };
+    object.retain(|name, value| {
+        if !value.is_null() {
+            return true;
+        }
+        let Some(types) = properties.get(name).and_then(|p| p.get("type")) else {
+            // Unknown property, or one with no declared type: leave it alone.
+            return true;
+        };
+        match types {
+            Value::String(kind) => kind == "null",
+            Value::Array(kinds) => kinds.iter().any(|k| k.as_str() == Some("null")),
+            // Malformed `type`: keep the key so validation reports it.
+            _ => true,
+        }
+    });
+}
+
 fn validate_schema_value(schema: &Value, value: &Value, path: &str) -> Result<(), String> {
     if let Some(types) = schema.get("type") {
         let allowed: Vec<&str> = match types {
@@ -277,7 +311,7 @@ fn json_type_name(value: &Value) -> &'static str {
     }
 }
 
-fn invoke_meta_tool(registry: &MetaToolRegistry, tool: String, arguments: Value) -> ApiResponse {
+fn invoke_meta_tool(registry: &MetaToolRegistry, tool: String, mut arguments: Value) -> ApiResponse {
     let Some(kind) = MetaToolKind::from_name(&tool) else {
         return error("unknown_tool", format!("unknown meta-tool: {tool}"));
     };
@@ -293,6 +327,7 @@ fn invoke_meta_tool(registry: &MetaToolRegistry, tool: String, arguments: Value)
             "meta-tools cannot assign formally_verified; certification requires proof evidence",
         );
     }
+    strip_permitted_nulls(&kind.input_schema(), &mut arguments);
     if let Err(message) = validate_meta_arguments(kind, &arguments) {
         return error("invalid_arguments", message);
     }
@@ -631,6 +666,57 @@ mod tests {
             assert_eq!(v["result"], "error", "request should fail: {raw}");
             assert_eq!(v["code"], "invalid_arguments", "request: {raw}");
             assert!(v["message"].as_str().is_some_and(|m| !m.is_empty()));
+        }
+    }
+
+    #[test]
+    fn explicit_null_for_an_optional_scalar_is_treated_as_absent() {
+        let s = store();
+        // A model emitting `"max_rounds": null` means "leave it unset"; that
+        // must dispatch exactly as if the key were omitted, not fail the
+        // integer type check.
+        let v = assert_versioned(&handle_json(
+            &s,
+            r#"{"op":"invoke_meta_tool","tool":"plan","arguments":{"statement":"n + 0 = n","max_rounds":null,"seed":null}}"#,
+        ));
+        assert_eq!(v["result"], "meta_tool_invoked", "message: {}", v["message"]);
+        assert_eq!(v["tool"], "plan");
+        assert_eq!(v["output"]["arguments"]["statement"], "n + 0 = n");
+        // The null keys reach the handler as absent, so `.get(k).unwrap_or(d)`
+        // style reads see the default.
+        let args = v["output"]["arguments"].as_object().expect("arguments object");
+        assert!(!args.contains_key("max_rounds"), "null key should be stripped");
+        assert!(!args.contains_key("seed"), "null key should be stripped");
+    }
+
+    #[test]
+    fn null_is_preserved_where_the_schema_declares_it() {
+        let s = store();
+        // `node_id` is `["string","null"]`, so an explicit null is meaningful
+        // and must survive to the handler.
+        let v = assert_versioned(&handle_json(
+            &s,
+            r#"{"op":"invoke_meta_tool","tool":"critique","arguments":{"project_id":"p","node_id":null}}"#,
+        ));
+        assert_eq!(v["result"], "meta_tool_invoked", "message: {}", v["message"]);
+        let args = v["output"]["arguments"].as_object().expect("arguments object");
+        assert!(args.contains_key("node_id"), "schema-permitted null must be kept");
+        assert!(args["node_id"].is_null());
+    }
+
+    #[test]
+    fn null_on_a_required_or_unknown_field_still_errors() {
+        let s = store();
+        let cases = [
+            // Nulling a required field is not a way to smuggle it past the check.
+            r#"{"op":"invoke_meta_tool","tool":"plan","arguments":{"statement":null}}"#,
+            // Unknown fields stay rejected even when null-valued.
+            r#"{"op":"invoke_meta_tool","tool":"spend","arguments":{"typo":null}}"#,
+        ];
+        for raw in cases {
+            let v = assert_versioned(&handle_json(&s, raw));
+            assert_eq!(v["result"], "error", "request should fail: {raw}");
+            assert_eq!(v["code"], "invalid_arguments", "request: {raw}");
         }
     }
 
