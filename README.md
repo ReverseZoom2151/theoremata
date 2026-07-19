@@ -147,6 +147,40 @@ factoring), that generation step is a documented, gated seam; the checker itself
 always runs offline. A HOL Light or CakeML-verified checker validating the same
 log is the toolchain-gated upgrade.
 
+### Untrusted oracles (Wolfram)
+
+That generator/checker split is what lets a closed, proprietary system be useful
+here without being trusted. A Wolfram Engine, when one is configured, is used to
+FIND objects our own checkers then verify: SOS and Positivstellensatz multipliers,
+Nullstellensatz cofactors, real-root counts, counterexamples, and integer
+relations. Wolfram cannot enter the gate, for four independent reasons: its
+kernel is closed and cannot be re-checked, it is not proof-producing, it makes
+silent generic assumptions (the unaccounted-hypothesis mode the gate's hypothesis
+audit exists to catch), and its free licence is development-only.
+
+So the boundary is enforced in code rather than by convention:
+
+- A generated certificate is passed through the corresponding existing checker
+  **before it is returned**, and exactly one function is able to populate the
+  certificate field, only on the checker's acceptance. No branch can emit an
+  unchecked certificate.
+- A proposed counterexample is re-verified in exact rational arithmetic against
+  the original claim before it counts as a refutation. A witness we cannot
+  independently confirm is discarded.
+- The falsification vocabulary contains no positive verdict at all. Wolfram
+  finding nothing is not evidence of anything, and there is deliberately no word
+  available to say otherwise.
+- Wolfram|Alpha additionally interprets natural language before computing, so
+  every result carries the assumptions it made. A silently reinterpreted question
+  is the same statement-drift failure the gate's statement-preservation layer
+  catches, so an answer is never separated from the reading it answered.
+
+Both transports (a local `wolframscript`, or the HTTP computation API) are
+opt-in, report which one produced a result, and degrade to a clean "unavailable"
+that is kept distinct from "we looked and found nothing". See
+[`docs/resource-mining/new/wolfram.md`](docs/resource-mining/new/wolfram.md) for
+the full evaluation of the ecosystem, including what was rejected and why.
+
 ## Features
 
 **Formal verification (six systems)**
@@ -369,6 +403,7 @@ external blocks a build or a run.
 | <img src="assets/logos/docker.svg" height="16"> <img src="assets/logos/ubuntu.svg" height="16"> | Docker and WSL | Runners: run any backend native, in WSL, or in a container | Config (`formal_runners`), optional |
 | | [LiteLLM](https://github.com/BerriAI/litellm) | Model provider seam (any chat model) | Optional, a deterministic mock runs without it |
 | | [Model Context Protocol](https://modelcontextprotocol.io) | `theoremata mcp` serves the tool workers over JSON-RPC to any MCP client; an Aristotle MCP reference client is included | Optional, stdio |
+| | [Wolfram Engine](https://www.wolfram.com/engine/) / [Wolfram\|Alpha](https://products.wolframalpha.com/api) | Untrusted oracle: finds certificates and counterexamples that our own checkers then verify. Never certifies | Optional, opt-in; local `wolframscript` or an HTTP key |
 | <img src="assets/logos/sympy.svg" height="16"> | [SymPy](https://www.sympy.org) (with bundled [mpmath](https://mpmath.org)) | Symbolic math, Wu's-method geometry, certificate generation | Core dependency, with stdlib fallbacks in the hot paths |
 | | [`rank_bm25`](https://pypi.org/project/rank-bm25/) | BM25 premise retrieval | Optional, a stdlib BM25 backend runs without it |
 | <img src="assets/logos/scikitlearn.svg" height="16"> | [scikit-learn](https://scikit-learn.org) | Learned backend and difficulty selectors | Optional, deterministic fallbacks otherwise |
