@@ -35,7 +35,13 @@
 //! UNTRUSTED DATA — it is only ever stored, threaded to the injected prover, or
 //! scanned for reused labels; it is never executed.
 
-use serde::Serialize;
+use crate::{
+    config::Config, db::Store, portfolio::portfolio_prove, prover::formal::FormalSystem,
+    provider::ModelProvider,
+};
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 // ------------------------------------------------------------------------
@@ -43,7 +49,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 // ------------------------------------------------------------------------
 
 /// One reusable piece of a proven technique: a lemma statement and its proof.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct MethodLemma {
     /// The lemma's statement (untrusted prose / formal goal).
     pub statement: String,
@@ -55,18 +61,20 @@ pub struct MethodLemma {
 /// proof-shape hint describing how the method is applied. In production the
 /// lemmas would be seeded into the [`crate::library::LemmaLibrary`] and the hint
 /// would prime the sketch generator; here they are threaded to [`MethodProver`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Method {
     /// A human-readable name for the method (e.g. `"Erdős-728 sieve"`).
     pub name: String,
     /// The method's reusable key lemmas.
+    #[serde(default)]
     pub lemmas: Vec<MethodLemma>,
     /// A proof-shape hint: how the method's steps are assembled.
+    #[serde(default)]
     pub shape_hint: String,
 }
 
 /// A single problem in the family the method is being applied to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct FamilyProblem {
     /// A stable, unique label for this problem (e.g. `"erdos-729"`).
     pub label: String,
@@ -75,6 +83,7 @@ pub struct FamilyProblem {
     /// Soft cross-links: labels of related problems (other family members, or
     /// external prior problems like `"erdos-401"`). In-family links order the
     /// family (dependencies applied first); all links are reported verbatim.
+    #[serde(default)]
     pub related_to: Vec<String>,
 }
 
@@ -331,6 +340,132 @@ pub fn transfer_method(
         n_known,
         coverage,
     }
+}
+
+// ------------------------------------------------------------------------
+// CLI entry point
+// ------------------------------------------------------------------------
+
+/// A transfer run described as data, so a CLI dispatch arm can deserialize one
+/// from a JSON request. Mirrors the driver's inputs: the method, the family, and
+/// the deterministic base seed; `systems` restricts the portfolio the production
+/// prover fans out over (empty = all backends), and `project` scopes the emitted
+/// store event.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TransferSpec {
+    /// The proven method to transfer.
+    pub method: Method,
+    /// The family of sibling problems to apply it to.
+    #[serde(default)]
+    pub family: Vec<FamilyProblem>,
+    /// Formal systems the portfolio prover may attempt (empty = all three).
+    #[serde(default)]
+    pub systems: Vec<FormalSystem>,
+    /// Base seed threaded to the driver (defaults to 0, matching
+    /// [`TransferConfig::default`]).
+    #[serde(default)]
+    pub seed: u64,
+    /// Optional project id used only to scope the emitted store event.
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+/// The production [`MethodProver`]: prove each family problem through the real
+/// portfolio gate ([`portfolio_prove`]). A close is reported ONLY when a system
+/// WON, and [`portfolio_prove`] sets a winner solely on `report.live &&
+/// lexically_verified`, so a mock/source-scan pass is never mistaken for a solve.
+/// Fail-closed: no winner yields `Ok(None)` (attempted-but-not-closed), never a
+/// false solve.
+///
+/// This is a thin adapter: it does NOT yet thread the method's lemmas into the
+/// library or the already-solved `available` members / per-problem `seed` into
+/// the sketch generator (the module doc's "production would prime the
+/// sketch/portfolio path" is still future work). Those seams are ignored here
+/// rather than faked, so the coverage the driver reports is honest.
+struct PortfolioMethodProver<'a> {
+    store: &'a Store,
+    config: &'a Config,
+    provider: &'a dyn ModelProvider,
+    systems: Vec<FormalSystem>,
+}
+
+impl MethodProver for PortfolioMethodProver<'_> {
+    fn apply(
+        &self,
+        _method: &Method,
+        problem: &FamilyProblem,
+        _available: &[SolvedProblem],
+        _seed: u64,
+    ) -> Result<Option<String>> {
+        let result = portfolio_prove(
+            self.store,
+            self.config,
+            self.provider,
+            &problem.statement,
+            &self.systems,
+        )?;
+        // `winner` is Some only on a live, gate-verified pass. Return that
+        // system's accepted source as the proof; anything else is a non-close.
+        Ok(result.winner.and_then(|system| {
+            result
+                .per_system
+                .iter()
+                .find(|a| a.system == system && a.verified)
+                .and_then(|a| a.code.clone())
+        }))
+    }
+}
+
+/// CLI entry point: transfer a proven method across a family of sibling problems,
+/// proving each through the real portfolio gate, and report coverage.
+///
+/// A thin adapter over [`transfer_method`]: it builds the production
+/// [`MethodProver`] (portfolio gate) and drives the family. No novelty oracle is
+/// wired: the `novelty` short-circuit is a Python worker
+/// (`theoremata_tools.novelty`) with no offline Rust impl, so no family member is
+/// pre-flagged as already known here; every problem is genuinely attempted.
+///
+/// Returns the full [`FamilyReport`] as JSON (method name, driven order,
+/// per-problem verdicts, and honest `coverage = n_solved / n_items`). Emits one
+/// `method_transfer.completed` store event carrying the method, family size, and
+/// the three outcome tallies, scoped to `spec.project` when supplied.
+pub fn transfer(
+    store: &Store,
+    config: &Config,
+    provider: &dyn ModelProvider,
+    spec: &TransferSpec,
+) -> Result<Value> {
+    let prover = PortfolioMethodProver {
+        store,
+        config,
+        provider,
+        systems: spec.systems.clone(),
+    };
+    // No offline novelty oracle exists in the Rust core (see fn doc); pass None.
+    let report = transfer_method(
+        &spec.method,
+        &spec.family,
+        &prover,
+        None,
+        TransferConfig { seed: spec.seed },
+    );
+
+    store.event(
+        spec.project.as_deref(),
+        None,
+        "method_transfer.completed",
+        "method_transfer",
+        json!({
+            "method": report.method,
+            "n_items": report.n_items(),
+            "n_solved": report.n_solved,
+            "n_failed": report.n_failed,
+            "n_known": report.n_known,
+            "coverage": report.coverage,
+        }),
+    )?;
+
+    serde_json::to_value(&report).context("serialize family report")
 }
 
 /// Deterministic soft topological order over the family's in-family `related_to`
@@ -731,5 +866,91 @@ mod tests {
         assert_eq!(report.n_solved, 0);
         assert_eq!(report.coverage, 0.0);
         assert!(report.order.is_empty());
+    }
+
+    // --- CLI entry point --------------------------------------------------
+    // `Config`, `Store`, `FormalSystem` come through `use super::*`.
+
+    use crate::provider::OfflineProvider;
+    use std::path::Path;
+
+    /// Mock-backend config: no real toolchain is assumed, so the portfolio runs
+    /// deterministically offline (and a mock pass is never `report.live`).
+    fn mock_config() -> Config {
+        Config {
+            prover_mock: true,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn transfer_spec_deserializes_with_defaulted_optional_fields() {
+        // A minimal spec: only names and statements. lemmas/shape_hint/related_to
+        // /systems/seed/project all default, so callers may omit them.
+        let spec: TransferSpec = serde_json::from_str(
+            r#"{
+                "method": { "name": "sieve" },
+                "family": [
+                    { "label": "q1", "statement": "first" },
+                    { "label": "q2", "statement": "second", "related_to": ["q1"] }
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(spec.method.name, "sieve");
+        assert!(spec.method.lemmas.is_empty());
+        assert_eq!(spec.seed, 0);
+        assert_eq!(spec.family.len(), 2);
+        assert_eq!(spec.family[1].related_to, vec!["q1".to_string()]);
+        assert!(spec.systems.is_empty());
+        assert!(spec.project.is_none());
+    }
+
+    #[test]
+    fn transfer_entry_reports_and_emits_event_offline() {
+        // Offline the portfolio can never produce a LIVE gate pass, so the sound
+        // adapter closes nothing: every problem is Failed, coverage is 0, and no
+        // unverified attempt is ever miscounted as a solve.
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "t").unwrap();
+        let spec = TransferSpec {
+            method: Method {
+                name: "erdos-728-sieve".into(),
+                lemmas: Vec::new(),
+                shape_hint: String::new(),
+            },
+            family: vec![
+                FamilyProblem {
+                    label: "q1".into(),
+                    statement: "first".into(),
+                    related_to: Vec::new(),
+                },
+                FamilyProblem {
+                    label: "q2".into(),
+                    statement: "second".into(),
+                    related_to: vec!["q1".into()],
+                },
+            ],
+            systems: vec![FormalSystem::Lean],
+            seed: 0,
+            project: Some(project.id.clone()),
+        };
+
+        let value = transfer(&store, &mock_config(), &OfflineProvider, &spec).unwrap();
+
+        assert_eq!(value["method"], "erdos-728-sieve");
+        assert_eq!(value["n_items"], 2);
+        assert_eq!(value["n_solved"], 0, "no live gate offline ⇒ no false solve");
+        assert_eq!(value["n_failed"], 2);
+        assert_eq!(value["coverage"], 0.0);
+        // Dependency order is still honoured in the report.
+        assert_eq!(value["order"][0], "q1");
+        assert_eq!(value["order"][1], "q2");
+
+        // The completion event landed, scoped to the project.
+        let events = store.events(&project.id, 10).unwrap();
+        assert!(events
+            .iter()
+            .any(|e| e.event_type == "method_transfer.completed"));
     }
 }
