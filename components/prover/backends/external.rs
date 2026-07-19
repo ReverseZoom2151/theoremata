@@ -24,11 +24,28 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use wait_timeout::ChildExt;
 
 const AGDA_INTERACTION_DIAGNOSTICS_ENV: &str = "THEOREMATA_AGDA_INTERACTION_JSON";
+
+/// Most holes a single enrichment pass will ask Agda about.
+///
+/// A generated file with a hundred holes must not be able to turn an advisory
+/// diagnostic into a gate-length job: every extra hole is another round trip
+/// through the type checker. Truncation is reported explicitly (see
+/// `holes_truncated`) so a reader never mistakes a capped context listing for a
+/// complete one.
+const AGDA_GOAL_CONTEXT_HOLE_CAP: usize = 16;
+
+/// Wall-clock budget for the WHOLE goal-context enrichment, measured from the
+/// start of the `Cmd_load` phase so a slow load cannot be topped up with a fresh
+/// allowance. It only ever curtails the NEW goal-context phase; the load phase
+/// keeps the limit it already had, because changing that would change
+/// diagnostics that exist today. Deliberately far below the batch checker's own
+/// limit: the enrichment is optional, so it yields rather than extends the gate.
+const AGDA_GOAL_CONTEXT_DEADLINE: Duration = Duration::from_secs(30);
 
 pub struct ExternalBackend {
     pub system: FormalSystem,
@@ -371,6 +388,116 @@ fn normalise_agda_error(
     }))
 }
 
+/// Collect the interaction-point ids worth asking Agda about, capped.
+///
+/// The ids come from the `AllGoalsWarnings` reply we ALREADY parse rather than
+/// from a `{! !}` regex over the source (which is what agda-cli does). Two
+/// reasons: the reply is Agda's own view of the file, so it cannot disagree with
+/// the checker about what a hole is, and it costs no new parser. A source regex
+/// additionally mis-reads holes inside comments, string literals, and nested
+/// braces, and it cannot see holes that Agda created but the text did not spell.
+///
+/// Only NUMERIC ids are returned. Agda's invisible goals are unsolved metas
+/// identified by name (`_8`); they are not interaction points, so
+/// `Cmd_goal_type_context_infer` has nothing to address them with.
+///
+/// Returns the capped id list plus how many were dropped by the cap.
+fn agda_interaction_point_ids(
+    diagnostics: &AgdaInteractionDiagnostics,
+    cap: usize,
+) -> (Vec<u64>, usize) {
+    let AgdaInteractionDiagnostics::Ready { goals, .. } = diagnostics else {
+        return (Vec::new(), 0);
+    };
+    let mut ids: Vec<u64> = Vec::new();
+    for goal in goals {
+        if goal.get("visibility").and_then(|v| v.as_str()) != Some("visible") {
+            continue;
+        }
+        let Some(id) = goal.get("id").and_then(|id| id.as_u64()) else {
+            continue;
+        };
+        // A repeated id would spend budget on an answer we already have.
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    let truncated = ids.len().saturating_sub(cap);
+    ids.truncate(cap);
+    (ids, truncated)
+}
+
+/// Build ONE stdin script that reloads the file and then asks for the type and
+/// context of each hole.
+///
+/// The reload is required because this is a fresh process: Agda holds the
+/// interaction points of the currently loaded file in memory, so a
+/// goal-specific command sent without a preceding `Cmd_load` addresses nothing.
+/// Every command goes on the same stream to the same process, so hole count
+/// costs round trips inside one type-checker run and never a new process.
+///
+/// The trailing `x` line is the same terminator the load-only request uses: it
+/// is not a valid `IOTCM`, which is how the interaction loop is told there is
+/// nothing more to serve.
+fn agda_goal_context_request(encoded_filename: &str, ids: &[u64]) -> String {
+    let mut request = format!(
+        "IOTCM {encoded_filename} None Direct (Cmd_load {encoded_filename} [])\n"
+    );
+    for id in ids {
+        request.push_str(&format!(
+            "IOTCM {encoded_filename} None Direct (Cmd_goal_type_context_infer Normalised {id} noRange \"?\")\n"
+        ));
+    }
+    request.push_str("x\n");
+    request
+}
+
+/// Fold the `GoalSpecific` contexts into the goals the load phase already
+/// produced, matching on interaction-point id.
+///
+/// This only ever ADDS a `context` key to an existing goal object. Nothing is
+/// removed, retyped, or reordered, so a caller that ignores `context` sees byte
+/// for byte what it saw before the enrichment existed. Returns how many goals
+/// gained a context and how many replies matched no known goal.
+fn merge_agda_goal_contexts(
+    goals: &mut [serde_json::Value],
+    enrichment: &AgdaInteractionDiagnostics,
+) -> (usize, usize) {
+    let AgdaInteractionDiagnostics::Ready { goals: replies, .. } = enrichment else {
+        return (0, 0);
+    };
+    let mut merged = 0usize;
+    let mut unmatched = 0usize;
+    for reply in replies {
+        if reply.get("visibility").and_then(|v| v.as_str()) != Some("specific") {
+            continue;
+        }
+        let Some(context) = reply.get("context") else {
+            continue;
+        };
+        let Some(id) = reply.get("id").and_then(|id| id.as_u64()) else {
+            unmatched += 1;
+            continue;
+        };
+        let mut hit = false;
+        for goal in goals.iter_mut() {
+            if goal.get("id").and_then(|value| value.as_u64()) != Some(id) {
+                continue;
+            }
+            let Some(object) = goal.as_object_mut() else {
+                continue;
+            };
+            object.insert("context".into(), context.clone());
+            hit = true;
+            merged += 1;
+        }
+        if !hit {
+            unmatched += 1;
+        }
+    }
+    (merged, unmatched)
+}
+
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -443,11 +570,16 @@ fn read_interaction_pipe<R: Read>(mut reader: R, cap: usize) -> (String, bool) {
 /// Run an optional interaction command with stdin while retaining the same
 /// timeout/output caps as the authoritative batch runner. This is local to the
 /// external backend because the normal gate runner intentionally closes stdin.
+///
+/// `deadline` may only TIGHTEN the configured wall-clock limit, never loosen it:
+/// the enrichment phase carries its own, smaller budget, but no caller may buy
+/// itself more time than the operator configured.
 fn run_interaction_with_input(
     runner: &Runner,
     argv: &[String],
     workspace: &Path,
     input: &str,
+    deadline: Option<Duration>,
 ) -> exec::ExecOutcome {
     let mut command = match interaction_process(runner, argv, workspace) {
         Ok(command) => command,
@@ -480,7 +612,10 @@ fn run_interaction_with_input(
         }
     };
 
-    let limits = exec::ResourceLimits::from_env();
+    let mut limits = exec::ResourceLimits::from_env();
+    if let Some(deadline) = deadline {
+        limits.timeout = limits.timeout.min(deadline);
+    }
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
@@ -798,10 +933,21 @@ impl ExternalBackend {
             "--safe".into(),
             "--interaction-json".into(),
         ];
-        let outcome = run_interaction_with_input(&self.runner, &command, &ws.root, &request);
+        let started = Instant::now();
+        // The load phase keeps the operator-configured limit it has always had:
+        // tightening it here would change diagnostics that exist today, which
+        // the goal-context work is not entitled to do.
+        let outcome = run_interaction_with_input(&self.runner, &command, &ws.root, &request, None);
         let parsed = parse_agda_interaction_outcome(&outcome);
         let mut detail = parsed.to_json();
+        // `Cmd_load` answers with goal TYPES only. The hypotheses in scope at
+        // each hole need a goal-specific command, so ask for them in a second
+        // phase and fold the answers into the goals above. Purely additive: on
+        // any failure the diagnostics stay exactly as the load phase left them.
+        let enrichment =
+            self.agda_goal_context_enrichment(&mut detail, &parsed, &command, ws, started);
         if let Some(object) = detail.as_object_mut() {
+            object.insert("goal_context_enrichment".into(), enrichment);
             object.insert("authority".into(), json!("advisory_only"));
             object.insert("verdict_source".into(), json!("batch_agda_safe"));
             object.insert("exit_status_trusted".into(), json!(false));
@@ -812,6 +958,99 @@ impl ExternalBackend {
             object.insert("stdout".into(), json!(outcome.stdout));
         }
         detail
+    }
+
+    /// Second phase of the advisory Agda diagnostics: ask for the CONTEXT
+    /// (hypotheses in scope) at each open hole and merge it into `detail`.
+    ///
+    /// Every failure mode here is silent by construction. An Agda too old to
+    /// know `Cmd_goal_type_context_infer`, a reply we cannot parse, a blown
+    /// deadline, or a file with no holes at all each return a status record and
+    /// leave `detail` byte for byte as the load phase produced it. Nothing on
+    /// this path can reach the pass/fail verdict, which is computed from the
+    /// separate batch `agda --safe` run before this is ever called.
+    fn agda_goal_context_enrichment(
+        &self,
+        detail: &mut serde_json::Value,
+        loaded: &AgdaInteractionDiagnostics,
+        command: &[String],
+        ws: &Workspace,
+        started: Instant,
+    ) -> serde_json::Value {
+        let (ids, holes_truncated) = agda_interaction_point_ids(loaded, AGDA_GOAL_CONTEXT_HOLE_CAP);
+        if ids.is_empty() {
+            return json!({
+                "status": "skipped",
+                "authority": "advisory_only",
+                "reason": "the load phase reported no addressable interaction points",
+                "holes_queried": 0,
+                "holes_truncated": holes_truncated,
+            });
+        }
+        // The deadline covers BOTH phases, so a slow load leaves less room here
+        // and can legitimately consume the whole budget.
+        let remaining = AGDA_GOAL_CONTEXT_DEADLINE
+            .checked_sub(started.elapsed())
+            .filter(|left| !left.is_zero());
+        let Some(remaining) = remaining else {
+            return json!({
+                "status": "deadline_exhausted",
+                "authority": "advisory_only",
+                "reason": "the load phase consumed the goal-context budget",
+                "deadline_secs": AGDA_GOAL_CONTEXT_DEADLINE.as_secs(),
+                "holes_queried": 0,
+                "holes_truncated": holes_truncated + ids.len(),
+            });
+        };
+        let filename = ws
+            .source_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Generated.agda");
+        let encoded_filename =
+            serde_json::to_string(filename).unwrap_or_else(|_| "\"Generated.agda\"".to_string());
+        let request = agda_goal_context_request(&encoded_filename, &ids);
+        let outcome =
+            run_interaction_with_input(&self.runner, command, &ws.root, &request, Some(remaining));
+        let replies = parse_agda_interaction_outcome(&outcome);
+        let (status, merged, unmatched, reason) = match &replies {
+            AgdaInteractionDiagnostics::Ready { .. } => {
+                match detail.get_mut("goals").and_then(|g| g.as_array_mut()) {
+                    Some(goals) => {
+                        let (merged, unmatched) = merge_agda_goal_contexts(goals, &replies);
+                        ("ready", merged, unmatched, String::new())
+                    }
+                    // Malformed load diagnostics expose no goals to merge into;
+                    // that state is preserved, never repaired from here.
+                    None => (
+                        "degraded",
+                        0,
+                        0,
+                        "the load phase exposed no goals to merge into".to_string(),
+                    ),
+                }
+            }
+            AgdaInteractionDiagnostics::Unsupported { reason } => {
+                ("unsupported", 0, 0, reason.clone())
+            }
+            AgdaInteractionDiagnostics::Malformed { reason } => ("degraded", 0, 0, reason.clone()),
+        };
+        json!({
+            "status": status,
+            "authority": "advisory_only",
+            "verdict_source": "batch_agda_safe",
+            "exit_status_trusted": false,
+            "reason": reason,
+            "hole_cap": AGDA_GOAL_CONTEXT_HOLE_CAP,
+            "deadline_secs": AGDA_GOAL_CONTEXT_DEADLINE.as_secs(),
+            "holes_queried": ids.len(),
+            "holes_truncated": holes_truncated,
+            "hole_ids": ids,
+            "contexts_merged": merged,
+            "replies_unmatched": unmatched,
+            "code": outcome.code,
+            "stderr": outcome.stderr,
+        })
     }
 }
 
@@ -1058,24 +1297,30 @@ impl FormalBackend for ExternalBackend {
 /// (copying them through verbatim, `--` options included). Metamath's
 /// `$( ... $)` needs no special handling — `strip_comments` already covers it.
 fn fallback_source_scan(system: FormalSystem, code: &str) -> ScanReport {
-    let stripped = crate::prover::formal::strip_comments(code);
-    let code = stripped.as_str();
     let mut findings = Vec::new();
     if system == FormalSystem::Agda {
-        for (needle, reason) in [
-            ("postulate", "Agda postulates widen the trusted base"),
-            ("--allow-unsolved-metas", "unsolved metas are not proofs"),
-            (
-                "{-# COMPILED",
-                "foreign compilation pragma bypasses Agda semantics",
-            ),
-        ] {
-            if code.contains(needle) {
-                findings.push(format!("{needle}: {reason}"));
-            }
-        }
+        // The token list is the SHARED, ALIAS-EXPANDED table in `formal.rs`
+        // ([`crate::prover::formal::escape_hatch_tokens`]), matched on word
+        // boundaries. Agda's hatches are a family of RENAMES of one move —
+        // turning a checker off — so banning `--allow-unsolved-metas` while
+        // leaving `--no-termination-check`, `--no-positivity-check`,
+        // `--no-coverage-check`, `--type-in-type`, `--unsafe` and `primTrustMe`
+        // unbanned was protection in name only.
+        //
+        // `--allow-incomplete-matches` is deliberately NOT in that list. Agda's
+        // own documentation lists it among the options `--safe` refuses, so the
+        // checker we invoke (`agda --safe`) already rejects any file that asks
+        // for it, both on the command line and via an `{-# OPTIONS #-}` pragma.
+        // Adding the needle would duplicate a guarantee we already hold rather
+        // than close a hole. `--allow-unsolved-metas` is likewise rejected by
+        // `--safe` but stays here as defence in depth for the offline scan,
+        // which runs on sources no checker has seen yet.
+        findings.extend(crate::prover::formal::escape_hatch_findings(system, code));
     } else if system == FormalSystem::Metamath {
-        findings.extend(metamath_source_findings(code));
+        // Metamath's checks are STRUCTURAL (`$a` declarations, `?` placeholder
+        // steps, escaping include paths), not a token list, so they stay here.
+        let stripped = crate::prover::formal::strip_comments(code);
+        findings.extend(metamath_source_findings(stripped.as_str()));
     }
     ScanReport {
         clean: findings.is_empty(),
@@ -1218,6 +1463,58 @@ mod tests {
         let compiled = fallback_source_scan(sys, "{-# COMPILED f g #-}\n");
         assert!(!compiled.clean, "pragma must not be stripped away");
         assert!(compiled.findings.iter().any(|f| f.starts_with("{-# COMPILED")));
+    }
+
+    /// ALIAS EXPANSION. Every flag here turns a checker off, exactly as
+    /// `--allow-unsolved-metas` does, and `primTrustMe` fabricates an equality
+    /// proof. Banning one spelling of a move with six other spellings is
+    /// protection in name only.
+    #[test]
+    fn renamed_agda_hatches_are_caught() {
+        let sys = FormalSystem::Agda;
+        for (code, expected) in [
+            ("{-# OPTIONS --type-in-type #-}\nthm : Set\n", "--type-in-type"),
+            ("{-# OPTIONS --unsafe #-}\nthm : Set\n", "--unsafe"),
+            (
+                "{-# OPTIONS --no-termination-check #-}\nthm : Set\n",
+                "--no-termination-check",
+            ),
+            (
+                "{-# OPTIONS --no-positivity-check #-}\nthm : Set\n",
+                "--no-positivity-check",
+            ),
+            (
+                "{-# OPTIONS --no-coverage-check #-}\nthm : Set\n",
+                "--no-coverage-check",
+            ),
+            ("thm = primTrustMe\n", "primTrustMe"),
+        ] {
+            let report = fallback_source_scan(sys, code);
+            assert!(!report.clean, "alias must be caught: {code:?}");
+            assert!(
+                report.findings.iter().any(|f| f == expected),
+                "expected `{expected}` in {:?}",
+                report.findings
+            );
+        }
+    }
+
+    /// The boundary trade-off, asserted in the OVER-matching direction: an
+    /// identifier that merely CONTAINS a banned token is ordinary Agda.
+    #[test]
+    fn identifiers_containing_a_hatch_token_are_not_flagged() {
+        let sys = FormalSystem::Agda;
+        for code in [
+            "postulates : Set\npostulates = Set\n",
+            "{-# OPTIONS --safe #-}\nthm : Set\nthm = Set\n",
+        ] {
+            let report = fallback_source_scan(sys, code);
+            assert!(
+                report.clean,
+                "innocent source must not be flagged ({code:?}): {:?}",
+                report.findings
+            );
+        }
     }
 
     /// Metamath's offline fallback under the same policy. `$( ... $)` is
@@ -1443,6 +1740,180 @@ mod tests {
     // (audit invariant #2). Downstream only grants `FormallyVerified` when both
     // `report.lexically_verified && report.live` hold (agent.rs), so the mock
     // report carrying `live == false` is what keeps mock proofs out of it.
+
+    // GAP 3: the goal-context enrichment. `Cmd_load` yields goal TYPES only;
+    // the hypotheses at each hole require a goal-specific command. Everything
+    // below stays inside the advisory diagnostics: none of it may move the
+    // verdict, which comes from the batch `agda --safe` run.
+
+    /// One `AllGoalsWarnings` reply with two real interaction points (7, 9) and
+    /// one unsolved meta identified by name.
+    fn load_phase_diagnostics() -> AgdaInteractionDiagnostics {
+        let output = r#"{"kind":"DisplayInfo","info":{"kind":"AllGoalsWarnings","visibleGoals":[{"constraintObj":{"id":7,"range":[]},"kind":"OfType","type":"Nat"},{"constraintObj":{"id":9,"range":[]},"kind":"OfType","type":"Bool"}],"invisibleGoals":[{"constraintObj":{"name":"_8","range":[]},"kind":"OfType","type":"Set"}],"warnings":[]}}"#;
+        parse_agda_interaction_output(output)
+    }
+
+    fn load_phase_goals() -> Vec<serde_json::Value> {
+        let AgdaInteractionDiagnostics::Ready { goals, .. } = load_phase_diagnostics() else {
+            panic!("fixture must parse")
+        };
+        goals
+    }
+
+    #[test]
+    fn agda_hole_ids_come_from_the_parsed_load_reply() {
+        // Ids are read off Agda's own reply, not regexed out of the source, and
+        // named (invisible) metas are not addressable interaction points.
+        let (ids, truncated) = agda_interaction_point_ids(&load_phase_diagnostics(), 16);
+        assert_eq!(ids, vec![7, 9]);
+        assert_eq!(truncated, 0);
+        let request = agda_goal_context_request("\"Generated.agda\"", &ids);
+        assert!(request.starts_with(
+            "IOTCM \"Generated.agda\" None Direct (Cmd_load \"Generated.agda\" [])\n"
+        ));
+        assert!(request.contains(
+            "IOTCM \"Generated.agda\" None Direct (Cmd_goal_type_context_infer Normalised 7 noRange \"?\")\n"
+        ));
+        assert!(request.contains(
+            "IOTCM \"Generated.agda\" None Direct (Cmd_goal_type_context_infer Normalised 9 noRange \"?\")\n"
+        ));
+        // One process, one stream: every hole is a line, never a new process.
+        assert!(request.ends_with("x\n"));
+        assert_eq!(request.lines().count(), 2 + ids.len());
+    }
+
+    #[test]
+    fn agda_hole_cap_truncates_visibly() {
+        // A file with a hundred holes must not be able to stretch the gate.
+        let visible = (0..100)
+            .map(|id| {
+                format!(r#"{{"constraintObj":{{"id":{id},"range":[]}},"kind":"OfType","type":"Nat"}}"#)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let output = format!(
+            r#"{{"kind":"DisplayInfo","info":{{"kind":"AllGoalsWarnings","visibleGoals":[{visible}],"invisibleGoals":[],"warnings":[]}}}}"#
+        );
+        let parsed = parse_agda_interaction_output(&output);
+        let (ids, truncated) = agda_interaction_point_ids(&parsed, AGDA_GOAL_CONTEXT_HOLE_CAP);
+        assert_eq!(ids.len(), AGDA_GOAL_CONTEXT_HOLE_CAP);
+        assert_eq!(truncated, 100 - AGDA_GOAL_CONTEXT_HOLE_CAP);
+        assert!(truncated > 0, "the cap must be reported, not hidden");
+    }
+
+    #[test]
+    fn agda_goal_specific_reply_supplies_the_hole_context() {
+        // This is the reply the load phase can never produce: hypotheses.
+        let reply = parse_agda_interaction_output(
+            r#"{"kind":"DisplayInfo","info":{"kind":"GoalSpecific","interactionPoint":{"id":7,"range":[]},"goalInfo":{"kind":"GoalType","type":"Nat","entries":[{"originalName":"n","reifiedName":"n","binding":"Nat","inScope":true}]}}}"#,
+        );
+        let mut goals = load_phase_goals();
+        let (merged, unmatched) = merge_agda_goal_contexts(&mut goals, &reply);
+        assert_eq!((merged, unmatched), (1, 0));
+        assert_eq!(goals[0]["id"], 7);
+        assert_eq!(goals[0]["context"][0]["binding"], "Nat");
+        // Purely additive: the goal that was not asked about is untouched.
+        assert!(goals[1].get("context").is_none());
+        // And the original fields survive verbatim.
+        assert_eq!(goals[0]["type"], "Nat");
+        assert_eq!(goals[0]["visibility"], "visible");
+    }
+
+    #[test]
+    fn agda_goal_context_degrades_silently() {
+        // A malformed reply, an Agda that never heard of the command, and an
+        // absent toolchain must each leave the load diagnostics untouched.
+        let baseline = load_phase_goals();
+        for reply in [
+            parse_agda_interaction_output("JSON> {not-json}"),
+            parse_agda_interaction_output("agda: unrecognized option --interaction-json"),
+            parse_agda_interaction_output(""),
+            parse_agda_interaction_outcome(&exec::ExecOutcome {
+                launched: false,
+                code: None,
+                stdout: String::new(),
+                stderr: "no such file or directory".into(),
+                timed_out: false,
+                output_capped: false,
+            }),
+            parse_agda_interaction_outcome(&exec::ExecOutcome {
+                launched: true,
+                code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                timed_out: true,
+                output_capped: false,
+            }),
+        ] {
+            let mut goals = baseline.clone();
+            let (merged, unmatched) = merge_agda_goal_contexts(&mut goals, &reply);
+            assert_eq!((merged, unmatched), (0, 0));
+            assert_eq!(
+                goals, baseline,
+                "a failed enrichment must not perturb the load diagnostics: {reply:?}"
+            );
+            // Nothing addressable is derived from a failed reply either.
+            assert_eq!(
+                agda_interaction_point_ids(&reply, AGDA_GOAL_CONTEXT_HOLE_CAP),
+                (Vec::<u64>::new(), 0usize)
+            );
+        }
+    }
+
+    #[test]
+    fn agda_goal_context_never_participates_in_the_verdict() {
+        // The verdict is a function of the BATCH run alone: (launched, exit,
+        // stdout, stderr) of `agda --safe`. The enrichment contributes no
+        // argument to it, so it is byte-identical whatever the enrichment did.
+        let signal = ExternalBackend::new(&Config::default(), FormalSystem::Agda, true)
+            .compile_success_signal();
+        let verdict = |stdout: &str, code_zero: bool| {
+            signal.is_pass(true, code_zero, stdout, "")
+        };
+        let pass = verdict("", true);
+        let fail = verdict("Generated.agda:3,1-4: error", false);
+        assert!(pass && !fail, "batch --safe decides pass/fail on its own");
+
+        // Run every enrichment outcome against the same batch result and check
+        // the verdict is recomputed identically each time.
+        let enrichments = [
+            parse_agda_interaction_output(
+                r#"{"kind":"DisplayInfo","info":{"kind":"GoalSpecific","interactionPoint":{"id":7,"range":[]},"goalInfo":{"kind":"GoalType","type":"Nat","entries":[{"binding":"Nat"}]}}}"#,
+            ),
+            parse_agda_interaction_output("JSON> {not-json}"),
+            parse_agda_interaction_output(""),
+        ];
+        for enrichment in &enrichments {
+            let mut goals = load_phase_goals();
+            merge_agda_goal_contexts(&mut goals, enrichment);
+            assert_eq!(verdict("", true), pass);
+            assert_eq!(verdict("Generated.agda:3,1-4: error", false), fail);
+        }
+
+        // Interaction output that would LOOK like success cannot rescue a
+        // failing batch run, which is the exit-0 trap the split design avoids.
+        assert!(!verdict("Generated.agda:3,1-4: error", false));
+    }
+
+    #[test]
+    fn agda_goal_context_is_absent_by_default() {
+        // With no Agda on the box the backend is mocked, and a mock compile
+        // carries no interaction diagnostics at all: the enrichment cannot
+        // change a run on a machine that has no toolchain.
+        let cfg = Config::default();
+        let backend = ExternalBackend::new(&cfg, FormalSystem::Agda, true);
+        let ws = backend
+            .scaffold(&cfg, "module Generated where\n", "Generated")
+            .expect("mock scaffold");
+        let report = backend.compile(&ws).expect("mock compile");
+        assert!(report.compiled);
+        assert!(
+            report.detail.get("interaction_diagnostics").is_none(),
+            "mock compile must not reach the interaction path: {:?}",
+            report.detail
+        );
+        assert!(report.detail.get("goal_context_enrichment").is_none());
+    }
 
     #[test]
     fn mock_async_verification_is_not_live() {
