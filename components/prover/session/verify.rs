@@ -35,8 +35,16 @@ pub fn verify_lean_round_trip(
     let lexical = if py.available() {
         let resp = py.run(json!({"tool": "lean_soundness", "text": after_src}))?;
         let parsed: serde_json::Value =
-            serde_json::from_str(&resp.stdout).unwrap_or(json!({"ok": false}));
-        parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false)
+            serde_json::from_str(&resp.stdout).unwrap_or(json!({"pregate_clean": false}));
+        // `lean_soundness` returns `pregate_clean` (with `clean` as a deprecated
+        // alias). It has NEVER returned `ok`, which is what this read asked for
+        // before, so `lexical` was permanently false and this pre-screen was dead
+        // for every external-prover adapter. Absent/unparseable still means false.
+        parsed
+            .get("pregate_clean")
+            .or_else(|| parsed.get("clean"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
     } else {
         false
     };
