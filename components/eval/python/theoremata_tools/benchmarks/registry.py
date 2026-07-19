@@ -14,6 +14,7 @@ import sys
 from typing import Any
 
 from . import graders
+from .adversarial import ADVERSARIAL_LOADERS, ADVERSARIAL_TRACK_KIND
 from .loaders import LOADERS
 from .proof_completion import run_proof_completion
 from .verified_programming import run_verified_programming
@@ -53,13 +54,22 @@ _TRACK_KIND = {
     "formalizing_100": ("formalization", "formalization"),
     "1lab": ("formalization", "formalization"),
     "metamath_100": ("formalization", "formalization"),
+    # Adversarial gate fixtures carry an expected verdict; see .adversarial.
+    **ADVERSARIAL_TRACK_KIND,
 }
+
+# The adversarial loaders live in their own module rather than loaders.py because
+# they answer a different question (what must the gate DO with this?) and their
+# items are validated against a fixed verdict vocabulary. Merging here keeps a
+# single catalogue, so list_benchmarks and load_benchmark stay the only entry
+# points callers need.
+_ALL_LOADERS: dict[str, Any] = {**LOADERS, **ADVERSARIAL_LOADERS}
 
 
 def list_benchmarks() -> list[dict[str, str]]:
     """Registered benchmark names with their track + item kind."""
     out = []
-    for name in LOADERS:
+    for name in _ALL_LOADERS:
         track, kind = _TRACK_KIND.get(name, ("unknown", "unknown"))
         out.append({"name": name, "track": track, "kind": kind})
     return out
@@ -71,11 +81,11 @@ def load_benchmark(name: str) -> list[dict[str, Any]]:
     Returns ``[]`` (logging a skip) when the corpus is absent — never raises for
     a missing corpus. Raises ``KeyError`` for an unknown name.
     """
-    if name not in LOADERS:
+    if name not in _ALL_LOADERS:
         raise KeyError(
-            f"unknown benchmark {name!r}; known: {sorted(LOADERS)}"
+            f"unknown benchmark {name!r}; known: {sorted(_ALL_LOADERS)}"
         )
-    return LOADERS[name]()
+    return _ALL_LOADERS[name]()
 
 
 def grade(item: dict[str, Any], response: Any, **kw: Any) -> dict[str, Any]:

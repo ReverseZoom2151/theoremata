@@ -76,6 +76,12 @@ _CORPUS_GLOB = {
     # never-present dir so `_corpus_present` reports absent and the loader is
     # handled via `_COMMITTED_FIXTURE` below.
     "formalizing_100": "formalizing-100-none",
+    # Adversarial expected-verdict fixtures (see test_adversarial_fixtures.py).
+    "borwein_vacuity": "gdm-formal-conjectures-main",
+    "partition_elliptic": "PartitionElliptic-main",
+    "higher_dyson": "HigherDyson-main",
+    "erdos_public": "erdos-public-main",
+    "ramanujan_tau": "ramanujan-tau-misses-primes-main",
 }
 
 # corpora that exist but ship no structured problems (PDF-only data cards)
@@ -106,8 +112,9 @@ def test_registry_lists_all_tracks():
         "reformulation",
         "proof_grading",
         "tactic_reference",
+        "adversarial",
     }
-    assert len(ALL_NAMES) == 33
+    assert len(ALL_NAMES) == 38
 
 
 def test_load_unknown_benchmark_raises():
