@@ -174,7 +174,12 @@ pub fn summarize_progress(partial: &PartialProof, goal_state: &GoalState) -> Sum
         }
     }
 
-    let seed = render_seed(&goal_state.goal, &closed_subgoals, &useful_lemmas, &open_subgoals);
+    let seed = render_seed(
+        &goal_state.goal,
+        &closed_subgoals,
+        &useful_lemmas,
+        &open_subgoals,
+    );
     Summary {
         goal: goal_state.goal.clone(),
         closed_subgoals,
@@ -221,12 +226,7 @@ fn extract_lemmas(proof: &str) -> Vec<String> {
     out
 }
 
-fn render_seed(
-    goal: &str,
-    closed: &[ClosedSubgoal],
-    lemmas: &[String],
-    open: &[String],
-) -> String {
+fn render_seed(goal: &str, closed: &[ClosedSubgoal], lemmas: &[String], open: &[String]) -> String {
     let mut s = String::new();
     s.push_str(&format!("Progress summary for goal: {goal}\n"));
 
@@ -415,7 +415,13 @@ pub fn reflective_redecompose(
                 s2.uses = s2
                     .uses
                     .iter()
-                    .map(|u| if u == &base { bridge_id.clone() } else { u.clone() })
+                    .map(|u| {
+                        if u == &base {
+                            bridge_id.clone()
+                        } else {
+                            u.clone()
+                        }
+                    })
                     .collect();
             }
             steps.push(s2);
@@ -682,10 +688,7 @@ mod tests {
 
     #[test]
     fn summarize_merges_prover_reported_open_subgoals_without_duplicates() {
-        let partial = PartialProof::new(
-            "attempt",
-            vec![SubgoalStatus::open("g", "already open")],
-        );
+        let partial = PartialProof::new("attempt", vec![SubgoalStatus::open("g", "already open")]);
         // One overlapping, one new open subgoal reported by the prover.
         let gs = GoalState::new("goal", vec!["already open".into(), "extra open".into()]);
         let summary = summarize_progress(&partial, &gs);
@@ -745,14 +748,29 @@ mod tests {
         assert_eq!(ids, vec!["s1", "s2_part0", "s2_part1", "s2_bridge", "s3"]);
 
         // The two parts carry the conjuncts.
-        let part0 = out.sketch.steps.iter().find(|s| s.id == "s2_part0").unwrap();
-        let part1 = out.sketch.steps.iter().find(|s| s.id == "s2_part1").unwrap();
+        let part0 = out
+            .sketch
+            .steps
+            .iter()
+            .find(|s| s.id == "s2_part0")
+            .unwrap();
+        let part1 = out
+            .sketch
+            .steps
+            .iter()
+            .find(|s| s.id == "s2_part1")
+            .unwrap();
         assert_eq!(part0.hole.as_ref().unwrap().subgoal, "A");
         assert_eq!(part1.hole.as_ref().unwrap().subgoal, "B");
 
         // The bridge recombines the parts (and keeps s2's original dep on s1),
         // and its subgoal is the original A ∧ B.
-        let bridge = out.sketch.steps.iter().find(|s| s.id == "s2_bridge").unwrap();
+        let bridge = out
+            .sketch
+            .steps
+            .iter()
+            .find(|s| s.id == "s2_bridge")
+            .unwrap();
         assert_eq!(bridge.hole.as_ref().unwrap().subgoal, "A ∧ B");
         assert_eq!(bridge.uses, vec!["s2_part0", "s2_part1", "s1"]);
 
@@ -764,7 +782,8 @@ mod tests {
     #[test]
     fn redecompose_honours_explicit_subparts() {
         let sketch = sample_sketch();
-        let fb = RedecomposeFeedback::on_step("s2").with_subparts(["lemma X", "residual Y", "tail Z"]);
+        let fb =
+            RedecomposeFeedback::on_step("s2").with_subparts(["lemma X", "residual Y", "tail Z"]);
         let out = reflective_redecompose(&sketch, &fb);
         // Three explicit parts + bridge.
         assert_eq!(
@@ -788,14 +807,15 @@ mod tests {
 
     #[test]
     fn redecompose_non_splittable_subgoal_still_wraps_in_a_bridge() {
-        let sketch = InformalSketch::new(
-            "T",
-            vec![SketchStep::hole("g", "atomic", "Irreducible a")],
-        );
+        let sketch =
+            InformalSketch::new("T", vec![SketchStep::hole("g", "atomic", "Irreducible a")]);
         let out = reflective_redecompose(&sketch, &RedecomposeFeedback::on_step("g"));
         assert!(out.changed());
         // One part carrying the whole subgoal + a bridge.
-        assert_eq!(out.added_steps, vec!["g_part0".to_string(), "g_bridge".to_string()]);
+        assert_eq!(
+            out.added_steps,
+            vec!["g_part0".to_string(), "g_bridge".to_string()]
+        );
         let part = out.sketch.steps.iter().find(|s| s.id == "g_part0").unwrap();
         assert_eq!(part.hole.as_ref().unwrap().subgoal, "Irreducible a");
     }

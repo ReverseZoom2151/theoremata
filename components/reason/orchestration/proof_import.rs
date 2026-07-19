@@ -367,15 +367,29 @@ mod tests {
 
         // It is lowercase hex of a 32-byte digest.
         assert_eq!(a.len(), 64);
-        assert!(a.chars().all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()));
+        assert!(a
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()));
     }
 
     #[test]
     fn content_id_changes_if_statement_or_any_dependency_or_backend_changes() {
         let base = content_id("goal", BACKEND, &["d1".into()]);
-        assert_ne!(base, content_id("goal2", BACKEND, &["d1".into()]), "statement change");
-        assert_ne!(base, content_id("goal", BACKEND, &["d1x".into()]), "dependency change");
-        assert_ne!(base, content_id("goal", "coq", &["d1".into()]), "backend change");
+        assert_ne!(
+            base,
+            content_id("goal2", BACKEND, &["d1".into()]),
+            "statement change"
+        );
+        assert_ne!(
+            base,
+            content_id("goal", BACKEND, &["d1x".into()]),
+            "dependency change"
+        );
+        assert_ne!(
+            base,
+            content_id("goal", "coq", &["d1".into()]),
+            "backend change"
+        );
         assert_ne!(
             base,
             content_id("goal", BACKEND, &["d1".into(), "d2".into()]),
@@ -423,7 +437,10 @@ mod tests {
         forged.statement = "A'; but claim A's id".into();
         let err = store.import(forged).unwrap_err().to_string();
         assert!(err.contains("content-id mismatch"), "got: {err}");
-        assert!(store.is_empty(), "a tampered theorem must not enter the store");
+        assert!(
+            store.is_empty(),
+            "a tampered theorem must not enter the store"
+        );
     }
 
     #[test]
@@ -447,19 +464,31 @@ mod tests {
             ],
         );
 
-        let d1 = Discharge::new("A1", ImportedTheorem::new("assumption one", BACKEND, vec![]));
-        let d2 = Discharge::new("A2", ImportedTheorem::new("assumption two", BACKEND, vec![]));
+        let d1 = Discharge::new(
+            "A1",
+            ImportedTheorem::new("assumption one", BACKEND, vec![]),
+        );
+        let d2 = Discharge::new(
+            "A2",
+            ImportedTheorem::new("assumption two", BACKEND, vec![]),
+        );
 
         // Not yet: only one of the two named assumptions is discharged.
         let err = shards.reassemble(&[d1.clone()]).unwrap_err().to_string();
-        assert!(err.contains("A2") && err.contains("not discharged"), "got: {err}");
+        assert!(
+            err.contains("A2") && err.contains("not discharged"),
+            "got: {err}"
+        );
 
         // All discharged → the goal is admitted, and it is content-addressed over
         // exactly the two discharge ids (order of discharges does not matter).
         let goal = shards.reassemble(&[d2.clone(), d1.clone()]).unwrap();
         let mut expected_deps = vec![d1.theorem.id.clone(), d2.theorem.id.clone()];
         expected_deps.sort();
-        assert_eq!(goal, ImportedTheorem::new("main_goal", BACKEND, expected_deps));
+        assert_eq!(
+            goal,
+            ImportedTheorem::new("main_goal", BACKEND, expected_deps)
+        );
         assert!(goal.id_is_valid());
     }
 
@@ -491,8 +520,7 @@ mod tests {
 
     #[test]
     fn reassembly_rejects_duplicate_or_unknown_discharges() {
-        let shards =
-            shard_implication("g", BACKEND, vec![NamedAssumption::new("A1", "s1")]);
+        let shards = shard_implication("g", BACKEND, vec![NamedAssumption::new("A1", "s1")]);
         let good = ImportedTheorem::new("s1", BACKEND, vec![]);
 
         let dup = shards
@@ -536,7 +564,10 @@ mod tests {
             ],
         );
         let goal = shards
-            .reassemble(&[Discharge::new("A1", a1.clone()), Discharge::new("A2", a2.clone())])
+            .reassemble(&[
+                Discharge::new("A1", a1.clone()),
+                Discharge::new("A2", a2.clone()),
+            ])
             .unwrap();
 
         // The reassembled goal imports cleanly: its dependency history (a1, a2,
@@ -554,8 +585,7 @@ mod tests {
     fn goal_with_a_missing_discharge_in_the_store_is_rejected_on_import() {
         // Reassembly can produce a well-formed goal, but importing it still fails
         // if a discharge was never imported — dangling history is caught late too.
-        let shards =
-            shard_implication("goal", BACKEND, vec![NamedAssumption::new("A1", "s1")]);
+        let shards = shard_implication("goal", BACKEND, vec![NamedAssumption::new("A1", "s1")]);
         let a1 = ImportedTheorem::new("s1", BACKEND, vec![]);
         let goal = shards.reassemble(&[Discharge::new("A1", a1)]).unwrap();
 

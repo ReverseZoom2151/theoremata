@@ -943,8 +943,16 @@ pub fn backend_for(cfg: &Config, system: FormalSystem, mock: bool) -> Box<dyn Fo
         (FormalSystem::Candle, false) => {
             Box::new(crate::prover::backends::candle::CandleBackend::live(cfg))
         }
-        (FormalSystem::Agda, mock) => Box::new(crate::prover::backends::external::ExternalBackend::new(cfg, FormalSystem::Agda, mock)),
-        (FormalSystem::Metamath, mock) => Box::new(crate::prover::backends::external::ExternalBackend::new(cfg, FormalSystem::Metamath, mock)),
+        (FormalSystem::Agda, mock) => Box::new(
+            crate::prover::backends::external::ExternalBackend::new(cfg, FormalSystem::Agda, mock),
+        ),
+        (FormalSystem::Metamath, mock) => {
+            Box::new(crate::prover::backends::external::ExternalBackend::new(
+                cfg,
+                FormalSystem::Metamath,
+                mock,
+            ))
+        }
     }
 }
 
@@ -1006,7 +1014,11 @@ pub fn live_poll(
                     },
                 )
             }
-            Err(e) => (ProverJobStatus::Error, None, format!("live verify error: {e}")),
+            Err(e) => (
+                ProverJobStatus::Error,
+                None,
+                format!("live verify error: {e}"),
+            ),
         }
     } else {
         (
@@ -1174,19 +1186,28 @@ mod tests {
     #[test]
     fn all_entry_names_lists_declarations_in_order() {
         let code = "theorem foo : True := trivial\nlemma bar : True := trivial\n";
-        assert_eq!(all_entry_names(FormalSystem::Lean, code), vec!["foo", "bar"]);
+        assert_eq!(
+            all_entry_names(FormalSystem::Lean, code),
+            vec!["foo", "bar"]
+        );
     }
 
     #[test]
     fn candle_parses_and_round_trips() {
         use std::str::FromStr;
         // Both accepted tags parse to Candle; `hol` stays claimed by Isabelle.
-        assert_eq!(FormalSystem::from_str("candle").unwrap(), FormalSystem::Candle);
+        assert_eq!(
+            FormalSystem::from_str("candle").unwrap(),
+            FormalSystem::Candle
+        );
         assert_eq!(
             FormalSystem::from_str("hol_light").unwrap(),
             FormalSystem::Candle
         );
-        assert_eq!(FormalSystem::from_str("hol").unwrap(), FormalSystem::Isabelle);
+        assert_eq!(
+            FormalSystem::from_str("hol").unwrap(),
+            FormalSystem::Isabelle
+        );
         // as_str / Display round-trip.
         assert_eq!(FormalSystem::Candle.as_str(), "candle");
         assert_eq!(FormalSystem::Candle.to_string(), "candle");
@@ -1218,10 +1239,15 @@ mod tests {
         assert_eq!(candle.primitive_notions, Some(25));
         assert!(candle.classical && candle.choice && candle.all_math);
         assert_eq!(
-            FormalSystem::Isabelle.foundation_profile().primitive_notions,
+            FormalSystem::Isabelle
+                .foundation_profile()
+                .primitive_notions,
             None
         );
-        assert_eq!(FormalSystem::Lean.foundation_profile().primitive_notions, None);
+        assert_eq!(
+            FormalSystem::Lean.foundation_profile().primitive_notions,
+            None
+        );
         // Every foundation we target can encode all of mathematics...
         for sys in [
             FormalSystem::Lean,
@@ -1229,7 +1255,10 @@ mod tests {
             FormalSystem::Isabelle,
             FormalSystem::Candle,
         ] {
-            assert!(sys.foundation_profile().all_math, "{sys} should be all-math");
+            assert!(
+                sys.foundation_profile().all_math,
+                "{sys} should be all-math"
+            );
         }
         // ...but Rocq is intuitionistic + choice-free by default, unlike the
         // HOL-family backends.

@@ -3,11 +3,11 @@
 use crate::{
     config::Config,
     db::Store,
-    provider::ModelProvider,
     prover::{
         model::{AttemptRunRecord, AttemptRunResult, AttemptRunStatus, ProofTask},
         proof_job,
     },
+    provider::ModelProvider,
 };
 use anyhow::{anyhow, Result};
 use chrono::Utc;
@@ -32,15 +32,16 @@ pub fn start(
     std::fs::create_dir_all(dir.join("lean"))?;
     std::fs::create_dir_all(dir.join("logs"))?;
     std::fs::create_dir_all(dir.join("verifier"))?;
-    std::fs::write(dir.join("input.json"), serde_json::to_string_pretty(&input)?)?;
+    std::fs::write(
+        dir.join("input.json"),
+        serde_json::to_string_pretty(&input)?,
+    )?;
 
     let statement = input["statement"]
         .as_str()
         .or_else(|| input["task"].as_str())
         .unwrap_or("True");
-    let theorem_name = input["theorem_name"]
-        .as_str()
-        .unwrap_or("Theoremata.Main");
+    let theorem_name = input["theorem_name"].as_str().unwrap_or("Theoremata.Main");
     let task = ProofTask {
         id: uuid::Uuid::new_v4().to_string(),
         project_id: Some(project_id.into()),
@@ -64,8 +65,14 @@ pub fn start(
             metadata: json!({}),
         },
         statement: statement.into(),
-        stub: input.get("stub").and_then(|v| v.as_str()).map(str::to_owned),
-        prompt: input.get("prompt").and_then(|v| v.as_str()).map(str::to_owned),
+        stub: input
+            .get("stub")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        prompt: input
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
         backend: input
             .get("backend")
             .and_then(|v| v.as_str())
@@ -140,9 +147,7 @@ pub fn result(
                     serde_json::to_string_pretty(&output)?,
                 )?;
                 record.output = Some(output);
-                record.status = if job.status
-                    == crate::prover::model::ProverJobStatus::Cancelled
-                {
+                record.status = if job.status == crate::prover::model::ProverJobStatus::Cancelled {
                     AttemptRunStatus::Cancelled
                 } else if matches!(
                     job.status,

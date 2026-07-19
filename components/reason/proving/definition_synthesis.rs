@@ -52,8 +52,8 @@ pub struct MissingSymbol {
 /// missing symbol. Kept small and conservative — a real corpus would supply the
 /// full vocabulary via `known_symbols`.
 const KEYWORD_STOPLIST: &[&str] = &[
-    "forall", "exists", "fun", "let", "in", "if", "then", "else", "match", "with",
-    "and", "or", "not", "iff", "True", "False", "Prop", "Type", "Sort", "by",
+    "forall", "exists", "fun", "let", "in", "if", "then", "else", "match", "with", "and", "or",
+    "not", "iff", "True", "False", "Prop", "Type", "Sort", "by",
 ];
 
 /// Scan `statement` for referenced identifiers absent from `known_symbols`.
@@ -443,7 +443,11 @@ mod tests {
         let syn = &report.synthesized[0];
 
         // The duplicate collapsed: two distinct candidates screened.
-        assert_eq!(syn.candidates.len(), 2, "byte-identical duplicate must dedup");
+        assert_eq!(
+            syn.candidates.len(),
+            2,
+            "byte-identical duplicate must dedup"
+        );
 
         // The chosen one is well-formed and non-degenerate — the content-bearing
         // definition, not the `:= True` vacuous one.
@@ -453,7 +457,10 @@ mod tests {
 
         // Both candidates are retained with flags for the human/next stage.
         assert!(syn.candidates.iter().any(|c| c.degenerate));
-        assert!(syn.candidates.iter().any(|c| c.well_formed && !c.degenerate));
+        assert!(syn
+            .candidates
+            .iter()
+            .any(|c| c.well_formed && !c.degenerate));
     }
 
     #[test]
@@ -493,7 +500,10 @@ mod tests {
         let syn = &report.synthesized[0];
         assert_eq!(syn.candidates.len(), 1);
         assert!(syn.candidates[0].degenerate);
-        assert!(syn.chosen.is_none(), "a degenerate candidate is never chosen");
+        assert!(
+            syn.chosen.is_none(),
+            "a degenerate candidate is never chosen"
+        );
     }
 
     #[test]
@@ -559,6 +569,9 @@ mod tests {
         let proposed = chosen.to_proposed_lemma("definition_synthesis");
         assert_eq!(proposed.statement, chosen.def_source);
         assert_eq!(proposed.provenance, "definition_synthesis");
-        assert!(proposed.proof.is_empty(), "a definition admits by well-formedness");
+        assert!(
+            proposed.proof.is_empty(),
+            "a definition admits by well-formedness"
+        );
     }
 }

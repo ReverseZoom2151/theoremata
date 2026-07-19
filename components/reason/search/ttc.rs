@@ -179,7 +179,8 @@ impl TtcController {
     /// Peek at the allocation for a goal *without* charging it — the pure policy
     /// applied to the current remaining budget.
     pub fn allocate(&self, difficulty: f64, prior_attempts: u32) -> Allocation {
-        self.cfg.allocate(difficulty, self.remaining(), prior_attempts)
+        self.cfg
+            .allocate(difficulty, self.remaining(), prior_attempts)
     }
 
     /// Allocate compute for a goal *and charge it* to the running total. The
@@ -219,7 +220,10 @@ mod tests {
         for step in 1..=10 {
             let d = step as f64 / 10.0;
             let a = cfg.allocate(d, u64::MAX, 0);
-            assert!(a.width >= prev.width, "width must not decrease with difficulty");
+            assert!(
+                a.width >= prev.width,
+                "width must not decrease with difficulty"
+            );
             assert!(a.rollouts >= prev.rollouts);
             prev = a;
         }

@@ -328,9 +328,7 @@ impl FormalBackend for IsabelleBackend {
         let root = crate::prover::formal::live_workspace_dir(cfg, SYSTEM)?;
         std::fs::write(root.join(format!("{thy_name}.thy")), &thy_body)?;
         // A minimal session ROOT so `isabelle build -D .` has a unit to check.
-        let root_file = format!(
-            "session {thy_name}_session = HOL +\n  theories\n    {thy_name}\n"
-        );
+        let root_file = format!("session {thy_name}_session = HOL +\n  theories\n    {thy_name}\n");
         std::fs::write(root.join("ROOT"), root_file)?;
         Ok(Workspace {
             system: SYSTEM,
@@ -385,7 +383,12 @@ impl FormalBackend for IsabelleBackend {
         })
     }
 
-    fn audit_axioms(&self, _ws: &Workspace, _thm: &str, whitelist: &[String]) -> Result<AxiomReport> {
+    fn audit_axioms(
+        &self,
+        _ws: &Workspace,
+        _thm: &str,
+        whitelist: &[String],
+    ) -> Result<AxiomReport> {
         if self.mock {
             return Ok(AxiomReport {
                 axioms: Vec::new(),
@@ -443,13 +446,7 @@ impl FormalBackend for IsabelleBackend {
         }
         // Isabelle escape hatches NOT caught by thm_oracles / clean build.
         let low = code.to_lowercase();
-        let patterns = [
-            "sorry",
-            "oops",
-            "quick_and_dirty",
-            "skip_proof",
-            "oracle",
-        ];
+        let patterns = ["sorry", "oops", "quick_and_dirty", "skip_proof", "oracle"];
         let findings: Vec<String> = patterns
             .iter()
             .filter(|p| low.contains(**p))

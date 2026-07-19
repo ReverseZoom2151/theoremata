@@ -81,11 +81,8 @@ pub struct ProposedLemma {
 pub trait Evolver {
     /// Propose a generalisation of `lemma` along `direction`, or `None` if this
     /// direction does not apply to this lemma.
-    fn transform(
-        &self,
-        lemma: &Lemma,
-        direction: EvolveDirection,
-    ) -> Result<Option<ProposedLemma>>;
+    fn transform(&self, lemma: &Lemma, direction: EvolveDirection)
+        -> Result<Option<ProposedLemma>>;
 
     /// Attempt to discharge an open request's `subgoal` directly, yielding a
     /// candidate skill. Defaults to "no attempt" so a `transform`-only evolver
@@ -153,9 +150,7 @@ impl<'a> LemmaLibrary<'a> {
             store,
             verifier,
             // dedup(candidate, existing) => existing subsumes candidate.
-            Box::new(|candidate, existing| {
-                crate::subsumption::subsumes_str(existing, candidate)
-            }),
+            Box::new(|candidate, existing| crate::subsumption::subsumes_str(existing, candidate)),
         )
     }
 
@@ -253,7 +248,8 @@ impl<'a> LemmaLibrary<'a> {
         subgoal: &str,
         provenance: &str,
     ) -> Result<LibraryRequest> {
-        self.store.add_library_request(project_id, subgoal, provenance)
+        self.store
+            .add_library_request(project_id, subgoal, provenance)
     }
 
     /// All requests for a project.
@@ -275,7 +271,8 @@ impl<'a> LemmaLibrary<'a> {
         statement: &str,
         provenance: &str,
     ) -> Result<Problem> {
-        self.store.add_library_problem(project_id, statement, provenance)
+        self.store
+            .add_library_problem(project_id, statement, provenance)
     }
 
     /// All target problems for a project.
@@ -308,25 +305,34 @@ impl<'a> LemmaLibrary<'a> {
                     self.tally_admit(project_id, &proposed, verifier, dedup, &mut summary)?;
                 }
             }
-            self.store.bump_library_lemma_update(project_id, &lemma.id)?;
+            self.store
+                .bump_library_lemma_update(project_id, &lemma.id)?;
         }
 
         // 2. Attempt the oldest open request; on admission, mark it solved.
         if let Some(request) = self.next_open_request(project_id)? {
             if let Some(proposed) = evolver.solve_request(&request.subgoal)? {
                 summary.n_proposed += 1;
-                let outcome =
-                    self.try_admit(project_id, &proposed.statement, &proposed.proof, &proposed.provenance, verifier, dedup)?;
+                let outcome = self.try_admit(
+                    project_id,
+                    &proposed.statement,
+                    &proposed.proof,
+                    &proposed.provenance,
+                    verifier,
+                    dedup,
+                )?;
                 match outcome {
                     AdmitOutcome::Admitted => {
                         summary.n_admitted += 1;
-                        self.store.mark_library_request_solved(project_id, &request.id)?;
+                        self.store
+                            .mark_library_request_solved(project_id, &request.id)?;
                     }
                     AdmitOutcome::Duplicate => summary.n_deduped += 1,
                     AdmitOutcome::Rejected => {}
                 }
             }
-            self.store.bump_library_request_update(project_id, &request.id)?;
+            self.store
+                .bump_library_request_update(project_id, &request.id)?;
         }
 
         Ok(summary)
@@ -371,7 +377,13 @@ pub fn embedding_key(statement: &str) -> String {
 /// Split into lowercased alphanumeric tokens (everything else is a separator).
 fn tokenize(s: &str) -> Vec<String> {
     s.chars()
-        .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { ' ' })
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
         .collect::<String>()
         .split_whitespace()
         .map(str::to_owned)
@@ -473,15 +485,21 @@ mod tests {
         let lib = LemmaLibrary::with_subsumption_dedup(&store, pattern_verifier());
 
         // General lemma admitted.
-        assert!(lib.record_lemma(&pid, "P x ⊢ R z", "by tac", "seed").unwrap());
+        assert!(lib
+            .record_lemma(&pid, "P x ⊢ R z", "by tac", "seed")
+            .unwrap());
         // A strictly MORE SPECIFIC restatement (extra hypothesis) is subsumed →
         // rejected. Exact-equality dedup would have (wrongly) admitted it.
         assert!(!lib
             .record_lemma(&pid, "Q y, P x ⊢ R z", "by tac", "seed2")
             .unwrap());
         // An α-equivalent restatement of a fresh lemma is also collapsed.
-        assert!(lib.record_lemma(&pid, "⊢ ∀ x, P x", "by intro", "s3").unwrap());
-        assert!(!lib.record_lemma(&pid, "⊢ ∀ y, P y", "by intro", "s4").unwrap());
+        assert!(lib
+            .record_lemma(&pid, "⊢ ∀ x, P x", "by intro", "s3")
+            .unwrap());
+        assert!(!lib
+            .record_lemma(&pid, "⊢ ∀ y, P y", "by intro", "s4")
+            .unwrap());
         // Exactly the two genuinely-distinct lemmas survived.
         assert_eq!(lib.lemmas(&pid).unwrap().len(), 2);
     }
@@ -500,7 +518,9 @@ mod tests {
             .record_lemma(&pid, "a + b = b + a", "commutativity by ring", "seed2")
             .unwrap());
         // Fails the verifier (no `by`) -> not admitted.
-        assert!(!lib.record_lemma(&pid, "c * d = d * c", "handwave", "seed3").unwrap());
+        assert!(!lib
+            .record_lemma(&pid, "c * d = d * c", "handwave", "seed3")
+            .unwrap());
 
         // Only the first landed in the store.
         assert_eq!(lib.lemmas(&pid).unwrap().len(), 1);
@@ -548,8 +568,10 @@ mod tests {
         let (store, pid) = store_with_project();
         let lib = LemmaLibrary::with_exact_dedup(&store, pattern_verifier());
 
-        lib.enqueue_request(&pid, "prove base case", "hole:s1").unwrap();
-        lib.enqueue_request(&pid, "prove step case", "hole:s2").unwrap();
+        lib.enqueue_request(&pid, "prove base case", "hole:s1")
+            .unwrap();
+        lib.enqueue_request(&pid, "prove step case", "hole:s2")
+            .unwrap();
         assert_eq!(lib.requests(&pid).unwrap().len(), 2);
 
         // Oldest open first; after bumping it, the second becomes least-updated.

@@ -299,7 +299,8 @@ impl FormalBackend for RocqBackend {
                 entry: name.to_string(),
             });
         }
-        let entry = crate::prover::formal::entry_name(SYSTEM, code).unwrap_or_else(|| name.to_string());
+        let entry =
+            crate::prover::formal::entry_name(SYSTEM, code).unwrap_or_else(|| name.to_string());
         let root = crate::prover::formal::live_workspace_dir(cfg, SYSTEM)?;
         let src = root.join(format!("{MODULE}.v"));
         // Append `Print Assumptions <entry>.` so a single `coqc` run compiles and
@@ -363,7 +364,12 @@ impl FormalBackend for RocqBackend {
         })
     }
 
-    fn audit_axioms(&self, ws: &Workspace, _thm: &str, whitelist: &[String]) -> Result<AxiomReport> {
+    fn audit_axioms(
+        &self,
+        ws: &Workspace,
+        _thm: &str,
+        whitelist: &[String],
+    ) -> Result<AxiomReport> {
         if self.mock {
             return Ok(AxiomReport {
                 axioms: Vec::new(),

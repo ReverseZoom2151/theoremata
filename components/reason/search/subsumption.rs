@@ -115,7 +115,10 @@ pub fn subsumes(general: &CanonicalGoal, specific: &CanonicalGoal) -> bool {
 
 /// Convenience: [`subsumes`] over raw goal strings (parses both first).
 pub fn subsumes_str(general: &str, specific: &str) -> bool {
-    subsumes(&CanonicalGoal::parse(general), &CanonicalGoal::parse(specific))
+    subsumes(
+        &CanonicalGoal::parse(general),
+        &CanonicalGoal::parse(specific),
+    )
 }
 
 /// Split a goal on its first turnstile into `(Some(hypotheses), conclusion)`, or
@@ -227,12 +230,8 @@ fn canonical_literal(s: &str) -> String {
     }
 
     // Map each bound name to a canonical De-Bruijn-ish name.
-    let rename = |w: &str| -> Option<String> {
-        order
-            .iter()
-            .position(|n| n == w)
-            .map(|i| format!("v{i}"))
-    };
+    let rename =
+        |w: &str| -> Option<String> { order.iter().position(|n| n == w).map(|i| format!("v{i}")) };
 
     // Second pass: rebuild, substituting bound variables, joining with single
     // spaces for a deterministic representation.

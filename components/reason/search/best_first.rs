@@ -490,8 +490,8 @@ fn mix_seed(base: u64, key: &str) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::driver::TacticStep;
+    use super::*;
     use std::collections::HashMap;
 
     // ---- Deterministic mocks -------------------------------------------------
@@ -547,7 +547,10 @@ mod tests {
             self
         }
         fn discard(mut self, from: &str, tactic: &str) -> Self {
-            self.dead.entry(from.into()).or_default().push(tactic.into());
+            self.dead
+                .entry(from.into())
+                .or_default()
+                .push(tactic.into());
             self
         }
         fn edge_hinted(
@@ -607,7 +610,11 @@ mod tests {
             .edge("root", "tA", 0.9f64.ln(), MockGoal::open("A"))
             .edge("root", "tB", 0.2f64.ln(), MockGoal::open("B"))
             .edge("A", "aClose", 0.9f64.ln(), MockGoal::closed("cA"));
-        let out = best_first_search(&mut scorer, MockGoal::open("root"), &BestFirstConfig::default());
+        let out = best_first_search(
+            &mut scorer,
+            MockGoal::open("root"),
+            &BestFirstConfig::default(),
+        );
 
         assert!(out.solved, "the A branch closes the goal");
         assert_eq!(out.proof_tactics(), vec!["tA", "aClose"]);
@@ -629,8 +636,7 @@ mod tests {
         // hint_weight = 0.0 (default): the hint is inert; log-prob decides, so the
         // frontier expands Hi before Lo -- byte-identical to the policy-only search.
         let mut s0 = build();
-        let out0 =
-            best_first_search(&mut s0, MockGoal::open("root"), &BestFirstConfig::default());
+        let out0 = best_first_search(&mut s0, MockGoal::open("root"), &BestFirstConfig::default());
         assert!(
             pos(&out0.order, "Hi") < pos(&out0.order, "Lo"),
             "with hint_weight=0 the frontier must ignore the hint and follow log-prob"
@@ -658,7 +664,11 @@ mod tests {
         let mut scorer = TableScorer::new()
             .edge("root", "hi", 0.9f64.ln(), MockGoal::open("Hi"))
             .edge("root", "lo", 0.1f64.ln(), MockGoal::open("Lo"));
-        let out = best_first_search(&mut scorer, MockGoal::open("root"), &BestFirstConfig::default());
+        let out = best_first_search(
+            &mut scorer,
+            MockGoal::open("root"),
+            &BestFirstConfig::default(),
+        );
 
         assert_eq!(out.order, vec!["root", "Hi", "Lo"]);
     }
@@ -684,7 +694,10 @@ mod tests {
         let o0 = best_first_search(
             &mut s0,
             MockGoal::open("root"),
-            &BestFirstConfig { alpha: 0.0, ..BestFirstConfig::default() },
+            &BestFirstConfig {
+                alpha: 0.0,
+                ..BestFirstConfig::default()
+            },
         );
         assert!(
             pos(&o0.order, "X") < pos(&o0.order, "Y2"),
@@ -697,7 +710,10 @@ mod tests {
         let o1 = best_first_search(
             &mut s1,
             MockGoal::open("root"),
-            &BestFirstConfig { alpha: 1.0, ..BestFirstConfig::default() },
+            &BestFirstConfig {
+                alpha: 1.0,
+                ..BestFirstConfig::default()
+            },
         );
         assert!(
             pos(&o1.order, "Y2") < pos(&o1.order, "X"),
@@ -709,7 +725,11 @@ mod tests {
     #[test]
     fn already_closed_root_is_trivially_solved() {
         let mut scorer = TableScorer::new();
-        let out = best_first_search(&mut scorer, MockGoal::closed("done"), &BestFirstConfig::default());
+        let out = best_first_search(
+            &mut scorer,
+            MockGoal::closed("done"),
+            &BestFirstConfig::default(),
+        );
         assert!(out.solved);
         assert_eq!(out.steps, 0, "no expansion needed for a closed root");
         assert!(out.proof_tactics().is_empty());
@@ -723,7 +743,11 @@ mod tests {
             .edge("root", "r", 0.5f64.ln(), MockGoal::open("R"))
             .edge("L", "ld", 0.9f64.ln(), MockGoal::open("D"))
             .edge("R", "rd", 0.9f64.ln(), MockGoal::open("D"));
-        let out = best_first_search(&mut scorer, MockGoal::open("root"), &BestFirstConfig::default());
+        let out = best_first_search(
+            &mut scorer,
+            MockGoal::open("root"),
+            &BestFirstConfig::default(),
+        );
         let d_count = out.order.iter().filter(|k| *k == "D").count();
         assert_eq!(d_count, 1, "the transposed state D is expanded only once");
     }
@@ -740,7 +764,10 @@ mod tests {
         let out = best_first_search(
             &mut scorer,
             MockGoal::open("n0"),
-            &BestFirstConfig { max_steps: 3, ..BestFirstConfig::default() },
+            &BestFirstConfig {
+                max_steps: 3,
+                ..BestFirstConfig::default()
+            },
         );
         assert!(!out.solved, "an unclosable chain must not be solved");
         assert!(out.steps <= 3, "expansions must not exceed the budget");
@@ -772,7 +799,9 @@ mod tests {
     }
     impl TableExpander {
         fn new() -> Self {
-            Self { table: HashMap::new() }
+            Self {
+                table: HashMap::new(),
+            }
         }
         fn edge(mut self, from: &str, tactic: &str, prior: f64, to: MockGoal) -> Self {
             self.table
@@ -797,7 +826,11 @@ mod tests {
             .edge("g2", "close", 1.0, MockGoal::open("g1"))
             .edge("g1", "close", 1.0, MockGoal::closed("g0"));
         let mut scorer = ExpanderScorer(expander);
-        let out = best_first_search(&mut scorer, MockGoal::open("g2"), &BestFirstConfig::default());
+        let out = best_first_search(
+            &mut scorer,
+            MockGoal::open("g2"),
+            &BestFirstConfig::default(),
+        );
         assert!(out.solved);
         assert_eq!(out.proof_tactics(), vec!["close", "close"]);
     }
@@ -816,7 +849,11 @@ mod tests {
             .discard("root", "ring_fails")
             .edge("A", "aClose", 0.9f64.ln(), MockGoal::closed("cA"))
             .discard("A", "omega_fails");
-        let out = best_first_search(&mut scorer, MockGoal::open("root"), &BestFirstConfig::default());
+        let out = best_first_search(
+            &mut scorer,
+            MockGoal::open("root"),
+            &BestFirstConfig::default(),
+        );
         assert!(out.solved);
 
         let pairs = dpo_pairs(&out);
@@ -852,7 +889,10 @@ mod tests {
         let out = best_first_search(
             &mut scorer,
             MockGoal::open("root"),
-            &BestFirstConfig { max_steps: 10, ..BestFirstConfig::default() },
+            &BestFirstConfig {
+                max_steps: 10,
+                ..BestFirstConfig::default()
+            },
         );
         assert!(!out.solved);
         assert!(dpo_pairs(&out).is_empty());

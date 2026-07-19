@@ -317,9 +317,12 @@ fn spawn_with(mut cmd: Command, limits: ResourceLimits) -> ExecOutcome {
     // readers return at once. On a kill, grace-bound the wait so a grandchild
     // holding the pipe cannot re-introduce a hang.
     let grace = Duration::from_secs(2);
-    let (stdout, out_capped) = orx
-        .recv_timeout(grace)
-        .unwrap_or_else(|_| ("[theoremata] stdout reader did not drain in time".into(), true));
+    let (stdout, out_capped) = orx.recv_timeout(grace).unwrap_or_else(|_| {
+        (
+            "[theoremata] stdout reader did not drain in time".into(),
+            true,
+        )
+    });
     let (mut stderr, err_capped) = erx
         .recv_timeout(grace)
         .unwrap_or_else(|_| (String::new(), true));
@@ -444,7 +447,10 @@ mod tests {
         let start = std::time::Instant::now();
         let out = spawn_with(sleeper(), limits);
         // Killed well before the ~4s sleeper would finish.
-        assert!(start.elapsed() < Duration::from_secs(3), "guard did not kill promptly");
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "guard did not kill promptly"
+        );
         assert!(out.timed_out, "a runaway must be flagged timed_out");
         assert!(!out.success(), "a timed-out run must fail closed");
         assert!(out.stderr.contains("resource limit"));

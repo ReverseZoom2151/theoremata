@@ -333,9 +333,11 @@ impl Outcome {
 /// Better-first comparison of two outcomes: solved beats unsolved; among equals,
 /// higher progress wins. Total (NaN progress sorts as equal) and deterministic.
 fn outcome_cmp(a: &Outcome, b: &Outcome) -> Ordering {
-    a.solved
-        .cmp(&b.solved)
-        .then_with(|| a.progress.partial_cmp(&b.progress).unwrap_or(Ordering::Equal))
+    a.solved.cmp(&b.solved).then_with(|| {
+        a.progress
+            .partial_cmp(&b.progress)
+            .unwrap_or(Ordering::Equal)
+    })
 }
 
 /// Rewrites exactly one marked region of a sketch (the LLM prover-subagent seam).
@@ -414,7 +416,10 @@ impl Population {
         scored.sort_by(|a, b| {
             outcome_cmp(&b.1, &a.1).then_with(|| self.members[a.0].id.cmp(&self.members[b.0].id))
         });
-        let order: Vec<&str> = scored.iter().map(|(i, _)| self.members[*i].id.as_str()).collect();
+        let order: Vec<&str> = scored
+            .iter()
+            .map(|(i, _)| self.members[*i].id.as_str())
+            .collect();
         self.ranker.record_ranking(&order);
         scored
             .iter()
@@ -602,22 +607,28 @@ pub fn evolve<M: Mutator, E: Evaluator>(
 
     for gen in 1..=config.max_generations {
         // 1. Select top-Elo parents (clone out so we can mutate the population).
-        let parents: Vec<EditableSketch> =
-            pop.elo_order().into_iter().take(parents_k).cloned().collect();
+        let parents: Vec<EditableSketch> = pop
+            .elo_order()
+            .into_iter()
+            .take(parents_k)
+            .cloned()
+            .collect();
 
         // 2. Mutate one marked region of each parent to spawn offspring.
         for (pi, parent) in parents.iter().enumerate() {
             for k in 0..offspring_k {
                 let s = mix4(config.seed, gen as u64, pi as u64, k as u64);
-                let child = mutate_one(parent, s, mutator)
-                    .with_id(format!("g{gen}-p{pi}-o{k}"));
+                let child = mutate_one(parent, s, mutator).with_id(format!("g{gen}-p{pi}-o{k}"));
                 pop.add(child);
             }
         }
 
         // 3. Evaluate the combined pool and fold the ranking into Elo.
         let scored = pop.rank_by(evaluator);
-        let solved = scored.iter().find(|(_, o)| o.solved).map(|(id, _)| id.clone());
+        let solved = scored
+            .iter()
+            .find(|(_, o)| o.solved)
+            .map(|(id, _)| id.clone());
 
         // 4. Cull the worst back to the fixed population size.
         pop.cull_to(n);
@@ -678,7 +689,8 @@ mod tests {
             if c == self.target {
                 Outcome::solved()
             } else {
-                let frac = common_prefix(c, &self.target) as f64 / self.target.chars().count() as f64;
+                let frac =
+                    common_prefix(c, &self.target) as f64 / self.target.chars().count() as f64;
                 Outcome::progress(frac)
             }
         }
@@ -709,9 +721,16 @@ mod tests {
         };
         let result = evolve(seed, &config, &mutator, &evaluator);
 
-        assert!(result.solved, "the reveal mutator must reach the solved content");
+        assert!(
+            result.solved,
+            "the reveal mutator must reach the solved content"
+        );
         // "qed" needs 3 reveals; convergence well within the 12-generation budget.
-        assert!(result.generations <= 5, "converged in {} gens", result.generations);
+        assert!(
+            result.generations <= 5,
+            "converged in {} gens",
+            result.generations
+        );
         assert_eq!(result.best.block_content("goal"), Some("qed"));
         assert_eq!(result.population_size, 4, "population size stays fixed");
     }

@@ -196,7 +196,10 @@ pub fn expansion_budget(node_importance: f64, base_budget: usize, cfg: &EtaMctsC
     let scaled = (base_budget as f64) * (1.0 + gain * imp);
     // Round to the nearest whole child count, then clamp into [min, max].
     let rounded = scaled.round() as i64;
-    let (lo, hi) = (cfg.min_budget.min(cfg.max_budget), cfg.max_budget.max(cfg.min_budget));
+    let (lo, hi) = (
+        cfg.min_budget.min(cfg.max_budget),
+        cfg.max_budget.max(cfg.min_budget),
+    );
     rounded.clamp(lo as i64, hi as i64) as usize
 }
 
@@ -262,7 +265,10 @@ mod tests {
         let mut prev = f64::INFINITY;
         for steps in 1..=n {
             let s = distance_score(&encode_distance(steps, n));
-            assert!(s >= 0.0 && s <= 1.0, "score {s} out of [0,1] at steps={steps}");
+            assert!(
+                s >= 0.0 && s <= 1.0,
+                "score {s} out of [0,1] at steps={steps}"
+            );
             assert!(
                 s < prev,
                 "score must strictly decrease as steps grow: steps={steps} score={s} prev={prev}"
@@ -303,7 +309,10 @@ mod tests {
         for i in 0..=10 {
             let imp = i as f64 / 10.0;
             let b = expansion_budget(imp, base, &cfg);
-            assert!(b >= cfg.min_budget && b <= cfg.max_budget, "budget {b} out of bounds");
+            assert!(
+                b >= cfg.min_budget && b <= cfg.max_budget,
+                "budget {b} out of bounds"
+            );
             assert!(b >= prev, "budget must be non-decreasing in importance");
             prev = b;
         }

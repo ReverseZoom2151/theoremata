@@ -397,8 +397,11 @@ fn order_family(family: &[FamilyProblem]) -> Vec<String> {
     // Soft dependency: append any cycle remainder in ascending label order.
     if order.len() != nodes.len() {
         let placed: HashSet<&str> = order.iter().map(|s| s.as_str()).collect();
-        let mut leftover: Vec<&str> =
-            nodes.iter().copied().filter(|l| !placed.contains(l)).collect();
+        let mut leftover: Vec<&str> = nodes
+            .iter()
+            .copied()
+            .filter(|l| !placed.contains(l))
+            .collect();
         leftover.sort_unstable();
         order.extend(leftover.into_iter().map(str::to_string));
     }
@@ -562,7 +565,11 @@ mod tests {
 
         // The known one is reported AlreadyKnown with the prior work, no proof,
         // and was never handed to the prover.
-        let gap = report.items.iter().find(|i| i.label == "prime_gap").unwrap();
+        let gap = report
+            .items
+            .iter()
+            .find(|i| i.label == "prime_gap")
+            .unwrap();
         match &gap.status {
             ApplicationStatus::AlreadyKnown { prior } => {
                 assert_eq!(prior.title, "Bertrand-style gap theorem");
@@ -588,8 +595,7 @@ mod tests {
             problem("q1", "first", &[]),
         ];
         let prover = MockProver::new(&[]);
-        let report =
-            transfer_method(&method(), &family, &prover, None, TransferConfig::default());
+        let report = transfer_method(&method(), &family, &prover, None, TransferConfig::default());
 
         // Soft topo order applies dependencies first.
         assert_eq!(report.order, vec!["q1", "q2", "q3"]);
@@ -617,8 +623,7 @@ mod tests {
             problem("hard", "method cannot close this", &[]),
         ];
         let prover = MockProver::new(&["hard"]);
-        let report =
-            transfer_method(&method(), &family, &prover, None, TransferConfig::default());
+        let report = transfer_method(&method(), &family, &prover, None, TransferConfig::default());
 
         assert_eq!(report.n_solved, 1);
         assert_eq!(report.n_failed, 1);
@@ -627,7 +632,10 @@ mod tests {
 
         let hard = report.items.iter().find(|i| i.label == "hard").unwrap();
         assert_eq!(hard.status, ApplicationStatus::Failed);
-        assert!(hard.proof.is_none(), "a failed problem never carries a proof");
+        assert!(
+            hard.proof.is_none(),
+            "a failed problem never carries a proof"
+        );
         assert!(hard.reused_from.is_empty());
     }
 
@@ -675,8 +683,13 @@ mod tests {
         ];
         let prover = MockProver::new(&["p3"]);
         let novelty = MockNovelty::with(&[("four (known)", "Known Four")]);
-        let report =
-            transfer_method(&method(), &family, &prover, Some(&novelty), TransferConfig::default());
+        let report = transfer_method(
+            &method(),
+            &family,
+            &prover,
+            Some(&novelty),
+            TransferConfig::default(),
+        );
 
         assert_eq!(report.n_solved, 2);
         assert_eq!(report.n_failed, 1);
@@ -695,8 +708,7 @@ mod tests {
             problem("a", "alpha", &[]),
         ];
         let prover = MockProver::new(&[]);
-        let report =
-            transfer_method(&method(), &family, &prover, None, TransferConfig::default());
+        let report = transfer_method(&method(), &family, &prover, None, TransferConfig::default());
         assert_eq!(report.order, vec!["a", "z", "t"]);
     }
 
@@ -704,13 +716,9 @@ mod tests {
     fn cyclic_related_to_is_soft_and_never_loops() {
         // r1 <-> r2 form a related_to cycle; a soft dependency must not error or
         // loop — both appear, ordered by label, and both still get driven.
-        let family = vec![
-            problem("r2", "two", &["r1"]),
-            problem("r1", "one", &["r2"]),
-        ];
+        let family = vec![problem("r2", "two", &["r1"]), problem("r1", "one", &["r2"])];
         let prover = MockProver::new(&[]);
-        let report =
-            transfer_method(&method(), &family, &prover, None, TransferConfig::default());
+        let report = transfer_method(&method(), &family, &prover, None, TransferConfig::default());
         assert_eq!(report.order, vec!["r1", "r2"]);
         assert_eq!(report.n_solved, 2);
     }
@@ -718,8 +726,7 @@ mod tests {
     #[test]
     fn empty_family_reports_zero_coverage() {
         let prover = MockProver::new(&[]);
-        let report =
-            transfer_method(&method(), &[], &prover, None, TransferConfig::default());
+        let report = transfer_method(&method(), &[], &prover, None, TransferConfig::default());
         assert_eq!(report.n_items(), 0);
         assert_eq!(report.n_solved, 0);
         assert_eq!(report.coverage, 0.0);

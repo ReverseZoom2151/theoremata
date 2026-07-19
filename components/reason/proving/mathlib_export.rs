@@ -327,7 +327,11 @@ mod tests {
         let cfg = ExportConfig::default();
         let lemmas = [
             lemma("a + b = b + a", "commutativity by ring", "seed:comm"),
-            lemma("sum of two even numbers is even", "by parity", "seed:parity"),
+            lemma(
+                "sum of two even numbers is even",
+                "by parity",
+                "seed:parity",
+            ),
         ];
         let bundle = export_library(&lemmas, &cfg);
 
@@ -390,7 +394,11 @@ mod tests {
         ];
         let bundle = export_library(&lemmas, &cfg);
 
-        assert_eq!(bundle.decls.len(), 1, "only the non-trivial skill is emitted");
+        assert_eq!(
+            bundle.decls.len(),
+            1,
+            "only the non-trivial skill is emitted"
+        );
         assert_eq!(bundle.skipped, vec!["n = n".to_owned()]);
 
         // With skip_trivial off, the trivial one is emitted too.

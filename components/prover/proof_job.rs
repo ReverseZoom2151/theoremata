@@ -3,12 +3,12 @@
 use crate::{
     config::Config,
     db::Store,
-    provider::ModelProvider,
     prover::{
         aristotle, external, isabelle, lean, leandojo,
         model::{ProofJob, ProofResult, ProofTask, ProverJobStatus},
         reprover, rocq,
     },
+    provider::ModelProvider,
 };
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -46,11 +46,22 @@ pub fn poll(
         "lean" => lean::poll(store, config, job_id),
         "rocq" => rocq::poll(store, config, job_id),
         "isabelle" => isabelle::poll(store, config, job_id),
-        "agda" => external::poll(store, config, job_id, crate::prover::formal::FormalSystem::Agda),
-        "metamath" => external::poll(store, config, job_id, crate::prover::formal::FormalSystem::Metamath),
+        "agda" => external::poll(
+            store,
+            config,
+            job_id,
+            crate::prover::formal::FormalSystem::Agda,
+        ),
+        "metamath" => external::poll(
+            store,
+            config,
+            job_id,
+            crate::prover::formal::FormalSystem::Metamath,
+        ),
         "leandojo" => leandojo::poll(store, config, job_id),
         "reprover" => {
-            let p = provider.ok_or_else(|| anyhow!("reprover backend requires a model provider"))?;
+            let p =
+                provider.ok_or_else(|| anyhow!("reprover backend requires a model provider"))?;
             reprover::poll_with_provider(store, config, p, job_id)
         }
         other => Err(anyhow!("unsupported prover backend: {other}")),
@@ -91,19 +102,19 @@ pub fn any_prover_available(config: &Config, model_ready: bool) -> bool {
         "aristotle" => {
             aristotle::mock_enabled(config) || std::env::var("THEOREMATA_ARISTOTLE_COMMAND").is_ok()
         }
-        "lean" => {
-            lean::mock_enabled(config) || std::env::var("THEOREMATA_LEAN_COMMAND").is_ok()
-        }
-        "rocq" => {
-            rocq::mock_enabled(config) || std::env::var("THEOREMATA_ROCQ_COMMAND").is_ok()
-        }
+        "lean" => lean::mock_enabled(config) || std::env::var("THEOREMATA_LEAN_COMMAND").is_ok(),
+        "rocq" => rocq::mock_enabled(config) || std::env::var("THEOREMATA_ROCQ_COMMAND").is_ok(),
         "isabelle" => {
             isabelle::mock_enabled(config) || std::env::var("THEOREMATA_ISABELLE_COMMAND").is_ok()
         }
-        "agda" => external::mock_enabled(config, crate::prover::formal::FormalSystem::Agda)
-            || std::env::var("THEOREMATA_AGDA_COMMAND").is_ok(),
-        "metamath" => external::mock_enabled(config, crate::prover::formal::FormalSystem::Metamath)
-            || std::env::var("THEOREMATA_METAMATH_COMMAND").is_ok(),
+        "agda" => {
+            external::mock_enabled(config, crate::prover::formal::FormalSystem::Agda)
+                || std::env::var("THEOREMATA_AGDA_COMMAND").is_ok()
+        }
+        "metamath" => {
+            external::mock_enabled(config, crate::prover::formal::FormalSystem::Metamath)
+                || std::env::var("THEOREMATA_METAMATH_COMMAND").is_ok()
+        }
         "leandojo" => leandojo::available(),
         "reprover" => reprover::available(model_ready),
         _ => false,
@@ -253,7 +264,9 @@ pub fn sparse_poll_plan(state: &ResumeState, cfg: &ResumeConfig) -> PollDecision
 
 /// Grow the backoff exponentially, clamped to `max_backoff`. Pure helper.
 fn advance_backoff(current: u64, cfg: &ResumeConfig) -> u64 {
-    current.saturating_mul(2).min(cfg.max_backoff.max(cfg.base_backoff))
+    current
+        .saturating_mul(2)
+        .min(cfg.max_backoff.max(cfg.base_backoff))
 }
 
 /// Drive a job to a terminal state (or budget exhaustion) by repeatedly applying
@@ -405,7 +418,11 @@ mod resume_tests {
             }
         };
         let out = resume_job(reloaded, &poller, &cfg);
-        assert_eq!(first_seen.get(), 2, "continued from index 2, did not restart");
+        assert_eq!(
+            first_seen.get(),
+            2,
+            "continued from index 2, did not restart"
+        );
         assert_eq!(out.kind, ResumeOutcomeKind::Done);
         assert_eq!(out.state.last_poll_index, 4);
     }
@@ -414,7 +431,10 @@ mod resume_tests {
     fn fresh_state_plan_is_poll_with_base_backoff() {
         let cfg = cfg();
         let state = ResumeState::new("job-5", &cfg);
-        assert_eq!(sparse_poll_plan(&state, &cfg), PollDecision::Poll { after: 1 });
+        assert_eq!(
+            sparse_poll_plan(&state, &cfg),
+            PollDecision::Poll { after: 1 }
+        );
     }
 
     #[test]

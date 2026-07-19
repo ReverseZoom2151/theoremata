@@ -138,9 +138,7 @@ impl Policy {
     pub fn is_soundness_authority(self) -> bool {
         matches!(
             self,
-            Policy::OutputSoundness
-                | Policy::AxiomBase
-                | Policy::StatementBinding
+            Policy::OutputSoundness | Policy::AxiomBase | Policy::StatementBinding
         )
     }
 }
@@ -222,9 +220,18 @@ impl InputVerdict {
 /// [`crate::guard`]'s `INJECTION_MARKERS`, categorized and reason-annotated.
 const MARKERS: &[(&str, InjectionKind)] = &[
     // --- instruction override -------------------------------------------------
-    ("ignore previous instructions", InjectionKind::InstructionOverride),
-    ("ignore all previous instructions", InjectionKind::InstructionOverride),
-    ("ignore all instructions", InjectionKind::InstructionOverride),
+    (
+        "ignore previous instructions",
+        InjectionKind::InstructionOverride,
+    ),
+    (
+        "ignore all previous instructions",
+        InjectionKind::InstructionOverride,
+    ),
+    (
+        "ignore all instructions",
+        InjectionKind::InstructionOverride,
+    ),
     ("ignore the above", InjectionKind::InstructionOverride),
     ("disregard previous", InjectionKind::InstructionOverride),
     ("disregard all previous", InjectionKind::InstructionOverride),
@@ -325,7 +332,10 @@ mod tests {
         );
         assert!(v.flagged, "an injection attempt must be flagged");
         assert!(v.kinds().contains(&InjectionKind::InstructionOverride));
-        assert!(v.reasons().iter().any(|r| r.contains("ignore previous instructions")));
+        assert!(v
+            .reasons()
+            .iter()
+            .any(|r| r.contains("ignore previous instructions")));
     }
 
     #[test]
@@ -355,7 +365,10 @@ mod tests {
         let clean = "theorem add_comm (a b : Nat) : a + b = b + a := by ring";
         assert!(!check_untrusted(clean).flagged, "benign math must pass");
         let lemma_list = "Nat.succ_le_succ, Nat.add_comm, Finset.sum_range_succ";
-        assert!(!check_untrusted(lemma_list).flagged, "a lemma list must pass");
+        assert!(
+            !check_untrusted(lemma_list).flagged,
+            "a lemma list must pass"
+        );
         // A clean verdict has no signals.
         assert_eq!(check_untrusted(clean), InputVerdict::clean());
     }
@@ -399,7 +412,11 @@ mod tests {
         for p in Policy::ALL {
             assert!(!p.id().is_empty());
             assert!(!p.enforces().is_empty(), "{} must document WHAT", p.id());
-            assert!(p.module().starts_with("crate::"), "{} must point at a module", p.id());
+            assert!(
+                p.module().starts_with("crate::"),
+                "{} must point at a module",
+                p.id()
+            );
         }
     }
 

@@ -554,11 +554,12 @@ fn run_interaction_with_input(
 }
 
 pub fn mock_enabled(config: &Config, system: FormalSystem) -> bool {
-    config.prover_mock || match system {
-        FormalSystem::Agda => std::env::var("THEOREMATA_AGDA_COMMAND").is_err(),
-        FormalSystem::Metamath => std::env::var("THEOREMATA_METAMATH_COMMAND").is_err(),
-        _ => false,
-    }
+    config.prover_mock
+        || match system {
+            FormalSystem::Agda => std::env::var("THEOREMATA_AGDA_COMMAND").is_err(),
+            FormalSystem::Metamath => std::env::var("THEOREMATA_METAMATH_COMMAND").is_err(),
+            _ => false,
+        }
 }
 
 pub fn build_task(
@@ -570,23 +571,38 @@ pub fn build_task(
     system: FormalSystem,
 ) -> ProofTask {
     ProofTask {
-        id: uuid::Uuid::new_v4().to_string(), project_id, node_id,
+        id: uuid::Uuid::new_v4().to_string(),
+        project_id,
+        node_id,
         theorem: crate::prover::model::TheoremIdentity {
-            repo: Some("theoremata".into()), commit: None, file: None,
-            full_name: theorem_name.into(), line: None,
+            repo: Some("theoremata".into()),
+            commit: None,
+            file: None,
+            full_name: theorem_name.into(),
+            line: None,
         },
         system,
         formal_project: FormalProject {
-            system, root: config.resources.clone(), toolchain: None,
-            imports: system.default_imports(), metadata: json!({}),
+            system,
+            root: config.resources.clone(),
+            toolchain: None,
+            imports: system.default_imports(),
+            metadata: json!({}),
         },
-        statement: statement.into(), stub: None, prompt: None,
-        backend: backend_name(system).into(), metadata: json!({}),
+        statement: statement.into(),
+        stub: None,
+        prompt: None,
+        backend: backend_name(system).into(),
+        metadata: json!({}),
     }
 }
 
-pub fn submit(store: &Store, config: &Config, task: ProofTask,
-              artifacts_dir: Option<std::path::PathBuf>) -> Result<ProofJob> {
+pub fn submit(
+    store: &Store,
+    config: &Config,
+    task: ProofTask,
+    artifacts_dir: Option<std::path::PathBuf>,
+) -> Result<ProofJob> {
     let mock = mock_enabled(config, task.system);
     let external_id = mock.then(|| format!("mock-{}", &task.id[..8.min(task.id.len())]));
     let job = store.create_proof_job(
@@ -656,17 +672,29 @@ pub fn poll(
     job.percent_complete = 100.0;
     job.completed_at = Some(Utc::now());
     job.result = Some(ProofResult {
-        task_id: job.task.id.clone(), job_id: job.id.clone(), status: job.status,
-        formal_code: Some(code.clone()), counterexample: None, verification,
-        artifacts_dir: job.artifacts_dir.clone(), duration_ms: 0, cost: None,
+        task_id: job.task.id.clone(),
+        job_id: job.id.clone(),
+        status: job.status,
+        formal_code: Some(code.clone()),
+        counterexample: None,
+        verification,
+        artifacts_dir: job.artifacts_dir.clone(),
+        duration_ms: 0,
+        cost: None,
         message: Some(format!("mock {system} checker completed")),
         provenance: json!({"backend": backend_name(system), "system": system.as_str(), "mock": true}),
     });
     if let Some(dir) = &job.artifacts_dir {
         let sub = dir.join(backend_name(system));
         std::fs::create_dir_all(&sub)?;
-        std::fs::write(sub.join(format!("solution{}", system.source_extension())), &code)?;
-        std::fs::write(dir.join("result.json"), serde_json::to_string_pretty(job.result.as_ref().unwrap())?)?;
+        std::fs::write(
+            sub.join(format!("solution{}", system.source_extension())),
+            &code,
+        )?;
+        std::fs::write(
+            dir.join("result.json"),
+            serde_json::to_string_pretty(job.result.as_ref().unwrap())?,
+        )?;
     }
     store.update_proof_job(&job)?;
     store.event(
@@ -680,7 +708,9 @@ pub fn poll(
 }
 
 pub fn cancel(store: &Store, job_id: &str) -> Result<ProofJob> {
-    let mut job = store.get_proof_job(job_id)?.ok_or_else(|| anyhow::anyhow!("unknown proof job {job_id}"))?;
+    let mut job = store
+        .get_proof_job(job_id)?
+        .ok_or_else(|| anyhow::anyhow!("unknown proof job {job_id}"))?;
     if !job.status.is_terminal() {
         job.status = ProverJobStatus::Cancelled;
         job.completed_at = Some(Utc::now());
@@ -883,7 +913,11 @@ impl FormalBackend for ExternalBackend {
             });
         }
         let out = self.run_file(ws);
-        let filename = ws.source_path.file_name().and_then(|s| s.to_str()).unwrap_or("Generated");
+        let filename = ws
+            .source_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Generated");
         let command = self.command(filename);
         // SOUNDNESS: the Metamath reference binary (`metamath`) returns exit code 0
         // even when `verify proof *` FAILS (failures only print `?Error` to stdout;
@@ -964,13 +998,21 @@ impl FormalBackend for ExternalBackend {
             });
         }
         let out = self.run_file(ws);
-        let filename = ws.source_path.file_name().and_then(|s| s.to_str()).unwrap_or("Generated");
+        let filename = ws
+            .source_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Generated");
         let command = self.command(filename);
         let mut secondary = json!(null);
         let mut rechecked = out.success();
         if rechecked {
             if let (FormalSystem::Metamath, Some(binary)) = (self.system, &self.secondary_binary) {
-                let filename = ws.source_path.file_name().and_then(|s| s.to_str()).unwrap_or("Generated");
+                let filename = ws
+                    .source_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Generated");
                 let args = [binary.as_str(), filename];
                 let second = exec::run(&self.runner, &args, &ws.root);
                 rechecked = second.success();
@@ -1045,7 +1087,10 @@ fn metamath_source_findings(code: &str) -> Vec<String> {
     }
     // In Metamath, `?` is exclusively the incomplete-proof marker, so any bare
     // `?` token disqualifies the proof.
-    if code.split(|c: char| c.is_whitespace()).any(|tok| tok == "?") {
+    if code
+        .split(|c: char| c.is_whitespace())
+        .any(|tok| tok == "?")
+    {
         findings.push(
             "?: incomplete `$p ... $= ? $.` proof contains an unproven placeholder step"
                 .to_string(),
@@ -1221,7 +1266,12 @@ mod tests {
             ""
         ));
         // Failure that (like the real binary) still exited 0 -> must be rejected.
-        assert!(!sig.is_pass(true, true, "?Error on line 5: ... proof does not verify.", ""));
+        assert!(!sig.is_pass(
+            true,
+            true,
+            "?Error on line 5: ... proof does not verify.",
+            ""
+        ));
         // Silent / empty output (missing file, no sentinel) -> rejected.
         assert!(!sig.is_pass(true, true, "", ""));
         assert!(!sig.is_pass(true, true, "No source file was read in.", ""));
@@ -1233,7 +1283,12 @@ mod tests {
             ""
         ));
         // Never launched -> rejected regardless of a clean-looking exit.
-        assert!(!sig.is_pass(false, false, "All proofs in the database were verified.", ""));
+        assert!(!sig.is_pass(
+            false,
+            false,
+            "All proofs in the database were verified.",
+            ""
+        ));
     }
 
     // GAP 1 — Metamath source scan. These exercise the pure lexical helper
@@ -1276,8 +1331,12 @@ mod tests {
     fn metamath_clean_proof_passes() {
         // Reuses the loaded database via a normal relative include and a complete
         // `$= ... $.` proof with no placeholder and no new axiom.
-        let findings = metamath_source_findings("$[ set.mm $]\nmp2 $p |- ph $= wph wps mp1 mp3 $.\n");
-        assert!(findings.is_empty(), "clean proof must not flag: {findings:?}");
+        let findings =
+            metamath_source_findings("$[ set.mm $]\nmp2 $p |- ph $= wph wps mp1 mp3 $.\n");
+        assert!(
+            findings.is_empty(),
+            "clean proof must not flag: {findings:?}"
+        );
     }
 
     #[test]
@@ -1291,10 +1350,12 @@ mod tests {
             .is_none()
         {
             assert!(!backend.source_scan("bad $a |- ph $.\n").unwrap().clean);
-            assert!(backend
-                .source_scan("$[ set.mm $]\nt $p |- ph $= a b c $.\n")
-                .unwrap()
-                .clean);
+            assert!(
+                backend
+                    .source_scan("$[ set.mm $]\nt $p |- ph $= a b c $.\n")
+                    .unwrap()
+                    .clean
+            );
         }
     }
 
@@ -1308,7 +1369,11 @@ mod tests {
         let cfg = crate::config::Config::default();
         let backend = ExternalBackend::new(&cfg, FormalSystem::Metamath, true);
         let report = backend
-            .verify(&cfg, "$c wff |- $.\n$v ph $.\nph $f wff ph $.\n", "some statement")
+            .verify(
+                &cfg,
+                "$c wff |- $.\n$v ph $.\nph $f wff ph $.\n",
+                "some statement",
+            )
             .expect("mock verify should not error");
         assert!(
             !report.live,

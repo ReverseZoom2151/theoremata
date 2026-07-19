@@ -107,11 +107,7 @@ impl EloRanker {
     /// All rated candidates ordered best-first (`(id, rating)`). Ties break by id
     /// so the ordering is deterministic.
     pub fn ranking(&self) -> Vec<(String, f64)> {
-        let mut v: Vec<(String, f64)> = self
-            .ratings
-            .iter()
-            .map(|(k, &r)| (k.clone(), r))
-            .collect();
+        let mut v: Vec<(String, f64)> = self.ratings.iter().map(|(k, &r)| (k.clone(), r)).collect();
         v.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)

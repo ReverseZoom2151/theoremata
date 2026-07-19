@@ -153,8 +153,7 @@ pub fn collect_all_results<T: Send>(
     // completion order.
     let slots: Vec<Mutex<Option<Task<T>>>> =
         tasks.into_iter().map(|t| Mutex::new(Some(t))).collect();
-    let results: Vec<Mutex<Option<thread::Result<T>>>> =
-        (0..n).map(|_| Mutex::new(None)).collect();
+    let results: Vec<Mutex<Option<thread::Result<T>>>> = (0..n).map(|_| Mutex::new(None)).collect();
     let next = AtomicUsize::new(0);
 
     thread::scope(|scope| {
@@ -350,9 +349,7 @@ mod tests {
     use std::sync::Arc;
 
     /// Build a `Vec<Task<T>>` from a list of closures.
-    fn tasks_from<T: Send + 'static>(
-        fns: Vec<Box<dyn FnOnce() -> T + Send>>,
-    ) -> Vec<Task<T>> {
+    fn tasks_from<T: Send + 'static>(fns: Vec<Box<dyn FnOnce() -> T + Send>>) -> Vec<Task<T>> {
         fns
     }
 
@@ -402,8 +399,20 @@ mod tests {
                 })
                 .collect()
         };
-        let off = run_concurrent(make(), &ConcurrentConfig { max_threads: 8, enabled: false });
-        let on = run_concurrent(make(), &ConcurrentConfig { max_threads: 8, enabled: true });
+        let off = run_concurrent(
+            make(),
+            &ConcurrentConfig {
+                max_threads: 8,
+                enabled: false,
+            },
+        );
+        let on = run_concurrent(
+            make(),
+            &ConcurrentConfig {
+                max_threads: 8,
+                enabled: true,
+            },
+        );
         assert_eq!(off, on);
     }
 
@@ -472,13 +481,21 @@ mod tests {
     #[test]
     fn first_success_none_when_nothing_succeeds() {
         let make = || -> Vec<Task<i32>> {
-            (0..5).map(|_| {
-                let b: Task<i32> = Box::new(|| -1);
-                b
-            }).collect()
+            (0..5)
+                .map(|_| {
+                    let b: Task<i32> = Box::new(|| -1);
+                    b
+                })
+                .collect()
         };
-        assert_eq!(first_success(make(), |v| *v >= 0, &ConcurrentConfig::sequential()), None);
-        assert_eq!(first_success(make(), |v| *v >= 0, &ConcurrentConfig::with_threads(4)), None);
+        assert_eq!(
+            first_success(make(), |v| *v >= 0, &ConcurrentConfig::sequential()),
+            None
+        );
+        assert_eq!(
+            first_success(make(), |v| *v >= 0, &ConcurrentConfig::with_threads(4)),
+            None
+        );
     }
 
     #[test]
@@ -526,7 +543,10 @@ mod tests {
         let empty: Vec<Task<i32>> = Vec::new();
         assert!(run_concurrent(empty, &ConcurrentConfig::with_threads(4)).is_empty());
         let empty2: Vec<Task<i32>> = Vec::new();
-        assert_eq!(first_success(empty2, |_| true, &ConcurrentConfig::with_threads(4)), None);
+        assert_eq!(
+            first_success(empty2, |_| true, &ConcurrentConfig::with_threads(4)),
+            None
+        );
     }
 
     #[test]

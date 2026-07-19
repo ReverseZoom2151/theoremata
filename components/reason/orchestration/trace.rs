@@ -192,10 +192,7 @@ impl RunTrace {
 
     /// The direct children of `id`, in open order.
     pub fn children(&self, id: u64) -> Vec<&Span> {
-        self.spans
-            .iter()
-            .filter(|s| s.parent == Some(id))
-            .collect()
+        self.spans.iter().filter(|s| s.parent == Some(id)).collect()
     }
 
     /// Every span of the given `kind`, in open order — e.g. `find(SpanKind::Verify)`
@@ -561,7 +558,10 @@ mod tests {
         // Timeout wins regardless of layer.
         let mut ctx = ErrorContext::from_layer(Layer::Model, "took too long");
         ctx.timed_out = true;
-        assert_eq!(FailureTaxonomy::classify(&ctx), FailureClass::TimeoutResource);
+        assert_eq!(
+            FailureTaxonomy::classify(&ctx),
+            FailureClass::TimeoutResource
+        );
 
         // Kernel rejection.
         let mut ctx = ErrorContext::from_layer(Layer::Verify, "unknown identifier");
@@ -614,10 +614,16 @@ mod tests {
             kernel_rejected: true,
             message: "everything at once".into(),
         };
-        assert_eq!(FailureTaxonomy::classify(&ctx), FailureClass::TimeoutResource);
+        assert_eq!(
+            FailureTaxonomy::classify(&ctx),
+            FailureClass::TimeoutResource
+        );
 
         // Tags are stable.
-        assert_eq!(FailureClass::VerificationReject.as_str(), "verification_reject");
+        assert_eq!(
+            FailureClass::VerificationReject.as_str(),
+            "verification_reject"
+        );
     }
 
     #[test]
@@ -634,8 +640,7 @@ mod tests {
         // The (span_id, phase) order reconstructs the exact run:
         //   enter root, enter search, enter model, exit model,
         //   enter verify, exit verify, exit search, exit root.
-        let order: Vec<(u64, StepPhase)> =
-            steps.iter().map(|s| (s.span_id, s.phase)).collect();
+        let order: Vec<(u64, StepPhase)> = steps.iter().map(|s| (s.span_id, s.phase)).collect();
         assert_eq!(
             order,
             vec![

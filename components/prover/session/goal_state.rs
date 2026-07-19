@@ -478,16 +478,11 @@ mod tests {
         // A runner pointed at a binary that cannot exist must degrade to None,
         // never panic — this is the safety property that keeps the live extractor
         // inert in a toolchain-less build.
-        let ex = LeanGoalStateExtractor::new(
-            Runner::Native,
-            "theoremata-nonexistent-lean-binary-xyz",
-        );
+        let ex =
+            LeanGoalStateExtractor::new(Runner::Native, "theoremata-nonexistent-lean-binary-xyz");
         assert!(!ex.available());
         assert_eq!(ex.dump("True", "trivial"), None);
-        assert_eq!(
-            GoalStateExtractor::extract(&ex, "True", "trivial"),
-            None
-        );
+        assert_eq!(GoalStateExtractor::extract(&ex, "True", "trivial"), None);
     }
 
     #[test]

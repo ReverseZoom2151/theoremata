@@ -4,11 +4,11 @@ use crate::{
     config::Config,
     db::Store,
     model::ModelRequest,
-    provider::ModelProvider,
     prover::{
-        model::{ProofJob, ProofResult, ProverJobStatus, ProofTask},
+        model::{ProofJob, ProofResult, ProofTask, ProverJobStatus},
         verify::verify_lean_output,
     },
+    provider::ModelProvider,
     tools::{PythonCheck, Tool},
 };
 use anyhow::{anyhow, Result};
@@ -91,10 +91,7 @@ pub fn poll_with_provider(
         }),
     })?;
 
-    let lean_code = response.content["lean"]
-        .as_str()
-        .unwrap_or("")
-        .to_owned();
+    let lean_code = response.content["lean"].as_str().unwrap_or("").to_owned();
     let verification = if lean_code.is_empty() {
         None
     } else {
@@ -157,10 +154,7 @@ fn fetch_accessible_premises(task: &ProofTask) -> Result<Vec<Value>> {
         "theorem_line": task.metadata.get("theorem_line"),
     }))?;
     let parsed: Value = serde_json::from_str(&result.stdout).unwrap_or(json!({}));
-    Ok(parsed["results"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default())
+    Ok(parsed["results"].as_array().cloned().unwrap_or_default())
 }
 
 pub fn cancel(store: &Store, job_id: &str) -> Result<ProofJob> {

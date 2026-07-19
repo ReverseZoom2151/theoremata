@@ -67,12 +67,18 @@ pub struct Literal {
 impl Literal {
     /// A positive literal `atom`.
     pub fn pos(atom: Term) -> Literal {
-        Literal { negated: false, atom }
+        Literal {
+            negated: false,
+            atom,
+        }
     }
 
     /// A negative literal `¬atom`.
     pub fn neg(atom: Term) -> Literal {
-        Literal { negated: true, atom }
+        Literal {
+            negated: true,
+            atom,
+        }
     }
 
     /// Rename every variable in the atom by appending `suffix` (used to make an
@@ -156,8 +162,15 @@ pub enum ProofStep {
 impl fmt::Display for ProofStep {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ProofStep::Extension { goal, clause, resolved_literal } => {
-                write!(f, "extend {goal} with clause #{clause} on {resolved_literal}")
+            ProofStep::Extension {
+                goal,
+                clause,
+                resolved_literal,
+            } => {
+                write!(
+                    f,
+                    "extend {goal} with clause #{clause} on {resolved_literal}"
+                )
             }
             ProofStep::Reduction { goal, ancestor } => {
                 write!(f, "reduce {goal} against ancestor {ancestor}")
@@ -510,8 +523,14 @@ mod tests {
         let goal = [pos1("P", c("a"))];
         let proof = prove(&clauses, &goal, 5).expect("the set is unsatisfiable");
         assert_eq!(proof.steps.len(), 2, "two extension steps close the chain");
-        assert!(matches!(proof.steps[0], ProofStep::Extension { clause: 1, .. }));
-        assert!(matches!(proof.steps[1], ProofStep::Extension { clause: 2, .. }));
+        assert!(matches!(
+            proof.steps[0],
+            ProofStep::Extension { clause: 1, .. }
+        ));
+        assert!(matches!(
+            proof.steps[1],
+            ProofStep::Extension { clause: 2, .. }
+        ));
 
         // `refute` finds it too, starting from a clause of the set.
         assert!(refute(&clauses, 5).is_some());
@@ -527,7 +546,10 @@ mod tests {
             "a depth-1 bound cannot close the two-step chain"
         );
         let proof = prove(&clauses, &goal, 2).expect("depth 2 suffices");
-        assert_eq!(proof.depth, 2, "deepening stops at the first depth that works");
+        assert_eq!(
+            proof.depth, 2,
+            "deepening stops at the first depth that works"
+        );
         // A larger ceiling still returns the shallowest proof (depth 2).
         assert_eq!(prove(&clauses, &goal, 9).unwrap().depth, 2);
     }
@@ -566,7 +588,10 @@ mod tests {
         assert!(without_cache.is_some());
 
         // The cache genuinely fired and saved expansions.
-        assert!(cached.cache_hits() >= 1, "the repeated `Common` must be a hit");
+        assert!(
+            cached.cache_hits() >= 1,
+            "the repeated `Common` must be a hit"
+        );
         assert!(
             cached.expansions() < plain.expansions(),
             "caching must reduce expansions: cached={}, uncached={}",
@@ -579,8 +604,14 @@ mod tests {
     fn occurs_check_is_respected() {
         // ¬Eq(x,x) is the only clause. Closing Eq(z, f(z)) would need z ↦ f(z),
         // which the occurs-check in `unify` rejects, so there is no proof.
-        let clauses = vec![Clause::new(vec![Literal::neg(app("Eq", vec![v("x"), v("x")]))])];
-        let cyclic = [Literal::pos(app("Eq", vec![v("z"), app("f", vec![v("z")])]))];
+        let clauses = vec![Clause::new(vec![Literal::neg(app(
+            "Eq",
+            vec![v("x"), v("x")],
+        ))])];
+        let cyclic = [Literal::pos(app(
+            "Eq",
+            vec![v("z"), app("f", vec![v("z")])],
+        ))];
         assert!(
             prove(&clauses, &cyclic, 5).is_none(),
             "x = f(x) must fail the occurs-check ⇒ no refutation"

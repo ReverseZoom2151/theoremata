@@ -82,11 +82,7 @@ impl<'a> GoalCache<'a> {
     /// [`Self::get_exact`]; it is separated out because the scan is O(n) over the
     /// project's cached entries, whereas [`Self::get_exact`] is an indexed lookup.
     /// A miss returns `None`.
-    pub fn get_subsuming(
-        &self,
-        project_id: &str,
-        query: &str,
-    ) -> Result<Option<(String, String)>> {
+    pub fn get_subsuming(&self, project_id: &str, query: &str) -> Result<Option<(String, String)>> {
         for entry in self.store.goal_cache_entries(project_id)? {
             // SOUNDNESS: cached (general) must subsume query (specific), never the
             // reverse. A proof of a more-general goal proves the query.
@@ -136,9 +132,7 @@ mod tests {
         let p = s.create_project("p", "t").unwrap();
         let cache = GoalCache::new(&s);
         // Store under one spelling …
-        cache
-            .put(&p.id, "P x, Q y ⊢ ∀ a, R a", "proof")
-            .unwrap();
+        cache.put(&p.id, "P x, Q y ⊢ ∀ a, R a", "proof").unwrap();
         // … query with hypotheses reordered and the bound variable renamed.
         assert_eq!(
             cache

@@ -326,9 +326,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::best_first::{ScoredExpansion, ScoredTactic};
     use super::super::driver::GoalState;
+    use super::*;
     use std::cell::Cell;
     use std::collections::HashMap;
 
@@ -341,10 +341,16 @@ mod tests {
     }
     impl MockGoal {
         fn open(key: &str) -> Self {
-            Self { key: key.into(), closed: false }
+            Self {
+                key: key.into(),
+                closed: false,
+            }
         }
         fn closed(key: &str) -> Self {
-            Self { key: key.into(), closed: true }
+            Self {
+                key: key.into(),
+                closed: true,
+            }
         }
     }
     impl GoalState for MockGoal {
@@ -363,7 +369,9 @@ mod tests {
     }
     impl TableScorer {
         fn new() -> Self {
-            Self { live: HashMap::new() }
+            Self {
+                live: HashMap::new(),
+            }
         }
         fn edge(mut self, from: &str, tactic: &str, logprob: f64, to: MockGoal) -> Self {
             self.live
@@ -407,7 +415,10 @@ mod tests {
         // Both alphas solve, via different-length paths.
         assert_eq!(out.runs.len(), 2);
         assert!(out.runs[0].solved && out.runs[1].solved);
-        assert_eq!(out.runs[0].proof_len, 1, "alpha=0 solves via the shallow path");
+        assert_eq!(
+            out.runs[0].proof_len, 1,
+            "alpha=0 solves via the shallow path"
+        );
         assert_eq!(out.runs[1].proof_len, 3, "alpha=1 solves via the deep path");
 
         // The shortest solution (shallow, alpha=0) is the reported one.
@@ -448,8 +459,7 @@ mod tests {
 
     #[test]
     fn multi_alpha_union_unsolved_when_no_alpha_closes() {
-        let mut scorer = TableScorer::new()
-            .edge("root", "t", 0.5f64.ln(), MockGoal::open("stuck"));
+        let mut scorer = TableScorer::new().edge("root", "t", 0.5f64.ln(), MockGoal::open("stuck"));
         let out = multi_alpha_union(&mut scorer, MockGoal::open("root"), &[0.0, 0.5, 1.0], 20);
         assert!(!out.solved);
         assert!(out.proof_tactics.is_empty());
@@ -488,7 +498,13 @@ mod tests {
         for &critic in &[true, false] {
             for step in 0..=10 {
                 let d = step as f64 / 10.0;
-                let plan = route(GoalFeatures { difficulty: d, critic_available: critic }, total);
+                let plan = route(
+                    GoalFeatures {
+                        difficulty: d,
+                        critic_available: critic,
+                    },
+                    total,
+                );
                 assert_eq!(
                     plan.bf_budget + plan.mcgs_budget,
                     total,
@@ -501,15 +517,33 @@ mod tests {
 
     #[test]
     fn route_gives_everything_to_best_first_without_a_critic() {
-        let plan = route(GoalFeatures { difficulty: 0.9, critic_available: false }, 500);
+        let plan = route(
+            GoalFeatures {
+                difficulty: 0.9,
+                critic_available: false,
+            },
+            500,
+        );
         assert_eq!(plan.bf_budget, 500);
         assert_eq!(plan.mcgs_budget, 0);
     }
 
     #[test]
     fn route_shifts_budget_toward_mcgs_as_difficulty_rises() {
-        let easy = route(GoalFeatures { difficulty: 0.1, critic_available: true }, 1_000);
-        let hard = route(GoalFeatures { difficulty: 0.9, critic_available: true }, 1_000);
+        let easy = route(
+            GoalFeatures {
+                difficulty: 0.1,
+                critic_available: true,
+            },
+            1_000,
+        );
+        let hard = route(
+            GoalFeatures {
+                difficulty: 0.9,
+                critic_available: true,
+            },
+            1_000,
+        );
         // Harder ⇒ more to the critic-guided side, less to best-first.
         assert!(hard.mcgs_budget > easy.mcgs_budget);
         assert!(hard.bf_budget < easy.bf_budget);
@@ -523,7 +557,10 @@ mod tests {
     #[test]
     fn run_split_returns_best_first_and_skips_mcgs_when_bf_solves() {
         let mcgs_called = Cell::new(false);
-        let plan = HybridPlan { bf_budget: 100, mcgs_budget: 100 };
+        let plan = HybridPlan {
+            bf_budget: 100,
+            mcgs_budget: 100,
+        };
         let sol = run_split(
             &plan,
             |_budget| Some(vec!["bf_proof".to_string()]),
@@ -535,12 +572,18 @@ mod tests {
         assert_eq!(sol.source, HybridSource::BestFirst);
         assert_eq!(sol.proof_tactics, vec!["bf_proof"]);
         assert!(sol.solved);
-        assert!(!mcgs_called.get(), "MCGS arm must be skipped once best-first solves");
+        assert!(
+            !mcgs_called.get(),
+            "MCGS arm must be skipped once best-first solves"
+        );
     }
 
     #[test]
     fn run_split_falls_through_to_mcgs_when_best_first_fails() {
-        let plan = HybridPlan { bf_budget: 100, mcgs_budget: 100 };
+        let plan = HybridPlan {
+            bf_budget: 100,
+            mcgs_budget: 100,
+        };
         let sol = run_split(&plan, |_| None, |_| Some(vec!["mcgs_proof".to_string()]));
         assert_eq!(sol.source, HybridSource::Mcgs);
         assert_eq!(sol.proof_tactics, vec!["mcgs_proof"]);
@@ -549,7 +592,10 @@ mod tests {
 
     #[test]
     fn run_split_unsolved_when_neither_arm_solves() {
-        let plan = HybridPlan { bf_budget: 10, mcgs_budget: 10 };
+        let plan = HybridPlan {
+            bf_budget: 10,
+            mcgs_budget: 10,
+        };
         let sol = run_split(&plan, |_| None, |_| None);
         assert!(!sol.solved);
         assert_eq!(sol.source, HybridSource::None);
@@ -560,7 +606,10 @@ mod tests {
     fn run_split_skips_a_zero_budget_arm() {
         // best-first gets no budget ⇒ its closure must not run; MCGS carries it.
         let bf_called = Cell::new(false);
-        let plan = HybridPlan { bf_budget: 0, mcgs_budget: 100 };
+        let plan = HybridPlan {
+            bf_budget: 0,
+            mcgs_budget: 100,
+        };
         let sol = run_split(
             &plan,
             |_| {

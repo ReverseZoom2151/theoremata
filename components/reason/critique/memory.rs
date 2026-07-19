@@ -141,11 +141,7 @@ impl<'a> EpisodicMemory<'a> {
     /// so the ranking outlives the transient pool.
     pub fn ranked_proofs(&self, project_id: &str, n_best: usize) -> Result<Vec<ProofCandidate>> {
         let pool = self.proof_pool(project_id)?;
-        Ok(pool
-            .rank_and_refine(n_best)
-            .into_iter()
-            .cloned()
-            .collect())
+        Ok(pool.rank_and_refine(n_best).into_iter().cloned().collect())
     }
 
     /// Record a proof candidate and report whether the pool now clears the
@@ -184,11 +180,7 @@ impl<'a> EpisodicMemory<'a> {
         let taint = self.taint_verdict(project_id, node_id)?;
         let pool = self.proof_pool(project_id)?;
         let all_pass = pool.all_pass().cloned();
-        let ranked_proofs = pool
-            .rank_and_refine(n_best)
-            .into_iter()
-            .cloned()
-            .collect();
+        let ranked_proofs = pool.rank_and_refine(n_best).into_iter().cloned().collect();
         Ok(MemorySnapshot {
             project_id: project_id.to_owned(),
             node_id: node_id.to_owned(),

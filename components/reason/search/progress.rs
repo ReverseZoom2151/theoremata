@@ -186,7 +186,10 @@ mod tests {
     fn no_goals_is_done() {
         assert_eq!(progress_value_from_state("no goals"), 1.0);
         assert_eq!(progress_value_from_state("   "), 1.0);
-        assert_eq!(ProgressFeatures::parse("no goals"), ProgressFeatures::default());
+        assert_eq!(
+            ProgressFeatures::parse("no goals"),
+            ProgressFeatures::default()
+        );
     }
 
     #[test]
@@ -194,7 +197,10 @@ mod tests {
         let state = "case succ\nn : ℕ\nih : n + 0 = n\n⊢ n + 1 + 0 = n + 1";
         let f = ProgressFeatures::parse(state);
         assert_eq!(f.goal_count, 1);
-        assert_eq!(f.hypothesis_count, 2, "n and ih are hypotheses; case is not");
+        assert_eq!(
+            f.hypothesis_count, 2,
+            "n and ih are hypotheses; case is not"
+        );
         assert!(f.term_size > 0);
     }
 

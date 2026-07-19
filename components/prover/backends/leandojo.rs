@@ -4,7 +4,7 @@ use crate::{
     config::Config,
     db::Store,
     prover::{
-        model::{ProofJob, ProofResult, ProverJobStatus, ProofTask},
+        model::{ProofJob, ProofResult, ProofTask, ProverJobStatus},
         verify::verify_lean_output,
     },
     tools::{PythonCheck, Tool},

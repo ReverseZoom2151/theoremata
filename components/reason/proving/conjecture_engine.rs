@@ -373,7 +373,9 @@ mod tests {
         let (store, pid) = store_with_project();
         let lib = LemmaLibrary::with_subsumption_dedup(&store, qed_verifier());
         // Seed "⊢ target" directly through the library interface.
-        assert!(lib.record_lemma(&pid, "⊢ target", "by tac qed", "root").unwrap());
+        assert!(lib
+            .record_lemma(&pid, "⊢ target", "by tac qed", "root")
+            .unwrap());
 
         let proposer = ScriptedProposer {
             // "H ⊢ target": same conclusion, an extra hypothesis -> subsumed by the
@@ -493,7 +495,10 @@ mod tests {
         );
 
         let report = engine.run(&pid).unwrap();
-        assert_eq!(report.n_graduated, 2, "root (r0) + child (r1) both graduate");
+        assert_eq!(
+            report.n_graduated, 2,
+            "root (r0) + child (r1) both graduate"
+        );
         let pool = engine.library().lemmas(&pid).unwrap();
         assert!(
             pool.iter().any(|l| l.statement == "⊢ derived_from(⊢ base)"),

@@ -766,7 +766,12 @@ mod tests {
     fn sharing_solves_with_fewer_expansions_than_no_sharing() {
         let seed = 7;
         let shared = skest_search(reuse_factory(seed), MockGoal::open("R"), cfg(2, true), seed);
-        let control = skest_search(reuse_factory(seed), MockGoal::open("R"), cfg(2, false), seed);
+        let control = skest_search(
+            reuse_factory(seed),
+            MockGoal::open("R"),
+            cfg(2, false),
+            seed,
+        );
 
         assert!(shared.solved, "sharing run must solve");
         assert!(

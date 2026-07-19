@@ -308,8 +308,14 @@ mod tests {
         let p = proof(&["intro", "simp"]);
         let proofs = vec![p.clone(), p.clone(), p];
         let d = diversity(&proofs);
-        assert!((d.distinct_ratio - 1.0 / 3.0).abs() < 1e-12, "1 distinct / 3");
-        assert!((d.mean_pairwise_jaccard - 1.0).abs() < 1e-12, "identical => jaccard 1");
+        assert!(
+            (d.distinct_ratio - 1.0 / 3.0).abs() < 1e-12,
+            "1 distinct / 3"
+        );
+        assert!(
+            (d.mean_pairwise_jaccard - 1.0).abs() < 1e-12,
+            "identical => jaccard 1"
+        );
         assert_eq!(d.distinct_tactics, 2, "vocabulary {{intro, simp}}");
     }
 
@@ -323,8 +329,14 @@ mod tests {
             proof(&["c1", "c2"]),
         ];
         let d = diversity(&proofs);
-        assert!((d.distinct_ratio - 1.0).abs() < 1e-12, "all unique => ratio 1");
-        assert!(d.mean_pairwise_jaccard.abs() < 1e-12, "disjoint => jaccard 0");
+        assert!(
+            (d.distinct_ratio - 1.0).abs() < 1e-12,
+            "all unique => ratio 1"
+        );
+        assert!(
+            d.mean_pairwise_jaccard.abs() < 1e-12,
+            "disjoint => jaccard 0"
+        );
         assert_eq!(d.distinct_tactics, 6);
 
         // And this is strictly more diverse than the collapsed bag on both axes.
@@ -366,8 +378,14 @@ mod tests {
         // sequence identity) but identical tactic sets (jaccard 1.0).
         let proofs = vec![proof(&["p", "q"]), proof(&["q", "p"])];
         let d = diversity(&proofs);
-        assert!((d.distinct_ratio - 1.0).abs() < 1e-12, "reordered => distinct");
-        assert!((d.mean_pairwise_jaccard - 1.0).abs() < 1e-12, "same set => jaccard 1");
+        assert!(
+            (d.distinct_ratio - 1.0).abs() < 1e-12,
+            "reordered => distinct"
+        );
+        assert!(
+            (d.mean_pairwise_jaccard - 1.0).abs() < 1e-12,
+            "same set => jaccard 1"
+        );
     }
 
     // ---- round_over_round ----------------------------------------------------
@@ -378,9 +396,9 @@ mod tests {
         // returned stats are parallel to the rounds and show a strictly deepening
         // mean, exactly the BFS-Prover round-over-round signal.
         let rounds = vec![
-            vec![proof_of_len(1), proof_of_len(1)],       // mean 1
-            vec![proof_of_len(2), proof_of_len(2)],       // mean 2
-            vec![proof_of_len(3), proof_of_len(5)],       // mean 4
+            vec![proof_of_len(1), proof_of_len(1)], // mean 1
+            vec![proof_of_len(2), proof_of_len(2)], // mean 2
+            vec![proof_of_len(3), proof_of_len(5)], // mean 4
         ];
         let stats = round_over_round(&rounds);
         assert_eq!(stats.len(), 3);

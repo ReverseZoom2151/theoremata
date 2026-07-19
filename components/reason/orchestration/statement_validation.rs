@@ -232,7 +232,9 @@ impl StatementValidator for ToolStatementValidator<'_> {
     fn validate(&self, informal: &str, formal: &str) -> ValidationOutcome {
         let py = PythonCheck::new();
         if !py.available() {
-            return ValidationOutcome::neutral("statement validation unavailable: no python worker");
+            return ValidationOutcome::neutral(
+                "statement validation unavailable: no python worker",
+            );
         }
 
         let mut findings = Vec::new();

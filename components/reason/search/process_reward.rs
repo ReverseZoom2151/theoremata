@@ -370,8 +370,16 @@ mod tests {
         assert_eq!(targets[0].node_id, a);
         assert_eq!(targets[1].node_id, b);
         // a is on one win + one loss -> Q = 0; b on the single win -> Q = 1.
-        assert!((targets[0].q - 0.0).abs() < 1e-12, "Q(a) = {}", targets[0].q);
-        assert!((targets[1].q - 1.0).abs() < 1e-12, "Q(b) = {}", targets[1].q);
+        assert!(
+            (targets[0].q - 0.0).abs() < 1e-12,
+            "Q(a) = {}",
+            targets[0].q
+        );
+        assert!(
+            (targets[1].q - 1.0).abs() < 1e-12,
+            "Q(b) = {}",
+            targets[1].q
+        );
     }
 
     /// Step-beam picks the top-value frontier nodes (backup-free), deterministic

@@ -236,7 +236,10 @@ mod tests {
         let low = blend_priority(q, progress_v, pw, 0.2, cw, u);
         let mid = blend_priority(q, progress_v, pw, 0.5, cw, u);
         let high = blend_priority(q, progress_v, pw, 0.9, cw, u);
-        assert!(low < mid && mid < high, "priority must rise with the critic value");
+        assert!(
+            low < mid && mid < high,
+            "priority must rise with the critic value"
+        );
         // The increment is exactly critic_weight·Δcritic.
         assert!(((mid - low) - cw * (0.5 - 0.2)).abs() < 1e-12);
     }
@@ -255,10 +258,8 @@ mod tests {
         let (q, progress_v, u) = (0.2, 0.4, 0.1);
         let hi = ConstantCritic(0.9).score(&TextState("⊢ almost done"));
         let lo = ConstantCritic(0.1).score(&TextState("⊢ far away"));
-        let score_hi =
-            blend_priority_with_cfg(q, progress_v, hi, critic_weight, u, &cfg);
-        let score_lo =
-            blend_priority_with_cfg(q, progress_v, lo, critic_weight, u, &cfg);
+        let score_hi = blend_priority_with_cfg(q, progress_v, hi, critic_weight, u, &cfg);
+        let score_lo = blend_priority_with_cfg(q, progress_v, lo, critic_weight, u, &cfg);
         assert!(
             score_hi > score_lo,
             "the critic-preferred node must rank higher ({score_hi} vs {score_lo})"

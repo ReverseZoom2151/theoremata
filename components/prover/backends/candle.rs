@@ -77,7 +77,11 @@ impl CandleBackend {
     /// `compile` and `kernel_recheck` — a Candle run both elaborates and, via the
     /// PROVEN kernel, checks every inference).
     fn check(&self, ws: &Workspace) -> exec::ExecOutcome {
-        exec::run(&self.runner, &[&self.candle, &format!("{MODULE}.ml")], &ws.root)
+        exec::run(
+            &self.runner,
+            &[&self.candle, &format!("{MODULE}.ml")],
+            &ws.root,
+        )
     }
 }
 
@@ -167,7 +171,12 @@ impl FormalBackend for CandleBackend {
         })
     }
 
-    fn audit_axioms(&self, _ws: &Workspace, _thm: &str, whitelist: &[String]) -> Result<AxiomReport> {
+    fn audit_axioms(
+        &self,
+        _ws: &Workspace,
+        _thm: &str,
+        whitelist: &[String],
+    ) -> Result<AxiomReport> {
         if self.mock {
             return Ok(AxiomReport {
                 axioms: Vec::new(),
@@ -240,7 +249,10 @@ impl FormalBackend for CandleBackend {
         // kernel cannot see because they sidestep it (`mk_thm` fabricates a `thm`,
         // `new_axiom` widens the fixed base) plus unsound definitional extensions
         // and INST/INST_TYPE capture. See `crate::prover::axiom_audit`.
-        Ok(crate::prover::axiom_audit::audit_hol_light(code, &SYSTEM.axiom_whitelist()).into_scan_report())
+        Ok(
+            crate::prover::axiom_audit::audit_hol_light(code, &SYSTEM.axiom_whitelist())
+                .into_scan_report(),
+        )
     }
 }
 
@@ -299,17 +311,17 @@ mod tests {
             ok.lexically_verified,
             "trivial HOL Light proof must certify: {ok:?}"
         );
-        assert!(ok.axioms_clean, "fixed-axiom-base proof is axiom-clean: {ok:?}");
+        assert!(
+            ok.axioms_clean,
+            "fixed-axiom-base proof is axiom-clean: {ok:?}"
+        );
         assert!(ok.lexical_clean, "no escape hatch present: {ok:?}");
         // The 3+1 mapping is recorded in the detail (system + gate + layers).
         // `verify()` nests each layer's whole report, so the recheck's own
         // `detail` object sits under ["kernel_recheck"]["detail"].
         assert_eq!(ok.detail["system"], "candle");
         assert_eq!(ok.detail["gate"], "3+1-layer");
-        assert_eq!(
-            ok.detail["kernel_recheck"]["detail"]["proven_kernel"],
-            true
-        );
+        assert_eq!(ok.detail["kernel_recheck"]["detail"]["proven_kernel"], true);
     }
 
     /// The layer-4 source scan / axiom audit fires on the HOL Light escape
@@ -337,7 +349,12 @@ mod tests {
 
         // Direct source-scan spot checks (clean vs. flagged).
         assert!(backend.source_scan("let X = TRUTH;;").unwrap().clean);
-        assert!(!backend.source_scan("let X = mk_thm([], `T`);;").unwrap().clean);
+        assert!(
+            !backend
+                .source_scan("let X = mk_thm([], `T`);;")
+                .unwrap()
+                .clean
+        );
         assert!(!backend.source_scan("new_axiom `P`").unwrap().clean);
     }
 
@@ -346,12 +363,15 @@ mod tests {
     fn candle_mock_layers_map_3_plus_1() {
         let backend = CandleBackend::mock();
         let cfg = Config::default();
-        let ws = backend
-            .scaffold(&cfg, "let X = TRUTH;;", "X")
-            .unwrap();
+        let ws = backend.scaffold(&cfg, "let X = TRUTH;;", "X").unwrap();
         assert!(backend.compile(&ws).unwrap().compiled); // layer 2b (build)
         let whitelist = FormalSystem::Candle.axiom_whitelist();
-        assert!(backend.audit_axioms(&ws, &ws.entry, &whitelist).unwrap().within_whitelist); // 2a
+        assert!(
+            backend
+                .audit_axioms(&ws, &ws.entry, &whitelist)
+                .unwrap()
+                .within_whitelist
+        ); // 2a
         assert!(backend.kernel_recheck(&ws).unwrap().rechecked); // layer 3 (proven kernel)
         assert!(backend.source_scan("let X = TRUTH;;").unwrap().clean); // layer 2c
     }

@@ -90,7 +90,10 @@ impl GraphView {
         if dependent == dependency {
             return;
         }
-        insert_sorted(self.deps.entry(dependent.to_owned()).or_default(), dependency);
+        insert_sorted(
+            self.deps.entry(dependent.to_owned()).or_default(),
+            dependency,
+        );
         insert_sorted(
             self.dependents.entry(dependency.to_owned()).or_default(),
             dependent,
@@ -290,7 +293,12 @@ impl GraphView {
     /// dependency graph ⇒ higher, via `1/(1+distance)`) plus a small co-usage
     /// boost. Unreachable candidates get proximity `0`. See [`PROXIMITY_WEIGHT`]
     /// and [`CO_USAGE_WEIGHT`].
-    pub fn relevance(&self, goal: &str, candidate: &str, distances: &BTreeMap<String, usize>) -> f64 {
+    pub fn relevance(
+        &self,
+        goal: &str,
+        candidate: &str,
+        distances: &BTreeMap<String, usize>,
+    ) -> f64 {
         let proximity = match distances.get(candidate) {
             Some(&d) if candidate != goal => 1.0 / (1.0 + d as f64),
             _ => 0.0,
@@ -526,7 +534,10 @@ mod tests {
         let r1 = g.graph_rank("goal", &["distant", "base", "premise_b", "premise_a"]);
         let r2 = g.graph_rank("goal", &["premise_a", "distant", "premise_b", "base"]);
         // Ranking is a pure function of the graph + candidate set, not input order.
-        assert_eq!(r1, r2, "graph_rank must not depend on candidate input order");
+        assert_eq!(
+            r1, r2,
+            "graph_rank must not depend on candidate input order"
+        );
     }
 
     #[test]
@@ -543,7 +554,7 @@ mod tests {
 
     #[test]
     fn from_model_edges_reads_only_premise_kinds() {
-        use crate::model::{Edge, EdgeKind, EdgeStrength, DepScope};
+        use crate::model::{DepScope, Edge, EdgeKind, EdgeStrength};
         use chrono::Utc;
         let mk = |src: &str, tgt: &str, kind: EdgeKind| Edge {
             id: 0,

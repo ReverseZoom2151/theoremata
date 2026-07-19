@@ -409,8 +409,8 @@ impl<E: TacticExpander> ProofSearchDriver<E> {
                             } else {
                                 0.0
                             };
-                            let u = self.cfg.exploration * e.prior * n_parent
-                                / (1.0 + c.visits as f64);
+                            let u =
+                                self.cfg.exploration * e.prior * n_parent / (1.0 + c.visits as f64);
                             // LeanProgress-style value prior, identical to mcts.rs.
                             let score = super::critic_scorer::blend_priority(
                                 q,
@@ -661,7 +661,9 @@ impl<E: TacticExpander> ProofSearchDriver<E> {
         }
         for t in order {
             let count = counts[&t];
-            let mut step = rep.remove(&t).expect("representative step for sampled action");
+            let mut step = rep
+                .remove(&t)
+                .expect("representative step for sampled action");
             step.prior = count as f64 / total as f64;
             out.push(step);
         }
@@ -718,8 +720,8 @@ fn mix_seed(base: u64, key: &str) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::ttc::TtcConfig;
+    use super::*;
 
     /// A deterministic, table-driven proof state: `key` identifies the state,
     /// `closed` marks proof completion. This is the injectable mock backing every
@@ -889,9 +891,7 @@ mod tests {
             global_budget: 10_000,
             ..TtcConfig::default()
         });
-        let mut driver = ProofSearchDriver::new(expander)
-            .with_seed(3)
-            .with_ttc(ttc);
+        let mut driver = ProofSearchDriver::new(expander).with_seed(3).with_ttc(ttc);
 
         let result = driver.run(MockGoal::open("h2").with_difficulty(0.8));
         assert!(result.solved);
@@ -958,7 +958,10 @@ mod tests {
             .with_seed(5)
             .with_negator(|g: &MockGoal| Some(MockGoal::open(&format!("not:{}", g.key))));
         let result = driver.run(MockGoal::open("G"));
-        assert!(result.refuted, "the disproof should close and refute the goal");
+        assert!(
+            result.refuted,
+            "the disproof should close and refute the goal"
+        );
         assert!(!result.solved, "a refuted goal must never also be solved");
     }
 
@@ -974,7 +977,10 @@ mod tests {
             .with_seed(9)
             .with_negator(|g: &MockGoal| Some(MockGoal::open(&format!("not:{}", g.key))));
         let result = driver.run(MockGoal::open("p2"));
-        assert!(result.solved, "an unclosable negation must not block proving");
+        assert!(
+            result.solved,
+            "an unclosable negation must not block proving"
+        );
         assert!(!result.refuted);
         assert_eq!(result.best_tactic.as_deref(), Some("close"));
     }
@@ -984,10 +990,12 @@ mod tests {
         // Without a negator the search behaves exactly as before: refuted stays
         // false even for an unprovable goal.
         let expander = TableExpander::new().edge("q", "stuck", 1.0, MockGoal::open("q"));
-        let mut driver = ProofSearchDriver::new(expander).with_seed(1).with_config(SearchConfig {
-            max_nodes: 20,
-            ..SearchConfig::default()
-        });
+        let mut driver = ProofSearchDriver::new(expander)
+            .with_seed(1)
+            .with_config(SearchConfig {
+                max_nodes: 20,
+                ..SearchConfig::default()
+            });
         let result = driver.run(MockGoal::open("q"));
         assert!(!result.refuted);
         assert!(!result.solved);
@@ -1018,20 +1026,40 @@ mod tests {
         // UCB (via child 1's high mean), so it is chosen; within A the lowest-LCB
         // (hardest) child is 2.
         let nodes = vec![
-            stat_node("root", 100, 0.0),        // 0: parent (visits used as N_parent)
-            stat_node("a-easy", 10, 9.0),       // 1: mean 0.9
-            stat_node("a-hard", 10, 2.0),       // 2: mean 0.2
-            stat_node("b1", 10, 5.0),           // 3: mean 0.5
-            stat_node("b2", 10, 5.0),           // 4: mean 0.5
+            stat_node("root", 100, 0.0),  // 0: parent (visits used as N_parent)
+            stat_node("a-easy", 10, 9.0), // 1: mean 0.9
+            stat_node("a-hard", 10, 2.0), // 2: mean 0.2
+            stat_node("b1", 10, 5.0),     // 3: mean 0.5
+            stat_node("b2", 10, 5.0),     // 4: mean 0.5
         ];
         let edges = vec![
-            Edge { tactic: "A".into(), prior: 1.0, child: 1 },
-            Edge { tactic: "A".into(), prior: 1.0, child: 2 },
-            Edge { tactic: "B".into(), prior: 1.0, child: 3 },
-            Edge { tactic: "B".into(), prior: 1.0, child: 4 },
+            Edge {
+                tactic: "A".into(),
+                prior: 1.0,
+                child: 1,
+            },
+            Edge {
+                tactic: "A".into(),
+                prior: 1.0,
+                child: 2,
+            },
+            Edge {
+                tactic: "B".into(),
+                prior: 1.0,
+                child: 3,
+            },
+            Edge {
+                tactic: "B".into(),
+                prior: 1.0,
+                child: 4,
+            },
         ];
         let chosen = and_or_select_child(&edges, &nodes, nodes[0].visits, 1.41);
-        assert_eq!(chosen, Some(2), "must descend into action A's hardest child");
+        assert_eq!(
+            chosen,
+            Some(2),
+            "must descend into action A's hardest child"
+        );
     }
 
     #[test]
@@ -1054,10 +1082,12 @@ mod tests {
         let expander = TableExpander::new()
             .edge("m2", "close", 1.0, MockGoal::open("m1"))
             .edge("m1", "close", 1.0, MockGoal::closed("m0"));
-        let mut driver = ProofSearchDriver::new(expander).with_seed(2).with_config(SearchConfig {
-            selection: SelectionMode::AndOrMinimax,
-            ..SearchConfig::default()
-        });
+        let mut driver = ProofSearchDriver::new(expander)
+            .with_seed(2)
+            .with_config(SearchConfig {
+                selection: SelectionMode::AndOrMinimax,
+                ..SearchConfig::default()
+            });
         let result = driver.run(MockGoal::open("m2"));
         assert!(result.solved);
     }
@@ -1120,8 +1150,12 @@ mod tests {
             prior_mode: PriorMode::EmpiricalSampled(8),
             ..SearchConfig::default()
         };
-        let mut d1 = ProofSearchDriver::new(build()).with_seed(4).with_config(cfg);
-        let mut d2 = ProofSearchDriver::new(build()).with_seed(4).with_config(cfg);
+        let mut d1 = ProofSearchDriver::new(build())
+            .with_seed(4)
+            .with_config(cfg);
+        let mut d2 = ProofSearchDriver::new(build())
+            .with_seed(4)
+            .with_config(cfg);
         let r1 = d1.run(MockGoal::open("e2"));
         let r2 = d2.run(MockGoal::open("e2"));
         assert!(r1.solved);

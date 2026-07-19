@@ -876,7 +876,10 @@ mod tests {
         // The confirmed finding carries the meta-verifier's reason.
         let confirmed = report.confirmed_findings();
         assert_eq!(confirmed[0].node_id.as_deref(), Some(real.id.as_str()));
-        assert_eq!(confirmed[0].meta_reason.as_deref(), Some("the cycle is real"));
+        assert_eq!(
+            confirmed[0].meta_reason.as_deref(),
+            Some("the cycle is real")
+        );
     }
 
     #[test]
@@ -1052,7 +1055,12 @@ mod tests {
             .unwrap();
         // Mark it hard (strategy hint), give it a trivial certified proof.
         store
-            .set_strategy_hint(&project.id, &node.id, Some("this is a hard, deep step"), "test")
+            .set_strategy_hint(
+                &project.id,
+                &node.id,
+                Some("this is a hard, deep step"),
+                "test",
+            )
             .unwrap();
         store
             .set_formal_statement(&project.id, &node.id, "theorem t : P := by simp", "test")
@@ -1071,7 +1079,11 @@ mod tests {
             .iter()
             .filter(|f| f.category == SUSPICIOUS_SHORT_PROOF_CATEGORY)
             .collect();
-        assert_eq!(advisory.len(), 1, "one hard+short certified node ⇒ one advisory");
+        assert_eq!(
+            advisory.len(),
+            1,
+            "one hard+short certified node ⇒ one advisory"
+        );
         assert_eq!(advisory[0].node_id.as_deref(), Some(node.id.as_str()));
         // It is advisory: it does not reject the node.
         assert!(!report.should_reject_node(&node.id));
@@ -1104,7 +1116,12 @@ mod tests {
             .set_strategy_hint(&project.id, &uncertified.id, Some("hard"), "test")
             .unwrap();
         store
-            .set_formal_statement(&project.id, &uncertified.id, "theorem t : P := by simp", "test")
+            .set_formal_statement(
+                &project.id,
+                &uncertified.id,
+                "theorem t : P := by simp",
+                "test",
+            )
             .unwrap();
 
         let critic = Critic {

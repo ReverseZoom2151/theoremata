@@ -329,7 +329,11 @@ fn parse_axioms(stdout: &str) -> Option<Vec<String>> {
         .unwrap_or(tail);
     let axioms: Vec<String> = inside
         .split(',')
-        .map(|s| s.trim().trim_matches(|c: char| c.is_whitespace()).to_string())
+        .map(|s| {
+            s.trim()
+                .trim_matches(|c: char| c.is_whitespace())
+                .to_string()
+        })
         .filter(|s| !s.is_empty())
         .collect();
     Some(axioms)

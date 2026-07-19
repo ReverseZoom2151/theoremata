@@ -207,11 +207,18 @@ impl BlueprintRun {
 
         for label in &self.order {
             let deps = self.deps.get(label).cloned().unwrap_or_default();
-            let statement = statements.get(label.as_str()).copied().unwrap_or("").to_string();
+            let statement = statements
+                .get(label.as_str())
+                .copied()
+                .unwrap_or("")
+                .to_string();
 
             // Any dependency that failed or was skipped blocks this item.
-            let blocking: Vec<String> =
-                deps.iter().filter(|d| broken.contains(*d)).cloned().collect();
+            let blocking: Vec<String> = deps
+                .iter()
+                .filter(|d| broken.contains(*d))
+                .cloned()
+                .collect();
             if !blocking.is_empty() {
                 broken.insert(label.clone());
                 n_skipped += 1;
@@ -231,7 +238,11 @@ impl BlueprintRun {
                 .filter_map(|d| {
                     proven.get(d).map(|proof| AvailableLemma {
                         label: d.clone(),
-                        statement: statements.get(d.as_str()).copied().unwrap_or("").to_string(),
+                        statement: statements
+                            .get(d.as_str())
+                            .copied()
+                            .unwrap_or("")
+                            .to_string(),
                         proof: proof.clone(),
                     })
                 })
@@ -324,7 +335,10 @@ fn topo_order(blueprint: &Blueprint, deps: &HashMap<String, Vec<String>>) -> Res
     let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
     for label in &nodes {
         for d in deps.get(label).into_iter().flatten() {
-            dependents.entry(d.as_str()).or_default().push(label.as_str());
+            dependents
+                .entry(d.as_str())
+                .or_default()
+                .push(label.as_str());
         }
     }
 
@@ -377,8 +391,11 @@ fn topo_order(blueprint: &Blueprint, deps: &HashMap<String, Vec<String>>) -> Res
 /// PROVIDER for the gate is injected too, so the same wiring runs live or offline
 /// with mocks. Proven dependencies are threaded into the statement handed to the
 /// generator as available context.
-pub struct SketchObligationProver<'a, G: crate::sketch::SketchGenerator, P: crate::sketch::HoleProver>
-{
+pub struct SketchObligationProver<
+    'a,
+    G: crate::sketch::SketchGenerator,
+    P: crate::sketch::HoleProver,
+> {
     pub store: &'a crate::db::Store,
     pub project_id: &'a str,
     pub generator: &'a G,
@@ -414,9 +431,34 @@ impl<G: crate::sketch::SketchGenerator, P: crate::sketch::HoleProver> Obligation
             return Ok(None);
         };
 
-        // Certification gate on the assembled sketch root. A full sketch closure
-        // maps to verifier_score 1.0 and a satisfied k-streak; the gate still
-        // populates the pool and (in live mode) runs the critic.
+        // `SketchPipeline` writes this status only after its independent live
+        // root verification. Re-read it here instead of treating assembled text
+        // as a verifier result: an arbitrary string must not manufacture the
+        // certification-gate score or clean streak.
+        let root_verified = self
+            .store
+            .nodes(self.project_id)?
+            .into_iter()
+            .find(|node| node.id == assembly.sketch_node_id)
+            .is_some_and(|node| {
+                node.status == crate::model::NodeStatus::FormallyVerified
+                    && node.formal_statement.as_deref() == Some(proof.as_str())
+            });
+        if !root_verified {
+            self.store.add_evidence(
+                self.project_id,
+                &assembly.sketch_node_id,
+                "sketch_assembly",
+                "blueprint_adapter",
+                "missing_live_receipt",
+                serde_json::json!({"proof": proof}),
+            )?;
+            return Ok(None);
+        }
+
+        // Certification gate on the live-verified sketch root. The score/streak
+        // below are derived solely from that persisted verifier receipt; the gate
+        // still populates the pool and (in live mode) runs the critic.
         let gate = crate::certification::PoolMetaGate {
             store: self.store,
             provider: self.provider,
@@ -520,10 +562,17 @@ mod tests {
         // Dependencies were proved before dependents.
         assert_eq!(
             prover.seen.into_inner(),
-            vec!["lem:a".to_string(), "lem:b".to_string(), "thm:c".to_string()]
+            vec![
+                "lem:a".to_string(),
+                "lem:b".to_string(),
+                "thm:c".to_string()
+            ]
         );
         // Every item report carries its assembled proof.
-        assert!(report.items.iter().all(|i| i.is_proved() && i.proof.is_some()));
+        assert!(report
+            .items
+            .iter()
+            .all(|i| i.is_proved() && i.proof.is_some()));
     }
 
     #[test]
@@ -534,15 +583,25 @@ mod tests {
         let contexts = prover.contexts.into_inner();
         // lem:a sees nothing; lem:b sees lem:a; thm:c sees lem:b.
         assert_eq!(contexts[0], ("lem:a".to_string(), vec![]));
-        assert_eq!(contexts[1], ("lem:b".to_string(), vec!["lem:a".to_string()]));
-        assert_eq!(contexts[2], ("thm:c".to_string(), vec!["lem:b".to_string()]));
+        assert_eq!(
+            contexts[1],
+            ("lem:b".to_string(), vec!["lem:a".to_string()])
+        );
+        assert_eq!(
+            contexts[2],
+            ("thm:c".to_string(), vec!["lem:b".to_string()])
+        );
     }
 
     #[test]
     fn failed_dependency_skips_dependents_and_reports_coverage_honestly() {
         let run = BlueprintRun::from_tex(chain_tex()).unwrap();
         // lem:b fails → thm:c (which \uses lem:b) is skipped; lem:a still proved.
-        let report = run.drive(&FailingOne { fail: "lem:b".into() }).unwrap();
+        let report = run
+            .drive(&FailingOne {
+                fail: "lem:b".into(),
+            })
+            .unwrap();
 
         assert_eq!(report.n_items, 3);
         assert_eq!(report.n_proved, 1);
@@ -593,7 +652,11 @@ mod tests {
     #[test]
     fn empty_blueprint_reports_zero_coverage_without_panicking() {
         let run = BlueprintRun::from_tex("").unwrap();
-        let report = run.drive(&FailingOne { fail: String::new() }).unwrap();
+        let report = run
+            .drive(&FailingOne {
+                fail: String::new(),
+            })
+            .unwrap();
         assert_eq!(report.n_items, 0);
         assert_eq!(report.coverage, 0.0);
         assert!(!report.fully_proved());
@@ -639,7 +702,11 @@ mod tests {
             self.subgoals.borrow_mut().push(statement.to_string());
             Ok(crate::sketch::InformalSketch::new(
                 statement,
-                vec![crate::sketch::SketchStep::hole("h1", "discharge", statement)],
+                vec![crate::sketch::SketchStep::hole(
+                    "h1",
+                    "discharge",
+                    statement,
+                )],
             ))
         }
     }
@@ -676,7 +743,8 @@ mod tests {
         let seen = subgoals.borrow();
         assert_eq!(seen.as_slice(), &["A holds."]);
         assert!(
-            seen.iter().all(|s| !s.contains("Available") && !s.contains("--")),
+            seen.iter()
+                .all(|s| !s.contains("Available") && !s.contains("--")),
             "context leaked into the goal proposition: {seen:?}"
         );
     }

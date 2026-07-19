@@ -623,7 +623,10 @@ mod tests {
     fn result_is_deterministic_given_seed() {
         let proof = "a\nBROKEN\nb";
         let verify = broken_line_verifier();
-        let cfg = RepairConfig { rounds: 3, seed: 42 };
+        let cfg = RepairConfig {
+            rounds: 3,
+            seed: 42,
+        };
         let a = repair_proof(proof, &verify, &SeedSensitiveRepairer, cfg);
         let b = repair_proof(proof, &verify, &SeedSensitiveRepairer, cfg);
         assert_eq!(a, b);
@@ -645,13 +648,19 @@ mod tests {
             proof,
             &verify,
             &SeedSensitiveRepairer,
-            RepairConfig { rounds: 1, seed: fixing_base },
+            RepairConfig {
+                rounds: 1,
+                seed: fixing_base,
+            },
         );
         let stuck = repair_proof(
             proof,
             &verify,
             &SeedSensitiveRepairer,
-            RepairConfig { rounds: 1, seed: stuck_base },
+            RepairConfig {
+                rounds: 1,
+                seed: stuck_base,
+            },
         );
         assert!(good.succeeded());
         assert!(!stuck.succeeded());
@@ -670,7 +679,9 @@ mod tests {
         // No span => not localizable.
         assert!(localize_failing_step(proof, &VerifyError::new("x", None)).is_none());
         // Span past end => not localizable.
-        assert!(localize_failing_step(proof, &VerifyError::new("x", Some(Span::line(9)))).is_none());
+        assert!(
+            localize_failing_step(proof, &VerifyError::new("x", Some(Span::line(9)))).is_none()
+        );
     }
 
     // -- Adapter mocks + strengthen_proof -----------------------------------
@@ -681,7 +692,10 @@ mod tests {
             if proof.contains("STRONG") {
                 VerifyOutcome::Ok
             } else {
-                VerifyOutcome::Err(VerifyError::new("does not prove the strong statement", None))
+                VerifyOutcome::Err(VerifyError::new(
+                    "does not prove the strong statement",
+                    None,
+                ))
             }
         }
     }
@@ -763,7 +777,10 @@ mod tests {
     #[test]
     fn strengthen_is_deterministic_given_seed() {
         let verify = strong_verifier();
-        let cfg = RepairConfig { rounds: 3, seed: 99 };
+        let cfg = RepairConfig {
+            rounds: 3,
+            seed: 99,
+        };
         let a = strengthen_proof("w", "s", "p", &StrengtheningAdapter, &verify, cfg);
         let b = strengthen_proof("w", "s", "p", &StrengtheningAdapter, &verify, cfg);
         assert_eq!(a, b);

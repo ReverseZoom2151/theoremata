@@ -43,11 +43,12 @@ pub fn snapshot_headers(lean_src: &str) -> Vec<TheoremHeader> {
     out
 }
 
-pub fn headers_preserved(before: &[TheoremHeader], after: &[TheoremHeader]) -> StatementGuardReport {
-    let after_map: std::collections::HashMap<_, _> = after
-        .iter()
-        .map(|h| (h.name.as_str(), h))
-        .collect();
+pub fn headers_preserved(
+    before: &[TheoremHeader],
+    after: &[TheoremHeader],
+) -> StatementGuardReport {
+    let after_map: std::collections::HashMap<_, _> =
+        after.iter().map(|h| (h.name.as_str(), h)).collect();
     let mut missing = Vec::new();
     let mut weakened = Vec::new();
     for h in before {

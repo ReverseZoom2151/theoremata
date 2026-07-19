@@ -351,9 +351,7 @@ pub fn formalize_portfolio(
 
     // 5: recommend the first well-formed, non-trivial candidate — never a
     // trivial or ill-formed one, and never silently when none qualifies.
-    let recommended = candidates
-        .iter()
-        .position(|c| c.well_formed && !c.trivial);
+    let recommended = candidates.iter().position(|c| c.well_formed && !c.trivial);
 
     FormalizationReport {
         informal: informal.to_string(),
@@ -373,16 +371,12 @@ fn pairwise_differences(candidates: &[ScreenedCandidate]) -> Vec<Difference> {
             let gb = CanonicalGoal::parse(&candidates[j].formal);
             let hb: BTreeSet<&str> = gb.hypotheses().iter().map(String::as_str).collect();
 
-            let only_in_a: Vec<String> =
-                ha.difference(&hb).map(|s| s.to_string()).collect();
-            let only_in_b: Vec<String> =
-                hb.difference(&ha).map(|s| s.to_string()).collect();
+            let only_in_a: Vec<String> = ha.difference(&hb).map(|s| s.to_string()).collect();
+            let only_in_b: Vec<String> = hb.difference(&ha).map(|s| s.to_string()).collect();
             let conclusion_differs = ga.conclusion() != gb.conclusion();
 
-            let a_subsumes_b =
-                subsumes_str(&candidates[i].formal, &candidates[j].formal);
-            let b_subsumes_a =
-                subsumes_str(&candidates[j].formal, &candidates[i].formal);
+            let a_subsumes_b = subsumes_str(&candidates[i].formal, &candidates[j].formal);
+            let b_subsumes_a = subsumes_str(&candidates[j].formal, &candidates[i].formal);
 
             let summary = difference_summary(
                 i,
@@ -461,11 +455,11 @@ mod tests {
     impl Formalizer for SlateFormalizer {
         fn formalize(&self, _informal: &str, _seed: u64) -> Vec<String> {
             vec![
-                "P x, Q y ⊢ R z".to_string(),   // 0: full hypotheses
-                "P x ⊢ R z".to_string(),        // 1: drops `Q y`
-                "Q y, P x ⊢ R z".to_string(),   // dup of 0 (reordered) → collapses
-                "⊢ True".to_string(),           // trivial
-                "garbage".to_string(),          // ill-formed (no turnstile)
+                "P x, Q y ⊢ R z".to_string(), // 0: full hypotheses
+                "P x ⊢ R z".to_string(),      // 1: drops `Q y`
+                "Q y, P x ⊢ R z".to_string(), // dup of 0 (reordered) → collapses
+                "⊢ True".to_string(),         // trivial
+                "garbage".to_string(),        // ill-formed (no turnstile)
             ]
         }
     }
@@ -512,7 +506,11 @@ mod tests {
     fn generates_and_screens_each_distinct_candidate() {
         let r = report();
         // 5 generated, one is a reordered duplicate → 4 distinct screened.
-        assert_eq!(r.candidates.len(), 4, "one reordered duplicate must collapse");
+        assert_eq!(
+            r.candidates.len(),
+            4,
+            "one reordered duplicate must collapse"
+        );
         // Every distinct candidate carries a screen verdict (note is non-empty).
         for c in &r.candidates {
             assert!(!c.note.is_empty(), "candidate {c:?} was not screened");
@@ -529,7 +527,10 @@ mod tests {
             .iter()
             .filter(|c| CanonicalGoal::parse(&c.formal).key() == key)
             .count();
-        assert_eq!(matches, 1, "canonically-identical renderings must collapse to one");
+        assert_eq!(
+            matches, 1,
+            "canonically-identical renderings must collapse to one"
+        );
     }
 
     #[test]
@@ -542,8 +543,13 @@ mod tests {
             .expect("the trivial candidate survives dedup");
         assert!(trivial.trivial, "`⊢ True` must be flagged trivial");
         // The recommendation must never point at the trivial candidate.
-        let rec = r.recommended.expect("a well-formed non-trivial candidate exists");
-        assert!(!r.candidates[rec].trivial, "recommended must not be trivial");
+        let rec = r
+            .recommended
+            .expect("a well-formed non-trivial candidate exists");
+        assert!(
+            !r.candidates[rec].trivial,
+            "recommended must not be trivial"
+        );
     }
 
     #[test]
@@ -566,7 +572,10 @@ mod tests {
             .iter()
             .find(|c| c.formal == "garbage")
             .expect("the ill-formed candidate is retained, not silently dropped");
-        assert!(!garbage.well_formed, "`garbage` has no turnstile → not well-formed");
+        assert!(
+            !garbage.well_formed,
+            "`garbage` has no turnstile → not well-formed"
+        );
     }
 
     #[test]
@@ -587,21 +596,33 @@ mod tests {
         assert!(diff.only_in_b.is_empty(), "candidate 1 adds no hypothesis");
         assert!(!diff.conclusion_differs, "both conclude `R z`");
         // The dropped-hypothesis (weaker-premise) rendering subsumes the fuller one.
-        assert!(diff.b_subsumes_a, "the P-only rendering is the more general one");
-        assert!(diff.summary.contains("Q y"), "summary names the dropped hypothesis");
+        assert!(
+            diff.b_subsumes_a,
+            "the P-only rendering is the more general one"
+        );
+        assert!(
+            diff.summary.contains("Q y"),
+            "summary names the dropped hypothesis"
+        );
     }
 
     #[test]
     fn seeded_generation_is_deterministic_and_threads_the_seed() {
         let screen = MarkerScreen;
-        let cfg7 = FormalizeConfig { seed: 7, max_candidates: 8 };
+        let cfg7 = FormalizeConfig {
+            seed: 7,
+            max_candidates: 8,
+        };
         let a = formalize_portfolio("phi", &SeedEchoFormalizer, &screen, &cfg7);
         let b = formalize_portfolio("phi", &SeedEchoFormalizer, &screen, &cfg7);
         assert_eq!(a, b, "same seed must yield an identical report");
 
         // A different seed threads through to different candidate text (7 -> odd
         // -> "B x", 8 -> even -> "A x"), proving the seed is actually used.
-        let cfg8 = FormalizeConfig { seed: 8, max_candidates: 8 };
+        let cfg8 = FormalizeConfig {
+            seed: 8,
+            max_candidates: 8,
+        };
         let c = formalize_portfolio("phi", &SeedEchoFormalizer, &screen, &cfg8);
         assert_ne!(a.candidates, c.candidates, "distinct seeds must diverge");
         assert!(a.candidates.iter().any(|x| x.formal.contains("H7")));
@@ -611,7 +632,10 @@ mod tests {
     #[test]
     fn max_candidates_caps_generation_before_dedup() {
         // Cap at 2 raw candidates: only `P x, Q y ⊢ R z` and `P x ⊢ R z` are seen.
-        let cfg = FormalizeConfig { seed: 0, max_candidates: 2 };
+        let cfg = FormalizeConfig {
+            seed: 0,
+            max_candidates: 2,
+        };
         let r = formalize_portfolio("x", &SlateFormalizer, &MarkerScreen, &cfg);
         assert_eq!(r.candidates.len(), 2);
         assert!(r.candidates.iter().all(|c| c.well_formed && !c.trivial));

@@ -40,7 +40,10 @@ const N_BEST: usize = 3;
 /// exercised without a config-file change.
 pub fn gate_enabled() -> bool {
     match std::env::var("THEOREMATA_POOL_META_GATE") {
-        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"),
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
         Err(_) => true,
     }
 }
@@ -173,8 +176,14 @@ pub fn conditional_accuracy(proved: usize, failed: usize) -> f64 {
 /// Convenience: compute [`conditional_accuracy`] directly over a slice of
 /// terminal outcomes (abstentions are dropped from the denominator).
 pub fn conditional_accuracy_of(outcomes: &[CertifyOutcome]) -> f64 {
-    let proved = outcomes.iter().filter(|o| **o == CertifyOutcome::Proved).count();
-    let failed = outcomes.iter().filter(|o| **o == CertifyOutcome::Failed).count();
+    let proved = outcomes
+        .iter()
+        .filter(|o| **o == CertifyOutcome::Proved)
+        .count();
+    let failed = outcomes
+        .iter()
+        .filter(|o| **o == CertifyOutcome::Failed)
+        .count();
     conditional_accuracy(proved, failed)
 }
 
@@ -429,7 +438,14 @@ mod tests {
         };
         // A full clean streak → verifier_score 1.0 → clears the all-pass gate.
         let outcome = gate
-            .evaluate(&project_id, &node_id, "theorem t : True := trivial", 1.0, 1.0, true)
+            .evaluate(
+                &project_id,
+                &node_id,
+                "theorem t : True := trivial",
+                1.0,
+                1.0,
+                true,
+            )
             .unwrap();
         assert!(outcome.pool_passed, "score 1.0 clears the all-pass gate");
         assert!(!outcome.critic_rejected, "a clean critic never rejects");
@@ -454,11 +470,24 @@ mod tests {
             enabled: true,
         };
         let outcome = gate
-            .evaluate(&project_id, &node_id, "theorem t : True := trivial", 1.0, 1.0, true)
+            .evaluate(
+                &project_id,
+                &node_id,
+                "theorem t : True := trivial",
+                1.0,
+                1.0,
+                true,
+            )
             .unwrap();
         assert!(outcome.pool_passed, "the pool still all-passes...");
-        assert!(outcome.critic_rejected, "...but the critic confirmed a critical finding");
-        assert!(!outcome.certified, "a confirmed critical finding vetoes certification");
+        assert!(
+            outcome.critic_rejected,
+            "...but the critic confirmed a critical finding"
+        );
+        assert!(
+            !outcome.certified,
+            "a confirmed critical finding vetoes certification"
+        );
         // The pool is still populated even when certification is vetoed.
         let pool = ProofPoolStore::new(&store).load(&project_id).unwrap();
         assert_eq!(pool.len(), 1);
@@ -480,7 +509,10 @@ mod tests {
         assert!(!outcome.pool_passed);
         assert!(!outcome.certified);
         // ...but the candidate is still recorded, so lineage survives.
-        assert_eq!(ProofPoolStore::new(&store).load(&project_id).unwrap().len(), 1);
+        assert_eq!(
+            ProofPoolStore::new(&store).load(&project_id).unwrap().len(),
+            1
+        );
     }
 
     #[test]
@@ -518,7 +550,15 @@ mod tests {
         // High confidence but the critic vetoes: a real negative, so it FAILS —
         // abstention only covers the low-confidence case.
         let outcome = gate
-            .evaluate_with_abstention(&project_id, &node_id, "theorem t : True := trivial", 1.0, 1.0, true, 0.5)
+            .evaluate_with_abstention(
+                &project_id,
+                &node_id,
+                "theorem t : True := trivial",
+                1.0,
+                1.0,
+                true,
+                0.5,
+            )
             .unwrap();
         assert!(!outcome.certified);
         assert!(!outcome.abstained, "confident failure is a real negative");
@@ -535,7 +575,15 @@ mod tests {
             enabled: true,
         };
         let outcome = gate
-            .evaluate_with_abstention(&project_id, &node_id, "theorem t : True := trivial", 1.0, 1.0, true, 0.5)
+            .evaluate_with_abstention(
+                &project_id,
+                &node_id,
+                "theorem t : True := trivial",
+                1.0,
+                1.0,
+                true,
+                0.5,
+            )
             .unwrap();
         assert!(outcome.certified);
         assert!(!outcome.abstained);
@@ -563,13 +611,15 @@ mod tests {
     #[test]
     fn strip_reasoning_removes_cot_but_preserves_the_proof_term() {
         use super::strip_reasoning;
-        let with_cot = "<think>\nfirst I try induction, then simp...\n</think>\ntheorem t : True := trivial";
+        let with_cot =
+            "<think>\nfirst I try induction, then simp...\n</think>\ntheorem t : True := trivial";
         let stripped = strip_reasoning(with_cot);
         assert_eq!(stripped, "theorem t : True := trivial");
         assert!(!stripped.contains("induction"));
 
         // Lean line-comment CoT block is also removed.
-        let lean_cot = "-- BEGIN COT\n-- scratch: unfold, then ring\n-- END COT\ntheorem u : 1 = 1 := rfl";
+        let lean_cot =
+            "-- BEGIN COT\n-- scratch: unfold, then ring\n-- END COT\ntheorem u : 1 = 1 := rfl";
         assert_eq!(strip_reasoning(lean_cot), "theorem u : 1 = 1 := rfl");
 
         // A proof with no reasoning block is unchanged (aside from trimming).
@@ -592,7 +642,13 @@ mod tests {
             .evaluate(&project_id, &node_id, "x", 1.0, 1.0, true)
             .unwrap();
         assert!(outcome.certified);
-        assert!(!outcome.pool_populated, "disabled gate does not touch the pool");
-        assert_eq!(ProofPoolStore::new(&store).load(&project_id).unwrap().len(), 0);
+        assert!(
+            !outcome.pool_populated,
+            "disabled gate does not touch the pool"
+        );
+        assert_eq!(
+            ProofPoolStore::new(&store).load(&project_id).unwrap().len(),
+            0
+        );
     }
 }

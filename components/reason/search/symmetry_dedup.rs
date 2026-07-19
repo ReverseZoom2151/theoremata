@@ -292,7 +292,10 @@ mod tests {
         let mut dedup = OrbitDedup::new(swap_pair());
         assert!(dedup.insert((2, 1)), "first orbit is genuinely new");
         // (1, 2) is the swap of (2, 1): a symmetric duplicate.
-        assert!(!dedup.insert((1, 2)), "symmetric equivalent already present");
+        assert!(
+            !dedup.insert((1, 2)),
+            "symmetric equivalent already present"
+        );
         // A genuinely different orbit.
         assert!(dedup.insert((1, 3)), "new orbit inserts");
         assert_eq!(dedup.len(), 2, "exactly two orbits stored");
@@ -327,7 +330,11 @@ mod tests {
         let fk: Vec<_> = forward.iter().cloned().collect();
         let bk: Vec<_> = backward.iter().cloned().collect();
         assert_eq!(fk, bk, "stored key set is independent of insertion order");
-        assert_eq!(forward.len(), 3, "three distinct orbits: (1,2), (4,5), (0,9)");
+        assert_eq!(
+            forward.len(),
+            3,
+            "three distinct orbits: (1,2), (4,5), (0,9)"
+        );
     }
 
     #[test]
@@ -336,7 +343,10 @@ mod tests {
         let mut dedup: OrbitDedup<(i32, i32)> = OrbitDedup::new(SymmetryGroup::new());
         assert!(dedup.insert((2, 1)));
         assert!(!dedup.insert((2, 1)), "exact duplicate");
-        assert!(dedup.insert((1, 2)), "swap is NOT merged without a generator");
+        assert!(
+            dedup.insert((1, 2)),
+            "swap is NOT merged without a generator"
+        );
         assert_eq!(dedup.len(), 2);
     }
 

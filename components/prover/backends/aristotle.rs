@@ -8,7 +8,7 @@ use crate::{
     config::Config,
     db::Store,
     prover::{
-        model::{ProofJob, ProofResult, ProverJobStatus, ProofTask},
+        model::{ProofJob, ProofResult, ProofTask, ProverJobStatus},
         verify::verify_lean_output,
     },
 };
@@ -60,7 +60,11 @@ pub fn submit(
     )?;
     if let Some(dir) = &artifacts_dir {
         write_artifact(dir, "task.json", &task)?;
-        write_artifact(dir, "submit.json", &json!({"mock": mock_enabled(config), "backend": BACKEND}))?;
+        write_artifact(
+            dir,
+            "submit.json",
+            &json!({"mock": mock_enabled(config), "backend": BACKEND}),
+        )?;
     }
     let _ = config;
     Ok(job)

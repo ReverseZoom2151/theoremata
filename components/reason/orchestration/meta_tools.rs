@@ -176,7 +176,9 @@ impl MetaToolKind {
             MetaToolKind::Spend => "search::ttc::TtcController::{spent,remaining}",
             MetaToolKind::Budget => "search::ttc::TtcController::{allocate,take}",
             MetaToolKind::SelfReview => "critique::critic (self-review pass)",
-            MetaToolKind::Abstain => "orchestration::agent abstention (THEOREMATA_ABSTAIN_THRESHOLD)",
+            MetaToolKind::Abstain => {
+                "orchestration::agent abstention (THEOREMATA_ABSTAIN_THRESHOLD)"
+            }
         }
     }
 

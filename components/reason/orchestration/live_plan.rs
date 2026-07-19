@@ -54,7 +54,10 @@ pub enum StepStatus {
 impl StepStatus {
     /// Whether this is a terminal state (nothing more to do on the step).
     pub fn is_terminal(self) -> bool {
-        matches!(self, StepStatus::Done | StepStatus::Failed | StepStatus::Skipped)
+        matches!(
+            self,
+            StepStatus::Done | StepStatus::Failed | StepStatus::Skipped
+        )
     }
 }
 
@@ -125,7 +128,10 @@ impl fmt::Display for PlanError {
                 write!(f, "at most one step may be InProgress at a time")
             }
             PlanError::DroppedDoneStep(id) => {
-                write!(f, "revision dropped Done step {id}; finished work is preserved")
+                write!(
+                    f,
+                    "revision dropped Done step {id}; finished work is preserved"
+                )
             }
             PlanError::DuplicateStep(id) => write!(f, "revision referenced step {id} twice"),
         }
@@ -198,7 +204,9 @@ impl LivePlan {
 
     /// The single `InProgress` step, if one exists.
     pub fn in_progress(&self) -> Option<&PlanStep> {
-        self.steps.iter().find(|s| s.status == StepStatus::InProgress)
+        self.steps
+            .iter()
+            .find(|s| s.status == StepStatus::InProgress)
     }
 
     /// The first `Pending` step in execution order — what to pick up next.
@@ -444,7 +452,10 @@ mod tests {
         p.set_notes(ids[0], "worked").unwrap();
         assert_eq!(p.get(ids[0]).unwrap().status, StepStatus::Done);
         assert_eq!(p.get(ids[0]).unwrap().notes.as_deref(), Some("worked"));
-        assert_eq!(p.update_status(999, StepStatus::Done), Err(PlanError::NoSuchStep(999)));
+        assert_eq!(
+            p.update_status(999, StepStatus::Done),
+            Err(PlanError::NoSuchStep(999))
+        );
         assert_eq!(p.set_notes(999, "x"), Err(PlanError::NoSuchStep(999)));
     }
 
@@ -467,7 +478,10 @@ mod tests {
         assert_eq!(p.in_progress().unwrap().id, ids[2]);
         // Never more than one InProgress at any time.
         assert_eq!(
-            p.steps().iter().filter(|s| s.status == StepStatus::InProgress).count(),
+            p.steps()
+                .iter()
+                .filter(|s| s.status == StepStatus::InProgress)
+                .count(),
             1
         );
     }
@@ -502,7 +516,7 @@ mod tests {
     fn revise_preserves_done_and_reorders_pending() {
         let (mut p, ids) = plan_with(&["a", "b", "c"]);
         p.update_status(ids[0], StepStatus::Done).unwrap(); // a is Done
-        // Reorder: keep a (Done), drop c, keep b after a, insert a new step.
+                                                            // Reorder: keep a (Done), drop c, keep b after a, insert a new step.
         p.revise(vec![
             RevisedStep::keep(ids[0]),
             RevisedStep::new_step("d"),

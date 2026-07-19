@@ -45,19 +45,12 @@ pub enum TacticOutcome<S> {
 /// A tactic that is error-free but makes *no* change — it returns the original
 /// open goal unchanged as its sole subgoal — is treated as [`TacticOutcome::Discard`]
 /// to avoid a self-loop edge that would waste search budget.
-pub fn classify<S: GoalState>(
-    error_free: bool,
-    parent: &S,
-    resulting: Vec<S>,
-) -> TacticOutcome<S> {
+pub fn classify<S: GoalState>(error_free: bool, parent: &S, resulting: Vec<S>) -> TacticOutcome<S> {
     if !error_free {
         return TacticOutcome::Discard;
     }
     let parent_key = parent.dedup_key();
-    let open: Vec<S> = resulting
-        .into_iter()
-        .filter(|s| !s.is_closed())
-        .collect();
+    let open: Vec<S> = resulting.into_iter().filter(|s| !s.is_closed()).collect();
     if open.is_empty() {
         return TacticOutcome::Closes;
     }

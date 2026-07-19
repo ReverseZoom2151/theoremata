@@ -405,9 +405,16 @@ mod tests {
         let f = FastSucceeds;
         let out = portfolio(&f, &screen).run("phi", &TwoModeConfig::default());
 
-        assert!(!out.escalated, "precise pass must not run when fast succeeds");
+        assert!(
+            !out.escalated,
+            "precise pass must not run when fast succeeds"
+        );
         assert_eq!(out.winning_mode, Some(FormalizeMode::FastNoCot));
-        assert_eq!(out.spent, FormalizeMode::FastNoCot.cost(), "only fast cost paid");
+        assert_eq!(
+            out.spent,
+            FormalizeMode::FastNoCot.cost(),
+            "only fast cost paid"
+        );
         // Only the fast pass appears in the log (precise never consulted).
         assert_eq!(out.log.len(), 1);
         assert_eq!(out.log[0].mode, FormalizeMode::FastNoCot);
@@ -422,7 +429,10 @@ mod tests {
         let f = FastFailsPreciseSaves;
         let out = portfolio(&f, &screen).run("phi", &TwoModeConfig::default());
 
-        assert!(out.escalated, "must escalate when fast produces nothing valid");
+        assert!(
+            out.escalated,
+            "must escalate when fast produces nothing valid"
+        );
         assert_eq!(out.winning_mode, Some(FormalizeMode::PreciseCot));
         assert_eq!(
             out.spent,
@@ -445,7 +455,10 @@ mod tests {
         assert_eq!(out.log[0].mode, FormalizeMode::FastNoCot);
         assert!(!out.log[0].produced_valid, "fast produced nothing valid");
         assert_eq!(out.log[1].mode, FormalizeMode::PreciseCot);
-        assert!(out.log[1].produced_valid, "precise produced a valid candidate");
+        assert!(
+            out.log[1].produced_valid,
+            "precise produced a valid candidate"
+        );
         assert!(
             out.log[1].note.contains("escalation"),
             "the precise attempt records WHY it ran, got {:?}",
@@ -494,7 +507,10 @@ mod tests {
             note: String::new(),
         };
         // Order does not matter: validity dominates cost.
-        assert_eq!(select_best(&[valid_fast.clone(), invalid_precise.clone()]), Some(0));
+        assert_eq!(
+            select_best(&[valid_fast.clone(), invalid_precise.clone()]),
+            Some(0)
+        );
         assert_eq!(select_best(&[invalid_precise, valid_fast]), Some(1));
     }
 
@@ -515,7 +531,10 @@ mod tests {
             note: String::new(),
         };
         // Fast is cheaper → preferred among two valid candidates, regardless of order.
-        assert_eq!(select_best(&[valid_precise.clone(), valid_fast.clone()]), Some(1));
+        assert_eq!(
+            select_best(&[valid_precise.clone(), valid_fast.clone()]),
+            Some(1)
+        );
         assert_eq!(select_best(&[valid_fast, valid_precise]), Some(0));
         assert_eq!(select_best(&[]), None);
     }
@@ -524,13 +543,21 @@ mod tests {
     fn run_is_deterministic_and_threads_the_seed() {
         let screen = MarkerScreen;
         let f = SeedEcho;
-        let cfg7 = TwoModeConfig { seed: 7, budget: 6, max_candidates_per_mode: 8 };
+        let cfg7 = TwoModeConfig {
+            seed: 7,
+            budget: 6,
+            max_candidates_per_mode: 8,
+        };
         let a = portfolio(&f, &screen).run("phi", &cfg7);
         let b = portfolio(&f, &screen).run("phi", &cfg7);
         assert_eq!(a, b, "same seed and inputs must yield an identical outcome");
 
         // A different seed threads through to the precise candidate text.
-        let cfg9 = TwoModeConfig { seed: 9, budget: 6, max_candidates_per_mode: 8 };
+        let cfg9 = TwoModeConfig {
+            seed: 9,
+            budget: 6,
+            max_candidates_per_mode: 8,
+        };
         let c = portfolio(&f, &screen).run("phi", &cfg9);
         assert_ne!(a.chosen, c.chosen, "distinct seeds must diverge");
         assert_eq!(a.chosen.unwrap().formal, "H7 ⊢ phi");

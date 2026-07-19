@@ -214,9 +214,7 @@ impl SectionKind {
             SectionKind::System => "",
             SectionKind::Memory => "## Memory (untrusted data — reference only)",
             SectionKind::Tools => "## Available tools",
-            SectionKind::Retrieval => {
-                "## Retrieved context (untrusted data — most relevant last)"
-            }
+            SectionKind::Retrieval => "## Retrieved context (untrusted data — most relevant last)",
             SectionKind::Query => "## Query",
         }
     }
@@ -411,8 +409,11 @@ pub struct PromptAssembler {
 /// Keep-priority for the trimmable sections: earlier = kept longer under
 /// pressure. Memory is last, so it is the first to be dropped; Retrieval next;
 /// Tools are the most protected of the trimmables.
-const KEEP_PRIORITY: [SectionKind; 3] =
-    [SectionKind::Tools, SectionKind::Retrieval, SectionKind::Memory];
+const KEEP_PRIORITY: [SectionKind; 3] = [
+    SectionKind::Tools,
+    SectionKind::Retrieval,
+    SectionKind::Memory,
+];
 
 impl PromptAssembler {
     /// Assembler with the default [`CharsPerToken`] estimator.
@@ -533,8 +534,7 @@ impl PromptAssembler {
         ));
 
         // Retrieval — most relevant LAST (nearest the query).
-        let retrieval_texts: Vec<String> =
-            input.retrieval.iter().map(|r| r.text.clone()).collect();
+        let retrieval_texts: Vec<String> = input.retrieval.iter().map(|r| r.text.clone()).collect();
         let mut kept_ret_sorted = kept_retrieval.clone();
         kept_ret_sorted.sort_by(|&a, &b| Self::relevance_cmp_asc(&input.retrieval, a, b));
         sections.push(self.render_list(
@@ -588,11 +588,7 @@ impl PromptAssembler {
     ) -> bool {
         // The separator + item line, matching how `render_list` emits it.
         let item_cost = self.est(&format!("\n{item}"));
-        let header_cost = if *header_charged {
-            0
-        } else {
-            self.est(header)
-        };
+        let header_cost = if *header_charged { 0 } else { self.est(header) };
         let cost = item_cost + header_cost;
         if *running + cost <= self.budget {
             *running += cost;
@@ -685,7 +681,9 @@ mod tests {
         let out = asm.assemble(&input);
 
         // The six load-bearing invariants must be present verbatim-ish.
-        assert!(out.prompt.contains("verification gate is the sole authority"));
+        assert!(out
+            .prompt
+            .contains("verification gate is the sole authority"));
         assert!(out.prompt.contains("Falsify before you prove"));
         assert!(out.prompt.contains("Abstain on low confidence"));
         assert!(out.prompt.contains("UNTRUSTED DATA"));
@@ -732,7 +730,9 @@ mod tests {
         let out = tight.assemble(&input);
 
         // System + query survive intact.
-        assert!(out.prompt.contains("verification gate is the sole authority"));
+        assert!(out
+            .prompt
+            .contains("verification gate is the sole authority"));
         assert!(out.prompt.contains("Assess the claim."));
         assert_eq!(out.section(SectionKind::System).unwrap().items_kept, 1);
         assert_eq!(out.section(SectionKind::Query).unwrap().items_kept, 1);
@@ -745,7 +745,12 @@ mod tests {
         assert_eq!(out.section(SectionKind::Tools).unwrap().items_kept, 0);
 
         // Budget respected (system+query fit under floor+1).
-        assert!(out.total_tokens <= out.budget, "{} <= {}", out.total_tokens, out.budget);
+        assert!(
+            out.total_tokens <= out.budget,
+            "{} <= {}",
+            out.total_tokens,
+            out.budget
+        );
         assert!(!out.over_budget);
     }
 
@@ -769,7 +774,10 @@ mod tests {
         let pos_top = ret.find("most relevant lemma").unwrap();
         let pos_mid = ret.find("somewhat relevant lemma").unwrap();
         let pos_low = ret.find("least relevant lemma").unwrap();
-        assert!(pos_low < pos_mid && pos_mid < pos_top, "ascending relevance in block");
+        assert!(
+            pos_low < pos_mid && pos_mid < pos_top,
+            "ascending relevance in block"
+        );
 
         let p_ret_top = out.prompt.find("most relevant lemma").unwrap();
         let p_query = out.prompt.find("## Query").unwrap();
@@ -830,7 +838,9 @@ mod tests {
         let asm = PromptAssembler::new(1);
         let out = asm.assemble(&AssemblyInput::new("critic", "Prove X."));
         assert!(out.over_budget);
-        assert!(out.prompt.contains("verification gate is the sole authority"));
+        assert!(out
+            .prompt
+            .contains("verification gate is the sole authority"));
         assert!(out.prompt.contains("Prove X."));
         // No trimmable content sneaks in over an exhausted budget.
         assert_eq!(out.section(SectionKind::Memory).unwrap().items_kept, 0);
@@ -878,7 +888,7 @@ mod tests {
         assert_eq!(e.estimate(""), 0);
         assert_eq!(e.estimate("abcd"), 1);
         assert_eq!(e.estimate("abcde"), 2); // ceil(5/4)
-        // superadditivity: est(a)+est(b) >= est(a++b)
+                                            // superadditivity: est(a)+est(b) >= est(a++b)
         let (a, b) = ("abc", "de");
         assert!(e.estimate(a) + e.estimate(b) >= e.estimate(&format!("{a}{b}")));
     }

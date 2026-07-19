@@ -117,8 +117,7 @@ impl Tool for MathlibSearch {
         "mathlib_search"
     }
     fn available(&self) -> bool {
-        self.root.exists()
-            && (self.rg_command().is_some() || PythonCheck::new().available())
+        self.root.exists() && (self.rg_command().is_some() || PythonCheck::new().available())
     }
     fn run(&self, input: serde_json::Value) -> Result<ToolResult> {
         let query = input["query"]
@@ -416,12 +415,24 @@ pub fn capability_report(config: &Config) -> serde_json::Value {
         .unwrap_or_else(|| config.resources.join("mathlib4-master/mathlib4-master"));
     let corpora = [
         ("mathlib4", lean_project.exists()),
-        ("datasets-main", config.resources.join("datasets-main").exists()),
+        (
+            "datasets-main",
+            config.resources.join("datasets-main").exists(),
+        ),
         ("BRIDGE-main", config.resources.join("BRIDGE-main").exists()),
-        ("QuantumLean-Bench-main", config.resources.join("QuantumLean-Bench-main").exists()),
+        (
+            "QuantumLean-Bench-main",
+            config.resources.join("QuantumLean-Bench-main").exists(),
+        ),
         ("flare-main", config.resources.join("flare-main").exists()),
-        ("IMO2025-main", config.resources.join("IMO2025-main").exists()),
-        ("aristotle_putnam25-main", config.resources.join("aristotle_putnam25-main").exists()),
+        (
+            "IMO2025-main",
+            config.resources.join("IMO2025-main").exists(),
+        ),
+        (
+            "aristotle_putnam25-main",
+            config.resources.join("aristotle_putnam25-main").exists(),
+        ),
         (
             "LeanMillenniumPrizeProblems-main",
             config

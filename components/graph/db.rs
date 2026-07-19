@@ -1133,10 +1133,7 @@ impl Store {
              updated_at=?5, completed_at=?6 WHERE id=?7",
             params![
                 serde_json::to_string(&job.status)?,
-                job.result
-                    .as_ref()
-                    .map(serde_json::to_string)
-                    .transpose()?,
+                job.result.as_ref().map(serde_json::to_string).transpose()?,
                 job.percent_complete,
                 job.poll_count,
                 job.updated_at.to_rfc3339(),
@@ -1147,10 +1144,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn get_proof_job(
-        &self,
-        id: &str,
-    ) -> Result<Option<crate::prover::model::ProofJob>> {
+    pub fn get_proof_job(&self, id: &str) -> Result<Option<crate::prover::model::ProofJob>> {
         self.conn
             .query_row(
                 "SELECT id,project_id,node_id,backend,status,task_json,result_json,external_id,\
@@ -1646,10 +1640,7 @@ impl Store {
 
     /// The least-`update_count` lemma (the evolver scheduler pick). Ties broken
     /// by oldest-created then id, so the choice is deterministic.
-    pub fn next_library_lemma_to_evolve(
-        &self,
-        project_id: &str,
-    ) -> Result<Option<LibraryLemma>> {
+    pub fn next_library_lemma_to_evolve(&self, project_id: &str) -> Result<Option<LibraryLemma>> {
         self.conn
             .query_row(
                 "SELECT id,project_id,statement,proof,provenance,embedding_key,update_count,\
@@ -1720,10 +1711,7 @@ impl Store {
     }
 
     /// The oldest still-open request (least `update_count`, then oldest-created).
-    pub fn oldest_open_library_request(
-        &self,
-        project_id: &str,
-    ) -> Result<Option<LibraryRequest>> {
+    pub fn oldest_open_library_request(&self, project_id: &str) -> Result<Option<LibraryRequest>> {
         self.conn
             .query_row(
                 "SELECT id,project_id,subgoal,provenance,solved,update_count,created_at,updated_at \
@@ -1780,7 +1768,13 @@ impl Store {
         self.conn.execute(
             "INSERT INTO library_problems(id,project_id,statement,provenance,created_at) \
              VALUES (?1,?2,?3,?4,?5)",
-            params![problem.id, project_id, statement, provenance, now.to_rfc3339()],
+            params![
+                problem.id,
+                project_id,
+                statement,
+                provenance,
+                now.to_rfc3339()
+            ],
         )?;
         Ok(problem)
     }
@@ -2126,9 +2120,9 @@ fn proof_job_row(r: &Row) -> rusqlite::Result<crate::prover::model::ProofJob> {
         project_id: r.get(1)?,
         node_id: r.get(2)?,
         backend: r.get(3)?,
-        status: serde_json::from_str(&status).unwrap_or(crate::prover::model::ProverJobStatus::Error),
-        task: serde_json::from_str(&task_raw)
-            .map_err(|e| sql_parse(e.into()))?,
+        status: serde_json::from_str(&status)
+            .unwrap_or(crate::prover::model::ProverJobStatus::Error),
+        task: serde_json::from_str(&task_raw).map_err(|e| sql_parse(e.into()))?,
         result: result_raw
             .filter(|s| !s.is_empty())
             .map(|s| serde_json::from_str(&s))
@@ -2156,8 +2150,7 @@ fn attempt_run_row(r: &Row) -> rusqlite::Result<crate::prover::model::AttemptRun
         status: serde_json::from_str(&status)
             .unwrap_or(crate::prover::model::AttemptRunStatus::Failed),
         artifacts_dir: std::path::PathBuf::from(r.get::<_, String>(5)?),
-        input: serde_json::from_str(&input_raw)
-            .map_err(|e| sql_parse(e.into()))?,
+        input: serde_json::from_str(&input_raw).map_err(|e| sql_parse(e.into()))?,
         output: output_raw
             .filter(|s| !s.is_empty())
             .map(|s| serde_json::from_str(&s))
@@ -2437,9 +2430,14 @@ mod tests {
     fn cycle_rejection_leaves_no_partial_edge() {
         let s = Store::open(Path::new(":memory:")).unwrap();
         let p = s.create_project("p", "t").unwrap();
-        let a = s.add_node(&p.id, NodeKind::Lemma, "a", "a", "test").unwrap();
-        let b = s.add_node(&p.id, NodeKind::Lemma, "b", "b", "test").unwrap();
-        s.add_edge(&p.id, &a.id, &b.id, EdgeKind::DependsOn).unwrap();
+        let a = s
+            .add_node(&p.id, NodeKind::Lemma, "a", "a", "test")
+            .unwrap();
+        let b = s
+            .add_node(&p.id, NodeKind::Lemma, "b", "b", "test")
+            .unwrap();
+        s.add_edge(&p.id, &a.id, &b.id, EdgeKind::DependsOn)
+            .unwrap();
         let edges_before = s.edges(&p.id).unwrap();
         // b -> a would close a cycle: it must be rejected AND leave the edge set
         // exactly as it was — no lingering half-inserted row from the aborted
@@ -2459,7 +2457,9 @@ mod tests {
     fn status_change_emits_event_atomically() {
         let s = Store::open(Path::new(":memory:")).unwrap();
         let p = s.create_project("p", "t").unwrap();
-        let n = s.add_node(&p.id, NodeKind::Lemma, "n", "N", "test").unwrap();
+        let n = s
+            .add_node(&p.id, NodeKind::Lemma, "n", "N", "test")
+            .unwrap();
         s.set_node_status(&p.id, &n.id, NodeStatus::InformallyVerified, "test")
             .unwrap();
         let got = s

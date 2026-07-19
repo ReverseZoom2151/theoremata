@@ -449,12 +449,7 @@ mod tests {
             // Only moves that do not push any coordinate below zero — keeps the
             // reachable space finite and every move genuine progress.
             (0..self.basis.len())
-                .filter(|&i| {
-                    state
-                        .iter()
-                        .zip(&self.basis[i])
-                        .all(|(&s, &b)| s - b >= 0)
-                })
+                .filter(|&i| state.iter().zip(&self.basis[i]).all(|(&s, &b)| s - b >= 0))
                 .collect()
         }
 
@@ -506,7 +501,10 @@ mod tests {
         for mv in &cert.moves {
             s = game.apply(&s, mv);
         }
-        assert!(s.iter().all(|&x| x == 0), "replayed moves must zero the residual");
+        assert!(
+            s.iter().all(|&x| x == 0),
+            "replayed moves must zero the residual"
+        );
     }
 
     #[test]
@@ -533,7 +531,10 @@ mod tests {
             max_depth: 64,
         };
         let result = search_discovery(&game, vec![3, 3], cfg, 0);
-        assert!(result.certificate.is_none(), "no discovery within a 1-state budget");
+        assert!(
+            result.certificate.is_none(),
+            "no discovery within a 1-state budget"
+        );
         assert!(!result.certified);
         assert_eq!(result.best_cost, None);
         assert!(result.states_explored <= 1);
@@ -599,7 +600,11 @@ mod tests {
         let game = BoundaryGame;
         let result = search_discovery(&game, "root", DiscoveryConfig::default(), 3);
         let cert = result.certificate.expect("the certified terminal is found");
-        assert_eq!(cert.moves, vec!["win"], "only the certified path is a discovery");
+        assert_eq!(
+            cert.moves,
+            vec!["win"],
+            "only the certified path is a discovery"
+        );
         assert!(cert.verified);
     }
 

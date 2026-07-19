@@ -300,7 +300,10 @@ mod tests {
             ProofCandidate::refined_from("d", 0.95, 0.5, 2, vec!["c".into()]),
         ]);
         let prov = pool.provenance("d");
-        assert_eq!(prov, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(
+            prov,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
         // A fresh root has no provenance.
         assert!(pool.provenance("a").is_empty());
     }
@@ -311,7 +314,8 @@ mod tests {
         let p = store.create_project("p", "t").unwrap();
         let pool = ProofPoolStore::new(&store);
 
-        pool.add(&p.id, &ProofCandidate::new("a", 0.4, 0.3)).unwrap();
+        pool.add(&p.id, &ProofCandidate::new("a", 0.4, 0.3))
+            .unwrap();
         let stop = pool
             .record(
                 &p.id,

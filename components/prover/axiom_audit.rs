@@ -71,11 +71,21 @@ pub struct Finding {
 
 impl Finding {
     pub fn critical(rule: &'static str, line: usize, detail: String) -> Self {
-        Self { severity: Severity::Critical, rule, line, detail }
+        Self {
+            severity: Severity::Critical,
+            rule,
+            line,
+            detail,
+        }
     }
 
     pub fn warning(rule: &'static str, line: usize, detail: String) -> Self {
-        Self { severity: Severity::Warning, rule, line, detail }
+        Self {
+            severity: Severity::Warning,
+            rule,
+            line,
+            detail,
+        }
     }
 }
 
@@ -94,24 +104,41 @@ impl AxiomAudit {
     /// A proof is clean iff it has NO CRITICAL findings. WARNINGs (possible
     /// capture) are surfaced but do not fail the gate.
     pub fn is_clean(&self) -> bool {
-        !self.findings.iter().any(|f| f.severity == Severity::Critical)
+        !self
+            .findings
+            .iter()
+            .any(|f| f.severity == Severity::Critical)
     }
 
     /// Number of CRITICAL findings.
     pub fn critical_count(&self) -> usize {
-        self.findings.iter().filter(|f| f.severity == Severity::Critical).count()
+        self.findings
+            .iter()
+            .filter(|f| f.severity == Severity::Critical)
+            .count()
     }
 
     /// Number of WARNING findings.
     pub fn warning_count(&self) -> usize {
-        self.findings.iter().filter(|f| f.severity == Severity::Warning).count()
+        self.findings
+            .iter()
+            .filter(|f| f.severity == Severity::Warning)
+            .count()
     }
 
     /// One human-readable line per finding: `CRITICAL: rule (line N): detail`.
     fn finding_strings(&self) -> Vec<String> {
         self.findings
             .iter()
-            .map(|f| format!("{}: {} (line {}): {}", f.severity.tag(), f.rule, f.line, f.detail))
+            .map(|f| {
+                format!(
+                    "{}: {} (line {}): {}",
+                    f.severity.tag(),
+                    f.rule,
+                    f.line,
+                    f.detail
+                )
+            })
             .collect()
     }
 
@@ -146,7 +173,11 @@ impl AxiomAudit {
             "findings": self.findings_json(),
             "axioms": self.axioms,
         });
-        ScanReport { clean, findings, detail }
+        ScanReport {
+            clean,
+            findings,
+            detail,
+        }
     }
 
     /// Layer 2a view: an [`AxiomReport`] the Candle backend's `audit_axioms` can
@@ -381,7 +412,10 @@ fn word_positions(chars: &[char], needle: &str) -> Vec<usize> {
 
 /// 1-based line number of char index `idx`.
 fn line_of(chars: &[char], idx: usize) -> usize {
-    1 + chars[..idx.min(chars.len())].iter().filter(|&&c| c == '\n').count()
+    1 + chars[..idx.min(chars.len())]
+        .iter()
+        .filter(|&&c| c == '\n')
+        .count()
 }
 
 /// The `let NAME =` bound directly before `pos` within the same `;;`-terminated
@@ -512,7 +546,11 @@ let MYADD = new_definition `myadd x y = x + y`;;
 let ID_DEF = new_definition `(myid:'a->'a) = \\x. x`;;
 ";
         let audit = audit_hol_light(code, &whitelist());
-        assert!(audit.is_clean(), "clean proof must pass: {:?}", audit.findings);
+        assert!(
+            audit.is_clean(),
+            "clean proof must pass: {:?}",
+            audit.findings
+        );
         assert_eq!(audit.critical_count(), 0);
         assert!(audit.into_scan_report().clean);
     }
@@ -523,10 +561,16 @@ let ID_DEF = new_definition `(myid:'a->'a) = \\x. x`;;
         let code = "let FAKE = mk_thm([], `p /\\ ~p`);;\n";
         let audit = audit_hol_light(code, &whitelist());
         assert!(!audit.is_clean());
-        assert!(audit.findings.iter().any(|f| f.rule == "mk_thm" && f.severity == Severity::Critical));
+        assert!(audit
+            .findings
+            .iter()
+            .any(|f| f.rule == "mk_thm" && f.severity == Severity::Critical));
         let report = audit.into_scan_report();
         assert!(!report.clean);
-        assert!(report.findings.iter().any(|s| s.contains("CRITICAL") && s.contains("mk_thm")));
+        assert!(report
+            .findings
+            .iter()
+            .any(|s| s.contains("CRITICAL") && s.contains("mk_thm")));
     }
 
     #[test]
@@ -548,7 +592,10 @@ let ID_DEF = new_definition `(myid:'a->'a) = \\x. x`;;
         let code = "let BAD_AX = new_axiom `!x. P x`;;\n";
         let audit = audit_hol_light(code, &whitelist());
         assert!(!audit.is_clean());
-        assert!(audit.findings.iter().any(|f| f.rule == "new_axiom" && f.severity == Severity::Critical));
+        assert!(audit
+            .findings
+            .iter()
+            .any(|f| f.rule == "new_axiom" && f.severity == Severity::Critical));
         assert!(audit.axioms.contains(&"BAD_AX".to_string()));
         // The AxiomReport view agrees: outside the whitelist.
         assert!(!audit.to_axiom_report(&whitelist()).within_whitelist);
@@ -560,7 +607,11 @@ let ID_DEF = new_definition `(myid:'a->'a) = \\x. x`;;
     fn whitelisted_axiom_is_allowed() {
         let code = "let ETA_AX = new_axiom `!t:A->B. (\\x. t x) = t`;;\n";
         let audit = audit_hol_light(code, &whitelist());
-        assert!(audit.is_clean(), "whitelisted axiom must be allowed: {:?}", audit.findings);
+        assert!(
+            audit.is_clean(),
+            "whitelisted axiom must be allowed: {:?}",
+            audit.findings
+        );
         assert!(audit.axioms.contains(&"ETA_AX".to_string()));
         assert!(audit.to_axiom_report(&whitelist()).within_whitelist);
     }
@@ -590,8 +641,14 @@ let ID_DEF = new_definition `(myid:'a->'a) = \\x. x`;;
         let audit = audit_hol_light(code, &whitelist());
         assert!(audit.is_clean(), "INST warnings must not fail the gate");
         assert!(audit.warning_count() >= 2);
-        assert!(audit.findings.iter().any(|f| f.rule == "INST_TYPE" && f.severity == Severity::Warning));
-        assert!(audit.findings.iter().any(|f| f.rule == "INST" && f.severity == Severity::Warning));
+        assert!(audit
+            .findings
+            .iter()
+            .any(|f| f.rule == "INST_TYPE" && f.severity == Severity::Warning));
+        assert!(audit
+            .findings
+            .iter()
+            .any(|f| f.rule == "INST" && f.severity == Severity::Warning));
         // Warnings still surface in the ScanReport findings but keep it clean.
         let report = audit.into_scan_report();
         assert!(report.clean);
@@ -607,7 +664,11 @@ let MSG = \"mk_thm and new_axiom in a string\";;
 let TR = TRUTH;;
 ";
         let audit = audit_hol_light(code, &whitelist());
-        assert!(audit.is_clean(), "comments/strings must not flag: {:?}", audit.findings);
+        assert!(
+            audit.is_clean(),
+            "comments/strings must not flag: {:?}",
+            audit.findings
+        );
     }
 
     /// `INST` inside `INST_TYPE` is not double-counted (whole-token matching).
@@ -615,8 +676,18 @@ let TR = TRUTH;;
     fn inst_not_matched_inside_inst_type() {
         let code = "let X = INST_TYPE [] th;;\n";
         let audit = audit_hol_light(code, &whitelist());
-        assert_eq!(audit.findings.iter().filter(|f| f.rule == "INST").count(), 0);
-        assert_eq!(audit.findings.iter().filter(|f| f.rule == "INST_TYPE").count(), 1);
+        assert_eq!(
+            audit.findings.iter().filter(|f| f.rule == "INST").count(),
+            0
+        );
+        assert_eq!(
+            audit
+                .findings
+                .iter()
+                .filter(|f| f.rule == "INST_TYPE")
+                .count(),
+            1
+        );
     }
 
     /// Deterministic: identical input yields identical findings (rules + lines).

@@ -116,9 +116,10 @@ pub fn apply_subst(subst: &Subst, term: &Term) -> Term {
             Some(v) => apply_subst(subst, v),
             None => term.clone(),
         },
-        Term::App(f, args) => {
-            Term::App(f.clone(), args.iter().map(|a| apply_subst(subst, a)).collect())
-        }
+        Term::App(f, args) => Term::App(
+            f.clone(),
+            args.iter().map(|a| apply_subst(subst, a)).collect(),
+        ),
     }
 }
 
@@ -413,7 +414,8 @@ fn kbo_var_condition(s: &Term, t: &Term) -> bool {
     let mut ct = BTreeMap::new();
     var_counts(s, &mut cs);
     var_counts(t, &mut ct);
-    ct.iter().all(|(x, &nt)| cs.get(x).copied().unwrap_or(0) >= nt)
+    ct.iter()
+        .all(|(x, &nt)| cs.get(x).copied().unwrap_or(0) >= nt)
 }
 
 /// Knuth–Bendix Order comparison (partial): `Some(Greater/Less)` when KBO-ordered,
@@ -616,9 +618,10 @@ fn replace_at(term: &Term, pos: &[usize], new: Term) -> Term {
 fn rename_term(term: &Term, suffix: &str) -> Term {
     match term {
         Term::Var(x) => Term::Var(format!("{x}{suffix}")),
-        Term::App(f, args) => {
-            Term::App(f.clone(), args.iter().map(|a| rename_term(a, suffix)).collect())
-        }
+        Term::App(f, args) => Term::App(
+            f.clone(),
+            args.iter().map(|a| rename_term(a, suffix)).collect(),
+        ),
     }
 }
 
@@ -720,13 +723,7 @@ fn add_oriented_equation(
         Some(Ordering::Greater) => Rule { lhs: l, rhs: r },
         Some(Ordering::Less) => Rule { lhs: r, rhs: l },
         Some(Ordering::Equal) => return Ok(()),
-        None => {
-            return Err(anyhow!(
-                "completion cannot orient equation: {} = {}",
-                l,
-                r
-            ))
-        }
+        None => return Err(anyhow!("completion cannot orient equation: {} = {}", l, r)),
     };
     if !rules.iter().any(|x| *x == rule) {
         rules.push(rule);
@@ -987,7 +984,7 @@ mod tests {
         let p = group_prec();
         let t = app("*", vec![c("a"), c("b")]);
         assert_eq!(lpo(&p, &t, &t), Some(Ordering::Equal)); // irreflexive: never Greater/Less
-        // Distinct ground terms are comparable (total-ish on ground terms).
+                                                            // Distinct ground terms are comparable (total-ish on ground terms).
         assert_eq!(lpo(&p, &t, &c("a")), Some(Ordering::Greater));
         assert!(lpo(&p, &t, &c("a")).is_some());
         assert!(lpo(&p, &c("a"), &c("b")).is_some());
@@ -1039,7 +1036,9 @@ mod tests {
             "completion should add f(a) -> a (got {rules:?})"
         );
         assert!(
-            rules.iter().any(|r| r.lhs == app("f", vec![c("a")]) && r.rhs == c("a")),
+            rules
+                .iter()
+                .any(|r| r.lhs == app("f", vec![c("a")]) && r.rhs == c("a")),
             "expected the derived rule f(a) -> a"
         );
 
@@ -1087,10 +1086,7 @@ mod tests {
     #[test]
     fn congruence_closure_decides_ground_equality() {
         // a=b, f(a)=c  ⊢  f(b) = c   (by congruence a~b ⇒ f(a)~f(b)).
-        let eqs = vec![
-            (c("a"), c("b")),
-            (app("f", vec![c("a")]), c("c")),
-        ];
+        let eqs = vec![(c("a"), c("b")), (app("f", vec![c("a")]), c("c"))];
         assert!(congruence_closure(&eqs, &(app("f", vec![c("b")]), c("c"))));
         // But a = c is NOT entailed.
         assert!(!congruence_closure(&eqs, &(c("a"), c("c"))));

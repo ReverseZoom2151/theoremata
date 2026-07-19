@@ -343,9 +343,7 @@ fn alpha_eq(env: &mut Vec<(Term, Term)>, s: &Term, t: &Term) -> bool {
             s == t // both free: must be identical (name + type)
         }
         (Term::Const(_, _), Term::Const(_, _)) => s == t,
-        (Term::Comb(f1, x1), Term::Comb(f2, x2)) => {
-            alpha_eq(env, f1, f2) && alpha_eq(env, x1, x2)
-        }
+        (Term::Comb(f1, x1), Term::Comb(f2, x2)) => alpha_eq(env, f1, f2) && alpha_eq(env, x1, x2),
         (Term::Abs(v1, b1), Term::Abs(v2, b2)) => {
             // Bound variables must have the same type to be alpha-equivalent.
             let types_match = match (v1.as_ref(), v2.as_ref()) {
@@ -453,11 +451,8 @@ fn vsubst_rec(ilist: &[Instantiation], tm: &Term) -> Term {
         Term::Comb(s, t) => Term::comb(vsubst_rec(ilist, s), vsubst_rec(ilist, t)),
         Term::Abs(v, body) => {
             // Substitutions targeting the bound var no longer apply inside.
-            let ilist2: Vec<Instantiation> = ilist
-                .iter()
-                .filter(|i| i.var != **v)
-                .cloned()
-                .collect();
+            let ilist2: Vec<Instantiation> =
+                ilist.iter().filter(|i| i.var != **v).cloned().collect();
             if ilist2.is_empty() {
                 return tm.clone();
             }
@@ -495,9 +490,10 @@ fn type_subst(tyin: &[TypeInstantiation], ty: &HolType) -> HolType {
             .find(|t| &t.var == n)
             .map(|t| t.ty.clone())
             .unwrap_or_else(|| ty.clone()),
-        HolType::Tyapp(n, args) => {
-            HolType::Tyapp(n.clone(), args.iter().map(|a| type_subst(tyin, a)).collect())
-        }
+        HolType::Tyapp(n, args) => HolType::Tyapp(
+            n.clone(),
+            args.iter().map(|a| type_subst(tyin, a)).collect(),
+        ),
     }
 }
 
@@ -513,11 +509,7 @@ enum Clash {
 /// each binder's pre/post-instantiation form and a [`Clash`] is raised when an
 /// instantiated variable coincides with a DIFFERENT original binder, triggering
 /// an alpha-rename of the offending binder.
-fn inst_rec(
-    env: &[(Term, Term)],
-    tyin: &[TypeInstantiation],
-    tm: &Term,
-) -> Result<Term, Clash> {
+fn inst_rec(env: &[(Term, Term)], tyin: &[TypeInstantiation], tm: &Term) -> Result<Term, Clash> {
     match tm {
         Term::Var(n, ty) => {
             let ty2 = type_subst(tyin, ty);
@@ -536,10 +528,7 @@ fn inst_rec(
             }
         }
         Term::Const(n, ty) => Ok(Term::Const(n.clone(), type_subst(tyin, ty))),
-        Term::Comb(f, x) => Ok(Term::comb(
-            inst_rec(env, tyin, f)?,
-            inst_rec(env, tyin, x)?,
-        )),
+        Term::Comb(f, x) => Ok(Term::comb(inst_rec(env, tyin, f)?, inst_rec(env, tyin, x)?)),
         Term::Abs(y, t) => {
             let y2 = inst_rec(&[], tyin, y)?;
             // (y, y2) :: env  — innermost binder first.
@@ -564,9 +553,7 @@ fn inst_rec(
                     // z keeps the ORIGINAL (un-instantiated) binder type so the
                     // rename substitution over `t` type-checks.
                     let z = match (&fresh, y.as_ref()) {
-                        (Term::Var(nm, _), Term::Var(_, oty)) => {
-                            Term::Var(nm.clone(), oty.clone())
-                        }
+                        (Term::Var(nm, _), Term::Var(_, oty)) => Term::Var(nm.clone(), oty.clone()),
                         _ => return Err(Clash::At(fresh)),
                     };
                     let renamed = vsubst_rec(
@@ -600,11 +587,7 @@ pub fn inst_type(tyin: &[TypeInstantiation], tm: &Term) -> CheckResult<Term> {
 // ===========================================================================
 
 /// Fetch a strictly-earlier premise sequent, rejecting forward/self references.
-fn premise<'a>(
-    results: &'a [Sequent],
-    idx: usize,
-    cur: usize,
-) -> CheckResult<&'a Sequent> {
+fn premise<'a>(results: &'a [Sequent], idx: usize, cur: usize) -> CheckResult<&'a Sequent> {
     if idx >= cur {
         return Err(CheckError::new(format!(
             "step {cur}: premise index {idx} is not a strictly-earlier step"
@@ -644,7 +627,10 @@ fn apply_step(step: &Step, results: &[Sequent], cur: usize) -> CheckResult<Seque
                     "MK_COMB: types do not agree (operator type {r1_ty:?}, argument type {r2_ty:?})"
                 )));
             }
-            let concl = mk_eq(&Term::comb(l1.clone(), l2.clone()), &Term::comb(r1.clone(), r2.clone()))?;
+            let concl = mk_eq(
+                &Term::comb(l1.clone(), l2.clone()),
+                &Term::comb(r1.clone(), r2.clone()),
+            )?;
             Ok(Sequent {
                 hyps: term_union(&s1.hyps, &s2.hyps),
                 concl,
@@ -827,10 +813,13 @@ mod tests {
         let x = v("x", tya());
         let f = v("f", HolType::fun(tya(), tyb()));
         let proof = Proof::new(vec![
-            Step::Refl { term: f.clone() },       // 0: |- f = f
-            Step::Refl { term: x.clone() },       // 1: |- x = x
-            Step::MkComb { left: 0, right: 1 },   // 2: |- f x = f x
-            Step::Abs { var: x.clone(), eq: 2 },  // 3: |- (\x. f x) = (\x. f x)
+            Step::Refl { term: f.clone() },     // 0: |- f = f
+            Step::Refl { term: x.clone() },     // 1: |- x = x
+            Step::MkComb { left: 0, right: 1 }, // 2: |- f x = f x
+            Step::Abs {
+                var: x.clone(),
+                eq: 2,
+            }, // 3: |- (\x. f x) = (\x. f x)
         ]);
         let seq = check_proof(&proof).unwrap();
         assert!(seq.hyps.is_empty());
@@ -846,11 +835,11 @@ mod tests {
         let p = v("p", HolType::boolean());
         let q = v("q", HolType::boolean());
         let proof = Proof::new(vec![
-            Step::Assume { term: p.clone() },       // 0: {p} |- p
-            Step::Assume { term: q.clone() },       // 1: {q} |- q
+            Step::Assume { term: p.clone() },          // 0: {p} |- p
+            Step::Assume { term: q.clone() },          // 1: {q} |- q
             Step::DeductAntisym { left: 0, right: 1 }, // 2: {p,q} |- p = q
-            Step::Assume { term: p.clone() },       // 3: {p} |- p
-            Step::EqMp { eq: 2, thm: 3 },           // 4: {p,q} |- q
+            Step::Assume { term: p.clone() },          // 3: {p} |- p
+            Step::EqMp { eq: 2, thm: 3 },              // 4: {p,q} |- q
         ]);
         let seq = check_proof(&proof).unwrap();
         assert_eq!(seq.concl, q);
@@ -908,8 +897,11 @@ mod tests {
         let x = v("x", tya());
         let y = v("y", tya());
         let proof = Proof::new(vec![
-            Step::Refl { term: x.clone() },      // 0: |- x = x
-            Step::Abs { var: y.clone(), eq: 0 }, // 1: |- (\y. x) = (\y. x)
+            Step::Refl { term: x.clone() }, // 0: |- x = x
+            Step::Abs {
+                var: y.clone(),
+                eq: 0,
+            }, // 1: |- (\y. x) = (\y. x)
             Step::Inst {
                 subst: vec![Instantiation {
                     var: x.clone(),
@@ -1006,7 +998,10 @@ mod tests {
         let y = v("y", tya());
         let proof = Proof::new(vec![
             Step::Refl { term: x.clone() },
-            Step::Abs { var: y.clone(), eq: 0 },
+            Step::Abs {
+                var: y.clone(),
+                eq: 0,
+            },
             Step::Inst {
                 subst: vec![Instantiation { var: x, term: y }],
                 thm: 1,

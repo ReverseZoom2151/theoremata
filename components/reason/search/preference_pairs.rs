@@ -205,7 +205,10 @@ pub fn path_pairs<S: Clone>(tree: &PreferenceTree<S>) -> Vec<PreferencePair<S>> 
         }
         // The winning-path child is strictly closer to the goal — corroborated by
         // remaining_distance when both are present, and always true by depth.
-        out.push(PreferencePair::new(child.state.clone(), parent.state.clone()));
+        out.push(PreferencePair::new(
+            child.state.clone(),
+            parent.state.clone(),
+        ));
     }
     out
 }

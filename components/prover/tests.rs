@@ -4,15 +4,11 @@ use crate::{
     config::Config,
     db::Store,
     prover::{
-        aristotle,
-        attempt_run,
-        external,
+        aristotle, attempt_run, external,
         formal::{FormalBackend, FormalSystem, ProofSession, SessionError},
-        isabelle,
-        lean,
+        isabelle, lean,
         model::{AttemptRunStatus, ProverJobStatus},
-        proof_job,
-        rocq,
+        proof_job, rocq,
     },
 };
 use serde_json::json;
@@ -113,7 +109,10 @@ fn rocq_submit_poll_result_mock() {
     assert_eq!(done.status, ProverJobStatus::Proved);
     let result = done.result.as_ref().unwrap();
     let code = result.formal_code.as_ref().unwrap();
-    assert!(code.contains("Qed."), "rocq mock must emit a .v proof: {code}");
+    assert!(
+        code.contains("Qed."),
+        "rocq mock must emit a .v proof: {code}"
+    );
     let v = result.verification.as_ref().unwrap();
     assert!(v.lexically_verified);
     assert!(v.axioms_clean);
@@ -147,7 +146,10 @@ fn isabelle_submit_poll_result_mock() {
     assert_eq!(done.status, ProverJobStatus::Proved);
     let result = done.result.as_ref().unwrap();
     let code = result.formal_code.as_ref().unwrap();
-    assert!(code.contains("by simp"), "isabelle mock must emit a .thy proof: {code}");
+    assert!(
+        code.contains("by simp"),
+        "isabelle mock must emit a .thy proof: {code}"
+    );
     let v = result.verification.as_ref().unwrap();
     assert!(v.lexically_verified);
     assert!(v.axioms_clean);
@@ -181,7 +183,11 @@ fn agda_and_metamath_submit_poll_result_mock() {
         let done = proof_job::poll(&store, &config, &job.id, None).unwrap();
         assert_eq!(done.status, ProverJobStatus::Proved);
         assert_eq!(done.task.system, system);
-        assert!(done.result.as_ref().and_then(|r| r.verification.as_ref()).is_some());
+        assert!(done
+            .result
+            .as_ref()
+            .and_then(|r| r.verification.as_ref())
+            .is_some());
     }
 }
 
@@ -190,7 +196,10 @@ fn isabelle_step_tactic_is_unsupported() {
     let mut backend = isabelle::IsabelleBackend::mock();
     let err = backend.step_tactic(0, "by simp").unwrap_err();
     assert!(
-        matches!(err.downcast_ref::<SessionError>(), Some(SessionError::Unsupported(_))),
+        matches!(
+            err.downcast_ref::<SessionError>(),
+            Some(SessionError::Unsupported(_))
+        ),
         "Isabelle step_tactic must return SessionError::Unsupported, got {err}"
     );
     // submit_unit IS supported and accepts the clean mock proof.
@@ -209,15 +218,28 @@ fn rocq_step_tactic_is_supported() {
 #[test]
 fn source_scan_rejects_escape_hatches() {
     let rocq_b = rocq::RocqBackend::mock();
-    assert!(!rocq_b.source_scan("Theorem t: True. Admitted.").unwrap().clean);
+    assert!(
+        !rocq_b
+            .source_scan("Theorem t: True. Admitted.")
+            .unwrap()
+            .clean
+    );
     let isa_b = isabelle::IsabelleBackend::mock();
-    assert!(!isa_b.source_scan("theorem t: \"True\" sorry").unwrap().clean);
+    assert!(
+        !isa_b
+            .source_scan("theorem t: \"True\" sorry")
+            .unwrap()
+            .clean
+    );
 }
 
 #[test]
 fn formal_system_from_str_and_display() {
     assert_eq!(FormalSystem::from_str("coq").unwrap(), FormalSystem::Rocq);
-    assert_eq!(FormalSystem::from_str("Isabelle/HOL").unwrap(), FormalSystem::Isabelle);
+    assert_eq!(
+        FormalSystem::from_str("Isabelle/HOL").unwrap(),
+        FormalSystem::Isabelle
+    );
     assert_eq!(FormalSystem::Lean.to_string(), "lean");
     assert_eq!(FormalSystem::default(), FormalSystem::Lean);
 }
@@ -339,7 +361,10 @@ fn lean_live_verifies_trivial_and_rejects_sorry() {
     let ok = backend
         .verify(&cfg, "theorem t : True := trivial\n", "theorem t : True")
         .unwrap();
-    assert!(ok.lexically_verified, "trivial Lean proof must certify: {ok:?}");
+    assert!(
+        ok.lexically_verified,
+        "trivial Lean proof must certify: {ok:?}"
+    );
     assert!(ok.axioms_clean, "trivial Lean proof is axiom-clean: {ok:?}");
 
     let bad = backend
@@ -367,7 +392,10 @@ fn rocq_live_verifies_trivial_and_rejects_admitted() {
             "Theorem t : True",
         )
         .unwrap();
-    assert!(ok.lexically_verified, "trivial Rocq proof must certify: {ok:?}");
+    assert!(
+        ok.lexically_verified,
+        "trivial Rocq proof must certify: {ok:?}"
+    );
     assert!(ok.axioms_clean, "trivial Rocq proof is axiom-clean: {ok:?}");
 
     let bad = backend
@@ -393,7 +421,11 @@ fn isabelle_live_verifies_trivial_and_rejects_sorry() {
         return;
     }
     let ok = backend
-        .verify(&cfg, "theorem t: \"True\"\n  by simp", "theorem t: \"True\"")
+        .verify(
+            &cfg,
+            "theorem t: \"True\"\n  by simp",
+            "theorem t: \"True\"",
+        )
         .unwrap();
     assert!(
         ok.lexically_verified,
@@ -401,7 +433,11 @@ fn isabelle_live_verifies_trivial_and_rejects_sorry() {
     );
 
     let bad = backend
-        .verify(&cfg, "theorem t: \"True\"\n  sorry", "theorem t: \"True\"")
+        .verify(
+            &cfg,
+            "theorem t: \"True\"\n  sorry",
+            "theorem t: \"True\"",
+        )
         .unwrap();
     assert!(
         !bad.lexically_verified,
@@ -425,7 +461,10 @@ fn agda_live_verifies_trivial_and_rejects_postulate() {
             "trivial : \u{22a4}",
         )
         .unwrap();
-    assert!(ok.lexically_verified, "trivial Agda proof must certify: {ok:?}");
+    assert!(
+        ok.lexically_verified,
+        "trivial Agda proof must certify: {ok:?}"
+    );
 
     let bad = backend
         .verify(
@@ -434,7 +473,10 @@ fn agda_live_verifies_trivial_and_rejects_postulate() {
             "bad : \u{22a4}",
         )
         .unwrap();
-    assert!(!bad.lexically_verified, "Agda postulates must be rejected: {bad:?}");
+    assert!(
+        !bad.lexically_verified,
+        "Agda postulates must be rejected: {bad:?}"
+    );
 }
 
 #[test]
@@ -460,12 +502,18 @@ fn metamath_live_verifies_trivial_and_rejects_malformed_proof() {
             "th $p |- ph $= wph id $.",
         )
         .unwrap();
-    assert!(ok.lexically_verified, "trivial Metamath proof must certify: {ok:?}");
+    assert!(
+        ok.lexically_verified,
+        "trivial Metamath proof must certify: {ok:?}"
+    );
 
     let bad = backend
         .verify(&cfg, "$c wff $.\nthis is not Metamath\n", "bad")
         .unwrap();
-    assert!(!bad.lexically_verified, "malformed Metamath must be rejected: {bad:?}");
+    assert!(
+        !bad.lexically_verified,
+        "malformed Metamath must be rejected: {bad:?}"
+    );
 }
 
 #[test]

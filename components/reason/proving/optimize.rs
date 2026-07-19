@@ -430,7 +430,13 @@ mod tests {
         let input = "by\nintro x\nintro y\nsimp\nring\nlinarith"; // 6 tactics
         let rewriter = FixedRewriter(vec!["by\nsimp\nring", "by\ntauto"]);
         let verify = accept_all();
-        let report = optimize(input, &Length, &rewriter, &*verify, OptimizeConfig::default());
+        let report = optimize(
+            input,
+            &Length,
+            &rewriter,
+            &*verify,
+            OptimizeConfig::default(),
+        );
 
         assert!(report.improved());
         // Best is the 1-tactic "by\ntauto" (score 2 counting `by`) ... actually
@@ -443,12 +449,18 @@ mod tests {
     #[test]
     fn a_failing_rewrite_is_never_returned() {
         let input = "by\nintro x\nsimp\nring\nlinarith"; // 5 tactics
-        // The SHORTEST candidate is "bad" and must be rejected by the verifier;
-        // the optimizer must fall back to the shorter *valid* one.
+                                                         // The SHORTEST candidate is "bad" and must be rejected by the verifier;
+                                                         // the optimizer must fall back to the shorter *valid* one.
         let rewriter = FixedRewriter(vec!["BAD", "by\nsimp"]);
         // Reject anything containing "BAD".
         let verify: Box<dyn Fn(&str) -> bool> = Box::new(|p: &str| !p.contains("BAD"));
-        let report = optimize(input, &Length, &rewriter, &*verify, OptimizeConfig::default());
+        let report = optimize(
+            input,
+            &Length,
+            &rewriter,
+            &*verify,
+            OptimizeConfig::default(),
+        );
 
         assert_ne!(report.optimized, "BAD");
         assert_eq!(report.optimized, "by\nsimp");
@@ -463,7 +475,13 @@ mod tests {
         let rewriter = FixedRewriter(vec!["by\ntauto", "by\ndecide"]);
         // Verifier rejects EVERY candidate; only the input is trusted.
         let verify: Box<dyn Fn(&str) -> bool> = Box::new(|p: &str| p == "by\nsimp");
-        let report = optimize(input, &Length, &rewriter, &*verify, OptimizeConfig::default());
+        let report = optimize(
+            input,
+            &Length,
+            &rewriter,
+            &*verify,
+            OptimizeConfig::default(),
+        );
 
         assert_eq!(report.optimized, input);
         assert_eq!(report.candidates_accepted, 0);
@@ -473,10 +491,16 @@ mod tests {
     #[test]
     fn no_metric_improvement_returns_original_unchanged() {
         let input = "by\nsimp"; // 2 tactics
-        // All candidates are LONGER (worse length), though verifier-valid.
+                                // All candidates are LONGER (worse length), though verifier-valid.
         let rewriter = FixedRewriter(vec!["by\nintro x\nsimp\nring", "by\nintro x\nsimp"]);
         let verify = accept_all();
-        let report = optimize(input, &Length, &rewriter, &*verify, OptimizeConfig::default());
+        let report = optimize(
+            input,
+            &Length,
+            &rewriter,
+            &*verify,
+            OptimizeConfig::default(),
+        );
 
         assert_eq!(report.optimized, input);
         assert_eq!(report.score_after, report.score_before);
@@ -506,7 +530,10 @@ mod tests {
     fn result_is_deterministic_given_seed() {
         let input = "by\nintro x";
         let rewriter = SeedSensitiveRewriter;
-        let cfg = OptimizeConfig { rounds: 2, seed: 42 };
+        let cfg = OptimizeConfig {
+            rounds: 2,
+            seed: 42,
+        };
         let a = optimize(input, &Length, &rewriter, &*accept_all(), cfg);
         let b = optimize(input, &Length, &rewriter, &*accept_all(), cfg);
         assert_eq!(a, b);
@@ -519,7 +546,13 @@ mod tests {
             "by\nhave h : a = b := rfl\nexact h", // 1/2 declarative => 0.5
             "by\ntauto",                          // 0 declarative => 1.0
         ]);
-        let report = optimize(input, &Modularity, &rewriter, &*accept_all(), OptimizeConfig::default());
+        let report = optimize(
+            input,
+            &Modularity,
+            &rewriter,
+            &*accept_all(),
+            OptimizeConfig::default(),
+        );
         assert_eq!(report.optimized, "by\nhave h : a = b := rfl\nexact h");
         assert!(report.improved());
     }
@@ -544,7 +577,10 @@ mod tests {
             &Length,
             &ShaveRewriter,
             &*accept_all(),
-            OptimizeConfig { rounds: 10, seed: 1 },
+            OptimizeConfig {
+                rounds: 10,
+                seed: 1,
+            },
         );
         // Shaved down to a single tactic; refinement chained across rounds.
         assert_eq!(report.optimized, "d");

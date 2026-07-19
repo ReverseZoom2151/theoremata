@@ -252,7 +252,11 @@ mod tests {
         fn generate(&self, informal_statement: &str, seed: u64) -> Blueprint {
             Blueprint {
                 nodes: vec![
-                    lemma("lem:easy", &format!("easy part of: {informal_statement}"), &[]),
+                    lemma(
+                        "lem:easy",
+                        &format!("easy part of: {informal_statement}"),
+                        &[],
+                    ),
                     lemma(
                         "lem:hard",
                         &format!("hard part [seed={seed}]: {informal_statement}"),
@@ -397,11 +401,19 @@ mod tests {
         assert!(sub1.is_some(), "sub-lemma 1 was inserted");
         assert_eq!(sub2.unwrap().statement_uses, vec!["lem:hard-sub1"]);
         // The failed lemma now \uses its sub-lemmas.
-        let hard = refined.nodes.iter().find(|n| n.label == "lem:hard").unwrap();
+        let hard = refined
+            .nodes
+            .iter()
+            .find(|n| n.label == "lem:hard")
+            .unwrap();
         assert_eq!(hard.proof_uses, vec!["lem:hard-sub1", "lem:hard-sub2"]);
         // The already-PROVED item is preserved verbatim.
         let easy_before = bp.nodes.iter().find(|n| n.label == "lem:easy").unwrap();
-        let easy_after = refined.nodes.iter().find(|n| n.label == "lem:easy").unwrap();
+        let easy_after = refined
+            .nodes
+            .iter()
+            .find(|n| n.label == "lem:easy")
+            .unwrap();
         assert_eq!(easy_before, easy_after, "proved item preserved intact");
         // The refined blueprint is still acyclic / drivable.
         assert!(is_acyclic(&refined));
@@ -422,7 +434,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(result.rounds.len() >= 2, "at least an initial + refined round");
+        assert!(
+            result.rounds.len() >= 2,
+            "at least an initial + refined round"
+        );
         let cov1 = result.rounds[0].report.coverage;
         let cov2 = result.rounds[1].report.coverage;
         // Round 1: lem:hard fails, thm:main skipped -> 1/3 covered.
@@ -521,8 +536,14 @@ mod tests {
             max_rounds: 0,
             seed: 0,
         };
-        let result =
-            plan_and_prove("stmt", &MockGenerator, &NoOpRefiner, &HardNeedsSupport, &cfg).unwrap();
+        let result = plan_and_prove(
+            "stmt",
+            &MockGenerator,
+            &NoOpRefiner,
+            &HardNeedsSupport,
+            &cfg,
+        )
+        .unwrap();
         // Never loops forever: at least the generated plan is driven exactly once.
         assert_eq!(result.rounds.len(), 1);
         assert_eq!(result.final_blueprint.nodes.len(), 3);

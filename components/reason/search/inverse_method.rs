@@ -294,7 +294,13 @@ impl Engine {
     /// Attempt to add a clause, enforcing forward + backward subsumption. Returns
     /// the new arena index, or `None` if the clause was redundant (dropped) or the
     /// store is full. Also records goal closure when the clause subsumes the goal.
-    fn add(&mut self, clause: Clause, rule: &str, parents: Vec<usize>, is_axiom: bool) -> Option<usize> {
+    fn add(
+        &mut self,
+        clause: Clause,
+        rule: &str,
+        parents: Vec<usize>,
+        is_axiom: bool,
+    ) -> Option<usize> {
         // Exact-duplicate guard: an α/order-equal live clause already present.
         if self
             .arena
@@ -357,7 +363,9 @@ impl Engine {
             }
             let better = match best {
                 None => true,
-                Some((_, b)) => order_key(&self.arena[idx].clause) < order_key(&self.arena[b].clause),
+                Some((_, b)) => {
+                    order_key(&self.arena[idx].clause) < order_key(&self.arena[b].clause)
+                }
             };
             if better {
                 best = Some((pos, idx));
@@ -737,8 +745,18 @@ mod tests {
         };
         let axioms = [Clause::parse("⊢ a")];
         let goal = Clause::parse("⊢ goal");
-        let r1 = saturate(&axioms, &goal, &build(), &SaturationConfig { seed: 1, ..cfg() });
-        let r2 = saturate(&axioms, &goal, &build(), &SaturationConfig { seed: 999, ..cfg() });
+        let r1 = saturate(
+            &axioms,
+            &goal,
+            &build(),
+            &SaturationConfig { seed: 1, ..cfg() },
+        );
+        let r2 = saturate(
+            &axioms,
+            &goal,
+            &build(),
+            &SaturationConfig { seed: 999, ..cfg() },
+        );
         // Deterministic regardless of seed: identical everything.
         assert_eq!(r1.proved, r2.proved);
         assert_eq!(r1.steps, r2.steps);

@@ -209,7 +209,14 @@ pub fn project_dag_to_tree(dag: &DagView) -> SearchTree {
         return tree;
     }
     let mut on_path = vec![false; dag.nodes.len()];
-    unroll(dag, dag.root, None, MAX_UNROLL_DEPTH, &mut on_path, &mut tree);
+    unroll(
+        dag,
+        dag.root,
+        None,
+        MAX_UNROLL_DEPTH,
+        &mut on_path,
+        &mut tree,
+    );
     tree
 }
 
@@ -325,7 +332,11 @@ mod tests {
     fn chain_view() -> DagView {
         let mut v = DagView::new();
         // Push closed leaf first so indices are stable, then wire parents by index.
-        let g0 = v.push(DagViewNode::closed("g0").with_stats(1, 1.0).with_progress(1.0));
+        let g0 = v.push(
+            DagViewNode::closed("g0")
+                .with_stats(1, 1.0)
+                .with_progress(1.0),
+        );
         let g1 = v.push(
             DagViewNode::open("g1")
                 .with_stats(2, 2.0)
@@ -378,8 +389,7 @@ mod tests {
         assert_eq!(edges, 3, "a 4-node tree has exactly 3 edges");
 
         // Exactly one terminal leaf (the closed g0), carrying a +1 gate verdict.
-        let terminals: Vec<&TreeNode> =
-            tree.nodes().iter().filter(|n| n.is_terminal()).collect();
+        let terminals: Vec<&TreeNode> = tree.nodes().iter().filter(|n| n.is_terminal()).collect();
         assert_eq!(terminals.len(), 1);
         assert_eq!(terminals[0].terminal, Some(REWARD_PASS));
 
@@ -387,7 +397,10 @@ mod tests {
         // sense here it IS visited, so mean = value_sum/visits = 4/4 = 1.0... use
         // the leaf, which is closed with progress 1.0 and mean 1.0).
         let root = tree.node(0);
-        assert!((root.value_estimate - 1.0).abs() < 1e-12, "g3 mean = 4/4 = 1.0");
+        assert!(
+            (root.value_estimate - 1.0).abs() < 1e-12,
+            "g3 mean = 4/4 = 1.0"
+        );
     }
 
     #[test]
@@ -456,7 +469,11 @@ mod tests {
 
         // One passing simulation flows through the whole chain, so every node's
         // backed-up Q is +1 and the root records exactly one visit.
-        assert_eq!(tree.node(0).visits, 1, "one terminal simulation reaches root");
+        assert_eq!(
+            tree.node(0).visits,
+            1,
+            "one terminal simulation reaches root"
+        );
         assert!((tree.q(0) - 1.0).abs() < 1e-12);
 
         // q_targets emits a label at each internal step-final node (g1, g2, g3 —
@@ -466,7 +483,10 @@ mod tests {
         let targets = q_targets(&tree);
         assert!(!targets.is_empty(), "projected tree yields process targets");
         for t in &targets {
-            assert!((t.q - 1.0).abs() < 1e-12, "every step on the winning path scores +1");
+            assert!(
+                (t.q - 1.0).abs() < 1e-12,
+                "every step on the winning path scores +1"
+            );
         }
     }
 
@@ -495,7 +515,11 @@ mod tests {
 
         // Highest value_estimate is B (0.9) at tree id 2.
         let top = step_beam_select(&frontier, 1);
-        assert_eq!(top, vec![2], "beam must pick the highest-value frontier node (B)");
+        assert_eq!(
+            top,
+            vec![2],
+            "beam must pick the highest-value frontier node (B)"
+        );
         assert!((tree.node(2).value_estimate - 0.9).abs() < 1e-12);
 
         // Full ranking is B(0.9) > C(0.5) > A(0.2).
@@ -510,7 +534,11 @@ mod tests {
         let dag = chain_view();
         let nodes = project_dag_nodes(&dag);
         // The only leaf (no children) is the closed g0 at index 0.
-        let leaves: Vec<TreeNode> = nodes.iter().filter(|n| n.children.is_empty()).cloned().collect();
+        let leaves: Vec<TreeNode> = nodes
+            .iter()
+            .filter(|n| n.children.is_empty())
+            .cloned()
+            .collect();
         assert_eq!(leaves.len(), 1);
         let top = step_beam_select(&leaves, 4);
         assert_eq!(top, vec![0]);
@@ -544,14 +572,30 @@ mod tests {
         v.nodes.push(DagViewNode::open("A")); // 0
         v.nodes.push(DagViewNode::open("B")); // 1
         v.nodes.push(DagViewNode::open("C")); // 2
-        v.nodes[0].edges.push(DagViewEdge { tactic: "ab".into(), prior: 1.0, child: 1 });
-        v.nodes[1].edges.push(DagViewEdge { tactic: "bc".into(), prior: 1.0, child: 2 });
-        v.nodes[2].edges.push(DagViewEdge { tactic: "ca".into(), prior: 1.0, child: 0 }); // cycle
+        v.nodes[0].edges.push(DagViewEdge {
+            tactic: "ab".into(),
+            prior: 1.0,
+            child: 1,
+        });
+        v.nodes[1].edges.push(DagViewEdge {
+            tactic: "bc".into(),
+            prior: 1.0,
+            child: 2,
+        });
+        v.nodes[2].edges.push(DagViewEdge {
+            tactic: "ca".into(),
+            prior: 1.0,
+            child: 0,
+        }); // cycle
         v.root = 0;
 
         let tree = project_dag_to_tree(&v);
         // A -> B -> C, then C's back-edge to A is skipped (A is on the path).
-        assert_eq!(tree.nodes().len(), 3, "the cycle is broken, not unrolled forever");
+        assert_eq!(
+            tree.nodes().len(),
+            3,
+            "the cycle is broken, not unrolled forever"
+        );
     }
 
     #[test]
