@@ -483,6 +483,231 @@ pub fn refute(clauses: &[Clause], max_bound: usize) -> Option<Proof> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// CLI entry point
+// ---------------------------------------------------------------------------
+
+/// Parse a single clause from surface text into a [`Clause`].
+///
+/// Grammar (deliberately tiny, since a CLI can only pass strings and
+/// [`super::rewriting`] ships no parser):
+///
+/// * a clause is literals separated by `|`;
+/// * a literal is an optional `~` (or `¬`) sign then an atom;
+/// * an atom is `symbol` or `symbol(arg, arg, ...)` where each arg is a term;
+/// * a term whose symbol starts with `?` is a **variable** (`?x`), every other
+///   symbol is a function / constant.
+///
+/// The `?` convention is needed because the predicate symbols in the intended
+/// use are themselves capitalised, so the usual "uppercase means variable" rule
+/// would be ambiguous. Whitespace is insignificant.
+pub fn parse_clause(text: &str) -> anyhow::Result<Clause> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("empty clause text");
+    }
+    let mut literals = Vec::new();
+    for part in split_top_level(trimmed, '|') {
+        let part = part.trim();
+        if part.is_empty() {
+            anyhow::bail!("empty literal in clause: {text}");
+        }
+        let (negated, rest) = match part.strip_prefix('~').or_else(|| part.strip_prefix('¬')) {
+            Some(r) => (true, r.trim()),
+            None => (false, part),
+        };
+        let atom = parse_term(rest)?;
+        literals.push(Literal { negated, atom });
+    }
+    Ok(Clause::new(literals))
+}
+
+/// Parse one term. `symbol` alone is a constant (or a variable if `?`-prefixed);
+/// `symbol(a, b)` is an application.
+fn parse_term(text: &str) -> anyhow::Result<Term> {
+    let t = text.trim();
+    if t.is_empty() {
+        anyhow::bail!("empty term");
+    }
+    match t.find('(') {
+        None => {
+            if !t.ends_with(')') && t.contains(')') {
+                anyhow::bail!("unbalanced parentheses in term: {t}");
+            }
+            match t.strip_prefix('?') {
+                Some(v) if !v.is_empty() => Ok(Term::var(v)),
+                Some(_) => anyhow::bail!("variable `?` has no name: {t}"),
+                None => Ok(Term::constant(t)),
+            }
+        }
+        Some(open) => {
+            let sym = t[..open].trim();
+            if sym.is_empty() {
+                anyhow::bail!("application has no head symbol: {t}");
+            }
+            if sym.starts_with('?') {
+                anyhow::bail!("a variable cannot take arguments: {t}");
+            }
+            let inner = t
+                .strip_suffix(')')
+                .and_then(|s| s.get(open + 1..))
+                .ok_or_else(|| anyhow::anyhow!("unbalanced parentheses in term: {t}"))?;
+            let mut args = Vec::new();
+            for a in split_top_level(inner, ',') {
+                if a.trim().is_empty() {
+                    anyhow::bail!("empty argument in term: {t}");
+                }
+                args.push(parse_term(a)?);
+            }
+            Ok(Term::app(sym, args))
+        }
+    }
+}
+
+/// Split `s` on `sep`, but only at parenthesis depth zero, so nested argument
+/// lists stay intact.
+fn split_top_level(s: &str, sep: char) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    for ch in s.chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                cur.push(ch);
+            }
+            ')' => {
+                depth -= 1;
+                cur.push(ch);
+            }
+            c if c == sep && depth == 0 => {
+                out.push(std::mem::take(&mut cur));
+            }
+            _ => cur.push(ch),
+        }
+    }
+    out.push(cur);
+    out
+}
+
+/// The JSON summary of a refutation search.
+///
+/// A refutation found by this procedure is a *search outcome*: it must be
+/// re-checked by a formal-system backend before anything is relied on, so
+/// `verified` is always `false` and `needs_verification` always `true`. A run
+/// that finds nothing is emphatically not a satisfiability proof.
+#[derive(Debug, serde::Serialize)]
+pub struct RefutationSummary {
+    pub project_id: String,
+    pub node_id: String,
+    pub evidence_id: String,
+    pub clause_count: usize,
+    /// A closed tableau was found within `max_bound`. A search hit, not a checked
+    /// proof.
+    pub refuted: bool,
+    /// Always `false`: no formal system checked this derivation.
+    pub verified: bool,
+    /// Always `true`.
+    pub needs_verification: bool,
+    /// The extension-depth bound the refutation was found at, if any.
+    pub depth: Option<usize>,
+    /// The iterative-deepening ceiling the search was run to.
+    pub max_bound: usize,
+    /// The reconstructed inference steps when `refuted`. Unchecked.
+    pub steps: Vec<String>,
+    pub caveats: Vec<String>,
+}
+
+/// Search for a refutation of an (allegedly unsatisfiable) clause set and record
+/// the outcome as node evidence.
+///
+/// Thin adapter over [`refute`]: it parses each clause from text, calls the
+/// iterative-deepening search unchanged, and reports the result. It never sets a
+/// node status, because a refutation found by proof search is not a
+/// formal-system verification and the status field is reserved for those.
+pub fn refute_clauses(
+    store: &crate::db::Store,
+    project_id: &str,
+    node_id: &str,
+    clause_texts: &[String],
+    max_bound: usize,
+) -> anyhow::Result<RefutationSummary> {
+    let clauses: Vec<Clause> = clause_texts
+        .iter()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .map(parse_clause)
+        .collect::<anyhow::Result<_>>()?;
+    if clauses.is_empty() {
+        anyhow::bail!("no clauses to refute");
+    }
+
+    let proof = refute(&clauses, max_bound);
+    let refuted = proof.is_some();
+
+    let mut caveats = vec![
+        "search outcome only: no formal system checked this refutation".to_string(),
+        "a found refutation is sound only if the input clauses faithfully encode \
+         the intended problem, which this adapter does not check"
+            .to_string(),
+    ];
+    if !refuted {
+        caveats.push(format!(
+            "no refutation within the depth bound ({max_bound}); this is NOT a proof \
+             that the clause set is satisfiable, only that none was found this shallow"
+        ));
+        // The ground-lemma cache is exact only for Horn / reduction-free refutations
+        // (see the module docs), so a miss on a richer clause set is not conclusive
+        // even setting the bound aside.
+        caveats.push(
+            "the lemma cache is exact only for Horn / reduction-free fragments, so a \
+             miss on a non-Horn set is not conclusive"
+                .to_string(),
+        );
+    }
+
+    let steps: Vec<String> = proof
+        .as_ref()
+        .map(|p| p.steps.iter().map(|s| s.to_string()).collect())
+        .unwrap_or_default();
+    let depth = proof.as_ref().map(|p| p.depth);
+
+    let payload = serde_json::json!({
+        "clause_count": clauses.len(),
+        "refuted": refuted,
+        "verified": false,
+        "needs_verification": true,
+        "depth": depth,
+        "max_bound": max_bound,
+        "steps": steps,
+        "caveats": caveats,
+    });
+    // "unverified" even on a hit: an evidence scan must never read a refutation
+    // search as a pass.
+    let evidence_id = store.add_evidence(
+        project_id,
+        node_id,
+        "model_elimination_refutation",
+        "model_elimination",
+        "unverified",
+        payload,
+    )?;
+
+    Ok(RefutationSummary {
+        project_id: project_id.to_string(),
+        node_id: node_id.to_string(),
+        evidence_id,
+        clause_count: clauses.len(),
+        refuted,
+        verified: false,
+        needs_verification: true,
+        depth,
+        max_bound,
+        steps,
+        caveats,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,5 +866,107 @@ mod tests {
         let clauses = pq_clauses();
         let goal = [pos1("R", c("a"))];
         assert!(prove(&clauses, &goal, 4).is_none());
+    }
+
+    // ---- entry point ----
+
+    use crate::db::Store;
+    use crate::model::{NodeKind, NodeTier};
+    use std::path::Path;
+
+    fn fixture() -> (Store, String, String) {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "a toy claim").unwrap();
+        let node = store
+            .add_node_detailed(
+                &project.id,
+                NodeKind::Conjecture,
+                NodeTier::Spine,
+                None,
+                "target",
+                "goal",
+                None,
+                &[],
+                "test",
+            )
+            .unwrap();
+        (store, project.id, node.id)
+    }
+
+    #[test]
+    fn parse_clause_reads_signs_variables_and_nesting() {
+        // Predicate P over a nested function term with one variable arg.
+        let cl = parse_clause("~P(f(?x, a))").unwrap();
+        assert_eq!(cl.literals.len(), 1);
+        let lit = &cl.literals[0];
+        assert!(lit.negated);
+        assert_eq!(
+            lit.atom,
+            app("P", vec![app("f", vec![v("x"), c("a")])])
+        );
+
+        // A disjunction with a `?`-variable and an ASCII constant.
+        let cl2 = parse_clause("~P(?x) | Q(?x)").unwrap();
+        assert_eq!(cl2, Clause::new(vec![neg1("P", v("x")), pos1("Q", v("x"))]));
+
+        assert!(parse_clause("").is_err());
+        assert!(parse_clause("P(a").is_err());
+        assert!(parse_clause("?x(a)").is_err());
+    }
+
+    #[test]
+    fn entry_point_records_a_refutation_as_unverified() {
+        let (store, project, node) = fixture();
+        // The classic { P(a) }, { ¬P(x) ∨ Q(x) }, { ¬Q(a) }.
+        let clauses = vec![
+            "P(a)".to_string(),
+            "~P(?x) | Q(?x)".to_string(),
+            "~Q(a)".to_string(),
+        ];
+        let summary = refute_clauses(&store, &project, &node, &clauses, 5).unwrap();
+        assert!(summary.refuted);
+        assert!(!summary.verified);
+        assert!(summary.needs_verification);
+        assert!(summary.depth.is_some());
+        assert!(!summary.steps.is_empty());
+
+        let evidence = store.evidence(&project, &node).unwrap();
+        let row = evidence
+            .iter()
+            .find(|e| e.evidence_type == "model_elimination_refutation")
+            .expect("the run must be recorded");
+        assert_eq!(row.verdict, "unverified");
+        assert_eq!(row.payload["verified"], serde_json::json!(false));
+        assert_eq!(row.payload["needs_verification"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn entry_point_marks_a_miss_as_inconclusive_not_satisfiable() {
+        let (store, project, node) = fixture();
+        // A consistent set: no refutation exists, so the search finds nothing.
+        let clauses = vec!["P(a)".to_string(), "Q(b)".to_string()];
+        let summary = refute_clauses(&store, &project, &node, &clauses, 4).unwrap();
+        assert!(!summary.refuted);
+        assert!(summary.depth.is_none());
+        assert!(summary.steps.is_empty());
+        // Must not be dressed up as a satisfiability proof.
+        assert!(summary
+            .caveats
+            .iter()
+            .any(|c| c.contains("NOT a proof")));
+    }
+
+    #[test]
+    fn entry_point_rejects_empty_or_malformed_input() {
+        let (store, project, node) = fixture();
+        assert!(refute_clauses(&store, &project, &node, &[], 3).is_err());
+        assert!(refute_clauses(
+            &store,
+            &project,
+            &node,
+            &["P(a".to_string()],
+            3
+        )
+        .is_err());
     }
 }
