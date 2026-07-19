@@ -839,6 +839,17 @@ fn block_closer(c: char, next: Option<char>) -> Option<(char, char)> {
 /// `#` is intentionally left untouched (too ambiguous). Conservative bias: when
 /// a delimiter is ambiguous we strip, which only makes the caller stricter.
 ///
+/// **Agda pragma exemption.** `{-# ... #-}` is NOT a comment — it is a pragma,
+/// and Agda acts on it (`{-# OPTIONS --allow-unsolved-metas #-}` disables the
+/// unsolved-meta check; `{-# COMPILED ... #-}` escapes Agda's semantics into
+/// foreign code). Blanket-stripping it would blind the very checks the offline
+/// source scan exists to run, so a well-formed pragma is copied through
+/// VERBATIM — including any `--` inside it, which is an OPTIONS flag and not a
+/// line comment. Only a pragma opener with no matching `#-}` falls back to
+/// being treated as an ordinary `{- -}` block comment (strip-on-ambiguity).
+/// Nothing here affects Lean (`/- -/`, `--`), Rocq/Isabelle/HOL (`(* *)`) or
+/// Metamath (`$( $)`): none of them can produce a `{-#` opener.
+///
 /// Operates on a `Vec<char>` and only ever compares against ASCII delimiter
 /// chars, so it is panic-free on arbitrary UTF-8 (multi-byte chars simply never
 /// match a delimiter and are copied through unchanged).
@@ -887,6 +898,18 @@ pub(crate) fn strip_comments(code: &str) -> String {
             i += 1;
             continue;
         }
+        // Agda pragma `{-# ... #-}`: not a comment. Copy it through verbatim
+        // when it is properly closed; otherwise fall through and treat it as a
+        // `{- -}` block comment (conservative bias).
+        if c == '{' && next == Some('-') && chars.get(i + 2) == Some(&'#') {
+            if let Some(end) = pragma_end(&chars, i + 3) {
+                for &pc in &chars[i..end] {
+                    out.push(pc);
+                }
+                i = end;
+                continue;
+            }
+        }
         if let Some(close) = block_closer(c, next) {
             stack.push(close);
             out.push(' ');
@@ -905,6 +928,22 @@ pub(crate) fn strip_comments(code: &str) -> String {
         i += 1;
     }
     out
+}
+
+/// Index just past the `#-}` closing an Agda pragma whose body starts at
+/// `from`, or `None` if the pragma is never closed. Pure lookahead: it consumes
+/// nothing, so an unclosed opener stays ambiguous and [`strip_comments`] falls
+/// back to stripping it. ASCII-only comparisons, so panic-free on arbitrary
+/// UTF-8.
+fn pragma_end(chars: &[char], from: usize) -> Option<usize> {
+    let mut j = from;
+    while j + 2 < chars.len() {
+        if chars[j] == '#' && chars[j + 1] == '-' && chars[j + 2] == '}' {
+            return Some(j + 3);
+        }
+        j += 1;
+    }
+    None
 }
 
 /// Cheap lexical "the code is about this statement" check: the statement's
@@ -1688,6 +1727,40 @@ theorem phi3 (hG : Glaisher3) : True := trivial
         assert!(!a.contains("café"));
         // Length in chars is preserved (every stripped char -> one space).
         assert_eq!(a.chars().count(), code.chars().count());
+    }
+
+    #[test]
+    fn strip_comments_preserves_agda_pragmas_but_not_agda_comments() {
+        let code = "{-# OPTIONS --allow-unsolved-metas #-}\n\
+                    {- postulate absurd : ⊥ -}\n\
+                    {-# COMPILED foo bar #-}\n\
+                    postulate real : Set\n";
+        let out = strip_comments(code);
+        // Pragmas survive verbatim — including the `--` OPTIONS flag, which is
+        // not a line comment inside `{-# ... #-}`.
+        assert!(out.contains("{-# OPTIONS --allow-unsolved-metas #-}"));
+        assert!(out.contains("{-# COMPILED foo bar #-}"));
+        // A genuine `{- ... -}` comment is still removed.
+        assert!(!out.contains("absurd"));
+        // Real code outside any comment survives.
+        assert!(out.contains("postulate real"));
+        // Char count preserved, so line numbers stay accurate.
+        assert_eq!(out.chars().count(), code.chars().count());
+        assert_eq!(out.lines().count(), code.lines().count());
+        // An UNCLOSED pragma opener stays ambiguous and is stripped (the
+        // conservative direction: it can only make a caller stricter).
+        let unclosed = strip_comments("{-# OPTIONS sorry\n");
+        assert!(!unclosed.contains("OPTIONS"));
+    }
+
+    #[test]
+    fn strip_comments_pragma_exemption_does_not_affect_other_systems() {
+        // Lean `/- -/` and `--`, Rocq/Isabelle `(* *)`, Metamath `$( $)` are all
+        // untouched by the `{-#` exemption: none of them can open one.
+        assert!(!strip_comments("/- sorry -/\nexact h\n").contains("sorry"));
+        assert!(!strip_comments("(* admit *)\nQed.\n").contains("admit"));
+        assert!(!strip_comments("$( $a bad $)\nfoo $p\n").contains("bad"));
+        assert!(!strip_comments("theorem t := by -- sorry\n  rfl\n").contains("sorry"));
     }
 
     #[test]
