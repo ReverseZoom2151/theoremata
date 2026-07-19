@@ -41,7 +41,8 @@
 //! * Canonicalisation is purely structural over `T`'s [`Ord`]: it knows nothing of
 //!   the state's meaning beyond the transformations and ordering you give it.
 
-use std::collections::BTreeSet;
+use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Safety cap on the number of distinct states enumerated while closing an orbit,
 /// so a mis-specified non-finite generator cannot loop forever. Finite symmetry
@@ -211,6 +212,185 @@ impl<T: Ord + Clone> OrbitDedup<T> {
     }
 }
 
+/// How [`dedup_candidates`] decides two candidates are "the same".
+///
+/// Recorded verbatim in every [`DedupReport`] so a consumer of the JSON never has
+/// to guess whether the merge was decided or asserted.
+pub const EQUIVALENCE_KIND: &str =
+    "orbit under caller-supplied generators; generators are asserted by the caller, not verified";
+
+/// Why a candidate was set aside by [`dedup_candidates`].
+pub const DROP_REASON: &str = "shares an orbit key with an earlier candidate";
+
+/// One candidate that survived dedup, with the input position it came from.
+#[derive(Debug, Clone)]
+pub struct KeptCandidate<C> {
+    /// Position in the input slice, so the original order can be rebuilt.
+    pub index: usize,
+    /// The candidate itself, untouched.
+    pub candidate: C,
+}
+
+/// One candidate that was set aside, kept whole so a later stage can put it back.
+#[derive(Debug, Clone)]
+pub struct DroppedCandidate<C> {
+    /// Position in the input slice.
+    pub index: usize,
+    /// The candidate itself. Dedup never destroys a candidate, it only moves it
+    /// off the hot path, because the orbit equivalence is asserted rather than
+    /// decided and the dropped member may be the one that would have verified.
+    pub candidate: C,
+    /// Index of the surviving candidate this one collapsed onto.
+    pub kept_index: usize,
+}
+
+/// JSON-able record of a single drop, for the run log.
+#[derive(Debug, Clone, Serialize)]
+pub struct DroppedRecord {
+    /// Position of the dropped candidate in the input.
+    pub index: usize,
+    /// Caller-supplied label of the dropped candidate.
+    pub label: String,
+    /// Position of the survivor it collapsed onto.
+    pub kept_index: usize,
+    /// Caller-supplied label of that survivor.
+    pub kept_label: String,
+    /// Debug rendering of the shared canonical (orbit-minimal) key.
+    pub orbit_key: String,
+    /// Always [`DROP_REASON`]; carried explicitly so the log is self-describing.
+    pub reason: &'static str,
+}
+
+/// JSON-able summary of one dedup pass.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DedupReport {
+    /// Candidates handed in.
+    pub input_count: usize,
+    /// Candidates still on the hot path.
+    pub kept_count: usize,
+    /// Candidates set aside (recoverable, see [`DedupOutcome::restore_all`]).
+    pub dropped_count: usize,
+    /// Size of the generator set the merge was computed against.
+    pub generator_count: usize,
+    /// See [`EQUIVALENCE_KIND`].
+    pub equivalence: String,
+    /// Always `false`: nothing here proves the supplied generators really are
+    /// symmetries of the problem, so a merge is never a verified equivalence.
+    pub equivalence_verified: bool,
+    /// Every drop, so a later stage can recover a candidate without re-running.
+    pub dropped: Vec<DroppedRecord>,
+}
+
+/// Result of [`dedup_candidates`]: the reduced set, the set-aside candidates, and
+/// a JSON-able summary.
+#[derive(Debug, Clone)]
+pub struct DedupOutcome<C> {
+    /// Survivors, in input order, one per orbit.
+    pub kept: Vec<KeptCandidate<C>>,
+    /// Set-aside candidates, in input order. Never discarded.
+    pub dropped: Vec<DroppedCandidate<C>>,
+    /// Summary suitable for the run log.
+    pub report: DedupReport,
+}
+
+impl<C> DedupOutcome<C> {
+    /// The survivors alone, in input order, for feeding the checker.
+    pub fn into_kept(self) -> Vec<C> {
+        self.kept.into_iter().map(|k| k.candidate).collect()
+    }
+
+    /// Undo the dedup: every input candidate back in its original order. The
+    /// escape hatch for when the kept members all fail and a dropped one may
+    /// still verify (which is possible whenever a generator was wrong).
+    pub fn restore_all(self) -> Vec<C> {
+        let mut slots: Vec<Option<C>> = (0..self.kept.len() + self.dropped.len())
+            .map(|_| None)
+            .collect();
+        for k in self.kept {
+            slots[k.index] = Some(k.candidate);
+        }
+        for d in self.dropped {
+            slots[d.index] = Some(d.candidate);
+        }
+        slots.into_iter().flatten().collect()
+    }
+}
+
+/// Collapse a candidate set to one member per orbit, before the expensive checker
+/// call.
+///
+/// `key_of` projects a candidate onto the state type the `group` acts on, and
+/// `label_of` names it for the log. The first candidate of each orbit (in input
+/// order) survives; later members of that orbit are moved to
+/// [`DedupOutcome::dropped`], never deleted.
+///
+/// ## Why nothing is discarded
+///
+/// The equivalence here is "same orbit under the generators you supplied". The
+/// module can close those generators under composition and pick a canonical
+/// representative exactly, but it has no way to check that a generator really is a
+/// symmetry of the theorem at hand. If a generator is wrong (two variables that
+/// are not in fact interchangeable, a reflection the statement is not invariant
+/// under), two genuinely different candidates get the same key and the one that
+/// would have verified can be the one merged away. A missing generator is the safe
+/// direction: it only costs redundant work. So drops are recorded in full and are
+/// reversible via [`DedupOutcome::restore_all`].
+pub fn dedup_candidates<C, T>(
+    candidates: Vec<C>,
+    group: &SymmetryGroup<T>,
+    key_of: impl Fn(&C) -> T,
+    label_of: impl Fn(&C) -> String,
+) -> DedupOutcome<C>
+where
+    T: Ord + Clone + std::fmt::Debug,
+{
+    let mut report = DedupReport {
+        input_count: candidates.len(),
+        generator_count: group.generator_count(),
+        equivalence: EQUIVALENCE_KIND.to_string(),
+        equivalence_verified: false,
+        ..Default::default()
+    };
+    let mut kept = Vec::new();
+    let mut dropped = Vec::new();
+    // Canonical key -> (input index, label) of the orbit's first-seen survivor.
+    let mut seen: BTreeMap<CanonKey<T>, (usize, String)> = BTreeMap::new();
+
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        let key = canonical_key(&key_of(&candidate), group);
+        let label = label_of(&candidate);
+        match seen.get(&key) {
+            Some((kept_index, kept_label)) => {
+                report.dropped.push(DroppedRecord {
+                    index,
+                    label,
+                    kept_index: *kept_index,
+                    kept_label: kept_label.clone(),
+                    orbit_key: format!("{:?}", key.get()),
+                    reason: DROP_REASON,
+                });
+                dropped.push(DroppedCandidate {
+                    index,
+                    candidate,
+                    kept_index: *kept_index,
+                });
+            }
+            None => {
+                seen.insert(key, (index, label));
+                kept.push(KeptCandidate { index, candidate });
+            }
+        }
+    }
+
+    report.kept_count = kept.len();
+    report.dropped_count = dropped.len();
+    DedupOutcome {
+        kept,
+        dropped,
+        report,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,5 +539,96 @@ mod tests {
         assert_eq!(from_a, from_b);
         // And its minimum (the canonical key) is stable.
         assert_eq!(from_a.iter().next(), Some(&vec![1, 2, 3]));
+    }
+
+    /// A pipeline candidate: a name plus the state the symmetry group acts on.
+    type Cand = (&'static str, (i32, i32));
+
+    fn run(candidates: Vec<Cand>) -> DedupOutcome<Cand> {
+        dedup_candidates(
+            candidates,
+            &swap_pair(),
+            |c: &Cand| c.1,
+            |c: &Cand| c.0.to_string(),
+        )
+    }
+
+    #[test]
+    fn dedup_keeps_first_of_each_orbit_and_sets_aside_the_rest() {
+        let out = run(vec![
+            ("a", (2, 1)),
+            ("b", (1, 2)), // swap of a
+            ("c", (1, 3)), // different orbit
+            ("d", (3, 1)), // swap of c
+        ]);
+
+        let kept: Vec<&str> = out.kept.iter().map(|k| k.candidate.0).collect();
+        assert_eq!(kept, vec!["a", "c"], "first member of each orbit survives");
+        assert_eq!(out.report.kept_count, 2);
+        assert_eq!(out.report.dropped_count, 2);
+        assert_eq!(out.report.input_count, 4);
+        assert_eq!(out.report.generator_count, 1);
+    }
+
+    #[test]
+    fn every_drop_is_recorded_with_the_survivor_it_merged_into() {
+        let out = run(vec![("a", (2, 1)), ("b", (1, 2))]);
+
+        assert_eq!(out.report.dropped.len(), 1);
+        let rec = &out.report.dropped[0];
+        assert_eq!(rec.label, "b");
+        assert_eq!(rec.index, 1);
+        assert_eq!(rec.kept_label, "a");
+        assert_eq!(rec.kept_index, 0);
+        assert_eq!(rec.reason, DROP_REASON);
+        assert_eq!(rec.orbit_key, format!("{:?}", (1, 2)));
+        // The dropped candidate itself is still in hand, not deleted.
+        assert_eq!(out.dropped[0].candidate.0, "b");
+        assert_eq!(out.dropped[0].kept_index, 0);
+    }
+
+    #[test]
+    fn dedup_is_reversible_in_original_order() {
+        let input = vec![("a", (2, 1)), ("b", (1, 2)), ("c", (1, 3))];
+        let out = run(input.clone());
+        assert_eq!(out.restore_all(), input, "no candidate is lost");
+    }
+
+    #[test]
+    fn report_never_claims_a_verified_equivalence() {
+        let out = run(vec![("a", (2, 1)), ("b", (1, 2))]);
+        assert!(!out.report.equivalence_verified);
+        assert_eq!(out.report.equivalence, EQUIVALENCE_KIND);
+    }
+
+    #[test]
+    fn report_serializes_to_json() {
+        let out = run(vec![("a", (2, 1)), ("b", (1, 2))]);
+        let json = serde_json::to_value(&out.report).expect("report is JSON-able");
+        assert_eq!(json["dropped_count"], 1);
+        assert_eq!(json["dropped"][0]["kept_label"], "a");
+        assert_eq!(json["equivalence_verified"], false);
+    }
+
+    #[test]
+    fn empty_group_drops_only_exact_duplicates() {
+        // Without generators the equivalence degrades to equality, which is the
+        // one setting where a drop is not a guess.
+        let out = dedup_candidates(
+            vec![("a", (2, 1)), ("b", (2, 1)), ("c", (1, 2))],
+            &SymmetryGroup::new(),
+            |c: &Cand| c.1,
+            |c: &Cand| c.0.to_string(),
+        );
+        let kept: Vec<&str> = out.kept.iter().map(|k| k.candidate.0).collect();
+        assert_eq!(kept, vec!["a", "c"]);
+    }
+
+    #[test]
+    fn empty_input_yields_an_empty_report() {
+        let out = run(Vec::new());
+        assert_eq!(out.report.input_count, 0);
+        assert!(out.kept.is_empty());
+        assert!(out.report.dropped.is_empty());
     }
 }
