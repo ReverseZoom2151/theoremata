@@ -19,8 +19,8 @@ mod verify;
 // paths unchanged — the physical layout is by component, the namespace is flat.
 pub use graph::{db, model, scheduler};
 pub use prover::{
-    aristotle, attempt_run, axiom_audit, error_feedback, exec, formal, goal_state,
-    hypothesis_audit, isabelle, lean, proof_job, proof_log, rocq, statement_preservation, vacuity,
+    aristotle, attempt_run, axiom_audit, declaration_lookup, error_feedback, exec, formal, goal_state,
+    hypothesis_audit, isabelle, lean, proof_job, proof_log, rocq, statement_preservation, subgoal_extract, vacuity,
 };
 pub use reason::{
     agent, best_first, blueprint, blueprint_generate, blueprint_run, certification, chat,
