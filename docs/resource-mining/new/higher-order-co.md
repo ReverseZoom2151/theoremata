@@ -119,6 +119,25 @@ Ecosystem signals corroborate rather than contradict:
   Kind-Legacy, kind2-archive, Kind (Haskell). Each abandoned the prior corpus.
 - `Nat/` contains 43 files and **zero proofs** — all executable functions, no
   `add/assoc`, no `comm`. No real mathematics has been formalized in Kind.
+
+The corpus question deserves hard numbers, since "is there anything to harvest"
+is the only reason a dead system would still be worth touching. `Kindex` at HEAD
+is 1,088 `.kind2` files, but the distribution is decisive:
+
+| Namespace | `.kind2` files | What it is |
+|---|---:|---|
+| `Data/` | 713 | integers, strings, lists, IO — programming stdlib |
+| `Apps/` | 325 | application code, not mathematics |
+| `Math/` | **29** | actual mathematics |
+| `Prop/` | **15** | proposition formers |
+| `Trait/` | 6 | typeclass-style dictionaries |
+
+So roughly **44 files of mathematical content**, and reading the paths shows it
+is the first two pages of an algebra textbook: `Math/Algebra/{Magma, Semigroup,
+Monoid, Group}`, a handful of laws (`left_identity`, `right_inverse`,
+`associativity`), and `Math/Relation/{Antisymmetric, TotalOrder}`. For
+calibration, mathlib4 is >200,000 theorems. There is nothing here to harvest as
+training or eval data.
 - Type theory is self types with `Set` as the sole universe (no visible
   hierarchy), a single ~130KB Haskell implementation, no formal metatheory.
 
@@ -198,6 +217,53 @@ latency and proof-checker subprocess time (`agda --safe`, Lean elaboration).
 HVM accelerates pure functional term reduction, which is not our bottleneck. A
 faster reducer does not help a pipeline waiting on a model and on a typechecker.
 
+### 7. Project churn: nothing here has survived two years
+
+The `HigherOrderCO-archive` org (21 repos) is the hard evidence on durability.
+Lineage was verified through GitHub rename redirects, which are conclusive — a
+redirect means the same repo object, same creation date, renamed in place.
+
+**The proof language has been reimplemented five times in seven years.**
+`moonad/Formality` redirects to `HigherOrderCO/Kind`: it is one continuous repo,
+created 2018-07-13, rewritten in place across Formality, Formality-Core /
+FormCoreJS (700-LOC JS kernel), Kind1 (JS), Kind2 (Rust), Kind2-on-HVM2 (Rust),
+and Kind (Haskell). Implementation language changed nearly every generation.
+
+**The runtime has been reimplemented six times in four years:** HVM1, HVM2
+(`HigherOrderCO/HVM` renamed in place), hvm-core / hvm-64 (496 stars, an entire
+parallel effort, discarded), HVM3 (Haskell), HVM3-Strict (C, **alive five
+weeks**), HVM4 (C). A C rewrite in 2025 following a Haskell rewrite in 2024 is
+thrash, not convergence.
+
+Median created-to-last-push across the archive is ~7 months; restricted to major
+projects it is ~12 months. **No project in the archive survived two years of
+active development.**
+
+Three specifics that bear directly on us:
+
+1. **The archive org was created 2026-01-29** — and HVM3's final push carries the
+   same date. This was a single mass-cleanup event, not organic decay. The
+   current generation has not yet been tested against that pattern.
+2. **Proof work is the part they abandoned, not the part they kept.** Bend is the
+   only repo pushed within the last month; Kind has been static 18 months and its
+   stdlib is archived. Integrating anything proof-related means adopting the
+   exact subsystem the vendor deprioritized.
+3. **Version pinning is impossible.** They rename repos in place (Formality→Kind,
+   HVM→HVM2, hvm-core→hvm-64), silently changing what a URL means. Combined with
+   10 of 21 archive repos carrying **no license**, and `Kindex`'s own README
+   pointing at a `Kind1` URL that now 404s, there is no stable artifact to
+   depend on.
+
+A softer signal worth recording: Bend's own tooling was archived out from under
+it — `bend-language-server` and `tree-sitter-bend` both died 2024-10-18 while
+Bend remains "active."
+
+Domain trajectory across the whole history: proof assistant (2018) → crypto
+(`kindelia/Kindelia`, 615 stars, dead since 2023-11; `moonad/Moonad`) →
+parallel-computing runtime and GPU language (2023-2025) → AI program synthesis
+(2025-2026). `HigherOrderCO/Kindelia` redirecting *out* to `kindelia/Kindelia`
+shows an entire org's attention redirected to crypto and then divested.
+
 ## What is worth taking: the idea, not the dependency
 
 "Why parallelize when we can share?" is a legitimate critique of our current
@@ -244,13 +310,19 @@ is disproportionate risk for the available upside.
 
 Recorded honestly so the next reader knows what was and was not checked:
 
-- The `HigherOrderCO-archive` org (21 repos) is covered at **metadata level
-  only** — name, license, stars, last push — plus targeted reads of `kindbook`
-  and `kind2-archive` while evaluating Kind. Full README/source reads of the
-  remaining archive repos have not been done. Known members include `hvm-64`
-  (Apache-2.0, 496 stars), `kind2-archive` (no license), `HVM3-Strict` (MIT),
-  `bend-language-server` (MIT), `tree-sitter-bend` (NOASSERTION), `TSPL` (no
-  license), `kindbook` (no license).
+- The `HigherOrderCO-archive` org is **fully enumerated**: all 21 repos, with
+  purpose, language, stars, license, creation and last-push dates, fork origin,
+  and lineage verified through rename redirects; plus `Kindex`'s corpus measured
+  at the git-tree level. What was **not** done is a full source read of each
+  archive repo — only `Kindex`, `kindbook`, `kind2-archive`, and `Kind2-old`
+  were opened beyond metadata. Given that every one of them is dead and 10 of 21
+  are unlicensed, deeper reads would inform nothing actionable.
+- Two items on Taelin's **personal** account are the only artifacts here with
+  ongoing research value, and were not read in depth:
+  `VictorTaelin/Interaction-Calculus` (950 stars, maintained through 2025-11)
+  and `VictorTaelin/interaction-calculus-of-constructions` (81 stars, "a minimal
+  proof checker"). Both are unlicensed, like all 25+ of his personal repos, so
+  they are readable as research literature but not vendorable.
 - `x.com` returned HTTP 402, so all Taelin thread content is from search-engine
   summaries rather than primary text. Lower confidence; not load-bearing for any
   conclusion above.
