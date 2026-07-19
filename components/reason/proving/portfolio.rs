@@ -19,6 +19,7 @@ use crate::{
     concurrent::ConcurrentConfig,
     config::Config,
     db::Store,
+    falsification::Falsifier,
     formal_generate::{generate_and_verify, generate_candidates_for_verification},
     formalize_portfolio::{
         run_owned_formal_system_verifications, OwnedVerificationTask, VerificationMode,
@@ -28,10 +29,14 @@ use crate::{
         model::VerificationReport,
     },
     provider::ModelProvider,
+    verification_ladder::{
+        CheapRung, KernelRung, KernelVerdict, LadderConfig, LadderOutcome, RefutationWitness,
+        RungBudget, RungVerdict, VerificationLadder,
+    },
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::time::Instant;
 
 /// The three systems attempted when the caller does not restrict the portfolio.
@@ -71,6 +76,16 @@ pub struct PortfolioResult {
     /// True iff at least one system's report is `lexically_verified`.
     pub any_verified: bool,
     pub per_system: Vec<SystemAttempt>,
+    /// Set when a cheap [`verification_ladder`](crate::verification_ladder) rung
+    /// refuted the statement *before* any backend was consulted. A refutation is
+    /// system-independent — if the claim is false, no formal system can certify
+    /// it — so `per_system` is empty and N backend calls were never paid for.
+    ///
+    /// `None` on every default run: both cheap tiers are disabled by
+    /// [`LadderConfig::default`], so this field is only ever populated when a
+    /// caller has explicitly opted in to pre-filtering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refutation: Option<RefutationWitness>,
 }
 
 /// Attempt `statement` across each of `systems` (defaulting to all three when
@@ -90,11 +105,168 @@ pub fn portfolio_prove(
     statement: &str,
     systems: &[FormalSystem],
 ) -> Result<PortfolioResult> {
+    portfolio_prove_with_ladder(
+        store,
+        config,
+        provider,
+        statement,
+        systems,
+        &[],
+        LadderConfig::default(),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// The cheap pre-filter: refute once, before N backend calls
+// ---------------------------------------------------------------------------
+
+/// The "kernel" seam handed to the pre-filter ladder.
+///
+/// The portfolio itself IS the expensive kernel — it fans out to Lean/Rocq/
+/// Isabelle and only a live gate pass certifies. The ladder is used here purely
+/// as the *screening* stage, so this rung always abstains and hands the question
+/// back to the per-system loop. It has no way to certify, by construction: a
+/// `KernelVerdict::Verified` is never produced on this path.
+struct DeferToPortfolio;
+
+impl KernelRung<str> for DeferToPortfolio {
+    fn name(&self) -> &str {
+        "portfolio"
+    }
+    fn verify(&self, _statement: &str, _budget: &RungBudget) -> KernelVerdict {
+        KernelVerdict::Abstain
+    }
+}
+
+/// The [`Falsifier`] as a tier-1 [`CheapRung`].
+///
+/// Mapping (deliberately conservative — only ONE verdict refutes):
+/// * `counterexample` ⇒ [`RungVerdict::Refuted`], with the falsifying assignment
+///   as the witness instance.
+/// * **everything else** — `no_counterexample_in_domain`, `not_applicable`,
+///   `no_model`, `unavailable`, `inconclusive`, `error` — ⇒
+///   [`RungVerdict::Abstain`]. In particular a bounded sweep that found nothing
+///   has said *nothing*: `∀`-claims are refutable by one instance but never
+///   provable by finitely many. An `Err` from the falsifier likewise abstains,
+///   since a failed probe is not evidence about the statement.
+pub struct FalsifierRung<'a> {
+    falsifier: Falsifier<'a>,
+}
+
+impl<'a> FalsifierRung<'a> {
+    /// Wrap `provider`'s falsifier as a refutation-only rung.
+    pub fn new(provider: &'a dyn ModelProvider) -> Self {
+        Self {
+            falsifier: Falsifier { provider },
+        }
+    }
+}
+
+/// Flatten a falsifying assignment into ordered `(variable, value)` bindings.
+/// Sorted by variable name so the witness serializes deterministically.
+fn assignment_bindings(assignment: Option<&Value>) -> Vec<(String, String)> {
+    match assignment {
+        Some(Value::Object(map)) => {
+            let mut bindings: Vec<(String, String)> = map
+                .iter()
+                .map(|(key, value)| {
+                    let rendered = match value {
+                        Value::String(text) => text.clone(),
+                        other => other.to_string(),
+                    };
+                    (key.clone(), rendered)
+                })
+                .collect();
+            bindings.sort_by(|a, b| a.0.cmp(&b.0));
+            bindings
+        }
+        Some(Value::Null) | None => Vec::new(),
+        Some(other) => vec![("assignment".to_string(), other.to_string())],
+    }
+}
+
+impl CheapRung<str> for FalsifierRung<'_> {
+    fn name(&self) -> &str {
+        "falsifier"
+    }
+
+    fn probe(&self, statement: &str, _budget: &RungBudget) -> RungVerdict {
+        let Ok(verdict) = self.falsifier.falsify(statement) else {
+            // A probe that failed to run is not evidence about the statement.
+            return RungVerdict::Abstain;
+        };
+        if verdict.verdict != "counterexample" {
+            return RungVerdict::Abstain;
+        }
+        let bindings = assignment_bindings(verdict.assignment.as_ref());
+        RungVerdict::Refuted(RefutationWitness::counterexample(
+            "falsifier",
+            format!("bounded numeric check found a counterexample to: {statement}"),
+            bindings,
+        ))
+    }
+}
+
+/// [`portfolio_prove`] with an explicit ladder policy and extra tier-1 rungs.
+///
+/// The cheap tiers run **once, on the statement**, before any system is touched.
+/// A refutation is system-independent, so it skips the entire portfolio rather
+/// than paying N backend calls; the witness is recorded on the result. Every
+/// other outcome falls through to exactly the pre-existing per-system logic.
+///
+/// With `ladder_config` at its default both cheap tiers are disabled, no rung is
+/// invoked (registration alone never enables a tier), and this is byte-identical
+/// to the sequential portfolio.
+fn portfolio_prove_with_ladder(
+    store: &Store,
+    config: &Config,
+    provider: &dyn ModelProvider,
+    statement: &str,
+    systems: &[FormalSystem],
+    extra_fast_refute: &[&dyn CheapRung<str>],
+    ladder_config: LadderConfig,
+) -> Result<PortfolioResult> {
     let systems: Vec<FormalSystem> = if systems.is_empty() {
         ALL_SYSTEMS.to_vec()
     } else {
         systems.to_vec()
     };
+
+    // Caller-supplied rungs are tried first, then the built-in falsifier.
+    let falsifier_rung = FalsifierRung::new(provider);
+    let mut fast_refute: Vec<&dyn CheapRung<str>> = extra_fast_refute.to_vec();
+    fast_refute.push(&falsifier_rung);
+
+    let kernel = DeferToPortfolio;
+    let screen = VerificationLadder::new(&kernel)
+        .with_fast_refute(fast_refute)
+        .with_config(ladder_config)
+        .run(statement);
+
+    if let LadderOutcome::Refuted { rung, tier, witness } = screen.outcome {
+        store.event(
+            None,
+            None,
+            "portfolio_prove.refuted",
+            &rung,
+            json!({
+                "statement": statement,
+                "rung": rung,
+                "tier": tier.as_str(),
+                "witness": &witness,
+                "systems_skipped": systems.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            }),
+        )?;
+        return Ok(PortfolioResult {
+            statement: statement.to_string(),
+            winner: None,
+            any_verified: false,
+            // No system was attempted: a false statement cannot be certified by
+            // any of them, so every backend call would have been pure waste.
+            per_system: Vec::new(),
+            refutation: Some(witness),
+        });
+    }
 
     let concurrency = portfolio_verification_concurrency();
     if concurrency.enabled {
@@ -187,6 +359,9 @@ pub fn portfolio_prove(
         winner,
         any_verified,
         per_system,
+        // Unreachable-with-a-refutation by construction: a refuting screen
+        // returns above, before any system is attempted.
+        refutation: None,
     })
 }
 
@@ -399,6 +574,7 @@ fn portfolio_prove_with_owned_verification(
         winner,
         any_verified,
         per_system,
+        refutation: None,
     })
 }
 
@@ -446,6 +622,243 @@ mod tests {
             // Non-"offline" so the provider path (not the stub) is exercised.
             "command"
         }
+    }
+
+    use crate::verification_ladder::{RungConfig, WitnessKind};
+    use std::cell::Cell;
+
+    /// A tier-1 rung that always refutes, counting its invocations.
+    struct MockRefuter {
+        calls: Cell<usize>,
+    }
+    impl MockRefuter {
+        fn new() -> Self {
+            Self {
+                calls: Cell::new(0),
+            }
+        }
+    }
+    impl CheapRung<str> for MockRefuter {
+        fn name(&self) -> &str {
+            "mock-refuter"
+        }
+        fn probe(&self, _statement: &str, _budget: &RungBudget) -> RungVerdict {
+            self.calls.set(self.calls.get() + 1);
+            RungVerdict::Refuted(RefutationWitness::counterexample(
+                "mock-refuter",
+                "claim fails at n = 4",
+                vec![("n".to_string(), "4".to_string())],
+            ))
+        }
+    }
+
+    /// A tier-1 rung that always abstains, counting its invocations.
+    struct MockAbstainer {
+        calls: Cell<usize>,
+    }
+    impl MockAbstainer {
+        fn new() -> Self {
+            Self {
+                calls: Cell::new(0),
+            }
+        }
+    }
+    impl CheapRung<str> for MockAbstainer {
+        fn name(&self) -> &str {
+            "mock-abstainer"
+        }
+        fn probe(&self, _statement: &str, _budget: &RungBudget) -> RungVerdict {
+            self.calls.set(self.calls.get() + 1);
+            RungVerdict::Abstain
+        }
+    }
+
+    /// Only tier 1 enabled — the shape a caller opting in to fast refutation uses.
+    fn fast_refute_enabled() -> LadderConfig {
+        LadderConfig {
+            fast_refute: RungConfig::enabled(RungBudget::default()),
+            ..LadderConfig::default()
+        }
+    }
+
+    /// The observable content of a portfolio run, for parity comparisons.
+    /// `duration_ms` is deliberately excluded: it is wall-clock and not part of
+    /// the behavior under test.
+    type Fingerprint = (
+        String,
+        Option<FormalSystem>,
+        bool,
+        Vec<(FormalSystem, bool, bool, bool, Option<bool>, Option<bool>)>,
+    );
+
+    fn fingerprint(result: &PortfolioResult) -> Fingerprint {
+        (
+            result.statement.clone(),
+            result.winner,
+            result.any_verified,
+            result
+                .per_system
+                .iter()
+                .map(|attempt| {
+                    (
+                        attempt.system,
+                        attempt.verified,
+                        attempt.available,
+                        attempt.error.is_some(),
+                        attempt.report.as_ref().map(|report| report.live),
+                        attempt
+                            .report
+                            .as_ref()
+                            .map(|report| report.lexically_verified),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn the_ladder_at_defaults_is_byte_identical_to_the_sequential_portfolio() {
+        // Registering a rung must NOT enable its tier: the default path has to
+        // stay exactly today's portfolio — same winner, same order, same
+        // SystemAttempt records — even with a rung that would refute everything.
+        for &(name, use_escape_hatch) in &[("offline", false), ("escape-hatch", true)] {
+            let provider: &dyn ModelProvider = if use_escape_hatch {
+                &EscapeHatchProvider
+            } else {
+                &OfflineProvider
+            };
+
+            let baseline =
+                portfolio_prove(&store(), &mock_config(), provider, "True", &[]).unwrap();
+
+            let refuter = MockRefuter::new();
+            let with_ladder = portfolio_prove_with_ladder(
+                &store(),
+                &mock_config(),
+                provider,
+                "True",
+                &[],
+                &[&refuter],
+                LadderConfig::default(),
+            )
+            .unwrap();
+
+            assert_eq!(
+                refuter.calls.get(),
+                0,
+                "{name}: a disabled tier must never invoke a registered rung"
+            );
+            assert!(
+                with_ladder.refutation.is_none(),
+                "{name}: no refutation on the default path"
+            );
+            assert!(
+                baseline.refutation.is_none(),
+                "{name}: portfolio_prove never refutes at defaults"
+            );
+            assert_eq!(
+                fingerprint(&baseline),
+                fingerprint(&with_ladder),
+                "{name}: default ladder diverged from the sequential portfolio"
+            );
+            assert_eq!(with_ladder.per_system.len(), 3, "{name}: all three ran");
+        }
+    }
+
+    #[test]
+    fn an_enabled_refuting_rung_skips_every_backend_attempt() {
+        let refuter = MockRefuter::new();
+        let result = portfolio_prove_with_ladder(
+            &store(),
+            &mock_config(),
+            &OfflineProvider,
+            "every integer is even",
+            &[],
+            &[&refuter],
+            fast_refute_enabled(),
+        )
+        .unwrap();
+
+        assert_eq!(refuter.calls.get(), 1, "the cheap rung ran exactly once");
+        // The whole point: N backend calls were never paid for.
+        assert!(
+            result.per_system.is_empty(),
+            "no backend attempt may be recorded after a refutation"
+        );
+        assert_eq!(result.winner, None);
+        assert!(!result.any_verified);
+
+        // ...and the witness that routes the repair survives onto the result.
+        let witness = result.refutation.expect("the refutation is surfaced");
+        assert_eq!(witness.rung, "mock-refuter");
+        assert_eq!(witness.kind, WitnessKind::Counterexample);
+        assert_eq!(witness.instance, vec![("n".to_string(), "4".to_string())]);
+        assert!(witness.is_actionable());
+    }
+
+    #[test]
+    fn an_enabled_abstaining_rung_produces_todays_exact_result() {
+        let baseline =
+            portfolio_prove(&store(), &mock_config(), &OfflineProvider, "True", &[]).unwrap();
+
+        let abstainer = MockAbstainer::new();
+        let result = portfolio_prove_with_ladder(
+            &store(),
+            &mock_config(),
+            &OfflineProvider,
+            "True",
+            &[],
+            &[&abstainer],
+            fast_refute_enabled(),
+        )
+        .unwrap();
+
+        assert_eq!(abstainer.calls.get(), 1, "the enabled tier ran the rung");
+        assert!(result.refutation.is_none(), "abstention is not a refutation");
+        assert_eq!(
+            fingerprint(&baseline),
+            fingerprint(&result),
+            "an abstaining ladder must fall through to today's per-system loop"
+        );
+    }
+
+    #[test]
+    fn only_a_counterexample_verdict_refutes() {
+        // The falsifier adapter is deliberately asymmetric: an exhausted bounded
+        // sweep has proved nothing, so every non-`counterexample` verdict — and
+        // an outright probe failure — must abstain.
+        let rung = FalsifierRung::new(&OfflineProvider);
+        // OfflineProvider yields `no_model`, which is NOT a refutation.
+        assert_eq!(
+            rung.probe("every even integer has an even square", &RungBudget::default()),
+            RungVerdict::Abstain
+        );
+        // Nor is a spec the model declares inapplicable (`not_applicable`).
+        let rung = FalsifierRung::new(&EscapeHatchProvider);
+        assert_eq!(
+            rung.probe("True", &RungBudget::default()),
+            RungVerdict::Abstain
+        );
+    }
+
+    #[test]
+    fn a_falsifying_assignment_becomes_ordered_witness_bindings() {
+        // Sorted by variable name so the witness serializes deterministically.
+        assert_eq!(
+            assignment_bindings(Some(&json!({ "n": 4, "k": -1, "s": "x" }))),
+            vec![
+                ("k".to_string(), "-1".to_string()),
+                ("n".to_string(), "4".to_string()),
+                ("s".to_string(), "x".to_string()),
+            ]
+        );
+        assert!(assignment_bindings(None).is_empty());
+        assert!(assignment_bindings(Some(&Value::Null)).is_empty());
+        // A non-object assignment is still carried, not silently dropped.
+        assert_eq!(
+            assignment_bindings(Some(&json!(7))),
+            vec![("assignment".to_string(), "7".to_string())]
+        );
     }
 
     #[test]
