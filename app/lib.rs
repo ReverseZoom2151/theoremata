@@ -493,6 +493,15 @@ pub fn run() -> Result<()> {
             node,
             status,
         } => {
+            // Trust boundary shared with the versioned API: a CLI command must
+            // not be able to forge a machine-checked proof status without the
+            // verifier's evidence-bearing certification path.
+            if status == NodeStatus::FormallyVerified {
+                anyhow::bail!(
+                    "formally_verified is set only by the verification pipeline; \
+                     the CLI cannot grant it directly"
+                );
+            }
             store.set_node_status(&project, &node, status, "user")?;
             print_value(cli.json, &serde_json::json!({"updated":true}))?
         }
