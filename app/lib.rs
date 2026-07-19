@@ -19,7 +19,7 @@ mod verify;
 // paths unchanged — the physical layout is by component, the namespace is flat.
 pub use graph::{db, model, scheduler};
 pub use reason::{
-    agent, best_first, blueprint, blueprint_generate, blueprint_run, certification, chat, concurrent,
+    agent, best_first, blueprint, blueprint_generate, blueprint_run, certification, chat, checker_cache, concurrent,
     consolidate, conjecture_engine, context_assembly, critic, critic_scorer, dag_projection, decompose,
     definition_synthesis, discovery_game, distance_critic, driver, evolve_sketch, falsification, fitness,
     graph_rag, guardrails, hybrid_search,

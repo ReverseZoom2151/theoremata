@@ -6,6 +6,7 @@ pub mod retry;
 pub mod sketch;
 pub mod falsification;
 pub mod blueprint;
+pub mod checker_cache;
 pub mod library;
 pub mod definition_synthesis;
 pub mod mathlib_export;

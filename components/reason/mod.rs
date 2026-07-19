@@ -20,7 +20,8 @@ pub use search::{
     sampler, sampling, search_telemetry, skest, subsumption, symmetry_dedup, tactic_outcome, ttc,
 };
 pub use proving::{
-    blueprint, conjecture_engine, decompose, definition_synthesis, evolve_sketch, falsification,
+    blueprint, checker_cache, conjecture_engine, decompose, definition_synthesis, evolve_sketch,
+    falsification,
     formal_generate, formalize_modes, formalize_portfolio, graph_rag, library, mathlib_export,
     model_router, optimize, portfolio, refine_ops, repair, retry, router, sketch,
 };
