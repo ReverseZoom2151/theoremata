@@ -21,6 +21,7 @@ use crate::{
     db::Store,
     model::ModelRequest,
     prover::{
+        error_feedback::{render_feedback, FeedbackConfig},
         formal::{backend_for, FormalBackend, FormalSystem},
         model::VerificationReport,
     },
@@ -145,8 +146,9 @@ pub fn generate_and_verify_with_cache(
                 checker_identity: &checker_identity,
                 policy_fingerprint: &policy_fingerprint,
             };
-            let (report, cache_hit) =
+            let (mut report, cache_hit) =
                 verify_candidate(cache, &key, || backend.verify(config, &code, statement))?;
+            attach_error_feedback(system, &code, &mut report);
             Ok(Candidate {
                 code,
                 report,
@@ -251,6 +253,77 @@ where
         cache.insert_verified(key, report.clone());
     }
     Ok((report, false))
+}
+
+/// The `detail` key under which rendered checker feedback is published.
+const ERROR_FEEDBACK_KEY: &str = "error_feedback";
+
+/// Enrich a FAILED verification's `detail` with prompt-ready checker feedback.
+///
+/// Until now the checker's own words reached the model nowhere: backends bury
+/// stdout/stderr in `detail["compile"]["detail"]`, and no `reason/` site reads
+/// it. This renders that raw text through [`render_feedback`] and republishes it
+/// under `detail["error_feedback"]`, so a retry/repair caller can hand the model
+/// the positional diagnostics instead of nothing.
+///
+/// **Advisory only, and strictly additive.** It never inspects or changes any
+/// verdict field, never runs on a passing report, and cannot fail: absent or
+/// unparseable checker output degrades inside `error_feedback` to a bounded raw
+/// passthrough. A `detail` that is not a JSON object is left untouched.
+fn attach_error_feedback(system: FormalSystem, code: &str, report: &mut VerificationReport) {
+    if report.lexically_verified {
+        return;
+    }
+    let Some(detail) = report.detail.as_object_mut() else {
+        return;
+    };
+    let raw = raw_checker_output(detail.get("compile"));
+    let rendered = render_feedback(system, &raw, code, &FeedbackConfig::default());
+    detail.insert(
+        ERROR_FEEDBACK_KEY.to_string(),
+        json!({
+            "schema": "theoremata.error-feedback.v1",
+            "system": system.as_str(),
+            "text": rendered.text,
+            "parsed": rendered.parsed,
+            "omitted": rendered.omitted,
+            "diagnostics": serde_json::to_value(&rendered.diagnostics).unwrap_or(Value::Null),
+        }),
+    );
+}
+
+/// Recover the checker's raw text from a serialized `CompileReport`.
+///
+/// The shape is `{"compiled":…, "errors":[…], "per_unit":[…], "detail":{…}}`;
+/// every live backend puts the checker's words in `detail.stderr`/`detail.stdout`
+/// (see `backends/lean.rs::compile`) and duplicates them into `errors`. Prefer
+/// the nested detail, fall back to `errors`, and return an empty string when
+/// neither exists — the renderer handles that case on its own.
+fn raw_checker_output(compile: Option<&Value>) -> String {
+    let Some(compile) = compile else {
+        return String::new();
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(inner) = compile.get("detail") {
+        for key in ["stderr", "stdout"] {
+            if let Some(s) = inner.get(key).and_then(Value::as_str) {
+                if !s.trim().is_empty() {
+                    parts.push(s);
+                }
+            }
+        }
+    }
+    if parts.is_empty() {
+        if let Some(errors) = compile.get("errors").and_then(Value::as_array) {
+            parts.extend(
+                errors
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|s| !s.trim().is_empty()),
+            );
+        }
+    }
+    parts.join("\n")
 }
 
 /// Stable identity for the checker installation and corpus selected by config.
@@ -788,6 +861,118 @@ mod tests {
         .unwrap();
         assert!(code.contains("trivial"));
         assert!(report.lexically_verified);
+    }
+
+    /// A failed report whose compile layer carries real Lean checker output, in
+    /// exactly the shape `FormalBackend::verify` publishes it.
+    fn failed_report_with_compile(stderr: &str) -> VerificationReport {
+        VerificationReport {
+            detail: json!({
+                "system": "lean",
+                "gate": "3+1-layer",
+                "compile": {
+                    "compiled": false,
+                    "errors": [stderr, ""],
+                    "per_unit": [],
+                    "detail": {"runner": "direct", "code": 1, "stdout": "", "stderr": stderr},
+                },
+            }),
+            ..failed_report()
+        }
+    }
+
+    #[test]
+    fn failed_verification_gains_rendered_checker_feedback() {
+        let code = "theorem foo (n : Nat) : n + 0 = n := by\n  exact bogus\n";
+        let mut report =
+            failed_report_with_compile("Generated.lean:2:8: error: unknown identifier 'bogus'");
+        attach_error_feedback(FormalSystem::Lean, code, &mut report);
+
+        let fb = &report.detail[ERROR_FEEDBACK_KEY];
+        assert_eq!(fb["schema"], "theoremata.error-feedback.v1");
+        assert_eq!(fb["parsed"], true, "a standard Lean header must parse");
+        let text = fb["text"].as_str().expect("text is a string");
+        assert!(!text.is_empty());
+        // The checker's own words AND the offending source both reach the model.
+        assert!(text.contains("unknown identifier 'bogus'"), "{text}");
+        assert!(text.contains("<error>bogus</error>"), "{text}");
+        assert_eq!(fb["diagnostics"][0]["line"], 2);
+        // Verdict fields are untouched: this is presentation only.
+        assert!(!report.lexically_verified);
+        assert_eq!(report.detail["compile"]["compiled"], false);
+    }
+
+    #[test]
+    fn passing_verification_detail_is_unchanged() {
+        let mut report = live_verified_report("clean");
+        let before = report.detail.clone();
+        attach_error_feedback(FormalSystem::Lean, "theorem t : True := trivial", &mut report);
+        assert_eq!(report.detail, before, "a pass must never gain feedback");
+        assert!(report.detail.get(ERROR_FEEDBACK_KEY).is_none());
+        assert!(report.lexically_verified);
+    }
+
+    #[test]
+    fn absent_or_unparseable_checker_text_never_panics() {
+        // No `compile` key at all (mock-shaped detail).
+        let mut bare = failed_report();
+        attach_error_feedback(FormalSystem::Lean, "", &mut bare);
+        assert!(!bare.detail[ERROR_FEEDBACK_KEY]["text"]
+            .as_str()
+            .unwrap()
+            .is_empty());
+        assert_eq!(bare.detail[ERROR_FEEDBACK_KEY]["parsed"], false);
+
+        // A `compile` layer present but carrying no checker words.
+        let mut empty = failed_report_with_compile("");
+        attach_error_feedback(FormalSystem::Rocq, "Theorem t : True.", &mut empty);
+        assert_eq!(empty.detail[ERROR_FEEDBACK_KEY]["parsed"], false);
+
+        // Garbage falls back to the module's bounded raw passthrough.
+        let mut noisy = failed_report_with_compile("\u{1f4a5} segfault at 0xdeadbeef");
+        attach_error_feedback(FormalSystem::Lean, "theorem t : True := trivial", &mut noisy);
+        let text = noisy.detail[ERROR_FEEDBACK_KEY]["text"].as_str().unwrap();
+        assert!(text.contains("segfault at 0xdeadbeef"), "{text}");
+
+        // A non-object `detail` is left exactly as it was.
+        let mut scalar = VerificationReport {
+            detail: json!("opaque"),
+            ..failed_report()
+        };
+        attach_error_feedback(FormalSystem::Lean, "", &mut scalar);
+        assert_eq!(scalar.detail, json!("opaque"));
+    }
+
+    #[test]
+    fn raw_checker_output_falls_back_to_the_errors_array() {
+        // Backends that leave `detail` empty still duplicate the text into
+        // `errors`; that must not be lost.
+        let compile = json!({
+            "compiled": false,
+            "errors": ["", "Generated.lean:1:1: error: fallback path"],
+            "detail": {"runner": "direct"},
+        });
+        let raw = raw_checker_output(Some(&compile));
+        assert_eq!(raw, "Generated.lean:1:1: error: fallback path");
+        assert!(raw_checker_output(None).is_empty());
+    }
+
+    #[test]
+    fn a_rejected_candidate_carries_feedback_through_the_real_generate_path() {
+        // End-to-end through generate_and_verify: the mock backend's source scan
+        // rejects `sorry`, and the returned report must carry the feedback key.
+        let store = store();
+        let config = mock_config();
+        let provider = CannedProvider {
+            code: "theorem t : True := by sorry".into(),
+        };
+        let (_, report) =
+            generate_and_verify(&store, &config, &provider, FormalSystem::Lean, "True").unwrap();
+        assert!(!report.lexically_verified);
+        let text = report.detail[ERROR_FEEDBACK_KEY]["text"]
+            .as_str()
+            .expect("a rejected candidate must publish feedback text");
+        assert!(!text.is_empty());
     }
 
     #[test]
