@@ -175,6 +175,14 @@ log is the toolchain-gated upgrade.
   witness for a decidable fragment, and both "found nothing in bounds" and
   "outside the fragment" collapse to no-witness so the guard cannot be talked into
   a pass by a search it never actually ran.
+- A hypothesis-discharge audit for assumptions that are invisible to `#print
+  axioms` and to a `sorry` grep: Prop-valued arguments and uninhabited
+  assumption-bundling structures that would otherwise let a proof quietly carry an
+  unaccounted hypothesis.
+- Async external-prover jobs (submit, sparse-poll, resume, cancel) with per-attempt
+  artifact directories, so a long remote proof run is checkpointed rather than
+  held open, and adapters for tactic-session and retrieval-augmented backends
+  (LeanDojo-style, ReProver-style, Aristotle) behind the same contract.
 
 **Search and proving**
 
@@ -195,6 +203,18 @@ log is the toolchain-gated upgrade.
 - An inline priority nudge the generator can emit alongside a tactic (the shape of
   HVM3's `CInc`/`CDec`), folded into the frontier ordering so a producer's own
   confidence steers the search without overriding the scorer.
+- A verification ladder that makes falsify-before-prove general: an ordered cost
+  hierarchy (`fast_refute` to `cheap_decide` to `expensive_kernel`) where numeric
+  spot checks, property testing, SMT probes, and the real kernel are all injected
+  rungs of one control flow, so the kernel is paid for only when a cheap check
+  could not settle the question.
+- A scored proof pool that keeps each candidate's verifier score, self-eval, and
+  `dep_proof_ids` lineage, so a refined proof records which candidate it came
+  from, and certification is routed through the pool plus meta-verification
+  rather than trusting a single sample.
+- Dense per-step process supervision: one terminal correctness bit from the
+  formal gate is turned into MCTS-Q per-step reward, which is what trains the
+  critic half of the flywheel.
 - First-order term rewriting primitives: true unification with occurs-check,
   LPO/KBO term orderings, and bounded Knuth-Bendix completion.
 - An informal-sketch to autoformalize-holes to splice pipeline: decompose a proof
@@ -245,7 +265,13 @@ log is the toolchain-gated upgrade.
 - Premise retrieval over each system's corpus (Lean Loogle-style, Rocq `Search`,
   Isabelle `find_theorems`) behind one contract.
 - A BM25, dense, and LM-reranker cascade, plus error-identifier-keyed retrieval
-  that queries on the exact unresolved names a failed proof needs.
+  that queries on the exact unresolved names a failed proof needs, and query
+  rewriting that expands one goal into several retrieval probes.
+- GraphRAG over the lemma and proof dependency DAG, so retrieval can follow
+  structure rather than text similarity alone, plus semantic and episodic recall
+  over the verified-lemma library.
+- A novelty and prior-work check, so a conjecture can be screened against what is
+  already known before effort is spent proving it.
 
 **Learning (self-improvement flywheel)**
 
@@ -277,6 +303,27 @@ log is the toolchain-gated upgrade.
 - WLOG frame-normalization with an invariance-lemma registry, so a goal invariant
   under a transformation group is pinned to a convenient coordinate frame with a
   soundness check.
+
+**The agent loop**
+
+- Meta-tools: the loop's own orchestration moves (plan, update plan, critique,
+  re-decompose, recall, spend/budget, self-review, abstain) are exposed as
+  callable tools, so the model can steer its own strategy. Certification is
+  structurally forbidden through this surface: a meta-tool call that tries to set
+  `formally_verified` is rejected, because status comes from proof evidence and
+  never from the agent asking for it.
+- A live, model-editable plan per run, plus cross-attempt strategy memory, so a
+  later attempt knows what earlier ones already tried and why they failed.
+- A context-assembly layer that composes the scattered inputs (retrieved premises,
+  goal state, prior failures, plan) into one bounded prompt, rather than letting
+  each call site improvise its own.
+- A difficulty-aware model-tier router with a provider fallback ladder, so an easy
+  obligation does not pay frontier-model prices and a provider outage degrades
+  instead of failing the run.
+- Guardrails on untrusted input (loop and cycle detection, prompt-injection
+  wrapping of retrieved and model-authored text) and structured observability:
+  per-run traces with a failure taxonomy, metrics, and replay.
+- Opt-in true concurrency for the search and portfolio fan-outs, off by default.
 
 **Abstention**
 
@@ -396,7 +443,7 @@ theoremata blueprint-run <project> content.tex --systems lean
 theoremata falsify <project> "the conjecture"
 theoremata agent <project>                 # the autonomous loop
 
-# Any Python worker tool, directly (94 tools, including the cert checkers)
+# Any Python worker tool, directly (100 tools, including the cert checkers)
 theoremata tool '{"tool":"cert_sturm","op":"check","log": ...}'
 theoremata tool '{"tool":"benchmark","request":{"op":"list"}}'
 ```
@@ -432,7 +479,7 @@ promote itself, a proof-producing stage counts a result as solved only when a
 live backend closed it, and `mathlib-export` exports nothing at all when no live
 gate is present.
 
-Run `theoremata help` (or `theoremata <command> --help`) for the full list of 90+
+Run `theoremata help` (or `theoremata <command> --help`) for the full list of 89
 commands. Projects, graph editing, retrieval, evaluation, training exports,
 proof-job management, and the interactive chat/TUI are all there.
 
@@ -469,7 +516,7 @@ theoremata/
 │   ├── retrieval/           # BM25/dense/reranker cascade + error-keyed retrieval + query templates
 │   ├── eval/                # benchmark harness (33), graders (system-routed), proof grader + calibration
 │   ├── train/               # flywheel, meta-verifier + autoformalization reward, curation, selectors
-│   └── tools/               # the Python worker dispatch (94 tools) + math tools
+│   └── tools/               # the Python worker dispatch (100 tools) + math tools
 ├── docs/
 │   ├── formal-systems/      # per-system integration references + trust boundaries
 │   ├── resource-mining/     # per-repository mining reports + adopt lists
