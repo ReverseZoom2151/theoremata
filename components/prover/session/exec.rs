@@ -192,6 +192,26 @@ impl ExecOutcome {
         self.launched && !self.timed_out && self.code == Some(0)
     }
 
+    /// True when this failure is *deterministic* for the same (input, limits)
+    /// pair — i.e. re-running the identical command would fail the identical
+    /// way, so a retry only burns budget and duplicates the trace entry.
+    ///
+    /// Currently this is exactly the wall-clock kill: the checker did not
+    /// disagree with the proof, it ran out of the budget it will be given again.
+    ///
+    /// Deliberately NOT covered:
+    /// * `output_capped` — it is not itself a failure (a capped run can still
+    ///   exit 0), and it is also set by the post-kill reader grace timeout in
+    ///   [`spawn_with`], which is a timing artifact rather than a property of
+    ///   the input. Folding it in here would make a merely chatty checker
+    ///   unretryable.
+    /// * `launched == false` — a missing `wsl.exe`/`docker` is an environment
+    ///   fault that a caller may legitimately fix and retry.
+    /// * a plain non-zero exit — that is the semantic failure retries exist for.
+    pub fn is_deterministic_failure(&self) -> bool {
+        self.timed_out
+    }
+
     fn not_launched(err: impl std::fmt::Display) -> Self {
         Self {
             launched: false,
@@ -462,6 +482,48 @@ mod tests {
         assert!(out.success(), "fast command should succeed: {out:?}");
         assert!(!out.timed_out);
         assert!(out.stdout.contains("hello"), "stdout was {:?}", out.stdout);
+    }
+
+    #[test]
+    fn timed_out_run_is_a_deterministic_failure() {
+        let limits = ResourceLimits {
+            timeout: Duration::from_millis(700),
+            max_output_bytes: 1024,
+        };
+        let out = spawn_with(sleeper(), limits);
+        assert!(out.timed_out);
+        assert!(
+            out.is_deterministic_failure(),
+            "a resource-limit kill must be reported as deterministic"
+        );
+    }
+
+    #[test]
+    fn ordinary_failures_are_not_deterministic() {
+        // A plain non-zero exit is a semantic failure: retryable.
+        let nonzero = ExecOutcome {
+            launched: true,
+            code: Some(1),
+            stdout: String::new(),
+            stderr: "error: unknown identifier 'foo'".into(),
+            timed_out: false,
+            output_capped: false,
+        };
+        assert!(!nonzero.success());
+        assert!(!nonzero.is_deterministic_failure());
+
+        // Capped output on its own is not a deterministic failure (and here is
+        // not a failure at all).
+        let capped = ExecOutcome {
+            output_capped: true,
+            code: Some(0),
+            ..nonzero.clone()
+        };
+        assert!(!capped.is_deterministic_failure());
+
+        // Nor is a runner that could not start.
+        let unlaunched = ExecOutcome::not_launched("no such file");
+        assert!(!unlaunched.is_deterministic_failure());
     }
 
     #[test]

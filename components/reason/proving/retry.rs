@@ -90,6 +90,33 @@ impl RetryState {
         }
     }
 
+    /// Resolve a requested decision while accounting for the *kind* of failure
+    /// that produced it. [`RetryState::resolve`] is a pure counter policy and so
+    /// cannot tell a semantic failure (the model wrote a wrong proof — worth
+    /// another attempt) from a deterministic one (the verifier was killed for
+    /// exceeding its resource limit — the identical statement under the identical
+    /// budget will be killed identically). Retrying the latter only burns budget
+    /// and appends duplicate failures to the trace.
+    ///
+    /// When `deterministic` is true this short-circuits: no counter is spent and
+    /// the caller is told to stop at this tier. A `ReviseProof` request — a retry
+    /// of the *same* work — becomes [`Decision::Terminate`]; a request for a
+    /// genuinely different tier (`RevisePlan` / `Rewrite`) is passed through to
+    /// [`RetryState::resolve`], because changing the plan or the decomposition
+    /// changes the input and therefore is not the same deterministic run again.
+    ///
+    /// When `deterministic` is false this is exactly [`RetryState::resolve`], so
+    /// existing callers are unaffected.
+    pub fn resolve_outcome(&mut self, requested: Decision, deterministic: bool) -> Decision {
+        if deterministic {
+            return match requested {
+                Decision::ReviseProof | Decision::Terminate => Decision::Terminate,
+                other => self.resolve(other),
+            };
+        }
+        self.resolve(requested)
+    }
+
     /// True when the innermost (proof) budget is fully spent for the current
     /// plan revision.
     pub fn proof_budget_exhausted(&self) -> bool {
@@ -257,6 +284,61 @@ mod tests {
         s.attempt = 1;
         let esc = s.escalate_exhausted();
         assert_eq!(esc.decision, Decision::Terminate);
+    }
+
+    #[test]
+    fn deterministic_failure_terminates_regardless_of_budget() {
+        // Every tier has plenty of budget left; a deterministic failure must
+        // still stop the retry loop instead of re-running the same command.
+        let limits = RetryLimits {
+            max_proof_attempts: 8,
+            max_revisions: 8,
+            max_decompositions: 8,
+        };
+        let mut s = RetryState::new(limits);
+        assert_eq!(
+            s.resolve_outcome(Decision::ReviseProof, true),
+            Decision::Terminate
+        );
+        // and no budget was consumed
+        assert_eq!(s.proof, 1);
+        assert_eq!(s.revision, 1);
+        assert_eq!(s.attempt, 1);
+    }
+
+    #[test]
+    fn deterministic_failure_still_allows_a_different_tier() {
+        // Replanning changes the input, so it is not the same deterministic run.
+        let mut s = RetryState::new(RetryLimits::default());
+        assert_eq!(
+            s.resolve_outcome(Decision::RevisePlan, true),
+            Decision::RevisePlan
+        );
+        assert_eq!(s.revision, 2);
+    }
+
+    #[test]
+    fn non_deterministic_resolve_outcome_matches_resolve() {
+        let limits = RetryLimits {
+            max_proof_attempts: 2,
+            max_revisions: 2,
+            max_decompositions: 2,
+        };
+        let requests = [
+            Decision::ReviseProof,
+            Decision::ReviseProof,
+            Decision::ReviseProof,
+            Decision::RevisePlan,
+            Decision::Rewrite,
+            Decision::Rewrite,
+            Decision::Terminate,
+        ];
+        let mut a = RetryState::new(limits);
+        let mut b = RetryState::new(limits);
+        for r in requests {
+            assert_eq!(a.resolve(r), b.resolve_outcome(r, false));
+            assert_eq!((a.proof, a.revision, a.attempt), (b.proof, b.revision, b.attempt));
+        }
     }
 
     #[test]
