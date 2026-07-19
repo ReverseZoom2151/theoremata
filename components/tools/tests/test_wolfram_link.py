@@ -13,6 +13,7 @@ def _clear_env(monkeypatch):
     engine installed cannot change what these assert."""
     monkeypatch.delenv(wolfram_link.WOLFRAM_ENABLED_ENV, raising=False)
     monkeypatch.delenv(wolfram_link.WOLFRAM_BINARY_ENV, raising=False)
+    monkeypatch.delenv(wolfram_link.CLOUD_KEY_ENV, raising=False)
 
 
 def test_unavailable_by_default_even_if_a_binary_exists(monkeypatch):
@@ -95,3 +96,80 @@ def test_run_rejects_an_empty_code_string():
 
 def test_run_rejects_an_unknown_op():
     assert wolfram_link.run({"op": "nope"})["ok"] is False
+
+
+# --- cloud transport -------------------------------------------------------
+
+
+def test_local_binary_wins_over_a_cloud_key(monkeypatch):
+    # A local kernel keeps the expression on the machine. An oracle we already do
+    # not trust is still better run without shipping the goal to a third party.
+    monkeypatch.setenv(wolfram_link.WOLFRAM_ENABLED_ENV, "1")
+    monkeypatch.setenv(wolfram_link.CLOUD_KEY_ENV, "k")
+    monkeypatch.setattr(wolfram_link, "_binary", lambda: "/usr/bin/wolframscript")
+    assert wolfram_link.transport() == "local"
+
+
+def test_cloud_key_alone_is_a_usable_transport(monkeypatch):
+    monkeypatch.setenv(wolfram_link.WOLFRAM_ENABLED_ENV, "1")
+    monkeypatch.setenv(wolfram_link.CLOUD_KEY_ENV, "k")
+    monkeypatch.setattr(wolfram_link, "_binary", lambda: None)
+    assert wolfram_link.transport() == "cloud"
+    assert wolfram_link.available() is True
+
+
+def test_no_transport_without_binary_or_key(monkeypatch):
+    monkeypatch.setenv(wolfram_link.WOLFRAM_ENABLED_ENV, "1")
+    monkeypatch.setattr(wolfram_link, "_binary", lambda: None)
+    assert wolfram_link.transport() is None
+    assert wolfram_link.available() is False
+
+
+def _cloud(monkeypatch, payload):
+    import json as _json
+    monkeypatch.setenv(wolfram_link.WOLFRAM_ENABLED_ENV, "1")
+    monkeypatch.setenv(wolfram_link.CLOUD_KEY_ENV, "k")
+    monkeypatch.setattr(wolfram_link, "_binary", lambda: None)
+
+    class _Resp:
+        def read(self):
+            return _json.dumps(payload).encode()
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(wolfram_link.urllib.request, "urlopen", lambda *a, **k: _Resp())
+
+
+def test_cloud_success_reports_its_transport(monkeypatch):
+    _cloud(monkeypatch, {"success": True, "result": "4", "code": 200})
+    out = wolfram_link.evaluate("2+2")
+    assert out["ok"] is True
+    assert out["result"] == "4"
+    assert out["transport"] == "cloud"
+
+
+def test_cloud_elided_output_is_refused(monkeypatch):
+    # A truncated expression parses as a valid SHORTER one rather than as an
+    # error, so elision has to be caught here or a clipped certificate looks fine.
+    _cloud(monkeypatch, {"success": True, "result": "{1, 2, << 40 >>, 99}", "code": 200})
+    out = wolfram_link.evaluate("Range[100]")
+    assert out["ok"] is False
+    assert "elided" in out["error"]
+
+
+def test_cloud_in_band_failure_marker_is_caught(monkeypatch):
+    # success:true at the protocol level is not proof the evaluation worked, the
+    # same trap as exit 0 locally.
+    _cloud(monkeypatch, {"success": True, "result": "$Failed", "code": 200})
+    out = wolfram_link.evaluate("Integrate[Bad]")
+    assert out["ok"] is False
+    assert "failure marker" in out["error"]
+
+
+def test_cloud_reported_failure_is_not_a_result(monkeypatch):
+    _cloud(monkeypatch, {"success": False, "result": None, "code": 501})
+    out = wolfram_link.evaluate("???")
+    assert out["ok"] is False
+    assert out["unavailable"] is False

@@ -22,11 +22,21 @@ owes its result an independent check before anything is concluded from it.
 Absence is the normal case. Nothing here raises because an engine is missing; the
 probe returns False and every evaluation returns an ``unavailable`` response, so
 CI and any machine without a licence exercise the same degrade path.
+
+Two transports, same contract. A LOCAL ``wolframscript`` binary is preferred when
+present. Otherwise the CAG ``WolframLanguageCompute`` endpoint evaluates the same
+source over HTTP, which removes the local install and its licence entirely at the
+cost of sending the expression to a third party. Callers do not choose; they call
+:func:`evaluate` and get whichever is configured, with the transport reported so a
+result is always attributable.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
+import urllib.error
+import urllib.request
 from typing import Any
 
 #: Environment override pointing at a ``wolframscript`` (or ``WolframKernel``)
@@ -45,6 +55,18 @@ DEFAULT_TIMEOUT_SECONDS = 30.0
 #: Candidate binary names, in preference order. ``wolframscript`` is the
 #: supported command-line entry point for the free Developer engine.
 _BINARIES = ("wolframscript", "wolfram", "WolframKernel", "math")
+
+#: API key for the CAG ``WolframLanguageCompute`` endpoint, which evaluates
+#: Wolfram Language over HTTP with no local install. Access is via
+#: partner-program@wolfram.com, so this is not the self-serve Alpha AppID.
+CLOUD_KEY_ENV = "THEOREMATA_WOLFRAM_CLOUD_KEY"
+
+CLOUD_COMPUTE_ENDPOINT = "https://services.wolfram.com/api/cag/v1/WolframLanguageCompute"
+
+#: The endpoint's own default output cap. Oversized results come back elided with
+#: `<<` and `>>` markers, which would silently truncate a certificate, so the
+#: elision is detected rather than parsed.
+CLOUD_MAX_CHARS = 10000
 
 
 def _enabled() -> bool:
@@ -67,14 +89,35 @@ def _binary() -> str | None:
     return None
 
 
+def _cloud_key() -> str | None:
+    value = os.environ.get(CLOUD_KEY_ENV, "").strip()
+    return value or None
+
+
+def transport() -> str | None:
+    """Which transport an evaluation would use: ``local``, ``cloud``, or None.
+
+    Local is preferred when both are configured. A local kernel keeps the
+    expression on the machine, and an untrusted oracle we are already not
+    trusting is still better run without shipping the goal to a third party.
+    """
+    if not _enabled():
+        return None
+    if _binary() is not None:
+        return "local"
+    if _cloud_key() is not None:
+        return "cloud"
+    return None
+
+
 def available() -> bool:
-    """True only if the operator opted in AND a kernel binary was located.
+    """True only if the operator opted in AND some transport is configured.
 
     Deliberately conservative: a machine with a kernel installed but no opt-in
     reports unavailable, because consulting a licence-gated engine should be a
     decision rather than a side effect of it being on PATH.
     """
-    return _enabled() and _binary() is not None
+    return transport() is not None
 
 
 def _describe_unavailable() -> str:
@@ -82,8 +125,9 @@ def _describe_unavailable() -> str:
     if not _enabled():
         return f"Wolfram support is off; set {WOLFRAM_ENABLED_ENV}=1 to enable it"
     return (
-        "no Wolfram binary found on PATH "
-        f"(looked for {', '.join(_BINARIES)}; set {WOLFRAM_BINARY_ENV} to override)"
+        "no Wolfram transport configured: no binary on PATH "
+        f"(looked for {', '.join(_BINARIES)}; set {WOLFRAM_BINARY_ENV}) "
+        f"and no cloud key ({CLOUD_KEY_ENV})"
     )
 
 
@@ -117,9 +161,110 @@ def evaluate(code: str, *, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> dict:
     silently entering a certificate would break the exact arithmetic our checkers
     depend on. Nothing here interprets the mathematics.
     """
-    if not available():
+    chosen = transport()
+    if chosen is None:
+        return unavailable_response()
+    if chosen == "cloud":
+        return _evaluate_cloud(code, timeout=timeout)
+    return _evaluate_local(code, timeout=timeout)
+
+
+def _evaluate_cloud(code: str, *, timeout: float) -> dict:
+    """Evaluate through the CAG WolframLanguageCompute endpoint.
+
+    Same contract as the local path. The expression leaves the machine, which is
+    why the transport is reported back: a caller auditing where a certificate came
+    from needs to know it was computed off-box.
+    """
+    key = _cloud_key()
+    if key is None:
         return unavailable_response()
 
+    payload = json.dumps(
+        {
+            "code": code,
+            "maxChars": CLOUD_MAX_CHARS,
+            # The endpoint enforces its own deadline too; passing ours keeps the
+            # two from disagreeing about how long is too long.
+            "timeConstraint": timeout,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        CLOUD_COMPUTE_ENDPOINT,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "User-Agent": "theoremata",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout + 5.0) as response:
+            body = response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            pass
+        return {
+            "ok": False,
+            "result": None,
+            "error": f"WolframLanguageCompute returned HTTP {exc.code}: {detail}",
+            "unavailable": False,
+            "transport": "cloud",
+        }
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return {
+            "ok": False,
+            "result": None,
+            "error": f"network failure reaching WolframLanguageCompute: {exc}",
+            "unavailable": False,
+            "transport": "cloud",
+        }
+
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        return {
+            "ok": False,
+            "result": None,
+            "error": "WolframLanguageCompute returned unparseable JSON",
+            "unavailable": False,
+            "transport": "cloud",
+        }
+
+    result = parsed.get("result")
+    if not parsed.get("success") or not isinstance(result, str):
+        return {
+            "ok": False,
+            "result": result if isinstance(result, str) else None,
+            "error": f"WolframLanguageCompute reported failure (code {parsed.get('code')})",
+            "unavailable": False,
+            "transport": "cloud",
+        }
+
+    # Elision is a correctness hazard, not a display detail. The endpoint truncates
+    # oversized output with `<<` and `>>`, and a truncated polynomial or rule list
+    # parses as a SHORTER valid expression rather than as an error. Refuse it.
+    if "<<" in result and ">>" in result:
+        return {
+            "ok": False,
+            "result": result,
+            "error": (
+                "WolframLanguageCompute elided its output (<< >>); a truncated "
+                "expression can parse as a valid shorter one, so it is refused"
+            ),
+            "unavailable": False,
+            "transport": "cloud",
+        }
+
+    return _classify_output(result, stderr=None, transport="cloud")
+
+
+def _evaluate_local(code: str, *, timeout: float) -> dict:
+    """Evaluate by shelling out to a locally installed kernel."""
     binary = _binary()
     if binary is None:
         return unavailable_response()
@@ -144,6 +289,7 @@ def evaluate(code: str, *, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> dict:
             "result": None,
             "error": f"wolfram evaluation timed out after {timeout}s",
             "unavailable": False,
+            "transport": "local",
         }
     except OSError as exc:
         # The binary vanished or is not executable between probe and run. That is
@@ -159,27 +305,37 @@ def evaluate(code: str, *, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> dict:
             "result": stdout or None,
             "error": stderr or f"wolfram exited {completed.returncode}",
             "unavailable": False,
+            "transport": "local",
         }
 
-    # A zero exit is NOT proof of success. wolframscript reports evaluation
-    # failures in-band while still exiting 0, so the sentinels are checked
-    # explicitly. This is the same discipline the formal backends apply in
-    # `SuccessSignal`: never trust an exit code on its own.
+    return _classify_output(stdout, stderr=stderr, transport="local")
+
+
+#: In-band failure markers. Both transports can report an evaluation failure while
+#: signalling success at the protocol level (exit 0 locally, success:true in the
+#: cloud), so the payload is inspected on BOTH paths. Same discipline the formal
+#: backends apply in `SuccessSignal`: a protocol-level success is not proof.
+_FAILURE_MARKERS = ("$failed", "syntax::", "::argx", "::argrx", "::nonopt")
+
+
+def _classify_output(stdout: str, *, stderr: str | None, transport: str) -> dict:
+    """Decide whether output that arrived "successfully" is actually a result."""
     lowered = stdout.lower()
-    for marker in ("$failed", "syntax::", "::argx", "::argrx", "::nonopt"):
+    for marker in _FAILURE_MARKERS:
         if marker in lowered:
             return {
                 "ok": False,
                 "result": stdout or None,
-                "error": f"wolfram reported a failure marker ({marker}) despite exit 0",
+                "error": f"wolfram reported a failure marker ({marker}) despite reporting success",
                 "unavailable": False,
+                "transport": transport,
             }
-
     return {
         "ok": True,
         "result": stdout,
         "error": stderr or None,
         "unavailable": False,
+        "transport": transport,
     }
 
 
