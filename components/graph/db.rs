@@ -215,6 +215,32 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_trace_spans_run ON trace_spans(run_id, start_seq);
             CREATE INDEX IF NOT EXISTS idx_trace_spans_project ON trace_spans(project_id);
+
+            -- `fidelity.divergences[]` of the formalization.yaml v0.3 schema
+            -- (see components/eval/python/theoremata_tools/formalization_meta.py):
+            -- an adversarial self-report of every way a node's FORMAL statement
+            -- departs from its INFORMAL source. This is the class of defect the
+            -- kernel cannot see — an answer baked into the statement compiles
+            -- perfectly — so it is only ever caught by being disclosed. `kind`
+            -- is stored as the schema's snake_case string (a closed enum
+            -- upstream, kept as TEXT here so a future schema revision
+            -- round-trips instead of failing to insert); `detail` is the
+            -- free-text explanation without which a divergence discloses
+            -- nothing.
+            CREATE TABLE IF NOT EXISTS node_divergences (
+              id TEXT PRIMARY KEY,
+              project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+              node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+              kind TEXT NOT NULL,
+              detail TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_node_divergences_project ON node_divergences(project_id);
+            CREATE INDEX IF NOT EXISTS idx_node_divergences_node ON node_divergences(node_id);
+            -- The `evidence` table predates any reader; index its lookup keys so
+            -- the new per-node reader does not table-scan. Purely additive.
+            CREATE INDEX IF NOT EXISTS idx_evidence_project ON evidence(project_id);
+            CREATE INDEX IF NOT EXISTS idx_evidence_node ON evidence(node_id);
             "#,
         )?;
         // Idempotent column additions so databases created before these fields
@@ -1019,6 +1045,124 @@ impl Store {
             serde_json::json!({"node_id":node_id,"evidence_type":kind,"verdict":verdict}),
         )?;
         Ok(id)
+    }
+
+    /// All evidence recorded against one node, oldest first.
+    ///
+    /// Counterpart to [`Store::add_evidence`], which had no reader: statement
+    /// validity screens, sketch defect priors, retrieval hits and hardening
+    /// findings all write here, and nothing could read them back. Ordering is
+    /// `(created_at, id)` — stable across reads and independent of insertion
+    /// concurrency. A node with no evidence yields an empty vector, not an
+    /// error: "nothing was recorded" is a legitimate answer, and making it an
+    /// error would force every caller to distinguish it from a real failure.
+    pub fn evidence(&self, project_id: &str, node_id: &str) -> Result<Vec<Evidence>> {
+        let mut st = self.conn.prepare(
+            "SELECT id,project_id,node_id,evidence_type,source,verdict,payload,created_at
+             FROM evidence WHERE project_id=?1 AND node_id=?2 ORDER BY created_at, id",
+        )?;
+        let rows = st.query_map(params![project_id, node_id], evidence_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// All evidence in a project, oldest first — the audit / export view.
+    pub fn project_evidence(&self, project_id: &str) -> Result<Vec<Evidence>> {
+        let mut st = self.conn.prepare(
+            "SELECT id,project_id,node_id,evidence_type,source,verdict,payload,created_at
+             FROM evidence WHERE project_id=?1 ORDER BY created_at, id",
+        )?;
+        let rows = st.query_map([project_id], evidence_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Evidence of one `evidence_type` against a node — the screening-specific
+    /// lookup, oldest first. The canonical `kind` values are the constants in
+    /// [`crate::evidence`] (e.g. `evidence::HARDENING`,
+    /// `evidence::RETRIEVAL`).
+    pub fn evidence_of_kind(
+        &self,
+        project_id: &str,
+        node_id: &str,
+        kind: &str,
+    ) -> Result<Vec<Evidence>> {
+        let mut st = self.conn.prepare(
+            "SELECT id,project_id,node_id,evidence_type,source,verdict,payload,created_at
+             FROM evidence WHERE project_id=?1 AND node_id=?2 AND evidence_type=?3
+             ORDER BY created_at, id",
+        )?;
+        let rows = st.query_map(params![project_id, node_id, kind], evidence_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Disclose one way this node's formal statement departs from its informal
+    /// source (`fidelity.divergences[]` of formalization.yaml v0.3).
+    ///
+    /// `kind` should be one of [`DIVERGENCE_KINDS`]; unknown kinds are stored
+    /// verbatim rather than rejected, matching the permissive parse on the
+    /// Python side — a divergence from a newer schema revision must survive
+    /// rather than be silently dropped. Use [`is_known_divergence_kind`] to
+    /// flag them. `detail` is required by convention (a divergence without
+    /// detail discloses nothing); enforcing that is the validator's job, not
+    /// this CRUD layer's.
+    pub fn add_divergence(
+        &self,
+        project_id: &str,
+        node_id: &str,
+        kind: &str,
+        detail: &str,
+    ) -> Result<NodeDivergence> {
+        let now = Utc::now();
+        let divergence = NodeDivergence {
+            id: Uuid::new_v4().to_string(),
+            project_id: project_id.to_owned(),
+            node_id: node_id.to_owned(),
+            kind: kind.to_owned(),
+            detail: detail.to_owned(),
+            created_at: now,
+        };
+        self.conn.execute(
+            "INSERT INTO node_divergences(id,project_id,node_id,kind,detail,created_at)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                divergence.id,
+                project_id,
+                node_id,
+                kind,
+                detail,
+                now.to_rfc3339()
+            ],
+        )?;
+        self.event(
+            Some(project_id),
+            None,
+            "node.divergence_disclosed",
+            "fidelity",
+            json!({"node_id": node_id, "kind": kind}),
+        )?;
+        Ok(divergence)
+    }
+
+    /// Every disclosed divergence for one node, oldest first. An empty vector is
+    /// *not* the same claim as "we looked and found none" — that positive claim
+    /// lives in the formalization document, not in the absence of rows here.
+    pub fn divergences(&self, project_id: &str, node_id: &str) -> Result<Vec<NodeDivergence>> {
+        let mut st = self.conn.prepare(
+            "SELECT id,project_id,node_id,kind,detail,created_at FROM node_divergences
+             WHERE project_id=?1 AND node_id=?2 ORDER BY created_at, id",
+        )?;
+        let rows = st.query_map(params![project_id, node_id], divergence_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Every disclosed divergence in a project, oldest first — what a
+    /// `fidelity` block is assembled from at export time.
+    pub fn project_divergences(&self, project_id: &str) -> Result<Vec<NodeDivergence>> {
+        let mut st = self.conn.prepare(
+            "SELECT id,project_id,node_id,kind,detail,created_at FROM node_divergences
+             WHERE project_id=?1 ORDER BY created_at, id",
+        )?;
+        let rows = st.query_map([project_id], divergence_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Record a solver attempt — a single tool run or model call against a node
@@ -2004,6 +2148,91 @@ fn lemma_row(r: &Row) -> rusqlite::Result<Lemma> {
     })
 }
 
+/// One row of the `evidence` table: a recorded observation about a node —
+/// a numeric screen, a retrieval hit, a hardening finding, a validity check.
+///
+/// Defined here rather than in `crate::model` because `model.rs` has no such
+/// type today (its `Evidence` is a [`NodeKind`] *variant*, not a struct), and
+/// this file is the only owner of the table. `model.rs` may well want to adopt
+/// it — see the report accompanying this change.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Evidence {
+    pub id: String,
+    pub project_id: String,
+    pub node_id: String,
+    /// The `evidence_type` column — free-text kind supplied by the writer.
+    pub evidence_type: String,
+    /// Who or what produced it (also the actor on the emitted event).
+    pub source: String,
+    pub verdict: String,
+    pub payload: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+fn evidence_row(r: &Row) -> rusqlite::Result<Evidence> {
+    let raw: String = r.get(6)?;
+    Ok(Evidence {
+        id: r.get(0)?,
+        project_id: r.get(1)?,
+        node_id: r.get(2)?,
+        evidence_type: r.get(3)?,
+        source: r.get(4)?,
+        verdict: r.get(5)?,
+        // Same tolerance as `event_row` / `attempt_row`: a payload that is not
+        // valid JSON is surfaced as a string rather than failing the read, so
+        // one malformed row cannot make a node's whole evidence set unreadable.
+        payload: serde_json::from_str(&raw).unwrap_or(serde_json::Value::String(raw)),
+        created_at: dt(r.get(7)?)?,
+    })
+}
+
+/// One row of `fidelity.divergences[]` (formalization.yaml v0.3), stored per
+/// node: a disclosed departure of the formal statement from the informal
+/// source. See `formalization_meta.py` for the schema rationale.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeDivergence {
+    pub id: String,
+    pub project_id: String,
+    pub node_id: String,
+    /// Normally one of [`DIVERGENCE_KINDS`]; unknown kinds round-trip.
+    pub kind: String,
+    /// Free-text explanation. A divergence without detail discloses nothing.
+    pub detail: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// The closed divergence enum of formalization.yaml v0.3, in canonical
+/// (declaration) order. Mirrors `DIVERGENCE_KINDS` in
+/// `components/eval/python/theoremata_tools/formalization_meta.py`; the two
+/// must be kept in step.
+pub const DIVERGENCE_KINDS: [&str; 7] = [
+    "answer_baked_into_statement",
+    "modeling_step_unproven",
+    "background_fact_assumed",
+    "hypothesis_added",
+    "statement_weakened",
+    "statement_strengthened",
+    "other",
+];
+
+/// Whether `kind` is one of the schema's known divergence kinds. Unknown kinds
+/// are stored (so a newer schema revision round-trips) but a validator should
+/// flag them, exactly as the Python `validate` does.
+pub fn is_known_divergence_kind(kind: &str) -> bool {
+    DIVERGENCE_KINDS.contains(&kind)
+}
+
+fn divergence_row(r: &Row) -> rusqlite::Result<NodeDivergence> {
+    Ok(NodeDivergence {
+        id: r.get(0)?,
+        project_id: r.get(1)?,
+        node_id: r.get(2)?,
+        kind: r.get(3)?,
+        detail: r.get(4)?,
+        created_at: dt(r.get(5)?)?,
+    })
+}
+
 /// An admitted skill in the growing verified-lemma library. Distinct from the
 /// legacy graph-extraction [`crate::model::Lemma`]: this is the LEGO-Prover
 /// "lemma store" record — a verified `(statement, proof)` with its provenance,
@@ -2509,5 +2738,160 @@ mod tests {
             .unwrap()
             .iter()
             .all(|e| e.event_type != "nodes.merged"));
+    }
+
+    #[test]
+    fn evidence_round_trips_through_the_reader() {
+        let s = Store::open(Path::new(":memory:")).unwrap();
+        let p = s.create_project("p", "t").unwrap();
+        let n = s
+            .add_node(&p.id, NodeKind::Obligation, "n", "N", "test")
+            .unwrap();
+        let other = s
+            .add_node(&p.id, NodeKind::Lemma, "other", "O", "test")
+            .unwrap();
+        s.add_evidence(
+            &p.id,
+            &n.id,
+            "numeric_screen",
+            "sympy",
+            "no_counterexample",
+            json!({"samples": 1000}),
+        )
+        .unwrap();
+        s.add_evidence(
+            &p.id,
+            &n.id,
+            "statement_validity",
+            "critic",
+            "suspect",
+            json!({"reason": "vacuous hypothesis"}),
+        )
+        .unwrap();
+        s.add_evidence(
+            &p.id,
+            &other.id,
+            "retrieval",
+            "graph_rag",
+            "hit",
+            json!({"k": 5}),
+        )
+        .unwrap();
+
+        let got = s.evidence(&p.id, &n.id).unwrap();
+        assert_eq!(got.len(), 2, "reader must scope to the requested node");
+        // Full field round-trip, including the JSON payload.
+        let screen = got
+            .iter()
+            .find(|e| e.evidence_type == "numeric_screen")
+            .unwrap();
+        assert_eq!(screen.project_id, p.id);
+        assert_eq!(screen.node_id, n.id);
+        assert_eq!(screen.source, "sympy");
+        assert_eq!(screen.verdict, "no_counterexample");
+        assert_eq!(screen.payload["samples"], json!(1000));
+        // Deterministic order: the ORDER BY makes repeated reads identical.
+        assert_eq!(got, s.evidence(&p.id, &n.id).unwrap());
+        assert!(got.windows(2).all(|w| w[0].created_at <= w[1].created_at));
+
+        // Kind filter and the project-wide variant.
+        let only_screen = s.evidence_of_kind(&p.id, &n.id, "numeric_screen").unwrap();
+        assert_eq!(only_screen.len(), 1);
+        assert_eq!(only_screen[0].id, screen.id);
+        assert_eq!(s.project_evidence(&p.id).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn evidence_reader_returns_empty_for_a_bare_node() {
+        let s = Store::open(Path::new(":memory:")).unwrap();
+        let p = s.create_project("p", "t").unwrap();
+        let n = s
+            .add_node(&p.id, NodeKind::Lemma, "n", "N", "test")
+            .unwrap();
+        // No evidence is a legitimate answer, never an error.
+        assert!(s.evidence(&p.id, &n.id).unwrap().is_empty());
+        assert!(s.evidence_of_kind(&p.id, &n.id, "anything").unwrap().is_empty());
+        assert!(s.project_evidence(&p.id).unwrap().is_empty());
+        // Likewise for a node id that does not exist at all.
+        assert!(s.evidence(&p.id, "does-not-exist").unwrap().is_empty());
+    }
+
+    #[test]
+    fn divergences_round_trip_for_every_schema_kind() {
+        let s = Store::open(Path::new(":memory:")).unwrap();
+        let p = s.create_project("p", "t").unwrap();
+        let n = s
+            .add_node(&p.id, NodeKind::FormalStatement, "n", "N", "test")
+            .unwrap();
+        assert!(s.divergences(&p.id, &n.id).unwrap().is_empty());
+
+        for kind in DIVERGENCE_KINDS {
+            assert!(is_known_divergence_kind(kind));
+            s.add_divergence(&p.id, &n.id, kind, &format!("detail for {kind}"))
+                .unwrap();
+        }
+        let got = s.divergences(&p.id, &n.id).unwrap();
+        assert_eq!(got.len(), DIVERGENCE_KINDS.len());
+        for kind in DIVERGENCE_KINDS {
+            let row = got
+                .iter()
+                .find(|d| d.kind == kind)
+                .unwrap_or_else(|| panic!("missing divergence kind {kind}"));
+            assert_eq!(row.project_id, p.id);
+            assert_eq!(row.node_id, n.id);
+            assert_eq!(row.detail, format!("detail for {kind}"));
+        }
+        // The headline defect the schema exists to catch must be storable and
+        // findable by kind.
+        assert!(got
+            .iter()
+            .any(|d| d.kind == "answer_baked_into_statement"));
+        assert_eq!(got, s.divergences(&p.id, &n.id).unwrap());
+        assert!(got.windows(2).all(|w| w[0].created_at <= w[1].created_at));
+
+        // Node scoping, project-wide variant, and the permissive unknown kind.
+        let other = s
+            .add_node(&p.id, NodeKind::Lemma, "other", "O", "test")
+            .unwrap();
+        assert!(s.divergences(&p.id, &other.id).unwrap().is_empty());
+        s.add_divergence(&p.id, &other.id, "kind_from_a_newer_schema", "preserved")
+            .unwrap();
+        let unknown = s.divergences(&p.id, &other.id).unwrap();
+        assert_eq!(unknown.len(), 1, "unknown kinds must round-trip, not be dropped");
+        assert!(!is_known_divergence_kind(&unknown[0].kind));
+        assert_eq!(
+            s.project_divergences(&p.id).unwrap().len(),
+            DIVERGENCE_KINDS.len() + 1
+        );
+    }
+
+    #[test]
+    fn migrate_is_idempotent() {
+        let s = Store::open(Path::new(":memory:")).unwrap();
+        let p = s.create_project("p", "t").unwrap();
+        let n = s
+            .add_node(&p.id, NodeKind::Lemma, "n", "N", "test")
+            .unwrap();
+        s.add_evidence(&p.id, &n.id, "screen", "sympy", "ok", json!({}))
+            .unwrap();
+        s.add_divergence(&p.id, &n.id, "hypothesis_added", "added h : 0 < n")
+            .unwrap();
+        // A second (and third) migrate must be a no-op: no error, no data loss.
+        s.migrate().unwrap();
+        s.migrate().unwrap();
+        assert_eq!(s.nodes(&p.id).unwrap().len(), 1);
+        assert_eq!(s.evidence(&p.id, &n.id).unwrap().len(), 1);
+        assert_eq!(s.divergences(&p.id, &n.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn divergence_requires_a_real_node() {
+        let s = Store::open(Path::new(":memory:")).unwrap();
+        let p = s.create_project("p", "t").unwrap();
+        // The FK to nodes(id) is live, so a dangling disclosure is refused
+        // rather than silently accumulating against nothing.
+        assert!(s
+            .add_divergence(&p.id, "does-not-exist", "other", "d")
+            .is_err());
     }
 }
