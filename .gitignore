@@ -17,3 +17,7 @@ __pycache__/
 /math-papers/
 /atp/
 *.egg-info/
+/books/
+/higher-order-co/
+/mcps/
+/terminals/
