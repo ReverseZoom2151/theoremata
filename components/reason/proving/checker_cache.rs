@@ -20,7 +20,39 @@
 //! revisions.
 //!
 //! Project/corpus identity belongs in `checker_identity`; callers must include it
-//! when it can affect elaboration. Contrast [`goal_cache`](crate::goal_cache),
+//! when it can affect elaboration.
+//!
+//! ## Why the IMPORT MANIFEST is its own key field
+//!
+//! `checker_identity` is an INSTALLATION identity — binaries, runner, pinned
+//! toolchain, project root, cache epoch. It is computed once per run and is
+//! therefore constant across every problem in that run. It does NOT capture the
+//! per-problem IMPORT CLOSURE, and neither does `proof_source` in general: a
+//! backend may prepend imports drawn from the task/project rather than from the
+//! candidate text, in which case two candidates with byte-identical source can be
+//! elaborated against different environments.
+//!
+//! That gap is not hypothetical. A mined system recorded a live failure in which an
+//! unvalidated import list let
+//!
+//! ```text
+//! Mathlib
+//! axiom cheat : False
+//! ```
+//!
+//! through as an "import", baking a false axiom into the environment of every
+//! subsequent proof. Under a key blind to imports, the FIRST proof verified in the
+//! poisoned environment would be cached and then replayed as verified for inputs
+//! elaborated in a clean one — and, worse, a proof verified in a clean environment
+//! would be served for a request made in the poisoned one, hiding the poisoning.
+//! [`VerificationCacheKey::import_manifest`] closes that: the environment a proof
+//! was checked in is part of what the cache remembers.
+//!
+//! This is a KEY field, not a validator. It makes a changed environment a
+//! mandatory MISS; it does not decide whether an import list is legitimate. Import
+//! *validation* is the backend/gate's job, upstream.
+//!
+//! Contrast [`goal_cache`](crate::goal_cache),
 //! which is a project-scoped cache of goal → proof text. This cache only skips a
 //! repeated verification of the same proof under the same gate.
 //!
@@ -68,7 +100,9 @@ use std::collections::HashMap;
 
 /// Domain-separation tag mixed in first so this key space can never collide with
 /// another SHA-256 pre-image in the crate.
-const DOMAIN: &[u8] = b"theoremata.checker_cache.v2";
+/// Bumped to `v3` when the import manifest joined the key: a v2 key and a v3 key
+/// for the same inputs must not collide, and no v2-era entry may be read as v3.
+const DOMAIN: &[u8] = b"theoremata.checker_cache.v3";
 
 /// Absorb one length-framed, tagged field into the hasher. Framing every field
 /// with its byte length makes the pre-image UNAMBIGUOUS: no choice of
@@ -111,6 +145,17 @@ pub struct VerificationCacheKey<'a> {
     pub ordered_context: &'a [String],
     /// Exact candidate source. This is never normalized.
     pub proof_source: &'a str,
+    /// The per-problem IMPORT CLOSURE this candidate is elaborated against, in
+    /// the order the backend applies it (`["Mathlib", "Mathlib.Tactic"]`).
+    ///
+    /// Order is preserved and each entry is hashed whitespace-normalized. Pass
+    /// the manifest the backend will ACTUALLY use, not the one the model asked
+    /// for. An empty slice means "no imports beyond what `proof_source` itself
+    /// declares" — pass `&[]` only when that is literally true, because an empty
+    /// manifest and a populated one are different keys, which is the point.
+    ///
+    /// See the module docs for why `checker_identity` does not cover this.
+    pub import_manifest: &'a [String],
     /// Backend/toolchain/corpus identity, including live vs mock mode.
     pub checker_identity: &'a str,
     /// Gate/policy fingerprint (axiom whitelist, hardening switches, gate epoch).
@@ -134,6 +179,11 @@ pub fn cache_key(input: &VerificationCacheKey<'_>) -> String {
         absorb(&mut hasher, b"hyp", normalize(hyp).as_bytes());
     }
     absorb(&mut hasher, b"proof", input.proof_source.as_bytes());
+    // Frame the import count for the same anti-ambiguity reason as the context.
+    hasher.update((input.import_manifest.len() as u64).to_be_bytes());
+    for import in input.import_manifest {
+        absorb(&mut hasher, b"import", normalize(import).as_bytes());
+    }
     absorb(&mut hasher, b"checker", input.checker_identity.as_bytes());
     absorb(&mut hasher, b"policy", input.policy_fingerprint.as_bytes());
     hex_lower(hasher.finalize())
@@ -263,10 +313,25 @@ mod tests {
         hyps.iter().map(|s| s.to_string()).collect()
     }
 
+    /// No-import shorthand used by the pre-existing tests, which are about the
+    /// other key fields.
     fn input<'a>(
         system: FormalSystem,
         statement: &'a str,
         context: &'a [String],
+        proof: &'a str,
+        checker: &'a str,
+        policy: &'a str,
+    ) -> VerificationCacheKey<'a> {
+        input_with_imports(system, statement, context, &[], proof, checker, policy)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn input_with_imports<'a>(
+        system: FormalSystem,
+        statement: &'a str,
+        context: &'a [String],
+        imports: &'a [String],
         proof: &'a str,
         checker: &'a str,
         policy: &'a str,
@@ -276,6 +341,7 @@ mod tests {
             canonical_statement: statement,
             ordered_context: context,
             proof_source: proof,
+            import_manifest: imports,
             checker_identity: checker,
             policy_fingerprint: policy,
         }
@@ -452,6 +518,82 @@ mod tests {
         assert!(cache.insert_verified(&key, verified_report()));
         assert!(cache.insert_verified(&key, verified_report()));
         assert_eq!(cache.len(), 1);
+    }
+
+    /// The environment a proof was checked in is part of the key. This is the
+    /// mined "unvalidated import list bakes in `axiom cheat : False`" failure:
+    /// everything else about the request is identical, so without this field the
+    /// poisoned and the clean environment would share one cache entry.
+    #[test]
+    fn changing_the_import_manifest_changes_the_key() {
+        let hyps = ctx(&[]);
+        let clean = ctx(&["Mathlib"]);
+        let poisoned = ctx(&["Mathlib\naxiom cheat : False"]);
+        let extra = ctx(&["Mathlib", "Mathlib.Tactic"]);
+        let reordered = ctx(&["Mathlib.Tactic", "Mathlib"]);
+
+        let base = input_with_imports(
+            FormalSystem::Lean,
+            "⊢ G",
+            &hyps,
+            &clean,
+            "theorem g : G := proof",
+            "lean:live:v4.19",
+            "policy",
+        );
+        let base_hash = cache_key(&base);
+
+        for changed in [&poisoned, &extra, &reordered, &hyps] {
+            let other = input_with_imports(
+                FormalSystem::Lean,
+                "⊢ G",
+                &hyps,
+                changed,
+                "theorem g : G := proof",
+                "lean:live:v4.19",
+                "policy",
+            );
+            assert_ne!(
+                base_hash,
+                cache_key(&other),
+                "a different import closure must be a different key: {changed:?}"
+            );
+        }
+
+        // And it is a real cache MISS, not merely a different hash: a verdict
+        // earned in the clean environment is never served for the poisoned one.
+        let cache = CheckerCache::new();
+        assert!(cache.insert_verified(&base, verified_report()));
+        let poisoned_key = input_with_imports(
+            FormalSystem::Lean,
+            "⊢ G",
+            &hyps,
+            &poisoned,
+            "theorem g : G := proof",
+            "lean:live:v4.19",
+            "policy",
+        );
+        assert!(
+            cache.get(&poisoned_key).is_none(),
+            "a proof checked against a clean import closure must NOT be reused \
+             for one checked against a poisoned closure"
+        );
+        // The converse direction is equally required.
+        assert!(cache.insert_verified(&poisoned_key, verified_report()));
+        assert!(cache.get(&base).is_some());
+        assert_eq!(cache.len(), 2, "the two environments occupy distinct slots");
+    }
+
+    /// Imports are normalized like the other text fields, so cosmetic whitespace
+    /// still shares a key.
+    #[test]
+    fn import_manifest_is_whitespace_normalized() {
+        let hyps = ctx(&[]);
+        let a = ctx(&["  Mathlib.Tactic  "]);
+        let b = ctx(&["Mathlib.Tactic"]);
+        let ka = input_with_imports(FormalSystem::Lean, "⊢ G", &hyps, &a, "p", "c", "pol");
+        let kb = input_with_imports(FormalSystem::Lean, "⊢ G", &hyps, &b, "p", "c", "pol");
+        assert_eq!(cache_key(&ka), cache_key(&kb));
     }
 
     #[test]

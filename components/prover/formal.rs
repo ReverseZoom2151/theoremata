@@ -349,6 +349,85 @@ pub struct ScanReport {
     pub detail: Value,
 }
 
+// --- Tier 0 gate switches -------------------------------------------------
+
+/// Which of the two Tier-0 semantic gates are CONJOINED into
+/// [`VerificationReport::lexically_verified`].
+///
+/// Both are **OFF by default, and that is a correctness requirement, not
+/// timidity.** Each gate demands a channel the caller must positively supply:
+///
+/// * [`crate::prover::hypothesis_audit`] needs the DESIGNATED INPUTS of the task
+///   ([`FormalBackend::designated_inputs`]). With none declared, every genuine
+///   antecedent of a conditional theorem reads as `Unaccounted`.
+/// * [`crate::prover::vacuity`] needs a [`SatisfiabilityWitness`]
+///   ([`FormalBackend::satisfiability_witness`]). It is fail-closed by design:
+///   *no witness ⇒ not clean*.
+///
+/// So conjoining either one before its channel is populated would fail EVERY
+/// non-trivial goal and halt the pipeline. Until the callers that own the task
+/// definition supply these, the reports are computed and published to the gate's
+/// JSON `detail` UNCONDITIONALLY — full observability, zero behavior change —
+/// and only the conjunction is gated.
+///
+/// [`SatisfiabilityWitness`]: crate::prover::vacuity::SatisfiabilityWitness
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TierZeroGates {
+    /// Conjoin the hypothesis-discharge audit's verdict.
+    pub hypothesis_discharge: bool,
+    /// Conjoin the vacuous-success guard's verdict.
+    pub vacuity: bool,
+}
+
+impl TierZeroGates {
+    /// Both gates observational only — the behavior-preserving default.
+    pub const OFF: Self = Self {
+        hypothesis_discharge: false,
+        vacuity: false,
+    };
+
+    /// Both gates enforcing.
+    pub const ON: Self = Self {
+        hypothesis_discharge: true,
+        vacuity: true,
+    };
+
+    /// Read the gates from the environment, in the crate's default-off env-seam
+    /// idiom (cf. `config::default_validate_statements` and
+    /// `agent::abstain_threshold`): absent / empty / `0`/`false`/`off` means OFF.
+    ///
+    /// * `THEOREMATA_HYPOTHESIS_GATE` — hypothesis-discharge audit.
+    /// * `THEOREMATA_VACUITY_GATE` — vacuous-success guard.
+    ///
+    /// These are a temporary seam. `app/config.rs` is owned elsewhere, so this
+    /// reads the process env the way `agent::abstain_threshold` does; the
+    /// preferred home is a pair of `Config` fields (see the module-level note in
+    /// the handover report). Deterministic per call: no clock, no RNG.
+    pub fn from_env() -> Self {
+        Self {
+            hypothesis_discharge: env_gate_on("THEOREMATA_HYPOTHESIS_GATE"),
+            vacuity: env_gate_on("THEOREMATA_VACUITY_GATE"),
+        }
+    }
+
+    /// Whether either gate is enforcing.
+    pub fn any(self) -> bool {
+        self.hypothesis_discharge || self.vacuity
+    }
+}
+
+/// Default-OFF truthiness for a gate env var: set to anything other than
+/// (empty) / `0` / `false` / `off` turns it on.
+fn env_gate_on(var: &str) -> bool {
+    match std::env::var(var) {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "off"
+        ),
+        Err(_) => false,
+    }
+}
+
 /// One trait, one impl per system. The default [`verify`](FormalBackend::verify)
 /// wires the four layers together, fail-closed: ALL must pass.
 pub trait FormalBackend {
@@ -414,10 +493,83 @@ pub trait FormalBackend {
     /// Layer 2c (MANDATORY): lexical escape-hatch scan of the raw source.
     fn source_scan(&self, code: &str) -> Result<ScanReport>;
 
+    /// **Layer 2d channel — DESIGNATED INPUTS.** The hypotheses this task
+    /// legitimately assumes, named either by BINDER name (`"hGlaisher"`) or by
+    /// TYPE HEAD (`"Glaisher3"`).
+    ///
+    /// [`crate::prover::hypothesis_audit`] exists to catch a theorem that is
+    /// silently conditional on unproved mathematics carried in its own signature
+    /// — a `Prop`-valued argument that is stated and never proved, or an
+    /// assumption-bundling `structure` no instance is ever constructed for.
+    /// Neither is visible to `#print axioms` or to a `sorry` scan. But a
+    /// *genuine* conditional result ("assuming RH, …") has exactly that shape,
+    /// and only the party that defined the task can tell the two apart. This is
+    /// where they say so.
+    ///
+    /// The default is EMPTY — nothing is assumed to be a designated input. That
+    /// is the safe default for the audit's verdict, and it is also why the
+    /// [`TierZeroGates::hypothesis_discharge`] gate must stay off until a
+    /// backend/job actually populates this: with an empty allowlist, every real
+    /// conditional theorem is `Unaccounted`.
+    fn designated_inputs(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// **Vacuity channel (1/2) — the goal's HYPOTHESIS BUNDLE**, when the caller
+    /// can state it.
+    ///
+    /// `None` (the default) means "this backend does not model the goal's
+    /// bundle", and the vacuity check is reported NOT DECLARED rather than run:
+    /// we will not synthesize a bundle we cannot parse and then fail closed on
+    /// our own guess. A backend/job that CAN state the bundle returns it here and
+    /// pairs it with [`satisfiability_witness`](FormalBackend::satisfiability_witness).
+    fn hypothesis_bundle(&self, _stmt: &str) -> Option<crate::prover::vacuity::HypothesisBundle> {
+        None
+    }
+
+    /// **Vacuity channel (2/2) — the SATISFIABILITY WITNESS** for the bundle: a
+    /// concrete instance meeting every field.
+    ///
+    /// [`crate::prover::vacuity`] catches a goal discharged by making its own
+    /// hypotheses contradictory (`(h₁ : x > 5) (h₂ : x < 3) : Goal` proves ANY
+    /// goal). Such a proof passes the kernel, the axiom audit AND statement
+    /// preservation — every existing layer asks "is this derivation sound?", and
+    /// it is. The only defense is to exhibit an instance, and satisfiability is
+    /// undecidable in general, so the witness must come from the caller.
+    ///
+    /// The default is `None`, which the vacuity check treats as fail-closed for
+    /// any non-trivial bundle — hence the default-off gate.
+    fn satisfiability_witness(
+        &self,
+        _stmt: &str,
+    ) -> Option<crate::prover::vacuity::SatisfiabilityWitness> {
+        None
+    }
+
     /// Default 3+1-layer orchestration (compile → axioms ⊆ whitelist → kernel
     /// re-check → source scan). Fail-closed: the proof is trusted only when all
     /// four layers pass. Reuses the existing [`VerificationReport`] fields.
     fn verify(&self, cfg: &Config, code: &str, stmt: &str) -> Result<VerificationReport> {
+        self.verify_with_gates(cfg, code, stmt, TierZeroGates::from_env())
+    }
+
+    /// [`verify`](FormalBackend::verify) with the Tier-0 gate switches passed
+    /// explicitly instead of read from the environment.
+    ///
+    /// This is the real implementation; `verify` is the env-reading wrapper.
+    /// Callers that know their policy (and tests, which must not race on a
+    /// process-global env var) should call this directly.
+    ///
+    /// Whatever the switches, both Tier-0 reports are COMPUTED and written to
+    /// `detail` — the observability is unconditional. The switches decide only
+    /// whether the verdicts are conjoined into `lexically_verified`.
+    fn verify_with_gates(
+        &self,
+        cfg: &Config,
+        code: &str,
+        stmt: &str,
+        gates: TierZeroGates,
+    ) -> Result<VerificationReport> {
         let system = self.system();
         let name = theorem_name_hint(stmt);
         let ws = self.scaffold(cfg, code, &name)?;
@@ -450,8 +602,35 @@ pub trait FormalBackend {
             crate::prover::statement_preservation::check_entry_signature(system, stmt, code);
         let mentioned = statement_mentioned(stmt, code);
         let statement_preserved = mentioned && (preservation.preserved || self.is_mock());
-        let lexically_verified =
-            kernel_clean && axioms_clean && lexical_clean && statement_preserved;
+
+        // --- Tier 0 layer 2d: hypothesis-discharge audit ---------------------
+        // Catches a theorem conditional on unproved mathematics carried in its
+        // own signature. Non-Lean systems report NOT APPLICABLE (clean, so this
+        // never regresses a backend we cannot parse).
+        let allowlist = self.designated_inputs();
+        let hypotheses = crate::prover::hypothesis_audit::audit_hypotheses(
+            system, stmt, code, &allowlist,
+        );
+        let hypotheses_discharged = hypotheses.clean;
+
+        // --- Tier 0: vacuous-success guard -----------------------------------
+        // Catches a goal discharged by making its hypotheses contradictory —
+        // sound, kernel-clean, and worthless. Only runs when the caller declared
+        // a bundle; an undeclared bundle is NOT DECLARED, never a guessed fail.
+        let bundle = self.hypothesis_bundle(stmt);
+        let vacuity = bundle.as_ref().map(|b| {
+            crate::prover::vacuity::check_vacuity(b, self.satisfiability_witness(stmt).as_ref())
+        });
+        let bundle_satisfiable = vacuity.as_ref().map_or(true, |v| v.clean);
+
+        // Conjoin ONLY behind the (default-off) switches. With the gates off this
+        // expression is byte-for-byte the historical one.
+        let lexically_verified = kernel_clean
+            && axioms_clean
+            && lexical_clean
+            && statement_preserved
+            && (!gates.hypothesis_discharge || hypotheses_discharged)
+            && (!gates.vacuity || bundle_satisfiable);
 
         Ok(VerificationReport {
             lexically_verified,
@@ -472,6 +651,25 @@ pub trait FormalBackend {
                 "source_scan": scan,
                 "statement_preservation": preservation,
                 "whitelist": whitelist,
+                // Tier 0 gates: ALWAYS reported, conjoined only when switched on.
+                // `enforced` records which verdicts actually moved
+                // `lexically_verified`, so a reader can never mistake an
+                // observational finding for a gating one.
+                "tier0": {
+                    "gates": gates,
+                    "hypothesis_audit": {
+                        "clean": hypotheses_discharged,
+                        "enforced": gates.hypothesis_discharge,
+                        "designated_inputs": allowlist,
+                        "report": hypotheses,
+                    },
+                    "vacuity": {
+                        "declared": vacuity.is_some(),
+                        "clean": bundle_satisfiable,
+                        "enforced": gates.vacuity,
+                        "report": vacuity,
+                    },
+                },
             }),
         })
     }
@@ -1095,6 +1293,306 @@ mod tests {
             imports: Vec::new(),
             metadata: json!({}),
         }
+    }
+
+    // --- Tier 0 gate plumbing --------------------------------------------
+    //
+    // A minimal backend whose four classic layers all PASS, so the only thing
+    // that can move `lexically_verified` in these tests is the Tier-0 wiring.
+
+    use crate::prover::vacuity::{HypothesisBundle, HypothesisField, SatisfiabilityWitness};
+
+    #[derive(Default)]
+    struct GateTestBackend {
+        inputs: Vec<String>,
+        bundle: Option<HypothesisBundle>,
+        witness: Option<SatisfiabilityWitness>,
+    }
+
+    impl FormalBackend for GateTestBackend {
+        fn system(&self) -> FormalSystem {
+            FormalSystem::Lean
+        }
+        fn compile_success_signal(&self) -> SuccessSignal {
+            SuccessSignal::NonZeroExitIsHonest
+        }
+        // Mock, so `statement_preserved` needs only the lexical mention and the
+        // test does not depend on the signature checker's parse.
+        fn is_mock(&self) -> bool {
+            true
+        }
+        fn scaffold(&self, _cfg: &Config, _code: &str, name: &str) -> Result<Workspace> {
+            Ok(Workspace {
+                system: FormalSystem::Lean,
+                root: PathBuf::from("."),
+                source_path: PathBuf::from("./Generated.lean"),
+                entry: name.to_string(),
+            })
+        }
+        fn compile(&self, _ws: &Workspace) -> Result<CompileReport> {
+            Ok(CompileReport {
+                compiled: true,
+                errors: Vec::new(),
+                per_unit: Vec::new(),
+                detail: json!({}),
+            })
+        }
+        fn audit_axioms(
+            &self,
+            _ws: &Workspace,
+            _thm: &str,
+            _whitelist: &[String],
+        ) -> Result<AxiomReport> {
+            Ok(AxiomReport {
+                axioms: Vec::new(),
+                within_whitelist: true,
+                detail: json!({}),
+            })
+        }
+        fn kernel_recheck(&self, _ws: &Workspace) -> Result<RecheckReport> {
+            Ok(RecheckReport {
+                rechecked: true,
+                detail: json!({}),
+            })
+        }
+        fn source_scan(&self, _code: &str) -> Result<ScanReport> {
+            Ok(ScanReport {
+                clean: true,
+                findings: Vec::new(),
+                detail: json!({}),
+            })
+        }
+        fn designated_inputs(&self) -> Vec<String> {
+            self.inputs.clone()
+        }
+        fn hypothesis_bundle(&self, _stmt: &str) -> Option<HypothesisBundle> {
+            self.bundle.clone()
+        }
+        fn satisfiability_witness(&self, _stmt: &str) -> Option<SatisfiabilityWitness> {
+            self.witness.clone()
+        }
+    }
+
+    /// A theorem conditional on a `Prop` that is STATED and never PROVED — the
+    /// mechanism-(a) hole the hypothesis audit exists to catch. Every classic
+    /// layer passes on it.
+    const COND_STMT: &str = "theorem phi3 (hG : Glaisher3) : True";
+    const COND_CODE: &str = "\
+def Glaisher3 : Prop := True
+
+theorem phi3 (hG : Glaisher3) : True := trivial
+";
+
+    /// A non-trivial hypothesis bundle with no witness — the fail-closed case.
+    fn unwitnessed_bundle() -> HypothesisBundle {
+        HypothesisBundle::new(
+            "phi3",
+            vec![
+                HypothesisField::datum("n", "Nat"),
+                HypothesisField::hypothesis("hn", "n > 5"),
+            ],
+        )
+    }
+
+    fn tier0<'a>(report: &'a VerificationReport) -> &'a Value {
+        &report.detail["tier0"]
+    }
+
+    /// GATES OFF (the default): a proof that would fail BOTH Tier-0 checks
+    /// verifies exactly as it does today — and both reports are nonetheless
+    /// present in `detail`.
+    #[test]
+    fn tier0_reports_are_observational_when_the_gates_are_off() {
+        let backend = GateTestBackend {
+            inputs: Vec::new(),
+            bundle: Some(unwitnessed_bundle()),
+            witness: None,
+        };
+        let cfg = Config::default();
+        let report = backend
+            .verify_with_gates(&cfg, COND_CODE, COND_STMT, TierZeroGates::OFF)
+            .expect("verify must succeed");
+
+        // Behavior preserved: the four classic layers decide, and they all pass.
+        assert!(
+            report.lexically_verified,
+            "gates off must not change the verdict: {:#?}",
+            report.detail
+        );
+        assert!(report.axioms_clean);
+        assert!(report.lexical_clean);
+        assert!(report.statement_preserved);
+
+        // ...yet BOTH findings are visible.
+        let t = tier0(&report);
+        assert_eq!(t["hypothesis_audit"]["clean"], json!(false));
+        assert_eq!(t["hypothesis_audit"]["enforced"], json!(false));
+        assert_eq!(t["vacuity"]["declared"], json!(true));
+        assert_eq!(t["vacuity"]["clean"], json!(false));
+        assert_eq!(t["vacuity"]["enforced"], json!(false));
+        // The detail names the culprits, not just a boolean.
+        let rendered = t.to_string();
+        assert!(rendered.contains("Glaisher3"), "{rendered}");
+        assert!(rendered.contains("witness_missing"), "{rendered}");
+    }
+
+    /// GATE ON: the same submission fails closed on the hypothesis audit alone.
+    #[test]
+    fn hypothesis_gate_fails_closed_when_switched_on() {
+        let backend = GateTestBackend::default();
+        let cfg = Config::default();
+        let gates = TierZeroGates {
+            hypothesis_discharge: true,
+            vacuity: false,
+        };
+        let report = backend
+            .verify_with_gates(&cfg, COND_CODE, COND_STMT, gates)
+            .unwrap();
+        assert!(
+            !report.lexically_verified,
+            "an undischarged hypothesis must fail the gate when it is enforced"
+        );
+        // The classic layers are untouched — this is a NEW, separable verdict.
+        assert!(report.axioms_clean && report.lexical_clean && report.statement_preserved);
+        assert_eq!(tier0(&report)["hypothesis_audit"]["enforced"], json!(true));
+    }
+
+    /// The ALLOWLIST channel: declaring the hypothesis a designated input clears
+    /// the same gate on the same submission.
+    #[test]
+    fn designated_inputs_clear_the_hypothesis_gate() {
+        let cfg = Config::default();
+        let gates = TierZeroGates {
+            hypothesis_discharge: true,
+            vacuity: false,
+        };
+        // By type head...
+        let by_head = GateTestBackend {
+            inputs: vec!["Glaisher3".to_string()],
+            ..Default::default()
+        };
+        assert!(by_head
+            .verify_with_gates(&cfg, COND_CODE, COND_STMT, gates)
+            .unwrap()
+            .lexically_verified);
+        // ...and by binder name.
+        let by_binder = GateTestBackend {
+            inputs: vec!["hG".to_string()],
+            ..Default::default()
+        };
+        assert!(by_binder
+            .verify_with_gates(&cfg, COND_CODE, COND_STMT, gates)
+            .unwrap()
+            .lexically_verified);
+    }
+
+    /// GATE ON: a declared bundle with no witness fails closed.
+    #[test]
+    fn vacuity_gate_fails_closed_without_a_witness() {
+        let backend = GateTestBackend {
+            inputs: vec!["Glaisher3".to_string()],
+            bundle: Some(unwitnessed_bundle()),
+            witness: None,
+        };
+        let cfg = Config::default();
+        let gates = TierZeroGates {
+            hypothesis_discharge: false,
+            vacuity: true,
+        };
+        let report = backend
+            .verify_with_gates(&cfg, COND_CODE, COND_STMT, gates)
+            .unwrap();
+        assert!(
+            !report.lexically_verified,
+            "no witness must fail closed: absence of a witness is not evidence \
+             of satisfiability"
+        );
+    }
+
+    /// The WITNESS channel: supplying a satisfying instance clears the gate.
+    #[test]
+    fn a_supplied_witness_clears_the_vacuity_gate() {
+        let backend = GateTestBackend {
+            inputs: vec!["Glaisher3".to_string()],
+            bundle: Some(unwitnessed_bundle()),
+            witness: Some(
+                SatisfiabilityWitness::new("n := 7")
+                    .bind("n", json!(7))
+                    .claim("hn"),
+            ),
+        };
+        let cfg = Config::default();
+        let report = backend
+            .verify_with_gates(&cfg, COND_CODE, COND_STMT, TierZeroGates::ON)
+            .unwrap();
+        assert!(
+            report.lexically_verified,
+            "a witnessed bundle + allowlisted input must pass: {:#?}",
+            report.detail
+        );
+        assert_eq!(tier0(&report)["vacuity"]["clean"], json!(true));
+    }
+
+    /// A witness that does NOT satisfy the bundle is rejected — the channel is a
+    /// real check, not a rubber stamp.
+    #[test]
+    fn a_violating_witness_does_not_clear_the_vacuity_gate() {
+        let backend = GateTestBackend {
+            inputs: vec!["Glaisher3".to_string()],
+            bundle: Some(unwitnessed_bundle()), // hn : n > 5
+            witness: Some(
+                SatisfiabilityWitness::new("n := 2")
+                    .bind("n", json!(2))
+                    .claim("hn"),
+            ),
+        };
+        let cfg = Config::default();
+        assert!(!backend
+            .verify_with_gates(&cfg, COND_CODE, COND_STMT, TierZeroGates::ON)
+            .unwrap()
+            .lexically_verified);
+    }
+
+    /// An UNDECLARED bundle is reported as such and never fails closed on a
+    /// bundle we had to guess at — even with the gate enforcing.
+    #[test]
+    fn an_undeclared_bundle_is_not_declared_rather_than_failed() {
+        let backend = GateTestBackend {
+            inputs: vec!["Glaisher3".to_string()],
+            bundle: None,
+            witness: None,
+        };
+        let cfg = Config::default();
+        let report = backend
+            .verify_with_gates(&cfg, COND_CODE, COND_STMT, TierZeroGates::ON)
+            .unwrap();
+        assert!(report.lexically_verified);
+        let t = tier0(&report);
+        assert_eq!(t["vacuity"]["declared"], json!(false));
+        assert_eq!(t["vacuity"]["report"], Value::Null);
+    }
+
+    /// The env seam parses default-OFF, and only truthy values switch a gate on.
+    #[test]
+    fn gate_env_parsing_is_default_off() {
+        assert_eq!(TierZeroGates::default(), TierZeroGates::OFF);
+        assert!(!TierZeroGates::OFF.any());
+        assert!(TierZeroGates::ON.any());
+
+        // Unset (this name is never set by the suite) reads OFF.
+        assert!(!env_gate_on("THEOREMATA_GATE_ENV_PROBE_UNSET"));
+
+        // The falsey spellings the crate's other seams accept, plus a truthy one.
+        let var = "THEOREMATA_GATE_ENV_PROBE";
+        for falsey in ["", " ", "0", "false", "FALSE", "off", " Off "] {
+            std::env::set_var(var, falsey);
+            assert!(!env_gate_on(var), "`{falsey}` must read as OFF");
+        }
+        for truthy in ["1", "true", "on", "yes"] {
+            std::env::set_var(var, truthy);
+            assert!(env_gate_on(var), "`{truthy}` must read as ON");
+        }
+        std::env::remove_var(var);
     }
 
     #[test]

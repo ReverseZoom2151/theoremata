@@ -315,7 +315,7 @@ pub fn replay(trace: &RunTrace) -> Vec<Step> {
     steps
 }
 
-/// The six standard failure classes an agent framework buckets errors into. The
+/// The standard failure classes an agent framework buckets errors into. The
 /// bucket, not the raw message, is what dashboards, retry policy, and the failure
 /// taxonomy reason over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -331,6 +331,15 @@ pub enum FailureClass {
     TimeoutResource,
     /// The model produced malformed / unparseable / schema-violating output.
     ModelFormat,
+    /// A HOLLOW success: the artifact was accepted by every soundness layer, yet
+    /// the result is worthless because its hypothesis bundle was never shown to
+    /// be satisfiable (see [`crate::prover::vacuity`]). This is deliberately NOT
+    /// [`VerificationReject`](FailureClass::VerificationReject): the kernel did
+    /// not reject anything — the derivation really is valid — so bucketing it as
+    /// a verification rejection would hide the distinct failure mode that
+    /// vacuity exists to surface, and would mislead retry policy (re-running the
+    /// prover cannot fix a contradictory bundle; the STATEMENT must change).
+    VacuousSuccess,
     /// Not attributable to any of the above.
     Unknown,
 }
@@ -344,6 +353,7 @@ impl FailureClass {
             FailureClass::VerificationReject => "verification_reject",
             FailureClass::TimeoutResource => "timeout_resource",
             FailureClass::ModelFormat => "model_format",
+            FailureClass::VacuousSuccess => "vacuous_success",
             FailureClass::Unknown => "unknown",
         }
     }
@@ -385,6 +395,16 @@ pub struct ErrorContext {
     pub format_error: bool,
     /// The verifier / kernel rejected the artifact.
     pub kernel_rejected: bool,
+    /// The artifact PASSED every soundness layer, but its hypothesis bundle was
+    /// never witnessed satisfiable — a vacuous success (see
+    /// [`crate::prover::vacuity`]). Distinct from `kernel_rejected` precisely
+    /// because the kernel did NOT reject: this is the signal for a derivation
+    /// that is sound and worthless.
+    ///
+    /// Defaults to `false` in [`ErrorContext::from_layer`], so every existing
+    /// caller keeps its exact prior classification.
+    #[serde(default)]
+    pub vacuity_unwitnessed: bool,
     /// The original error text, kept for the record (not matched against).
     pub message: String,
 }
@@ -398,6 +418,7 @@ impl ErrorContext {
             timed_out: false,
             format_error: false,
             kernel_rejected: false,
+            vacuity_unwitnessed: false,
             message: message.into(),
         }
     }
@@ -414,14 +435,23 @@ impl FailureTaxonomy {
     ///
     /// 1. `timed_out` ⇒ [`FailureClass::TimeoutResource`] (a budget failure looks
     ///    the same whatever layer it hit).
-    /// 2. `kernel_rejected` ⇒ [`FailureClass::VerificationReject`].
-    /// 3. `format_error` ⇒ [`FailureClass::ModelFormat`].
-    /// 4. otherwise, the `layer`: Plan⇒Planning, Tool⇒ToolingExec,
+    /// 2. `vacuity_unwitnessed` ⇒ [`FailureClass::VacuousSuccess`]. This is
+    ///    checked AFTER `timed_out` (a run that never finished has no success to
+    ///    call vacuous) and BEFORE `kernel_rejected`, because a vacuous success
+    ///    is precisely the case where the kernel did NOT reject. Should a caller
+    ///    set both, the vacuity diagnosis is the more specific and therefore the
+    ///    more useful one.
+    /// 3. `kernel_rejected` ⇒ [`FailureClass::VerificationReject`].
+    /// 4. `format_error` ⇒ [`FailureClass::ModelFormat`].
+    /// 5. otherwise, the `layer`: Plan⇒Planning, Tool⇒ToolingExec,
     ///    Verify⇒VerificationReject, Model⇒ModelFormat, Repair⇒ToolingExec,
     ///    Search⇒Planning, Unknown⇒Unknown.
     pub fn classify(ctx: &ErrorContext) -> FailureClass {
         if ctx.timed_out {
             return FailureClass::TimeoutResource;
+        }
+        if ctx.vacuity_unwitnessed {
+            return FailureClass::VacuousSuccess;
         }
         if ctx.kernel_rejected {
             return FailureClass::VerificationReject;
@@ -612,6 +642,7 @@ mod tests {
             timed_out: true,
             format_error: true,
             kernel_rejected: true,
+            vacuity_unwitnessed: true,
             message: "everything at once".into(),
         };
         assert_eq!(
@@ -623,6 +654,85 @@ mod tests {
         assert_eq!(
             FailureClass::VerificationReject.as_str(),
             "verification_reject"
+        );
+    }
+
+    /// The `vacuity_unwitnessed` signal yields [`FailureClass::VacuousSuccess`],
+    /// and it OUTRANKS `kernel_rejected` — a vacuous success is exactly the case
+    /// where the kernel did not reject, so bucketing it as a verification
+    /// rejection would erase the distinction the class exists to draw.
+    #[test]
+    fn vacuity_signal_classifies_as_vacuous_success() {
+        let mut ctx = ErrorContext::from_layer(Layer::Verify, "hypothesis bundle unwitnessed");
+        ctx.vacuity_unwitnessed = true;
+        assert_eq!(FailureTaxonomy::classify(&ctx), FailureClass::VacuousSuccess);
+
+        // Beats kernel_rejected...
+        ctx.kernel_rejected = true;
+        assert_eq!(FailureTaxonomy::classify(&ctx), FailureClass::VacuousSuccess);
+
+        // ...but not a timeout (an unfinished run has no success to call vacuous).
+        ctx.timed_out = true;
+        assert_eq!(
+            FailureTaxonomy::classify(&ctx),
+            FailureClass::TimeoutResource
+        );
+    }
+
+    /// Existing callers are untouched: `from_layer` clears the new signal, so a
+    /// Verify-layer failure still classifies as a verification rejection.
+    #[test]
+    fn vacuity_signal_defaults_off_for_existing_callers() {
+        let ctx = ErrorContext::from_layer(Layer::Verify, "compile error");
+        assert!(!ctx.vacuity_unwitnessed);
+        assert_eq!(
+            FailureTaxonomy::classify(&ctx),
+            FailureClass::VerificationReject
+        );
+    }
+
+    /// The new variant round-trips through its stable tag and through serde.
+    #[test]
+    fn vacuous_success_tag_round_trips() {
+        assert_eq!(FailureClass::VacuousSuccess.as_str(), "vacuous_success");
+        let json = serde_json::to_string(&FailureClass::VacuousSuccess).unwrap();
+        assert_eq!(json, "\"vacuous_success\"");
+        let back: FailureClass = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, FailureClass::VacuousSuccess);
+        // Every class's serde tag agrees with its `as_str`.
+        for class in [
+            FailureClass::Planning,
+            FailureClass::ToolingExec,
+            FailureClass::VerificationReject,
+            FailureClass::TimeoutResource,
+            FailureClass::ModelFormat,
+            FailureClass::VacuousSuccess,
+            FailureClass::Unknown,
+        ] {
+            assert_eq!(
+                serde_json::to_value(class).unwrap(),
+                serde_json::Value::String(class.as_str().to_string())
+            );
+        }
+    }
+
+    /// `ErrorContext` still round-trips, and an OLD serialized context (with no
+    /// `vacuity_unwitnessed` key) deserializes with the signal cleared.
+    #[test]
+    fn error_context_round_trips_and_tolerates_legacy_payloads() {
+        let mut ctx = ErrorContext::from_layer(Layer::Verify, "vacuous");
+        ctx.vacuity_unwitnessed = true;
+        let back: ErrorContext =
+            serde_json::from_str(&serde_json::to_string(&ctx).unwrap()).unwrap();
+        assert_eq!(ctx, back);
+
+        let legacy = r#"{"layer":"verify","timed_out":false,"format_error":false,
+            "kernel_rejected":true,"message":"old"}"#;
+        let old: ErrorContext = serde_json::from_str(legacy).unwrap();
+        assert!(!old.vacuity_unwitnessed);
+        assert_eq!(
+            FailureTaxonomy::classify(&old),
+            FailureClass::VerificationReject
         );
     }
 

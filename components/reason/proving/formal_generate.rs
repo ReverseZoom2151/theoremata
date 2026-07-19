@@ -109,6 +109,11 @@ pub fn generate_and_verify_with_cache(
     };
     let checker_identity = checker_identity(config, backend.as_ref());
     let policy_fingerprint = policy_fingerprint(config, backend.as_ref());
+    // The import closure this verification runs under. A cached PASS is only
+    // meaningful relative to an environment: a proof verified under an import
+    // list that smuggles in an axiom must never share a cache slot with one
+    // verified under a clean list.
+    let import_manifest = system.default_imports();
 
     // An ADDITIONAL best-of-N candidate: a hammer-assisted proof. We ask the
     // `hammer` worker (Sledgehammer / CoqHammer / aesop) to FIND a tactic for the
@@ -145,6 +150,7 @@ pub fn generate_and_verify_with_cache(
                 proof_source: &code,
                 checker_identity: &checker_identity,
                 policy_fingerprint: &policy_fingerprint,
+                import_manifest: &import_manifest,
             };
             let (mut report, cache_hit) =
                 verify_candidate(cache, &key, || backend.verify(config, &code, statement))?;
@@ -665,6 +671,7 @@ mod tests {
             proof_source: "theorem p : P := h",
             checker_identity: "lean:live:v4.19",
             policy_fingerprint: "gate-v1",
+            import_manifest: &[],
         };
         let calls = Cell::new(0);
 
@@ -695,6 +702,7 @@ mod tests {
             proof_source: "theorem t : True := trivial",
             checker_identity: "lean:live",
             policy_fingerprint: "gate-v1",
+            import_manifest: &[],
         };
         let calls = Cell::new(0);
         for marker in ["first", "second"] {
@@ -720,6 +728,7 @@ mod tests {
             proof_source: "theorem bad : False := candidate",
             checker_identity: "lean:live",
             policy_fingerprint: "gate-v1",
+            import_manifest: &[],
         };
         let mock_key = VerificationCacheKey {
             checker_identity: "lean:mock",
