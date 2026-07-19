@@ -17,6 +17,161 @@ pub struct Falsifier<'a> {
     pub provider: &'a dyn ModelProvider,
 }
 
+/// The verdict both falsifiers use for "a refuting assignment was found". The
+/// rest of the codebase keys refutation off this exact string, which is why the
+/// Wolfram path must produce it verbatim to have any effect at all.
+const VERDICT_COUNTEREXAMPLE: &str = "counterexample";
+/// The Wolfram tool's "there is no engine on this machine" answer. It means
+/// "we did not look", which is a different fact from `no_counterexample_found`
+/// ("we looked, bounded and heuristically, and saw nothing") and from
+/// `inconclusive` ("we looked and the answer was unusable"). Collapsing the
+/// three would let a missing dependency read as evidence.
+const WOLFRAM_UNAVAILABLE: &str = "unavailable";
+
+/// Read the worker envelope and hand back the oracle response, or `None` when
+/// the oracle told us nothing at all.
+///
+/// `None` is returned for an unparseable envelope, a failed call, and for the
+/// `unavailable` verdict alike, because in every one of those cases we did not
+/// look. Encoding "did not look" as absence is deliberate: when no Wolfram
+/// Engine is configured, the caller then records nothing and the existing
+/// falsifier's output stays exactly what it is today.
+fn wolfram_response(stdout: &str) -> Option<Value> {
+    let parsed: Value = serde_json::from_str(stdout).ok()?;
+    if !parsed.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    let output = parsed.get("output")?.clone();
+    // A response whose verdict we cannot read is a response we refuse to
+    // interpret: fail closed rather than guess.
+    if output.get("verdict")?.as_str()? == WOLFRAM_UNAVAILABLE {
+        return None;
+    }
+    Some(output)
+}
+
+/// The exact numerator/denominator pair the oracle reported for one variable.
+///
+/// The oracle prints witness values as STRINGS (`"3/2"`), because a witness can
+/// be rational. We never parse those strings ourselves and never cast them:
+/// integrality is decided from this exact pair instead, so there is no place
+/// where a rational could be silently truncated to an integer.
+fn exact_pair(entry: Option<&Value>) -> Option<(i64, i64)> {
+    let pair = entry?.as_array()?;
+    if pair.len() != 2 {
+        return None;
+    }
+    Some((pair[0].as_i64()?, pair[1].as_i64()?))
+}
+
+/// Is the oracle's witness a point the model's spec actually quantified over?
+///
+/// The oracle rechecks that the claim is FALSE at the witness, but it does not
+/// know how the spec quantified the variables. The spec declares integer
+/// domains, so a rational witness such as 3/2 refutes nothing about the
+/// statement: it is not a point the statement talks about. A `step` likewise
+/// carves out a residue class (e.g. even `n` only), and a witness outside that
+/// class is equally inadmissible.
+///
+/// The declared `start`/`stop` BOUNDS are deliberately not enforced. Searching
+/// outside the cheap searcher's window is the entire reason to consult a second
+/// oracle; only the KIND of point is checked here, never its size.
+///
+/// Every failure path returns false. An unrecognised witness must cost us
+/// recall, never soundness.
+fn witness_admissible(spec_variables: &Value, exact: &Value) -> bool {
+    let Some(declared) = spec_variables.as_object() else {
+        return false;
+    };
+    let Some(point) = exact.as_object() else {
+        return false;
+    };
+    if declared.is_empty() || point.is_empty() {
+        return false;
+    }
+    // Every declared variable must be pinned, or the "witness" is a partial
+    // assignment that does not name a point at all.
+    if !declared.keys().all(|name| point.contains_key(name)) {
+        return false;
+    }
+    for (name, _) in point {
+        let Some(domain) = declared.get(name) else {
+            // A variable the spec never declared: we cannot say what it ranges
+            // over, so we cannot admit it.
+            return false;
+        };
+        let Some((numerator, denominator)) = exact_pair(point.get(name)) else {
+            return false;
+        };
+        if denominator != 1 {
+            return false;
+        }
+        let start = domain.get("start").and_then(Value::as_i64).unwrap_or(0);
+        let step = domain.get("step").and_then(Value::as_i64).unwrap_or(1).abs();
+        if step > 1 && (numerator - start).rem_euclid(step) != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Fold one oracle response into `(refutes, record)`.
+///
+/// `refutes` is true only for a counterexample that the oracle's own exact
+/// recheck confirmed AND that lands on an admissible point. Nothing else in
+/// this function can ever return true: there is no path here from "found
+/// nothing" to a pass, because a bounded heuristic search over a domain we
+/// chose cannot establish a universal claim.
+fn wolfram_record(spec_variables: &Value, oracle: &Value) -> (bool, Value) {
+    let oracle_verdict = oracle["verdict"]
+        .as_str()
+        .unwrap_or("inconclusive")
+        .to_string();
+    // All three conditions come from the oracle itself; we require the explicit
+    // `independently_verified` flag so that a refutation is only ever admitted
+    // when the Python side re-evaluated the ORIGINAL claim in exact arithmetic.
+    let confirmed = oracle_verdict == VERDICT_COUNTEREXAMPLE
+        && oracle["refuted"].as_bool().unwrap_or(false)
+        && oracle["independently_verified"].as_bool().unwrap_or(false);
+    let witness = oracle.get("assignment").cloned().unwrap_or(Value::Null);
+    let exact = oracle
+        .get("assignment_numerator_denominator")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let admissible = confirmed && witness_admissible(spec_variables, &exact);
+
+    let mut record = json!({
+        "oracle": "wolfram",
+        // Restated here so a reader of the stored evidence never has to go
+        // looking for whether this oracle is authoritative. It is not.
+        "trusted": false,
+        "verdict": oracle_verdict,
+        "refuted": admissible,
+        "independently_verified": confirmed,
+        "witness_admissible": admissible,
+        // Witness values are kept EXACTLY as the oracle printed them, so "3/2"
+        // stays "3/2". Truncating it to 1 would manufacture a witness that
+        // refutes nothing.
+        "assignment": witness,
+        "assignment_numerator_denominator": exact,
+        "response": oracle.clone(),
+    });
+    if confirmed && !admissible {
+        record["note"] = json!(
+            "witness passed the oracle's exact recheck but is not a point the \
+             spec quantified over (non-integral or wrong residue class); \
+             discarded, NOT a refutation"
+        );
+    }
+    if !confirmed {
+        record["note"] = json!(
+            "no confirmed counterexample. This is NOT verification and NOT a \
+             pass: the Wolfram search is bounded, heuristic and untrusted."
+        );
+    }
+    (admissible, record)
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct FalsifyVerdict {
     /// Whether the statement admits a bounded computational check at all.
@@ -104,14 +259,79 @@ impl Falsifier<'_> {
                 "error"
             })
             .to_string();
-        let assignment = output["output"].get("assignment").cloned();
+        let mut verdict = verdict;
+        let mut assignment = output["output"].get("assignment").cloned();
+        let mut details = serde_json::to_value(&result).unwrap_or(Value::Null);
+
+        // 3. Optional second falsifier. The cheap bounded search above always
+        //    runs FIRST and the untrusted oracle is consulted only when that
+        //    search did not settle the question, mirroring the falsify-before-
+        //    prove cost discipline: once we already hold a refutation there is
+        //    nothing left to buy. When no Wolfram Engine is configured the tool
+        //    answers `unavailable`, `wolfram_response` maps that to `None`, and
+        //    the verdict/assignment/details below are exactly what they are
+        //    without this step.
+        if verdict != VERDICT_COUNTEREXAMPLE {
+            if let Some(oracle) = self.consult_wolfram(&py, &spec) {
+                let (refutes, record) = wolfram_record(&spec["variables"], &oracle);
+                if refutes {
+                    verdict = VERDICT_COUNTEREXAMPLE.to_string();
+                    // The rational-capable, string-valued map from the oracle,
+                    // stored verbatim. It is deliberately shaped differently
+                    // from the bounded searcher's integer-valued map so the two
+                    // oracles' witnesses stay distinguishable downstream, and so
+                    // a reader that expects an integer gets `None` rather than a
+                    // truncated number.
+                    assignment = record.get("assignment").cloned();
+                }
+                // Recorded whether or not it refuted: `inconclusive` and
+                // `no_counterexample_found` are facts worth keeping, but neither
+                // touches `verdict`, so neither can upgrade a status or be read
+                // as a pass.
+                match details.as_object_mut() {
+                    Some(map) => {
+                        map.insert("wolfram".into(), record);
+                    }
+                    None => details = json!({ "python": details, "wolfram": record }),
+                }
+            }
+        }
+
         Ok(FalsifyVerdict {
             applicable: true,
             verdict,
             assignment,
             spec,
-            details: serde_json::to_value(&result).unwrap_or(Value::Null),
+            details,
         })
+    }
+
+    /// Ask the untrusted Wolfram oracle for a counterexample, or `None` when we
+    /// did not get an answer we are willing to interpret.
+    ///
+    /// `None` covers every "we did not look" case at once: no engine configured,
+    /// the worker unavailable, a transport failure, unparseable output, or the
+    /// oracle's own `unavailable` verdict. Collapsing them here is deliberate,
+    /// because the caller's only correct response to all of them is identical:
+    /// leave the bounded searcher's verdict exactly as it was. What must never
+    /// collapse is "did not look" into "looked and found nothing", and that
+    /// distinction is preserved because a genuine `no_counterexample_found`
+    /// comes back as `Some` and is recorded without touching the verdict.
+    ///
+    /// The oracle re-verifies any witness it proposes in exact arithmetic on the
+    /// Python side before reporting it, so what arrives here is already a
+    /// confirmed counterexample or nothing.
+    fn consult_wolfram(&self, py: &PythonCheck, spec: &Value) -> Option<Value> {
+        let result = py
+            .run(json!({
+                "tool": "wolfram_falsify",
+                "op": "falsify",
+                "variables": spec.get("variables").cloned().unwrap_or_else(|| json!({})),
+                "assumptions": spec["assumptions"].as_str().unwrap_or("True"),
+                "claim": spec["claim"].as_str().unwrap_or("True"),
+            }))
+            .ok()?;
+        wolfram_response(&result.stdout)
     }
 }
 
