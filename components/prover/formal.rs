@@ -946,6 +946,193 @@ fn pragma_end(chars: &[char], from: usize) -> Option<usize> {
     None
 }
 
+// --- shared escape-hatch token table (alias-expanded) ---------------------
+//
+// WHY THIS EXISTS. Every backend used to carry its own private list of banned
+// literals matched with `str::contains`. Two things were wrong with that:
+//
+//  1. ALIASES. A ban a model can sidestep by renaming is worse than no ban,
+//     because it reads as protection. `native_decide` has the config-syntax
+//     alias `decide +native`; Rocq's `Admitted` has the tactic form `admit` and
+//     the command forms `Parameter` / `Hypothesis` / `Variable` / `Conjecture`
+//     that are the SAME escape hatch as `Axiom`; Isabelle's `oracle` has
+//     `Thm.add_oracle` and `axiomatization`. Each list had a different subset,
+//     so which rename worked depended on which backend you happened to hit.
+//  2. SUBSTRING MATCHING. `contains("admit")` also fires on `admits_a_root`,
+//     and `contains("sorry")` on `my_sorry'`. Over-rejection is not free: it
+//     costs a retry on an artifact that was fine.
+//
+// So: ONE table, keyed by system, alias-expanded, matched on WORD BOUNDARIES.
+// The tables deliberately mirror the CRITICAL rules of the authoritative online
+// scanner (`components/verify/python/theoremata_tools/formal_source_scan.py`),
+// so the offline fallback and the worker reject the same set instead of the
+// offline path being quietly laxer.
+//
+// BOUNDARY TRADE-OFF (chosen deliberately). A token only needs a boundary on
+// the ends that are themselves identifier chars: `admit` must not match inside
+// `admits`, but `--unsafe` needs no boundary before the `-`. Identifier chars
+// are alphanumeric, `_`, and `'` (Lean admits the prime, so `sorry'` is a
+// DIFFERENT name than `sorry`). The cost of this choice is that a token can no
+// longer be caught as a substring of a longer alias, so every alias must be
+// listed explicitly -- `sorryAx` does NOT match the `sorry` token and is listed
+// on its own line. Under-matching is the real hole; the explicit alias list is
+// how we pay for the boundary.
+
+/// Identifier char for escape-hatch token boundaries. `'` is included because
+/// Lean admits the prime in identifiers.
+fn is_hatch_word(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '\''
+}
+
+/// Word-boundary containment of `token` (already lowercase) in `lowered`
+/// (already lowercase chars). A boundary is required only on an end whose token
+/// char is itself an identifier char, so `--unsafe` / `+native` / `{-# compiled`
+/// still match where they legitimately appear.
+fn contains_hatch_token(lowered: &[char], token: &str) -> bool {
+    let n: Vec<char> = token.chars().collect();
+    if n.is_empty() || lowered.len() < n.len() {
+        return false;
+    }
+    let head_is_word = n.first().map_or(false, |&c| is_hatch_word(c));
+    let tail_is_word = n.last().map_or(false, |&c| is_hatch_word(c));
+    for i in 0..=(lowered.len() - n.len()) {
+        if lowered[i..i + n.len()] != n[..] {
+            continue;
+        }
+        let before_ok = !head_is_word || i == 0 || !is_hatch_word(lowered[i - 1]);
+        let after_ok =
+            !tail_is_word || lowered.get(i + n.len()).map_or(true, |&c| !is_hatch_word(c));
+        if before_ok && after_ok {
+            return true;
+        }
+    }
+    false
+}
+
+/// Lean escape hatches, alias-expanded. `native_decide` and its config-syntax
+/// twin `decide +native` are the same trust hole (the compiled evaluator, which
+/// the kernel never re-checks); `sorryAx` is the axiom `sorry` elaborates to and
+/// does NOT match the `sorry` token under word boundaries; `ofReduceNat` is the
+/// sibling of `ofReduceBool`.
+const LEAN_HATCH_TOKENS: &[&str] = &[
+    "sorry",
+    "sorryAx",
+    "admit",
+    "native_decide",
+    // `decide +native` (and `decide +kernel +native`) is `native_decide` under
+    // another spelling. Matched as the bare `+native` config flag so the flag
+    // order inside the config list does not matter. A preceding identifier char
+    // suppresses the match, so the arithmetic `x+native` is not flagged.
+    "+native",
+    "ofReduceBool",
+    "ofReduceNat",
+    "trustCompiler",
+    // `open private f in …` pulls a PRIVATE declaration into scope under its real
+    // name. Private is Lean's only encapsulation boundary, so this is the way to
+    // reach an internal lemma a module deliberately did not export, or to shadow
+    // a name the surrounding proof is read as using. Neither the kernel nor
+    // `#print axioms` says anything about it. `open Foo` on its own is ordinary
+    // and stays allowed.
+    "open private",
+];
+
+/// Rocq escape hatches, alias-expanded. `Admitted` (command), `admit` (tactic)
+/// and `Admit Obligations` are one hatch; `Axiom` has the exact synonyms
+/// `Axioms` / `Parameter(s)` / `Conjecture(s)` / `Hypothesis`/`Hypotheses` /
+/// `Variable(s)`, all of which introduce an undischarged assumption; the three
+/// `Unset ... Checking` commands disable kernel checks without an axiom.
+const ROCQ_HATCH_TOKENS: &[&str] = &[
+    "Admitted",
+    "admit",
+    "Admit Obligations",
+    "Axiom",
+    "Axioms",
+    "Parameter",
+    "Parameters",
+    "Conjecture",
+    "Conjectures",
+    "Hypothesis",
+    "Hypotheses",
+    "Variable",
+    "Variables",
+    "-type-in-type",
+    "type_in_type",
+    "Unset Universe Checking",
+    "Unset Guard Checking",
+    "Unset Positivity Checking",
+    "bypass_check",
+];
+
+/// Isabelle escape hatches, alias-expanded. `oracle` no longer catches
+/// `Thm.add_oracle` or `oracles` as substrings once boundaries are enforced, so
+/// both are listed; `axiomatization` / `axioms` assert facts by fiat exactly as
+/// an oracle does.
+const ISABELLE_HATCH_TOKENS: &[&str] = &[
+    "sorry",
+    "oops",
+    "quick_and_dirty",
+    "skip_proof",
+    "oracle",
+    "oracles",
+    "add_oracle",
+    "axiomatization",
+    "axioms",
+];
+
+/// Agda escape hatches, alias-expanded: `postulate` plus the whole family of
+/// checker-disabling `OPTIONS` flags (each one is a rename of the same "turn a
+/// check off" move) and `primTrustMe`.
+const AGDA_HATCH_TOKENS: &[&str] = &[
+    "postulate",
+    "--allow-unsolved-metas",
+    "--type-in-type",
+    "--unsafe",
+    "--no-termination-check",
+    "--no-positivity-check",
+    "--no-coverage-check",
+    "primTrustMe",
+    "{-# COMPILED",
+];
+
+/// The alias-expanded escape-hatch token table for `system`.
+///
+/// Candle and Metamath return an empty slice on purpose: Candle's hatches are
+/// audited structurally by [`crate::prover::axiom_audit::audit_hol_light`] and
+/// Metamath's by the backend's own `$a` / `?` / include scan, neither of which
+/// is a token list.
+pub(crate) fn escape_hatch_tokens(system: FormalSystem) -> &'static [&'static str] {
+    match system {
+        FormalSystem::Lean => LEAN_HATCH_TOKENS,
+        FormalSystem::Rocq => ROCQ_HATCH_TOKENS,
+        FormalSystem::Isabelle => ISABELLE_HATCH_TOKENS,
+        FormalSystem::Agda => AGDA_HATCH_TOKENS,
+        FormalSystem::Candle | FormalSystem::Metamath => &[],
+    }
+}
+
+/// Which of `system`'s escape-hatch tokens occur in `code`, in table order.
+///
+/// Matched over COMMENT-STRIPPED source, so this agrees with
+/// [`crate::prover::statement_preservation::ESCAPE_HATCH_COMMENT_POLICY`]
+/// (`CodeOnly`): a commented hatch is never seen by the kernel and so is not a
+/// soundness violation. Matching is case-insensitive (Rocq commands are
+/// capitalized, Lean tactics are not) but each finding is reported in the
+/// table's canonical spelling.
+pub(crate) fn escape_hatch_findings(system: FormalSystem, code: &str) -> Vec<String> {
+    // Whitespace is normalized as well as comments stripped, so a multi-word
+    // token matches however the source broke the line between its words
+    // (`open\n  private foo in …`, `Unset\n  Universe Checking`). Single-token
+    // patterns are unaffected: a token cannot span whitespace in the first place.
+    let stripped = strip_comments(code).to_lowercase();
+    let normalized = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lowered: Vec<char> = normalized.chars().collect();
+    escape_hatch_tokens(system)
+        .iter()
+        .filter(|t| contains_hatch_token(&lowered, &t.to_lowercase()))
+        .map(|t| (*t).to_string())
+        .collect()
+}
+
 /// Cheap lexical "the code is about this statement" check: the statement's
 /// leading identifier/head appears in the whitespace-normalized source.
 ///
@@ -1761,6 +1948,82 @@ theorem phi3 (hG : Glaisher3) : True := trivial
         assert!(!strip_comments("(* admit *)\nQed.\n").contains("admit"));
         assert!(!strip_comments("$( $a bad $)\nfoo $p\n").contains("bad"));
         assert!(!strip_comments("theorem t := by -- sorry\n  rfl\n").contains("sorry"));
+    }
+
+    /// The shared table's THREE properties, per system: the base token is still
+    /// caught, its alias is caught too, and an innocent identifier that merely
+    /// contains the token is not. The middle one is the bug this table exists
+    /// for -- a ban a rename walks past reads as protection while providing none.
+    #[test]
+    fn escape_hatch_table_is_alias_expanded_and_boundary_matched() {
+        // (system, base token that must STILL be caught, an ALIAS that must NOW
+        // be caught, innocent source that must NOT be flagged)
+        let cases: &[(FormalSystem, &str, &str, &str)] = &[
+            (
+                FormalSystem::Lean,
+                "theorem t : P := by native_decide\n",
+                "theorem t : P := by decide +native\n",
+                "theorem t : 2 + 2 = 4 := by decide\ninstance : DecidableEq Foo := decidable_eq_foo\n",
+            ),
+            (
+                FormalSystem::Rocq,
+                "Theorem t : True.\nProof.\nAdmitted.\n",
+                "Parameter bad : False.\n",
+                "Theorem admits_a_root : True.\nProof. exact I. Qed.\n",
+            ),
+            (
+                FormalSystem::Isabelle,
+                "lemma t: \"True\"\n  sorry\n",
+                "axiomatization bad where bad: \"False\"\n",
+                "lemma oracle_free: \"True\" by simp\n",
+            ),
+            (
+                FormalSystem::Agda,
+                "postulate absurd : Set\n",
+                "{-# OPTIONS --no-termination-check #-}\nthm : Set\n",
+                "postulates : Set\npostulates = Set\n",
+            ),
+        ];
+        for (system, base, alias, innocent) in cases {
+            assert!(
+                !escape_hatch_findings(*system, base).is_empty(),
+                "{system}: the base token must still be caught"
+            );
+            assert!(
+                !escape_hatch_findings(*system, alias).is_empty(),
+                "{system}: the alias must be caught too -- a rename must not evade the ban"
+            );
+            assert!(
+                escape_hatch_findings(*system, innocent).is_empty(),
+                "{system}: innocent identifier flagged: {:?}",
+                escape_hatch_findings(*system, innocent)
+            );
+        }
+    }
+
+    /// A commented hatch stays non-gating (ESCAPE_HATCH_COMMENT_POLICY ==
+    /// CodeOnly), and a multi-word token matches across a line break because the
+    /// scan normalizes whitespace.
+    #[test]
+    fn escape_hatch_findings_honour_comments_and_line_breaks() {
+        assert!(escape_hatch_findings(
+            FormalSystem::Lean,
+            "-- sorry\n/- native_decide -/\ntheorem t : True := trivial\n"
+        )
+        .is_empty());
+        assert_eq!(
+            escape_hatch_findings(FormalSystem::Rocq, "Unset\n  Universe Checking.\n"),
+            vec!["Unset Universe Checking".to_string()]
+        );
+    }
+
+    /// Candle and Metamath are deliberately NOT token-scanned: their hatches are
+    /// audited structurally. Stated here so an empty slice reads as a decision
+    /// rather than an omission.
+    #[test]
+    fn candle_and_metamath_are_audited_structurally_not_by_token() {
+        assert!(escape_hatch_tokens(FormalSystem::Candle).is_empty());
+        assert!(escape_hatch_tokens(FormalSystem::Metamath).is_empty());
     }
 
     #[test]

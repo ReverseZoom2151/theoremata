@@ -143,3 +143,12 @@ def test_fully_clean_proof():
     result = check(src)
     assert result["pregate_clean"] is True
     assert result["issues"] == []
+
+
+def test_sorryax_alias_is_flagged_and_sorry_still_is():
+    # `sorryAx` is the axiom `sorry` elaborates to. Identifier-boundary matching
+    # means `sorry` does not reach it, so it is banned by name.
+    assert check("theorem t : P := sorryAx _ false\n")["pregate_clean"] is False
+    assert check("theorem t : P := by sorry\n")["pregate_clean"] is False
+    # ...and a name that merely contains the token is still fine.
+    assert check("theorem sorry_free' : True := trivial\n")["pregate_clean"] is True

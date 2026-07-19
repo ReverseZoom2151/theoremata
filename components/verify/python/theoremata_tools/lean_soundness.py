@@ -97,8 +97,11 @@ def mask_comments_and_strings(text: str, *, mask_strings: bool = True) -> str:
 
 
 # A Lean-identifier-aware boundary: the prime `'` is a legal identifier char, so
-# `sorry'` and `my_sorry` must NOT match.
-_PLACEHOLDER_RE = re.compile(r"(?<![\w'])(sorry|admit)(?![\w'])")
+# `sorry'` and `my_sorry` must NOT match. That boundary is also why `sorryAx` --
+# the axiom `sorry` elaborates to -- has to be spelled out: it is a rename of
+# `sorry` that the `sorry` alternative deliberately does not reach. It is listed
+# first so the alternation prefers the longer token.
+_PLACEHOLDER_RE = re.compile(r"(?<![\w'])(sorryAx|sorry|admit)(?![\w'])")
 _ATTR_FRAGMENT = r"(?:@\[(?:[^\]\[]|\[[^\]]*\])*\]\s*)*"
 _DECL_NAME = r"([^\s:({\[]+)"
 _FORBIDDEN_RE = re.compile(

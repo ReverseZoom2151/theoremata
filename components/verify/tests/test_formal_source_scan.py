@@ -353,3 +353,52 @@ def test_coq_alias_routes_to_rocq():
 def test_unknown_system_raises():
     with pytest.raises(ValueError):
         scan("unknown-system", "postulate p : Set\n")
+
+
+# ---------------------------------------------------------------------------
+# Alias expansion + boundary matching
+#
+# A ban a model can sidestep by renaming is worse than no ban: it reads as
+# protection. These tests pin the three properties that matter for every token
+# list -- the base token is still caught, its alias is caught too, and an
+# innocent identifier that merely CONTAINS the token is not.
+# ---------------------------------------------------------------------------
+
+
+def _critical_patterns(result):
+    return {f["pattern"] for f in result["flags"] if f["severity"] == "critical"}
+
+
+def test_native_decide_base_token_is_still_caught():
+    result = scan("lean", "theorem t : P := by native_decide\n")
+    assert result["clean"] is False
+    assert "native_decide" in _critical_patterns(result)
+
+
+def test_decide_native_config_alias_is_caught():
+    # `decide +native` is `native_decide` under Lean's tactic-config syntax.
+    for src in (
+        "theorem t : P := by decide +native\n",
+        "theorem t : P := by decide +kernel +native\n",
+    ):
+        result = scan("lean", src)
+        assert result["clean"] is False, src
+        assert "native_decide_config" in _critical_patterns(result), src
+
+
+def test_sorryax_alias_is_caught_and_sorry_still_is():
+    assert "sorryAx" in _critical_patterns(scan("lean", "theorem t : P := sorryAx _ false\n"))
+    assert "sorry" in _critical_patterns(scan("lean", "theorem t : P := by sorry\n"))
+
+
+def test_innocent_identifiers_are_not_flagged():
+    # A plain `decide` is kernel-checked and legitimate; `decidable_eq` and
+    # `ring_hom` merely contain a banned token as a substring.
+    for src in (
+        "theorem t : 2 + 2 = 4 := by decide\n",
+        "instance : DecidableEq Foo := decidable_eq_foo\n",
+        "theorem admits_a_root : True := trivial\n",
+        "theorem sorry_free' : True := trivial\n",
+        "theorem ring_hom_comp : True := trivial\n",
+    ):
+        assert scan("lean", src)["clean"] is True, src

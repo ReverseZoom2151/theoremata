@@ -450,20 +450,13 @@ impl FormalBackend for RocqBackend {
 /// respect to commented text ONLY — a real `Admitted.` in code is untouched by
 /// stripping and still fails here.
 fn fallback_source_scan(code: &str) -> ScanReport {
-    let low = crate::prover::formal::strip_comments(code).to_lowercase();
-    let patterns = [
-        "admitted",
-        "axiom ",
-        "-type-in-type",
-        "type_in_type",
-        "unset universe checking",
-        "bypass_check",
-    ];
-    let findings: Vec<String> = patterns
-        .iter()
-        .filter(|p| low.contains(**p))
-        .map(|p| (*p).to_string())
-        .collect();
+    // The token list is the SHARED, ALIAS-EXPANDED table in `formal.rs`
+    // ([`crate::prover::formal::escape_hatch_tokens`]), matched on word
+    // boundaries. Rocq is the clearest case for alias expansion: `Admitted` had
+    // no sibling `admit` here, and `Axiom` has the exact synonyms `Parameter` /
+    // `Conjecture` / `Hypothesis` / `Variable`, so a rename walked straight past
+    // this list even though the online worker rejected every one of them.
+    let findings = crate::prover::formal::escape_hatch_findings(SYSTEM, code);
     ScanReport {
         clean: findings.is_empty(),
         findings,
@@ -538,9 +531,55 @@ mod tests {
         // A REAL one in code still fails, offline as well as online.
         let real = fallback_source_scan("Theorem t : True.\nProof.\nAdmitted.\n");
         assert!(!real.clean);
-        assert!(real.findings.iter().any(|f| f == "admitted"));
+        assert!(real.findings.iter().any(|f| f == "Admitted"));
         let real2 = fallback_source_scan("Axiom bad : False.\n");
         assert!(!real2.clean);
-        assert!(real2.findings.iter().any(|f| f == "axiom "));
+        assert!(real2.findings.iter().any(|f| f == "Axiom"));
+    }
+
+    /// ALIAS EXPANSION. Every one of these is the SAME escape hatch as a token
+    /// that was already banned, reachable by renaming: `admit` is the tactic
+    /// form of `Admitted`, and `Parameter` / `Conjecture` / `Hypothesis` /
+    /// `Variable` are exact synonyms of `Axiom` as ways to assert a fact with no
+    /// proof. Before the shared table only `Admitted` and `Axiom` were caught.
+    #[test]
+    fn renamed_rocq_hatches_are_caught() {
+        for (code, expected) in [
+            ("Lemma l : True.\nProof.\n  admit.\n", "admit"),
+            ("Parameter bad : False.\n", "Parameter"),
+            ("Conjecture bad : False.\n", "Conjecture"),
+            ("Hypothesis bad : False.\n", "Hypothesis"),
+            ("Variable bad : nat.\n", "Variable"),
+            ("Unset Guard Checking.\n", "Unset Guard Checking"),
+            ("Unset Positivity Checking.\n", "Unset Positivity Checking"),
+        ] {
+            let report = fallback_source_scan(code);
+            assert!(!report.clean, "alias must be caught: {code:?}");
+            assert!(
+                report.findings.iter().any(|f| f == expected),
+                "expected `{expected}` in {:?}",
+                report.findings
+            );
+        }
+    }
+
+    /// The boundary trade-off, asserted in the OVER-matching direction: an
+    /// identifier that merely CONTAINS a banned token is ordinary Rocq and must
+    /// not cost a retry. Substring matching flagged every one of these.
+    #[test]
+    fn identifiers_containing_a_hatch_token_are_not_flagged() {
+        for code in [
+            "Theorem admits_a_root : True.\nProof. exact I. Qed.\n",
+            "Theorem axiom_of_choice_free : True.\nProof. exact I. Qed.\n",
+            "Definition variable_name := 0.\n",
+            "Definition parameterize (n : nat) := n.\n",
+        ] {
+            let report = fallback_source_scan(code);
+            assert!(
+                report.clean,
+                "innocent identifier must not be flagged ({code:?}): {:?}",
+                report.findings
+            );
+        }
     }
 }

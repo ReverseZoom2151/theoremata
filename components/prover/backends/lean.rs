@@ -487,7 +487,7 @@ fn split_at_top_colon(sig: &[char]) -> (&[char], Option<&[char]>) {
 }
 
 /// Whitespace-separated identifiers in a slice (`.` included, for namespaced
-/// names). `_` is preserved here — the caller renames it, because a bundle field
+/// names). `_` is preserved here -- the caller renames it, because a bundle field
 /// needs a referable name.
 fn split_lean_idents(chars: &[char]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -607,34 +607,14 @@ fn norm_ws(s: &str) -> String {
 /// passed online. This LOOSENS the gate with respect to commented text ONLY —
 /// a real `sorry` in code is untouched by stripping and still fails here.
 fn fallback_source_scan(code: &str) -> ScanReport {
-    // Whitespace is normalized as well as comments stripped, so a pattern made of
-    // two words matches however the source broke the line between them
-    // (`open\n  private foo in …`). Every single-token pattern is unaffected: a
-    // token cannot span whitespace in the first place.
-    let low = norm_ws(&crate::prover::formal::strip_comments(code).to_lowercase());
-    let patterns = [
-        "sorry",
-        "sorryax",
-        "admit",
-        "native_decide",
-        "ofreducebool",
-        "trustcompiler",
-        // `open private f in …` pulls a PRIVATE declaration into scope under its
-        // real name. Private is Lean's only encapsulation boundary, so this is
-        // the way to reach an internal lemma a module deliberately did not
-        // export, or to shadow a name the surrounding proof is read as using.
-        // Neither the kernel nor `#print axioms` says anything about it: the
-        // resulting term is perfectly well-typed and axiom-free, which is why it
-        // belongs on this lexical list next to the other escape hatches.
-        // Not covered by any existing pattern above (none mentions `open` or
-        // `private`), and `open Foo` on its own is ordinary and stays allowed.
-        "open private",
-    ];
-    let findings: Vec<String> = patterns
-        .iter()
-        .filter(|p| low.contains(**p))
-        .map(|p| (*p).to_string())
-        .collect();
+    // The token list is the SHARED, ALIAS-EXPANDED table in `formal.rs`
+    // ([`crate::prover::formal::escape_hatch_tokens`]), matched on word
+    // boundaries. It lives there rather than here because a per-file list is how
+    // `native_decide` ended up banned in one place and its exact alias
+    // `decide +native` banned in none: one table means one edit covers every
+    // backend, and it mirrors the Python worker's rules so offline and online
+    // reject the same set.
+    let findings = crate::prover::formal::escape_hatch_findings(SYSTEM, code);
     ScanReport {
         clean: findings.is_empty(),
         findings,
@@ -1024,6 +1004,50 @@ mod tier0_tests {
         let real2 = fallback_source_scan("theorem t : P := by native_decide\n");
         assert!(!real2.clean);
         assert!(real2.findings.iter().any(|f| f == "native_decide"));
+    }
+
+    /// ALIAS EXPANSION. `decide +native` is `native_decide` under Lean's tactic
+    /// CONFIG syntax, and `sorryAx` is the axiom `sorry` elaborates to. Banning
+    /// only the base spelling was a ban a rename walked straight past.
+    #[test]
+    fn renamed_lean_hatches_are_caught() {
+        for (code, expected) in [
+            ("theorem t : P := by decide +native\n", "+native"),
+            ("theorem t : P := by decide +kernel +native\n", "+native"),
+            ("theorem t : P := sorryAx _ false\n", "sorryAx"),
+            ("theorem t : P := by exact Lean.ofReduceNat h\n", "ofReduceNat"),
+        ] {
+            let report = fallback_source_scan(code);
+            assert!(!report.clean, "alias must be caught: {code:?}");
+            assert!(
+                report.findings.iter().any(|f| f == expected),
+                "expected `{expected}` in {:?}",
+                report.findings
+            );
+        }
+    }
+
+    /// The boundary trade-off, asserted in the OVER-matching direction. A plain
+    /// `decide` is kernel-checked and legitimate, and an identifier that merely
+    /// CONTAINS a banned token is ordinary Lean; substring matching flagged
+    /// these and every false flag costs a retry.
+    #[test]
+    fn identifiers_containing_a_hatch_token_are_not_flagged() {
+        for code in [
+            "theorem t : 2 + 2 = 4 := by decide\n",
+            "instance : DecidableEq Foo := decidable_eq_foo\n",
+            "theorem admits_a_root (f : R) : True := trivial\n",
+            "theorem sorry_free' : True := trivial\n",
+            "theorem t (x native : Nat) : x + native = native + x := by ring\n",
+            "open Nat Finset in\ntheorem t : True := trivial\n",
+        ] {
+            let report = fallback_source_scan(code);
+            assert!(
+                report.clean,
+                "innocent source must not be flagged ({code:?}): {:?}",
+                report.findings
+            );
+        }
     }
 
     /// `open private` reaches a declaration a module deliberately did not

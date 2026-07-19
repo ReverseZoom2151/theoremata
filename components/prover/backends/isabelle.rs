@@ -459,13 +459,13 @@ impl FormalBackend for IsabelleBackend {
 /// commented text ONLY — a real `sorry` in code is untouched by stripping and
 /// still fails here.
 fn fallback_source_scan(code: &str) -> ScanReport {
-    let low = crate::prover::formal::strip_comments(code).to_lowercase();
-    let patterns = ["sorry", "oops", "quick_and_dirty", "skip_proof", "oracle"];
-    let findings: Vec<String> = patterns
-        .iter()
-        .filter(|p| low.contains(**p))
-        .map(|p| (*p).to_string())
-        .collect();
+    // The token list is the SHARED, ALIAS-EXPANDED table in `formal.rs`
+    // ([`crate::prover::formal::escape_hatch_tokens`]), matched on word
+    // boundaries. `oracle` used to catch `Thm.add_oracle` and `oracles` only
+    // because it was a substring match; both are now listed explicitly, and
+    // `axiomatization` / `axioms` (the same assert-by-fiat move under another
+    // keyword) are listed with them.
+    let findings = crate::prover::formal::escape_hatch_findings(SYSTEM, code);
     ScanReport {
         clean: findings.is_empty(),
         findings,
@@ -563,5 +563,45 @@ mod tests {
         let real2 = fallback_source_scan("lemma t: \"True\"\n  oops\n");
         assert!(!real2.clean);
         assert!(real2.findings.iter().any(|f| f == "oops"));
+    }
+
+    /// ALIAS EXPANSION. `Thm.add_oracle` and `axiomatization` assert facts by
+    /// fiat exactly as a bare `oracle` does. `add_oracle` and `oracles` used to
+    /// be caught only incidentally, as SUBSTRINGS of `oracle`; word-boundary
+    /// matching would drop them, so they are listed explicitly and asserted here.
+    #[test]
+    fn renamed_isabelle_hatches_are_caught() {
+        for (code, expected) in [
+            ("ML \\<open>Thm.add_oracle\\<close>\n", "add_oracle"),
+            ("axiomatization bad where bad: \"False\"\n", "axiomatization"),
+            ("axioms bad: \"False\"\n", "axioms"),
+            ("ML \\<open>Thm.oracles\\<close>\n", "oracles"),
+        ] {
+            let report = fallback_source_scan(code);
+            assert!(!report.clean, "alias must be caught: {code:?}");
+            assert!(
+                report.findings.iter().any(|f| f == expected),
+                "expected `{expected}` in {:?}",
+                report.findings
+            );
+        }
+    }
+
+    /// The boundary trade-off, asserted in the OVER-matching direction: a name
+    /// that merely CONTAINS a banned token is ordinary Isabelle.
+    #[test]
+    fn identifiers_containing_a_hatch_token_are_not_flagged() {
+        for code in [
+            "lemma oracle_free: \"True\" by simp\n",
+            "lemma sorry_free: \"True\" by simp\n",
+            "lemma oopsie: \"True\" by simp\n",
+        ] {
+            let report = fallback_source_scan(code);
+            assert!(
+                report.clean,
+                "innocent identifier must not be flagged ({code:?}): {:?}",
+                report.findings
+            );
+        }
     }
 }

@@ -1302,7 +1302,7 @@ fn fallback_source_scan(system: FormalSystem, code: &str) -> ScanReport {
         // The token list is the SHARED, ALIAS-EXPANDED table in `formal.rs`
         // ([`crate::prover::formal::escape_hatch_tokens`]), matched on word
         // boundaries. Agda's hatches are a family of RENAMES of one move —
-        // turning a checker off — so banning `--allow-unsolved-metas` while
+        // turning a checker off -- so banning `--allow-unsolved-metas` while
         // leaving `--no-termination-check`, `--no-positivity-check`,
         // `--no-coverage-check`, `--type-in-type`, `--unsafe` and `primTrustMe`
         // unbanned was protection in name only.

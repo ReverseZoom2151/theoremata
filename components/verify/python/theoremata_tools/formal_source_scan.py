@@ -229,6 +229,14 @@ _LEAN_RULES: tuple[tuple[str, re.Pattern[str], str], ...] = (
     ("sorryAx", _lean_word("sorryAx"), CRITICAL),
     ("admit", _lean_word("admit"), CRITICAL),
     ("native_decide", _lean_word("native_decide"), CRITICAL),
+    # `decide +native` (in any flag order, e.g. `decide +kernel +native`) runs the
+    # same compiled evaluator as `native_decide`: it is the tactic-CONFIG spelling
+    # of the rule above, and banning only the base spelling is a ban a rename
+    # walks straight past. Matched as the bare `+native` flag so flag order does
+    # not matter. The lookbehind keeps the arithmetic `x+native` out; a spaced
+    # `x + native` would still flag, which we accept because `native` is not a
+    # plausible Lean identifier and under-matching is the costlier error.
+    ("native_decide_config", re.compile(r"(?<![\w'])\+\s*native(?![\w'])"), CRITICAL),
     ("axiom", _lean_word("axiom"), CRITICAL),
     ("ofReduceBool", re.compile(r"\bLean\.ofReduceBool\b"), CRITICAL),
     ("ofReduceNat", re.compile(r"\bLean\.ofReduceNat\b"), CRITICAL),
