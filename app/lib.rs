@@ -35,7 +35,7 @@ pub use reason::{
     preference_pairs, process_reward, progress, proof_import, proof_pool, refine_ops, repair,
     research, retry, rewriting, router, sampler, sampling, search_telemetry, skest, sketch,
     statement_validation, statement_validity, subsumption, symmetry_dedup, tactic_outcome, taint,
-    team, trace, ttc, verification_ladder,
+    team, trace, ttc, validity_seams, verification_ladder,
 };
 pub use verify::{hardening, lean_session};
 

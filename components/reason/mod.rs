@@ -9,7 +9,7 @@ pub mod search;
 // (`reason::mcts`, hence `crate::mcts` via app/main.rs, and sibling references
 // like `crate::mcts`) continue to resolve after the subgroup reorganization.
 pub use critique::{
-    critic, guard, guardrails, memory, plan_history, statement_validity, taint,
+    critic, guard, guardrails, memory, plan_history, statement_validity, taint, validity_seams,
 };
 pub use orchestration::{
     agent, blueprint_generate, blueprint_run, certification, chat, consolidate, context_assembly,
