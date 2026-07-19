@@ -42,11 +42,14 @@
 //! [`SearchConfig`] tuning struct from [`crate::search::mcts`], and
 //! [`CanonicalGoal`] / [`subsumes_str`] from [`crate::search::subsumption`].
 
-use super::driver::{GoalState, TacticExpander};
+use super::driver::{GoalState, TacticExpander, TacticStep};
 use super::mcts::SearchConfig;
 use super::subsumption::{self, CanonicalGoal};
+use crate::db::Store;
+use anyhow::{bail, Result};
 use serde::Serialize;
-use std::collections::HashMap;
+use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 
 /// A deterministic FNV-1a mix of a base seed and a string — the same primitive the
 /// driver uses to derive per-node seeds, re-implemented here so nothing in the
@@ -601,6 +604,161 @@ where
     }
 }
 
+// ---------------------------------------------------------------------------
+// CLI entry point.
+//
+// `skest_search` is generic over `TacticExpander`, so a command line cannot call
+// it without a concrete proof-state space. No production tactic backend is wired
+// into this repository yet, so the entry point runs the ensemble over an EXPLICIT
+// goal graph the caller supplies: goal texts as nodes, tactic edges between them,
+// and a set of already-closed goals. That is the smallest input from which the
+// cross-tree sharing this module exists to demonstrate can actually be exercised;
+// a real prover backend that implements `TacticExpander` plugs into the same
+// `skest_search` later without touching this file.
+// ---------------------------------------------------------------------------
+
+/// One goal state in a caller-supplied goal graph. The `key` is the goal text and
+/// doubles as the dedup key (so the subsumption machinery parses it exactly as it
+/// parses a real backend's pretty-printed goal). `closed` marks proof completion.
+#[derive(Clone)]
+pub struct GraphGoal {
+    key: String,
+    closed: bool,
+}
+
+impl GoalState for GraphGoal {
+    fn dedup_key(&self) -> String {
+        self.key.clone()
+    }
+    fn is_closed(&self) -> bool {
+        self.closed
+    }
+}
+
+/// A tactic edge in the goal graph: applying `tactic` (with weight `prior`) to the
+/// goal `from` yields the goal `to`.
+#[derive(Debug, Clone)]
+pub struct GraphEdge {
+    pub from: String,
+    pub tactic: String,
+    pub prior: f64,
+    pub to: String,
+}
+
+/// A deterministic goal-graph expander built from an adjacency table. Pure in
+/// `(state, seed)`: it ignores the seed and returns the recorded successors, so
+/// every tree in the ensemble sees the same edges and only the seeded frontier
+/// tie-break makes them heterogeneous.
+#[derive(Clone)]
+pub struct GoalGraphExpander {
+    edges: HashMap<String, Vec<(String, f64, String)>>,
+    closed: HashSet<String>,
+}
+
+impl GoalGraphExpander {
+    fn goal(&self, key: &str) -> GraphGoal {
+        GraphGoal {
+            key: key.to_string(),
+            closed: self.closed.contains(key),
+        }
+    }
+}
+
+impl TacticExpander for GoalGraphExpander {
+    type State = GraphGoal;
+    fn expand(&mut self, state: &GraphGoal, _seed: u64) -> Vec<TacticStep<GraphGoal>> {
+        self.edges
+            .get(&state.key)
+            .map(|succ| {
+                succ.iter()
+                    .map(|(tactic, prior, to)| {
+                        TacticStep::new(tactic.clone(), *prior, self.goal(to))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// Run a SKEST ensemble over an explicit goal graph and record the outcome,
+/// returning a JSON summary for the CLI.
+///
+/// The result is a SEARCH OUTCOME over a caller-asserted graph, not a checked
+/// proof. "Solved" here means the ensemble reached a goal the CALLER marked
+/// closed (or one subsumed by such a goal); the closedness is an input, not a
+/// verdict from Lean, Rocq, or Isabelle. The summary therefore carries
+/// `status: "candidate"` and `formally_verified: false` unconditionally so
+/// nothing downstream can read the ensemble's "solved" as a formal proof.
+///
+/// Deterministic in `(closed_goals, edges, root, config, seed)`.
+pub fn run_skest_search(
+    store: &Store,
+    project_id: Option<&str>,
+    closed_goals: Vec<String>,
+    edges: Vec<GraphEdge>,
+    root: String,
+    config: SkestConfig,
+    seed: u64,
+) -> Result<Value> {
+    if root.is_empty() {
+        bail!("skest search needs a non-empty root goal");
+    }
+    let closed: HashSet<String> = closed_goals.into_iter().collect();
+    let mut adjacency: HashMap<String, Vec<(String, f64, String)>> = HashMap::new();
+    for e in &edges {
+        if e.from.is_empty() || e.to.is_empty() {
+            bail!("skest graph edges must have non-empty endpoints");
+        }
+        adjacency
+            .entry(e.from.clone())
+            .or_default()
+            .push((e.tactic.clone(), e.prior, e.to.clone()));
+    }
+
+    let root_goal = GraphGoal {
+        key: root.clone(),
+        closed: closed.contains(&root),
+    };
+    // Each tree is the same graph; heterogeneity comes from the per-tree seed's
+    // frontier tie-break, exactly as in `skest_search`'s contract.
+    let factory = |_derived_seed: u64| GoalGraphExpander {
+        edges: adjacency.clone(),
+        closed: closed.clone(),
+    };
+    let result = skest_search(factory, root_goal, config, seed);
+
+    let summary = json!({
+        "kind": "skest_ensemble_search",
+        // A search over an asserted graph surfaces a candidate. These two keys are
+        // the guard against a reader promoting the ensemble's "solved" to a proof.
+        "status": "candidate",
+        "formally_verified": false,
+        "root": root,
+        "seed": seed,
+        "trees": config.trees,
+        "max_steps": config.max_steps,
+        "share": config.share,
+        "solved": result.solved,
+        "winner_tree": result.winner_tree,
+        "cross_tree_reuses": result.cross_tree_reuses,
+        "states_explored": result.states_explored,
+        "published_facts": result.shared.published,
+        "per_tree": result.per_tree,
+        "note": "Search over a caller-supplied goal graph. 'solved' means a \
+                 caller-marked-closed goal was reached; no formal system verified \
+                 anything here.",
+    });
+
+    store.event(
+        project_id,
+        None,
+        "skest.searched",
+        "skest",
+        summary.clone(),
+    )?;
+    Ok(summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::driver::{GoalState, TacticExpander, TacticStep};
@@ -863,5 +1021,149 @@ mod tests {
         let r1 = skest_search(reuse_factory(seed), MockGoal::open("R"), cfg(2, true), seed);
         let r2 = skest_search(reuse_factory(seed), MockGoal::open("R"), cfg(2, true), seed);
         assert_eq!(r1, r2, "same seed ⇒ identical result + counters");
+    }
+
+    // ---- CLI entry point ----------------------------------------------------
+
+    use std::path::Path;
+
+    fn store_with_project() -> (Store, String) {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "skest entry point").unwrap();
+        (store, project.id)
+    }
+
+    fn edge(from: &str, tactic: &str, prior: f64, to: &str) -> GraphEdge {
+        GraphEdge {
+            from: from.into(),
+            tactic: tactic.into(),
+            prior,
+            to: to.into(),
+        }
+    }
+
+    #[test]
+    fn entry_point_solves_a_chain_but_reports_only_a_candidate() {
+        let (store, project) = store_with_project();
+        let summary = run_skest_search(
+            &store,
+            Some(&project),
+            vec!["g0".into()],
+            vec![edge("g2", "c", 1.0, "g1"), edge("g1", "c", 1.0, "g0")],
+            "g2".into(),
+            cfg(2, true),
+            3,
+        )
+        .unwrap();
+
+        assert_eq!(summary["solved"], json!(true));
+        // The framing keys are what stop the ensemble's "solved" reading as proof.
+        assert_eq!(summary["status"], json!("candidate"));
+        assert_eq!(summary["formally_verified"], json!(false));
+    }
+
+    #[test]
+    fn entry_point_emits_a_store_event() {
+        let (store, project) = store_with_project();
+        run_skest_search(
+            &store,
+            Some(&project),
+            vec!["g0".into()],
+            vec![edge("g1", "c", 1.0, "g0")],
+            "g1".into(),
+            cfg(2, true),
+            1,
+        )
+        .unwrap();
+        let events = store.events(&project, 100).unwrap();
+        assert!(events.iter().any(|e| e.event_type == "skest.searched"));
+    }
+
+    #[test]
+    fn entry_point_reuse_scenario_shares_a_fact_across_trees() {
+        // The reuse scenario from the trait-level tests, driven through the entry
+        // point: tree 0 proves the general "⊢ P", tree 1 solves the specific
+        // "H ⊢ P" only by subsumption of that shared fact.
+        let (store, project) = store_with_project();
+        let edges = vec![
+            edge("R", "a", 1.0, "M"),
+            edge("M", "a2", 1.0, "⊢ P"),
+            edge("R", "b", 1.0, "H ⊢ P"),
+        ];
+        let summary = run_skest_search(
+            &store,
+            Some(&project),
+            vec!["⊢ P".into()],
+            edges,
+            "R".into(),
+            cfg(2, true),
+            7,
+        )
+        .unwrap();
+        assert_eq!(summary["solved"], json!(true));
+        assert!(summary["cross_tree_reuses"].as_u64().unwrap() > 0);
+        assert_eq!(summary["formally_verified"], json!(false));
+    }
+
+    #[test]
+    fn entry_point_unsolvable_graph_reports_not_solved_never_a_false_solve() {
+        let (store, project) = store_with_project();
+        // No goal is marked closed, so nothing can be solved.
+        let summary = run_skest_search(
+            &store,
+            Some(&project),
+            Vec::new(),
+            vec![edge("g", "step", 0.5, "h")],
+            "g".into(),
+            cfg(3, true),
+            5,
+        )
+        .unwrap();
+        assert_eq!(summary["solved"], json!(false));
+        assert_eq!(summary["winner_tree"], json!(null));
+        assert_eq!(summary["formally_verified"], json!(false));
+    }
+
+    #[test]
+    fn entry_point_rejects_empty_root_or_edge_endpoints() {
+        let (store, project) = store_with_project();
+        assert!(run_skest_search(
+            &store,
+            Some(&project),
+            Vec::new(),
+            Vec::new(),
+            String::new(),
+            cfg(2, true),
+            0,
+        )
+        .is_err());
+        assert!(run_skest_search(
+            &store,
+            Some(&project),
+            Vec::new(),
+            vec![edge("g", "t", 1.0, "")],
+            "g".into(),
+            cfg(2, true),
+            0,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn entry_point_is_deterministic_for_a_fixed_seed() {
+        let (store, project) = store_with_project();
+        let run = || {
+            run_skest_search(
+                &store,
+                Some(&project),
+                vec!["g0".into()],
+                vec![edge("g2", "c", 1.0, "g1"), edge("g1", "c", 1.0, "g0")],
+                "g2".into(),
+                cfg(2, true),
+                42,
+            )
+            .unwrap()
+        };
+        assert_eq!(run(), run());
     }
 }
