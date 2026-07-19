@@ -514,6 +514,30 @@ fn attach_error_feedback(system: FormalSystem, code: &str, report: &mut Verifica
             "diagnostics": serde_json::to_value(&rendered.diagnostics).unwrap_or(Value::Null),
         }),
     );
+
+    // Every failed attempt exposes subgoals -- explicit holes plus the positions
+    // the checker actually complained about -- and until now they were thrown
+    // away with the attempt. Lifting them here costs one pass over text we have
+    // already parsed.
+    //
+    // These are published as OBLIGATIONS, never as results. `to_obligations`
+    // enters them unproved without exception; a subgoal is a hypothesis about
+    // where the proof has to go, and a failed compile is not evidence that any
+    // of them holds.
+    let subgoals = extract_subgoals(system, code, &rendered.diagnostics);
+    if !subgoals.is_empty() {
+        detail.insert(
+            SUBGOALS_KEY.to_string(),
+            json!({
+                "schema": "theoremata.extracted-subgoals.v1",
+                "system": system.as_str(),
+                "subgoals": serde_json::to_value(&subgoals).unwrap_or(Value::Null),
+                "obligations": serde_json::to_value(to_obligations(&subgoals))
+                    .unwrap_or(Value::Null),
+                "proved": false,
+            }),
+        );
+    }
 }
 
 /// Recover the checker's raw text from a serialized `CompileReport`.
