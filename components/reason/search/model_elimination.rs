@@ -557,7 +557,7 @@ fn parse_term(text: &str) -> anyhow::Result<Term> {
                 if a.trim().is_empty() {
                     anyhow::bail!("empty argument in term: {t}");
                 }
-                args.push(parse_term(a)?);
+                args.push(parse_term(&a)?);
             }
             Ok(Term::app(sym, args))
         }
