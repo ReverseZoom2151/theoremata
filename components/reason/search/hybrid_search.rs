@@ -21,6 +21,10 @@
 //!   `alpha`, union the visited states and the solved paths, and return the
 //!   shortest solution together with coverage statistics. It *reuses* best-first
 //!   verbatim; it does not reimplement search.
+//! * [`multi_alpha_union_minimized`] — the same sweep, then a proof shrink gated on
+//!   a **caller-supplied** re-check. The re-check is a parameter because nothing in
+//!   this module can execute a tactic: the scorer proposes and ranks, it never
+//!   verifies, so it must never be the gate. See that function's docs.
 //! * [`HybridPlan`] + [`split_budget`] + [`route`] — split a total compute budget
 //!   between the best-first side and the critic-guided-driver side from cheap goal
 //!   features. A [`super::ttc::TtcController`] is the intended caller (see the
@@ -39,7 +43,8 @@
 //! into a [`BTreeSet`] so its enumeration is sorted and stable. Given the same
 //! scorer, root, alphas, and budget it returns byte-identical results.
 
-use super::best_first::{best_first_search, BestFirstConfig, TacticScorer};
+use super::best_first::{best_first_search, BestFirstConfig, BestFirstOutcome, TacticScorer};
+use super::minimize::MinimizeOutcome;
 use std::collections::BTreeSet;
 
 // ---------------------------------------------------------------------------
@@ -106,10 +111,28 @@ pub fn multi_alpha_union<Sc: TacticScorer>(
     alphas: &[f64],
     per_alpha_budget: usize,
 ) -> HybridOutcome {
+    multi_alpha_union_inner(scorer, root, alphas, per_alpha_budget).0
+}
+
+/// The sweep, additionally returning the [`BestFirstOutcome`] of the pass that
+/// produced the reported (shortest) solution.
+///
+/// That outcome is retained only so [`multi_alpha_union_minimized`] can reach its
+/// search arena; the arena is what a minimizer's BFS needs, and it cannot be
+/// reconstructed from a [`HybridOutcome`], which keeps only the tactic list. It is
+/// `None` when no pass solved.
+fn multi_alpha_union_inner<Sc: TacticScorer>(
+    scorer: &mut Sc,
+    root: Sc::State,
+    alphas: &[f64],
+    per_alpha_budget: usize,
+) -> (HybridOutcome, Option<BestFirstOutcome<Sc::State>>) {
     let mut runs: Vec<AlphaRun> = Vec::with_capacity(alphas.len());
     let mut union: BTreeSet<String> = BTreeSet::new();
     // Best (shortest) solution so far: (proof_len, tactics, alpha).
     let mut best: Option<(usize, Vec<String>, f64)> = None;
+    // The search outcome that produced `best`, kept in lockstep with it.
+    let mut best_outcome: Option<BestFirstOutcome<Sc::State>> = None;
 
     for &alpha in alphas {
         let cfg = BestFirstConfig {
@@ -126,8 +149,10 @@ pub fn multi_alpha_union<Sc: TacticScorer>(
 
         let tactics = out.proof_tactics();
         let proof_len = tactics.len();
+        // Read the per-pass stats out before `out` can be moved into `best_outcome`.
+        let (pass_solved, pass_steps, pass_visited) = (out.solved, out.steps, out.order.len());
 
-        if out.solved {
+        if pass_solved {
             // Strictly-shorter wins; equal length keeps the earlier alpha (this
             // pass only replaces on `<`), so the tie-break is deterministic.
             let take = match &best {
@@ -135,16 +160,17 @@ pub fn multi_alpha_union<Sc: TacticScorer>(
                 Some((best_len, _, _)) => proof_len < *best_len,
             };
             if take {
-                best = Some((proof_len, tactics.clone(), alpha));
+                best = Some((proof_len, tactics, alpha));
+                best_outcome = Some(out);
             }
         }
 
         runs.push(AlphaRun {
             alpha,
-            solved: out.solved,
-            steps: out.steps,
+            solved: pass_solved,
+            steps: pass_steps,
             proof_len,
-            visited: out.order.len(),
+            visited: pass_visited,
         });
     }
 
@@ -153,13 +179,78 @@ pub fn multi_alpha_union<Sc: TacticScorer>(
         None => (false, Vec::new(), None),
     };
 
-    HybridOutcome {
-        solved,
-        proof_tactics,
-        best_alpha,
-        runs,
-        union_keys: union.into_iter().collect(),
-    }
+    (
+        HybridOutcome {
+            solved,
+            proof_tactics,
+            best_alpha,
+            runs,
+            union_keys: union.into_iter().collect(),
+        },
+        best_outcome,
+    )
+}
+
+/// Run the sweep, then shrink the winning proof **behind a caller-supplied
+/// re-check**.
+///
+/// This is [`multi_alpha_union`] plus one extra step: the winning pass's arena is
+/// handed to [`BestFirstOutcome::minimized_proof`], which BFS-searches the arena
+/// (projected to a DAG, so transpositions expose shortcuts the log-prob-ordered
+/// line missed) for a shorter closing sequence and then asks `replay` whether that
+/// sequence actually closes the goal. The returned [`MinimizeOutcome`] is
+/// `Some` only when a pass solved; it is `None` otherwise, and `replay` is never
+/// consulted for an unsolved sweep.
+///
+/// # `replay` is the entire soundness boundary
+///
+/// `replay(seq) -> bool` must return `true` **only** if executing exactly `seq`
+/// from the root goal against a real proof checker leaves no open goal. Nothing in
+/// this module can establish that, which is why it is a parameter rather than
+/// something built here:
+///
+/// * The only capability in scope is [`TacticScorer`], and
+///   [`score`](TacticScorer::score) is a *proposer*: it returns candidate tactics
+///   with policy log-probabilities and a `next` state it asserts the tactic yields.
+///   It never executes anything, so it cannot witness closure.
+/// * A state's [`is_closed`](super::driver::GoalState::is_closed) is likewise just
+///   a flag on a state the scorer itself produced, not a checker verdict.
+///
+/// So using the scorer (or an
+/// [`ExpanderScorer`](super::best_first::ExpanderScorer)-wrapped expander, or the
+/// MCGS critic) as `replay` would be circular: the component that guessed the
+/// shrink would be the one confirming it, and a shorter-but-wrong sequence would be
+/// promoted to `accepted` and emitted as a proof. Do not do that. A real `replay`
+/// closes over a checker: `ProofSession::step_tactic` (`components/prover/formal.rs`)
+/// stepped over the sequence, `LeanSession::check`
+/// (`components/verify/lean_session.rs`) on the assembled source, or
+/// `FormalBackend::verify` (`components/prover/formal.rs`).
+///
+/// # Cost
+///
+/// Every call runs one real checker pass, so this entry point is opt-in: plain
+/// [`multi_alpha_union`] is unchanged and stays free of prover calls. Callers with
+/// no checker wired up should keep using it rather than passing a fake `replay`.
+///
+/// Emit only [`MinimizeOutcome::accepted`], or fall back through
+/// [`MinimizeOutcome::best_safe`] to the original line, which passed a gate
+/// upstream. Never emit [`MinimizeOutcome::candidate`] on its own.
+pub fn multi_alpha_union_minimized<Sc: TacticScorer, F>(
+    scorer: &mut Sc,
+    root: Sc::State,
+    alphas: &[f64],
+    per_alpha_budget: usize,
+    replay: F,
+) -> (HybridOutcome, Option<MinimizeOutcome>)
+where
+    F: FnMut(&[String]) -> bool,
+{
+    let (outcome, best_outcome) = multi_alpha_union_inner(scorer, root, alphas, per_alpha_budget);
+    // No solving pass ⇒ no arena to shrink and nothing to re-check. Returning None
+    // (rather than an empty minimize outcome) keeps "we never ran the gate"
+    // distinguishable from "the gate rejected", which the caller logs differently.
+    let minimized = best_outcome.map(|out| out.minimized_proof(replay));
+    (outcome, minimized)
 }
 
 // ---------------------------------------------------------------------------
@@ -328,6 +419,7 @@ where
 mod tests {
     use super::super::best_first::{ScoredExpansion, ScoredTactic};
     use super::super::driver::GoalState;
+    use super::super::minimize::MinimizeStatus;
     use super::*;
     use std::cell::Cell;
     use std::collections::HashMap;
@@ -474,6 +566,124 @@ mod tests {
             multi_alpha_union(&mut s, MockGoal::open("root"), &[0.0, 0.5, 1.0], 50)
         };
         assert_eq!(run(), run());
+    }
+
+    // ---- Gate-re-checked minimization over the sweep --------------------------
+
+    /// A space whose winning line is *not* the shortest closing path in the arena.
+    /// alpha=0 follows the high-log-prob two-step line root -t1-> A -t3-> G(closed),
+    /// but the frontier also discovered root -t2-> C(closed), a length-one close.
+    fn shortcut_scorer() -> TableScorer {
+        TableScorer::new()
+            .edge("root", "t1", 0.99f64.ln(), MockGoal::open("A"))
+            .edge("root", "t2", 0.5f64.ln(), MockGoal::closed("C"))
+            .edge("A", "t3", 0.99f64.ln(), MockGoal::closed("G"))
+    }
+
+    #[test]
+    fn minimized_sweep_accepts_a_shortcut_the_replay_confirms() {
+        let mut scorer = shortcut_scorer();
+        let mut seen: Vec<Vec<String>> = Vec::new();
+        let (outcome, minimized) = multi_alpha_union_minimized(
+            &mut scorer,
+            MockGoal::open("root"),
+            &[0.0],
+            50,
+            |cand| {
+                seen.push(cand.to_vec());
+                true
+            },
+        );
+
+        assert!(outcome.solved);
+        assert_eq!(outcome.proof_tactics, vec!["t1", "t3"]);
+
+        let m = minimized.expect("a solving sweep yields a minimize outcome");
+        assert_eq!(m.status, MinimizeStatus::Verified);
+        assert_eq!(m.accepted, Some(vec!["t2".to_string()]));
+        assert_eq!(
+            seen,
+            vec![vec!["t2".to_string()]],
+            "the replay must be handed the exact shrunk sequence to re-check"
+        );
+        assert!(m.best_safe(&outcome.proof_tactics).len() < outcome.proof_tactics.len());
+    }
+
+    #[test]
+    fn minimized_sweep_keeps_the_original_when_the_replay_rejects() {
+        // A replay that refuses the shrink is what a real checker does when the
+        // arena's short path does not actually close the goal. Nothing may be
+        // accepted in that case.
+        let mut scorer = shortcut_scorer();
+        let (outcome, minimized) =
+            multi_alpha_union_minimized(&mut scorer, MockGoal::open("root"), &[0.0], 50, |_| false);
+
+        let m = minimized.expect("a solving sweep yields a minimize outcome");
+        assert_eq!(m.status, MinimizeStatus::RejectedByGate);
+        assert_eq!(m.accepted, None, "a rejected shrink is never emittable");
+        assert!(!m.status.is_emittable());
+        assert_eq!(
+            m.candidate,
+            Some(vec!["t2".to_string()]),
+            "the rejected shrink stays in the report for inspection"
+        );
+        // The caller falls back to the line the search actually closed on.
+        assert_eq!(
+            m.best_safe(&outcome.proof_tactics),
+            outcome.proof_tactics.as_slice()
+        );
+    }
+
+    #[test]
+    fn minimized_sweep_never_consults_the_replay_when_unsolved() {
+        let mut scorer = TableScorer::new().edge("root", "t", 0.5f64.ln(), MockGoal::open("stuck"));
+        let mut calls = 0usize;
+        let (outcome, minimized) = multi_alpha_union_minimized(
+            &mut scorer,
+            MockGoal::open("root"),
+            &[0.0, 1.0],
+            20,
+            |_| {
+                calls += 1;
+                true
+            },
+        );
+
+        assert!(!outcome.solved);
+        assert_eq!(calls, 0, "an unsolved sweep must not spend a checker call");
+        assert!(
+            minimized.is_none(),
+            "no proof was found, so there is nothing to report a status for"
+        );
+    }
+
+    #[test]
+    fn minimized_sweep_shrinks_the_winner_across_alphas() {
+        // The sweep's winner is the shortest across alphas; the minimizer then runs
+        // against *that* pass's arena, so both stages compose without either one
+        // deciding solvedness on its own.
+        let mut scorer = two_path_scorer();
+        let (outcome, minimized) =
+            multi_alpha_union_minimized(&mut scorer, MockGoal::open("root"), &[0.0, 1.0], 50, |_| {
+                true
+            });
+        assert_eq!(outcome.proof_tactics, vec!["sx"], "alpha=0 wins the sweep");
+        let m = minimized.expect("solved");
+        // Already minimal: the arena's shortest close is the winning line itself.
+        assert_eq!(m.accepted, Some(vec!["sx".to_string()]));
+        assert_eq!(m.report.tactics_removed, 0);
+    }
+
+    #[test]
+    fn plain_sweep_matches_the_minimized_sweeps_search_result() {
+        // The opt-in entry point must not perturb the search itself: same runs,
+        // same coverage, same reported proof as the free path.
+        let mut a = shortcut_scorer();
+        let plain = multi_alpha_union(&mut a, MockGoal::open("root"), &[0.0, 1.0], 50);
+        let mut b = shortcut_scorer();
+        let (checked, _) =
+            multi_alpha_union_minimized(&mut b, MockGoal::open("root"), &[0.0, 1.0], 50, |_| true);
+        assert_eq!(plain, checked);
     }
 
     // ---- split_budget / route ------------------------------------------------
