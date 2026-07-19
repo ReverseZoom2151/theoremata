@@ -11,17 +11,17 @@ use crate::{
     db::Store,
     hardening,
     lean_session::LeanSession,
-    model::{EdgeKind, ModelRequest, Node, NodeKind, NodeStatus, NodeTier},
+    model::{Edge, EdgeKind, ModelRequest, Node, NodeKind, NodeStatus, NodeTier},
+    prover::{attempt_run, formal::FormalSystem, proof_job},
     provider::ModelProvider,
     research::ResearchEngine,
     router::{self, NodeSignals, Route, ToolAvailability},
     sampling, scheduler,
-    prover::{attempt_run, proof_job, formal::FormalSystem},
     tools::{LeanCheck, MathlibSearch, PythonCheck, Tool},
 };
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 // Statement VALIDATION as a first-class pipeline stage (sibling module).
 use crate::statement_validation::{StatementValidator, ToolStatementValidator, ValidationOutcome};
@@ -396,28 +396,44 @@ impl AgentLoop<'_> {
             }
             Route::Retrieve => {
                 let py = PythonCheck::new();
-                if !py.available() {
-                    return Ok("noop");
+                let project_nodes = self.store.nodes(project_id)?;
+                let project_edges = self.store.edges(project_id)?;
+                let graph_candidates =
+                    graph_lemma_candidates(&node.id, &project_nodes, &project_edges, 8);
+                let mut lemmas: Vec<String> = graph_candidates
+                    .iter()
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                let mut worker_detail = Value::Null;
+
+                if py.available() {
+                    let root = self
+                        .config
+                        .resources
+                        .join("mathlib4-master/mathlib4-master");
+                    let result = py.run(json!({
+                        "tool":"retrieve","root":root,"imports":["Mathlib"],
+                        "query":node.statement,"limit":8,"op":"accessible_retrieve",
+                        "theorem_module": node.lean_decls.first(),
+                    }))?;
+                    lemmas.extend(parse_lemma_names(&result.stdout));
+                    if crate::guard::looks_injected(&result.stdout) {
+                        self.store.event(
+                            Some(project_id),
+                            None,
+                            "guard.injection_flagged",
+                            "librarian",
+                            json!({ "node": node.id }),
+                        )?;
+                    }
+                    worker_detail = serde_json::to_value(&result)?;
                 }
-                let root = self
-                    .config
-                    .resources
-                    .join("mathlib4-master/mathlib4-master");
-                let result = py.run(json!({
-                    "tool":"retrieve","root":root,"imports":["Mathlib"],
-                    "query":node.title,"limit":8,"op":"accessible_retrieve",
-                    "theorem_module": node.lean_decls.first(),
-                }))?;
-                let lemmas = parse_lemma_names(&result.stdout);
-                if crate::guard::looks_injected(&result.stdout) {
-                    self.store.event(
-                        Some(project_id),
-                        None,
-                        "guard.injection_flagged",
-                        "librarian",
-                        json!({ "node": node.id }),
-                    )?;
-                }
+
+                // Graph candidates come first because they are already-certified
+                // project-local premises. Preserve that order while removing any
+                // duplicate names returned by the external retriever.
+                let mut seen = BTreeSet::new();
+                lemmas.retain(|name| seen.insert(name.clone()));
                 if !lemmas.is_empty() {
                     self.store
                         .set_suggested_lemmas(project_id, &node.id, &lemmas, "librarian")?;
@@ -438,9 +454,16 @@ impl AgentLoop<'_> {
                     } else {
                         "candidates"
                     },
-                    serde_json::to_value(&result)?,
+                    json!({
+                        "graph_candidates": graph_candidates,
+                        "worker": worker_detail,
+                    }),
                 )?;
-                Ok("retrieve")
+                if lemmas.is_empty() && !py.available() {
+                    Ok("noop")
+                } else {
+                    Ok("retrieve")
+                }
             }
             Route::Formalize => {
                 self.formalize(project_id, run, node, session, certified, abstained)
@@ -544,13 +567,8 @@ impl AgentLoop<'_> {
             "theorem_name": format!("Theoremata.N{}", node.id.replace('-', "").get(0..8).unwrap_or("ode")),
             "backend": self.config.prover_backend,
         });
-        let record = attempt_run::start(
-            self.store,
-            self.config,
-            project_id,
-            Some(&node.id),
-            input,
-        )?;
+        let record =
+            attempt_run::start(self.store, self.config, project_id, Some(&node.id), input)?;
         let out = attempt_run::run_to_completion(
             self.store,
             self.config,
@@ -598,10 +616,14 @@ impl AgentLoop<'_> {
         // statement faithfully encode the node's informal statement?
         self.validate_new_statement(project_id, run, &node.id, &node.statement, &lean)?;
         let theorem = extract_theorem(&lean);
-        let (compiles, axioms_clean) =
-            self.verify_source(&lean, theorem.as_deref(), session)?;
+        let (compiles, axioms_clean) = self.verify_source(&lean, theorem.as_deref(), session)?;
         if compiles && axioms_clean {
-            let fresh = self.store.nodes(project_id)?.into_iter().find(|n| n.id == node.id).unwrap();
+            let fresh = self
+                .store
+                .nodes(project_id)?
+                .into_iter()
+                .find(|n| n.id == node.id)
+                .unwrap();
             self.certify_k_consecutive(
                 project_id,
                 &fresh,
@@ -668,7 +690,13 @@ impl AgentLoop<'_> {
             .set_formal_statement(project_id, &node.id, &sampled.value.lean, "formalizer")?;
         // Advisory statement-validation stage (default-off): faithfulness check
         // of the freshly formalized statement before proving is trusted.
-        self.validate_new_statement(project_id, run, &node.id, &node.statement, &sampled.value.lean)?;
+        self.validate_new_statement(
+            project_id,
+            run,
+            &node.id,
+            &node.statement,
+            &sampled.value.lean,
+        )?;
         if sampled.accepted {
             let theorem = extract_theorem(&sampled.value.lean);
             self.certify_k_consecutive(
@@ -1132,6 +1160,49 @@ fn extract_theorem(src: &str) -> Option<String> {
     None
 }
 
+/// Retrieve project-local Lean declarations through the proof dependency DAG.
+/// Only declarations backed by a completed proof are eligible; graph proximity
+/// controls ordering and declaration-name order breaks ties deterministically.
+fn graph_lemma_candidates(
+    goal: &str,
+    nodes: &[Node],
+    edges: &[Edge],
+    budget: usize,
+) -> Vec<(String, f64)> {
+    if budget == 0 {
+        return Vec::new();
+    }
+    let graph = crate::graph_rag::GraphView::from_model_edges(edges);
+    let by_id: BTreeMap<&str, &Node> = nodes.iter().map(|node| (node.id.as_str(), node)).collect();
+    let mut best_by_decl: BTreeMap<String, f64> = BTreeMap::new();
+
+    for (node_id, score) in graph.graph_retrieve(goal, budget) {
+        let Some(candidate) = by_id.get(node_id.as_str()).copied() else {
+            continue;
+        };
+        if candidate.status != NodeStatus::FormallyVerified && !candidate.proof_done {
+            continue;
+        }
+        for declaration in &candidate.lean_decls {
+            let declaration = declaration.trim();
+            if declaration.is_empty() {
+                continue;
+            }
+            best_by_decl
+                .entry(declaration.to_owned())
+                .and_modify(|best| *best = (*best).max(score))
+                .or_insert(score);
+        }
+    }
+
+    let mut out: Vec<(String, f64)> = best_by_decl.into_iter().collect();
+    out.sort_by(|(name_a, score_a), (name_b, score_b)| {
+        score_b.total_cmp(score_a).then_with(|| name_a.cmp(name_b))
+    });
+    out.truncate(budget);
+    out
+}
+
 /// Outcome of the k-consecutive-clean acceptance gate.
 #[derive(Debug, Clone, Copy)]
 pub struct KConsecutiveOutcome {
@@ -1327,7 +1398,14 @@ mod tests {
         let agent = validation_agent(&store, &config, &MockProvider);
         let mock = MockValidator::new(Verdict::Ok, 0.95, false);
         let out = agent
-            .validate_statement(&mock, &project.id, None, &node.id, "n = n", "theorem t : n = n := rfl")
+            .validate_statement(
+                &mock,
+                &project.id,
+                None,
+                &node.id,
+                "n = n",
+                "theorem t : n = n := rfl",
+            )
             .unwrap()
             .expect("stage ran (flag on)");
         assert_eq!(out.verdict, Verdict::Ok);
@@ -1359,7 +1437,14 @@ mod tests {
         let agent = validation_agent(&store, &config, &MockProvider);
         let mock = MockValidator::new(Verdict::Suspect, 0.6, false);
         let out = agent
-            .validate_statement(&mock, &project.id, None, &node.id, "hard claim", "theorem t : True := trivial")
+            .validate_statement(
+                &mock,
+                &project.id,
+                None,
+                &node.id,
+                "hard claim",
+                "theorem t : True := trivial",
+            )
             .unwrap()
             .unwrap();
         assert_eq!(out.verdict, Verdict::Suspect);
@@ -1391,7 +1476,14 @@ mod tests {
         let agent = validation_agent(&store, &config, &MockProvider);
         let mock = MockValidator::new(Verdict::Reject, 0.1, true);
         let result = agent
-            .validate_statement(&mock, &project.id, None, &node.id, "s", "theorem t : True := trivial")
+            .validate_statement(
+                &mock,
+                &project.id,
+                None,
+                &node.id,
+                "s",
+                "theorem t : True := trivial",
+            )
             .unwrap();
         assert!(result.is_none(), "flag off ⇒ stage returns None");
         assert_eq!(mock.calls.get(), 0, "validator is never called when off");
@@ -1419,7 +1511,14 @@ mod tests {
         let agent = validation_agent(&store, &config, &MockProvider);
         let mock = MockValidator::new(Verdict::Reject, 0.2, true);
         agent
-            .validate_statement(&mock, &project.id, None, &node.id, "s", "theorem t : True := trivial")
+            .validate_statement(
+                &mock,
+                &project.id,
+                None,
+                &node.id,
+                "s",
+                "theorem t : True := trivial",
+            )
             .unwrap();
         // add_evidence emits an `evidence.recorded` event tagged with our source;
         // and a Reject surfaces the warning. Both prove the outcome was persisted.
@@ -1434,6 +1533,64 @@ mod tests {
             .iter()
             .any(|e| e.event_type == "statement_validation.warning");
         assert!(warned, "Reject surfaces a warning event");
+    }
+
+    #[test]
+    fn graph_retrieval_uses_only_completed_project_lemmas() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "target").unwrap();
+        let goal = store
+            .add_node(&project.id, NodeKind::Conjecture, "goal", "target", "test")
+            .unwrap();
+        let direct = store
+            .add_node(&project.id, NodeKind::Lemma, "direct", "d", "test")
+            .unwrap();
+        let distant = store
+            .add_node(&project.id, NodeKind::Lemma, "distant", "e", "test")
+            .unwrap();
+        let unfinished = store
+            .add_node(&project.id, NodeKind::Lemma, "unfinished", "u", "test")
+            .unwrap();
+
+        store
+            .set_lean_decls(&project.id, &direct.id, &["Project.direct".into()], "test")
+            .unwrap();
+        store
+            .set_lean_decls(
+                &project.id,
+                &distant.id,
+                &["Project.distant".into()],
+                "test",
+            )
+            .unwrap();
+        store
+            .set_lean_decls(
+                &project.id,
+                &unfinished.id,
+                &["Project.unfinished".into()],
+                "test",
+            )
+            .unwrap();
+        for id in [&direct.id, &distant.id] {
+            store
+                .set_node_status(&project.id, id, NodeStatus::FormallyVerified, "test")
+                .unwrap();
+        }
+        store
+            .add_edge(&project.id, &goal.id, &direct.id, EdgeKind::DependsOn)
+            .unwrap();
+        store
+            .add_edge(&project.id, &direct.id, &distant.id, EdgeKind::DependsOn)
+            .unwrap();
+        store
+            .add_edge(&project.id, &goal.id, &unfinished.id, EdgeKind::DependsOn)
+            .unwrap();
+
+        let nodes = store.nodes(&project.id).unwrap();
+        let edges = store.edges(&project.id).unwrap();
+        let got = graph_lemma_candidates(&goal.id, &nodes, &edges, 8);
+        let names: Vec<&str> = got.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, vec!["Project.direct", "Project.distant"]);
     }
 
     #[test]
