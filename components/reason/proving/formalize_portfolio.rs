@@ -24,9 +24,18 @@
 //! production. Generation is threaded a `seed`, never wall-clock or unseeded RNG,
 //! so a portfolio run is reproducible.
 
-use crate::subsumption::{subsumes_str, CanonicalGoal};
+use crate::{
+    concurrent::{run_owned, ConcurrentConfig},
+    config::Config,
+    prover::{
+        formal::{backend_for, FormalSystem},
+        model::VerificationReport,
+    },
+    subsumption::{subsumes_str, CanonicalGoal},
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::time::Instant;
 
 /// Produce N candidate FORMAL statements for one informal statement.
 ///
@@ -134,6 +143,158 @@ impl Default for FormalizeConfig {
             seed: 0,
             max_candidates: 8,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Owned verification seam for the formal-system portfolio
+// ---------------------------------------------------------------------------
+
+/// Which backend an owned verification task must use.
+///
+/// Selection is explicit and happens before the task crosses the worker
+/// boundary. A live task never falls back to a mock backend when its toolchain is
+/// unavailable; it returns an unavailable result instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationMode {
+    Live,
+    Mock,
+}
+
+/// A fully owned formal-system verification job.
+///
+/// This is the concurrency boundary for portfolio proving. Model generation,
+/// database access, and event persistence stay on the caller thread. Once a
+/// candidate proof has been generated, the caller moves its owned config, source,
+/// and statement into this value; only backend construction and the independent
+/// 3+1-layer verification gate run in a worker.
+///
+/// There are intentionally no references or service handles here. In particular,
+/// neither `Store` nor `dyn ModelProvider` can be carried by this type.
+#[derive(Debug, Clone)]
+pub struct OwnedVerificationTask {
+    pub system: FormalSystem,
+    pub code: String,
+    pub statement: String,
+    config: Config,
+    mode: VerificationMode,
+}
+
+impl OwnedVerificationTask {
+    /// Prepare a task for a live backend. If the toolchain is unavailable at
+    /// execution time, the result is `available: false`; no mock fallback occurs.
+    pub fn live(config: Config, system: FormalSystem, code: String, statement: String) -> Self {
+        Self {
+            system,
+            code,
+            statement,
+            config,
+            mode: VerificationMode::Live,
+        }
+    }
+
+    /// Prepare an explicitly mocked verification task for deterministic tests.
+    /// Mock reports remain stamped `live: false` by the backend gate.
+    pub fn mock(config: Config, system: FormalSystem, code: String, statement: String) -> Self {
+        Self {
+            system,
+            code,
+            statement,
+            config,
+            mode: VerificationMode::Mock,
+        }
+    }
+
+    pub fn mode(&self) -> VerificationMode {
+        self.mode
+    }
+}
+
+/// Result of one [`OwnedVerificationTask`], retained in input-system order by
+/// [`run_owned_formal_system_verifications`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnedVerificationResult {
+    pub system: FormalSystem,
+    pub available: bool,
+    pub code: String,
+    pub report: Option<VerificationReport>,
+    pub duration_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl OwnedVerificationResult {
+    /// Whether all configured gate layers passed. This deliberately does not
+    /// imply live certification; use [`live_verified`](Self::live_verified) for
+    /// that stronger predicate.
+    pub fn gate_passed(&self) -> bool {
+        self.report
+            .as_ref()
+            .is_some_and(|report| report.lexically_verified)
+    }
+
+    /// Whether a live backend, rather than a mock, passed every gate layer.
+    pub fn live_verified(&self) -> bool {
+        self.report
+            .as_ref()
+            .is_some_and(|report| report.live && report.lexically_verified)
+    }
+}
+
+/// Verify already-generated, fully owned proof candidates, optionally in
+/// parallel, while returning results in the exact input order.
+///
+/// `ConcurrentConfig::default()` is sequential, preserving the existing
+/// portfolio behavior until a caller explicitly opts in. The worker receives no
+/// database or provider handle; the remaining production caller hook is to split
+/// sequential candidate generation/event persistence from verification in
+/// `proving/portfolio.rs` and feed the generated candidates through this seam.
+pub fn run_owned_formal_system_verifications(
+    tasks: Vec<OwnedVerificationTask>,
+    concurrency: &ConcurrentConfig,
+) -> Vec<OwnedVerificationResult> {
+    run_owned(tasks, execute_owned_verification, concurrency)
+}
+
+fn execute_owned_verification(task: OwnedVerificationTask) -> OwnedVerificationResult {
+    let OwnedVerificationTask {
+        system,
+        code,
+        statement,
+        config,
+        mode,
+    } = task;
+    let started = Instant::now();
+    let backend = backend_for(&config, system, mode == VerificationMode::Mock);
+
+    if mode == VerificationMode::Live && !backend.available() {
+        return OwnedVerificationResult {
+            system,
+            available: false,
+            code,
+            report: None,
+            duration_ms: started.elapsed().as_millis(),
+            error: None,
+        };
+    }
+
+    match backend.verify(&config, &code, &statement) {
+        Ok(report) => OwnedVerificationResult {
+            system,
+            available: true,
+            code,
+            report: Some(report),
+            duration_ms: started.elapsed().as_millis(),
+            error: None,
+        },
+        Err(error) => OwnedVerificationResult {
+            system,
+            available: true,
+            code,
+            report: None,
+            duration_ms: started.elapsed().as_millis(),
+            error: Some(error.to_string()),
+        },
     }
 }
 
@@ -454,5 +615,90 @@ mod tests {
         let r = formalize_portfolio("x", &SlateFormalizer, &MarkerScreen, &cfg);
         assert_eq!(r.candidates.len(), 2);
         assert!(r.candidates.iter().all(|c| c.well_formed && !c.trivial));
+    }
+
+    fn mock_verification_tasks(workspace: &std::path::Path) -> Vec<OwnedVerificationTask> {
+        let mut config = Config {
+            prover_mock: true,
+            ..Config::default()
+        };
+        config.workspace = workspace.join("workspaces");
+
+        vec![
+            OwnedVerificationTask::mock(
+                config.clone(),
+                FormalSystem::Lean,
+                "theorem generated : True := by trivial\n".to_string(),
+                "True".to_string(),
+            ),
+            OwnedVerificationTask::mock(
+                config.clone(),
+                FormalSystem::Rocq,
+                "Theorem generated : True.\nProof. exact I. Qed.\n".to_string(),
+                "True".to_string(),
+            ),
+            OwnedVerificationTask::mock(
+                config,
+                FormalSystem::Isabelle,
+                "theory Scratch\n  imports Main\nbegin\n\
+                 theorem generated: \"True\" by simp\nend\n"
+                    .to_string(),
+                "True".to_string(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn owned_verification_seam_is_send_and_static() {
+        fn assert_send_static<T: Send + 'static>() {}
+        assert_send_static::<OwnedVerificationTask>();
+        assert_send_static::<OwnedVerificationResult>();
+    }
+
+    #[test]
+    fn owned_verifications_match_sequential_and_keep_system_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let sequential = run_owned_formal_system_verifications(
+            mock_verification_tasks(temp.path()),
+            &ConcurrentConfig::default(),
+        );
+        let parallel = run_owned_formal_system_verifications(
+            mock_verification_tasks(temp.path()),
+            &ConcurrentConfig::with_threads(3),
+        );
+
+        let shape = |results: &[OwnedVerificationResult]| {
+            results
+                .iter()
+                .map(|result| {
+                    (
+                        result.system,
+                        result.available,
+                        result.gate_passed(),
+                        result.live_verified(),
+                        result.error.is_none(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected_systems = vec![
+            FormalSystem::Lean,
+            FormalSystem::Rocq,
+            FormalSystem::Isabelle,
+        ];
+
+        assert_eq!(
+            sequential
+                .iter()
+                .map(|result| result.system)
+                .collect::<Vec<_>>(),
+            expected_systems
+        );
+        assert_eq!(shape(&parallel), shape(&sequential));
+        assert!(sequential.iter().all(OwnedVerificationResult::gate_passed));
+        assert!(
+            sequential.iter().all(|result| !result.live_verified()),
+            "mock verification must never be presented as live certification"
+        );
     }
 }

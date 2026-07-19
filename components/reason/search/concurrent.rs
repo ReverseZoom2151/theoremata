@@ -34,10 +34,12 @@
 //!
 //! ## No new dependencies
 //!
-//! Pure `std`: [`std::thread::scope`] (scoped threads, so tasks may borrow
-//! non-`'static` data and are joined before this returns), a bounded worker pool
-//! keyed off an [`AtomicUsize`] work counter, and [`std::panic::catch_unwind`] so
-//! a panicking task is isolated and never poisons its siblings or a shared lock.
+//! Pure `std`: [`std::thread::scope`], a bounded worker pool keyed off an
+//! [`AtomicUsize`] work counter, and [`std::panic::catch_unwind`] so a panicking
+//! task is isolated and never poisons its siblings or a shared lock. Tasks are
+//! deliberately `'static`: callers cannot accidentally move a borrowed database
+//! connection or model provider into a worker merely because the pool uses scoped
+//! threads. Use [`run_owned`] when the fan-out starts from owned input values.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -45,8 +47,10 @@ use std::sync::Mutex;
 use std::thread;
 
 /// A boxed, sendable proof attempt / alpha pass / best-of-N candidate. `FnOnce`
-/// because each task runs exactly once; `Send` so it can cross to a worker thread.
-pub type Task<T> = Box<dyn FnOnce() -> T + Send>;
+/// because each task runs exactly once; `Send + 'static` so it can cross to a
+/// worker thread without borrowing caller-owned state such as `Store` or a model
+/// provider.
+pub type Task<T> = Box<dyn FnOnce() -> T + Send + 'static>;
 
 /// Execution policy for the fan-out.
 ///
@@ -204,6 +208,36 @@ pub fn run_concurrent<T: Send>(tasks: Vec<Task<T>>, cfg: &ConcurrentConfig) -> V
         .collect()
 }
 
+/// Apply one stateless worker to owned inputs, optionally concurrently, and
+/// return outputs in **input order**.
+///
+/// This is the safe adapter for production fan-outs whose preparation phase is
+/// not thread-safe. The caller performs generation, database reads/writes, and
+/// provider calls before constructing `inputs`; only the owned values cross the
+/// worker boundary. The `'static` bounds reject closures that borrow a `Store`,
+/// `&dyn ModelProvider`, or other stack-owned service. Shared worker state must
+/// itself be `Send + Sync`.
+///
+/// With [`ConcurrentConfig::sequential`] (and therefore `Default`) this is an
+/// ordinary in-order map on the calling thread. Enabling concurrency changes only
+/// scheduling: output position `i` still corresponds to input position `i`.
+pub fn run_owned<I, O, F>(inputs: Vec<I>, worker: F, cfg: &ConcurrentConfig) -> Vec<O>
+where
+    I: Send + 'static,
+    O: Send,
+    F: Fn(I) -> O + Send + Sync + 'static,
+{
+    let worker = std::sync::Arc::new(worker);
+    let tasks = inputs
+        .into_iter()
+        .map(|input| {
+            let worker = std::sync::Arc::clone(&worker);
+            Box::new(move || worker(input)) as Task<O>
+        })
+        .collect();
+    run_concurrent(tasks, cfg)
+}
+
 // ---------------------------------------------------------------------------
 // first_success: race semantics with a deterministic lowest-index winner
 // ---------------------------------------------------------------------------
@@ -342,6 +376,20 @@ mod tests {
         assert_eq!(seq, expected, "sequential is a plain in-order map");
         assert_eq!(par, expected, "concurrent preserves task-index order");
         assert_eq!(seq, par, "concurrent result == sequential result");
+    }
+
+    #[test]
+    fn run_owned_matches_sequential_and_preserves_input_order() {
+        let inputs: Vec<String> = (0..12).map(|i| format!("candidate-{i}")).collect();
+        let worker = |input: String| format!("verified:{input}");
+
+        let sequential = run_owned(inputs.clone(), worker, &ConcurrentConfig::default());
+        let parallel = run_owned(inputs, worker, &ConcurrentConfig::with_threads(4));
+
+        let expected: Vec<String> = (0..12).map(|i| format!("verified:candidate-{i}")).collect();
+        assert_eq!(sequential, expected);
+        assert_eq!(parallel, expected);
+        assert_eq!(parallel, sequential);
     }
 
     #[test]
