@@ -165,7 +165,10 @@ impl PreservationReport {
 /// reports `preserved` unless it can actually parse BOTH sides and see the same
 /// signature, so an ambiguous or unparsable input fails closed rather than
 /// silently passing.
-pub fn check_statement_preserved(canonical_statement: &str, submitted_code: &str) -> PreservationReport {
+pub fn check_statement_preserved(
+    canonical_statement: &str,
+    submitted_code: &str,
+) -> PreservationReport {
     let Some(canonical) = parse_first_decl(canonical_statement) else {
         return report(
             PreservationVerdict::CanonicalUnparsable,
@@ -232,7 +235,8 @@ fn classify(canonical: &TheoremSig, submitted: &TheoremSig) -> (PreservationVerd
     }
 
     // Trivial restatement takes priority — the clearest cheat.
-    if is_trivial_conclusion(&submitted.conclusion) && !is_trivial_conclusion(&canonical.conclusion) {
+    if is_trivial_conclusion(&submitted.conclusion) && !is_trivial_conclusion(&canonical.conclusion)
+    {
         return (
             PreservationVerdict::TriviallyRestated,
             vec![format!(
@@ -381,10 +385,6 @@ fn entry_sig(kind: &str, name: &str, conclusion: &str) -> TheoremSig {
     }
 }
 
-// --- Agda ------------------------------------------------------------------
-
-/// Confirm the submission declares the canonical Agda entry with the SAME type.
-fn check_agda_signature(canonical_statement: &str, submitted_code: &str) -> PreservationReport {
 // --- Isabelle --------------------------------------------------------------
 
 /// Confirm a quoted Isabelle declaration has the same entry name and proposition.
@@ -548,6 +548,10 @@ fn skip_isabelle_comment(chars: &[char], mut i: usize) -> usize {
     i
 }
 
+// --- Agda ------------------------------------------------------------------
+
+/// Confirm the submission declares the canonical Agda entry with the SAME type.
+fn check_agda_signature(canonical_statement: &str, submitted_code: &str) -> PreservationReport {
     let Some((name, canon_type)) = parse_agda_decl(canonical_statement) else {
         return report(
             PreservationVerdict::CanonicalUnparsable,
@@ -665,8 +669,10 @@ fn agda_type_region(region: &[char]) -> String {
                 let next = region.get(i + 1).copied();
                 // Skip `==` / `=>` / `<=` / `>=` / `:=` / `!=` operators; a lone
                 // `=` at depth 0 is the equation delimiter and ends the type.
-                let part_of_op = matches!(prev, Some('=') | Some('<') | Some('>') | Some(':') | Some('!'))
-                    || matches!(next, Some('=') | Some('>'));
+                let part_of_op = matches!(
+                    prev,
+                    Some('=') | Some('<') | Some('>') | Some(':') | Some('!')
+                ) || matches!(next, Some('=') | Some('>'));
                 if !part_of_op {
                     break;
                 }
@@ -837,8 +843,16 @@ pub struct EscapeHatch {
 ///   relies on them is non-reproducible (it exercised an editor/UI code path, not
 ///   the kernel) — the DeepSeek-Prover-V2 reward-hacking erratum.
 const ESCAPE_HATCHES: &[(&str, &str, &str)] = &[
-    ("sorry", "sorry", "open goal admitted with `sorry` (no proof)"),
-    ("admit", "admit", "open goal admitted with `admit` (no proof)"),
+    (
+        "sorry",
+        "sorry",
+        "open goal admitted with `sorry` (no proof)",
+    ),
+    (
+        "admit",
+        "admit",
+        "open goal admitted with `admit` (no proof)",
+    ),
     (
         "native_decide",
         "native_decide",
@@ -1105,8 +1119,7 @@ fn token_positions(chars: &[char], needle: &str) -> Vec<usize> {
         if chars[i..i + n.len()] == n[..] {
             let before_ok = i == 0 || !is_word(chars[i - 1]);
             // Trailing boundary only matters when the needle ends in a word char.
-            let after_ok = !last_is_word
-                || chars.get(i + n.len()).map_or(true, |&c| !is_word(c));
+            let after_ok = !last_is_word || chars.get(i + n.len()).map_or(true, |&c| !is_word(c));
             if before_ok && after_ok {
                 out.push(i);
                 i += n.len();
@@ -1120,7 +1133,10 @@ fn token_positions(chars: &[char], needle: &str) -> Vec<usize> {
 
 /// 1-based line number of char index `idx`.
 fn line_of(chars: &[char], idx: usize) -> usize {
-    1 + chars[..idx.min(chars.len())].iter().filter(|&&c| c == '\n').count()
+    1 + chars[..idx.min(chars.len())]
+        .iter()
+        .filter(|&&c| c == '\n')
+        .count()
 }
 
 /// Collapse all runs of whitespace to a single space and trim.
@@ -1130,7 +1146,10 @@ fn norm_ws(s: &str) -> String {
 
 /// Whether a conclusion is a trivial proposition a restatement cheat resolves to.
 fn is_trivial_conclusion(conclusion: &str) -> bool {
-    matches!(norm_ws(conclusion).as_str(), "True" | "true" | "trivial" | "⊤")
+    matches!(
+        norm_ws(conclusion).as_str(),
+        "True" | "true" | "trivial" | "⊤"
+    )
 }
 
 // --- declaration parsing --------------------------------------------------
@@ -1506,7 +1525,10 @@ mod tests {
     /// An unparsable canonical statement fails closed (cannot confirm anything).
     #[test]
     fn unparsable_canonical_fails_closed() {
-        let r = check_statement_preserved("-- just a comment, no theorem", "theorem T : True := trivial");
+        let r = check_statement_preserved(
+            "-- just a comment, no theorem",
+            "theorem T : True := trivial",
+        );
         assert!(!r.preserved);
         assert_eq!(r.verdict, PreservationVerdict::CanonicalUnparsable);
     }
@@ -1543,6 +1565,21 @@ def aux : Nat := 0
         }
     }
 
+    #[test]
+    fn isabelle_quoted_signature_is_preserved_and_comment_cannot_spoof_it() {
+        let canonical = "theorem t: \"x = x\"";
+        let submitted = "(* theorem t: \"x = x\" *)\ntheorem t: \"x = x\"\n  by simp\n";
+        let preserved = check_entry_signature(FormalSystem::Isabelle, canonical, submitted);
+        assert!(preserved.preserved, "{:?}", preserved.findings);
+
+        let altered = check_entry_signature(
+            FormalSystem::Isabelle,
+            canonical,
+            "theorem t: \"True\"\n  by simp\n",
+        );
+        assert_eq!(altered.verdict, PreservationVerdict::TriviallyRestated);
+    }
+
     /// Agda: a proof declaring the requested `foo : A` passes.
     #[test]
     fn agda_same_type_is_preserved() {
@@ -1565,21 +1602,6 @@ def aux : Nat := 0
 
     /// Agda: a proof declaring a DIFFERENT type (`foo : B`) is flagged.
     #[test]
-    #[test]
-    fn isabelle_quoted_signature_is_preserved_and_comment_cannot_spoof_it() {
-        let canonical = "theorem t: \"x = x\"";
-        let submitted = "(* theorem t: \"x = x\" *)\ntheorem t: \"x = x\"\n  by simp\n";
-        let preserved = check_entry_signature(FormalSystem::Isabelle, canonical, submitted);
-        assert!(preserved.preserved, "{:?}", preserved.findings);
-
-        let altered = check_entry_signature(
-            FormalSystem::Isabelle,
-            canonical,
-            "theorem t: \"True\"\n  by simp\n",
-        );
-        assert_eq!(altered.verdict, PreservationVerdict::TriviallyRestated);
-    }
-
     fn agda_different_type_is_flagged() {
         let canonical = "foo : A";
         let submitted = "foo : B\nfoo = b\n";
@@ -1632,7 +1654,11 @@ def aux : Nat := 0
     /// Metamath: canonical without a `$p`/`$a` assertion falls back (not flagged).
     #[test]
     fn metamath_unparsable_canonical_falls_back() {
-        let r = check_entry_signature(FormalSystem::Metamath, "|- ( ph -> ph )", "th1 $p |- ( ph -> ph ) $= x $.");
+        let r = check_entry_signature(
+            FormalSystem::Metamath,
+            "|- ( ph -> ph )",
+            "th1 $p |- ( ph -> ph ) $= x $.",
+        );
         assert_eq!(r.verdict, PreservationVerdict::CanonicalUnparsable);
         assert!(!is_flagged(r.verdict));
     }
@@ -1650,9 +1676,17 @@ def aux : Nat := 0
     /// Non-ASCII input never panics for either non-Lean system.
     #[test]
     fn non_ascii_entry_signature_does_not_panic() {
-        let _ = check_entry_signature(FormalSystem::Agda, "β : ∀ x → x ≡ x", "β : ∀ x → x ≡ x\nβ x = refl\n");
+        let _ = check_entry_signature(
+            FormalSystem::Agda,
+            "β : ∀ x → x ≡ x",
+            "β : ∀ x → x ≡ x\nβ x = refl\n",
+        );
         let _ = check_entry_signature(FormalSystem::Agda, "café", "≤ ∞ λ π");
-        let _ = check_entry_signature(FormalSystem::Metamath, "τ $p |- ∀ x $= ? $.", "τ $p |- ∀ x $= π $.");
+        let _ = check_entry_signature(
+            FormalSystem::Metamath,
+            "τ $p |- ∀ x $= ? $.",
+            "τ $p |- ∀ x $= π $.",
+        );
         let _ = check_entry_signature(FormalSystem::Metamath, "", "");
     }
 
@@ -1662,8 +1696,16 @@ def aux : Nat := 0
         let a1 = check_entry_signature(FormalSystem::Agda, "foo : A", "foo : B\nfoo = b\n");
         let a2 = check_entry_signature(FormalSystem::Agda, "foo : A", "foo : B\nfoo = b\n");
         assert_eq!(a1, a2);
-        let m1 = check_entry_signature(FormalSystem::Metamath, "t $p |- a $= ? $.", "t $p |- b $= x $.");
-        let m2 = check_entry_signature(FormalSystem::Metamath, "t $p |- a $= ? $.", "t $p |- b $= x $.");
+        let m1 = check_entry_signature(
+            FormalSystem::Metamath,
+            "t $p |- a $= ? $.",
+            "t $p |- b $= x $.",
+        );
+        let m2 = check_entry_signature(
+            FormalSystem::Metamath,
+            "t $p |- a $= ? $.",
+            "t $p |- b $= x $.",
+        );
         assert_eq!(m1, m2);
     }
 
@@ -1731,7 +1773,11 @@ theorem W : 2 + 2 = 4 := by native_decide
 /- admit and apply? in a block comment -/
 theorem T : String := \"sorry and exact? in a literal\"
 ";
-        assert!(escape_hatches_clean(code), "{:?}", scan_escape_hatches(code));
+        assert!(
+            escape_hatches_clean(code),
+            "{:?}",
+            scan_escape_hatches(code)
+        );
     }
 
     /// A tactic name is matched whole-token: `apply` (no `?`) is not flagged, and
@@ -1755,9 +1801,15 @@ theorem T : String := \"sorry and exact? in a literal\"
         assert!(out.contains("error at line 3: unsolved goals"));
         // The offending line is marked, context lines are not.
         assert!(out.contains(">>>"));
-        assert!(out.lines().any(|l| l.starts_with(">>>") && l.contains("line3")));
-        assert!(out.lines().any(|l| l.starts_with("   ") && l.contains("line2")));
-        assert!(out.lines().any(|l| l.starts_with("   ") && l.contains("line4")));
+        assert!(out
+            .lines()
+            .any(|l| l.starts_with(">>>") && l.contains("line3")));
+        assert!(out
+            .lines()
+            .any(|l| l.starts_with("   ") && l.contains("line2")));
+        assert!(out
+            .lines()
+            .any(|l| l.starts_with("   ") && l.contains("line4")));
         // ±2 window: line1 and line5 are included, nothing beyond.
         assert!(out.contains("line1"));
         assert!(out.contains("line5"));
@@ -1769,7 +1821,9 @@ theorem T : String := \"sorry and exact? in a literal\"
         let code = "only1\nonly2";
         // Error on line 1: window clamps to [1,2].
         let out = format_error_spans(code, &[LeanError::new(1, "at top")]);
-        assert!(out.lines().any(|l| l.starts_with(">>>") && l.contains("only1")));
+        assert!(out
+            .lines()
+            .any(|l| l.starts_with(">>>") && l.contains("only1")));
         assert!(out.contains("only2"));
         // Out-of-range error still renders its message.
         let oor = format_error_spans(code, &[LeanError::new(99, "phantom")]);
@@ -1783,10 +1837,7 @@ theorem T : String := \"sorry and exact? in a literal\"
     #[test]
     fn format_error_spans_orders_errors() {
         let code = "a\nb\nc\nd\ne\nf";
-        let errors = vec![
-            LeanError::new(5, "second"),
-            LeanError::new(2, "first"),
-        ];
+        let errors = vec![LeanError::new(5, "second"), LeanError::new(2, "first")];
         let out = format_error_spans(code, &errors);
         let first = out.find("first").unwrap();
         let second = out.find("second").unwrap();
