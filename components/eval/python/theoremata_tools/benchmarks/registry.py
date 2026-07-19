@@ -15,6 +15,7 @@ from typing import Any
 
 from . import graders
 from .adversarial import ADVERSARIAL_LOADERS, ADVERSARIAL_TRACK_KIND
+from .formal_conjectures import load_formal_conjectures
 from .loaders import LOADERS
 from .proof_completion import run_proof_completion
 from .verified_programming import run_verified_programming
@@ -54,6 +55,10 @@ _TRACK_KIND = {
     "formalizing_100": ("formalization", "formalization"),
     "1lab": ("formalization", "formalization"),
     "metamath_100": ("formalization", "formalization"),
+    # Open conjectures whose `sorry` is the GOAL MARKER, not a failed proof.
+    # Carries the fourth expected verdict, `expect_open`; see
+    # .formal_conjectures for why it is not one of the adversarial three.
+    "formal_conjectures": ("open_conjecture", "open_target"),
     # Adversarial gate fixtures carry an expected verdict; see .adversarial.
     **ADVERSARIAL_TRACK_KIND,
 }
@@ -63,7 +68,11 @@ _TRACK_KIND = {
 # items are validated against a fixed verdict vocabulary. Merging here keeps a
 # single catalogue, so list_benchmarks and load_benchmark stay the only entry
 # points callers need.
-_ALL_LOADERS: dict[str, Any] = {**LOADERS, **ADVERSARIAL_LOADERS}
+_ALL_LOADERS: dict[str, Any] = {
+    **LOADERS,
+    **ADVERSARIAL_LOADERS,
+    "formal_conjectures": load_formal_conjectures,
+}
 
 
 def list_benchmarks() -> list[dict[str, str]]:

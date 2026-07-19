@@ -76,6 +76,8 @@ _CORPUS_GLOB = {
     # never-present dir so `_corpus_present` reports absent and the loader is
     # handled via `_COMMITTED_FIXTURE` below.
     "formalizing_100": "formalizing-100-none",
+    # Open conjectures as open targets (see test_formal_conjectures.py).
+    "formal_conjectures": "formal-conjectures-main",
     # Adversarial expected-verdict fixtures (see test_adversarial_fixtures.py).
     "borwein_vacuity": "gdm-formal-conjectures-main",
     "partition_elliptic": "PartitionElliptic-main",
@@ -113,8 +115,9 @@ def test_registry_lists_all_tracks():
         "proof_grading",
         "tactic_reference",
         "adversarial",
+        "open_conjecture",
     }
-    assert len(ALL_NAMES) == 38
+    assert len(ALL_NAMES) == 39
 
 
 def test_load_unknown_benchmark_raises():
