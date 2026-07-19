@@ -672,6 +672,13 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.wolfram_alpha import run as wolfram_alpha_run
 
         return wolfram_alpha_run(request)
+    if tool == "wolfram_recognizer":
+        # Cheap triage in front of `wolfram_alpha`. Its output is a ROUTING hint
+        # about Alpha's coverage, never a statement about the mathematics, so it
+        # sits beside the oracles rather than anywhere near the checkers.
+        from theoremata_tools.wolfram_recognizer import run as wolfram_recognizer_run
+
+        return wolfram_recognizer_run(request)
     if tool == "wolfram_falsify":
         from theoremata_tools.wolfram_falsify import run as wolfram_falsify_run
 

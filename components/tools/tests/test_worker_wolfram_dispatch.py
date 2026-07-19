@@ -98,10 +98,27 @@ def test_wolfram_cert_ops_unavailable(no_engine, op):
 def test_wolfram_tools_are_not_meta_tools():
     from theoremata_tools.worker import is_meta_tool_op
 
-    for tool in ("wolfram_link", "wolfram_alpha", "wolfram_falsify", "wolfram_cert"):
+    for tool in (
+        "wolfram_link",
+        "wolfram_alpha",
+        "wolfram_recognizer",
+        "wolfram_falsify",
+        "wolfram_cert",
+    ):
         assert is_meta_tool_op(tool) is False
 
 
 def test_unknown_wolfram_op_still_rejected(no_engine):
     with pytest.raises(ValueError):
         dispatch({"tool": "wolfram_cert", "op": "definitely_not_an_op"})
+
+
+@pytest.mark.parametrize("op", ["available", "recognize", "triage_then_query"])
+def test_wolfram_recognizer_is_reachable_and_degrades(no_engine, op):
+    # The triage rung landed after the other four were registered, so this pins
+    # that it is actually dispatchable rather than merely built.
+    out = dispatch({"tool": "wolfram_recognizer", "op": op, "text": "2+2"})
+    assert out.get("trusted", False) is False
+    # A routing hint is never a mathematical verdict, in any response.
+    for banned in ("verdict", "proved", "verified", "refuted"):
+        assert banned not in out
