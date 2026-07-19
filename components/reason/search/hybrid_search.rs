@@ -116,6 +116,7 @@ pub fn multi_alpha_union<Sc: TacticScorer>(
             alpha,
             max_steps: per_alpha_budget,
             seed: 0,
+            hint_weight: 0.0,
         };
         let out = best_first_search(scorer, root.clone(), &cfg);
 

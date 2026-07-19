@@ -73,6 +73,13 @@ pub struct ScoredTactic<S> {
     pub logprob: f64,
     /// The goal state that results from applying `tactic` (error-free edge).
     pub next: S,
+    /// Producer-emitted inline priority nudge (the HVM3 `CInc`/`CDec` analogue),
+    /// in the same "nats" units as the frontier score. `0.0` = no hint (the
+    /// default, behaviour-preserving). Positive ⇒ schedule this branch sooner,
+    /// negative ⇒ later, ORTHOGONALLY to `logprob`. It is accumulated along the
+    /// path and folded into the priority only when [`BestFirstConfig::hint_weight`]
+    /// is non-zero, so it stays inert unless a producer and the config opt in.
+    pub prio_hint: f64,
 }
 
 impl<S> ScoredTactic<S> {
@@ -81,7 +88,14 @@ impl<S> ScoredTactic<S> {
             tactic: tactic.into(),
             logprob,
             next,
+            prio_hint: 0.0,
         }
+    }
+
+    /// Attach an inline priority hint (see [`ScoredTactic::prio_hint`]).
+    pub fn with_hint(mut self, prio_hint: f64) -> Self {
+        self.prio_hint = prio_hint;
+        self
     }
 }
 
@@ -142,6 +156,7 @@ impl<E: TacticExpander> TacticScorer for ExpanderScorer<E> {
                 tactic: step.tactic,
                 logprob: step.prior.max(PRIOR_EPS).ln(),
                 next: step.next,
+                prio_hint: 0.0,
             })
             .collect();
         ScoredExpansion::live_only(live)
@@ -161,6 +176,12 @@ pub struct BestFirstConfig {
     /// Base seed threaded into scoring (per-state seeds are derived from it), so a
     /// sampling policy is reproducible.
     pub seed: u64,
+    /// Weight on the producer-emitted inline priority hint
+    /// ([`ScoredTactic::prio_hint`]), accumulated along the path and added to the
+    /// length-normalized score. Default `0.0` keeps the frontier ordering
+    /// identical to the policy-only search; raise it to let producers nudge
+    /// scheduling orthogonally to log-prob.
+    pub hint_weight: f64,
 }
 
 impl Default for BestFirstConfig {
@@ -169,6 +190,7 @@ impl Default for BestFirstConfig {
             alpha: 0.5,
             max_steps: 1_000,
             seed: 0,
+            hint_weight: 0.0,
         }
     }
 }
@@ -193,6 +215,12 @@ struct Node<S> {
     depth: usize,
     /// Cumulative `Σ log p(a_t | s_t)` along the path from the root.
     cum_logprob: f64,
+    /// Cumulative `Σ prio_hint` along the path — the producer-emitted priority
+    /// nudges (see [`ScoredTactic::prio_hint`]), kept separate from `cum_logprob`
+    /// so the log-prob signal (used for DPO mining and length normalization)
+    /// stays pure. Folded into the frontier score via
+    /// [`BestFirstConfig::hint_weight`].
+    cum_hint: f64,
     /// Discarded sibling tactics recorded when this node was expanded — the DPO
     /// losers proposed at this state. Empty until the node is expanded.
     discarded: Vec<String>,
@@ -340,6 +368,7 @@ pub fn best_first_search<Sc: TacticScorer>(
         tactic_in: None,
         depth: 0,
         cum_logprob: 0.0,
+        cum_hint: 0.0,
         discarded: Vec::new(),
     });
     let mut seq = 0u64;
@@ -382,9 +411,11 @@ pub fn best_first_search<Sc: TacticScorer>(
 
         let parent_depth = arena[node].depth;
         let parent_cum = arena[node].cum_logprob;
+        let parent_hint = arena[node].cum_hint;
         for st in expansion.live {
             let child_depth = parent_depth + 1;
             let child_cum = parent_cum + st.logprob;
+            let child_hint = parent_hint + st.prio_hint;
             let child = arena.len();
             arena.push(Node {
                 state: st.next,
@@ -392,11 +423,13 @@ pub fn best_first_search<Sc: TacticScorer>(
                 tactic_in: Some(st.tactic),
                 depth: child_depth,
                 cum_logprob: child_cum,
+                cum_hint: child_hint,
                 discarded: Vec::new(),
             });
             seq += 1;
             heap.push(QueueItem {
-                score: length_normalized_score(child_cum, child_depth, cfg.alpha),
+                score: length_normalized_score(child_cum, child_depth, cfg.alpha)
+                    + cfg.hint_weight * child_hint,
                 seq,
                 node: child,
             });
@@ -517,6 +550,20 @@ mod tests {
             self.dead.entry(from.into()).or_default().push(tactic.into());
             self
         }
+        fn edge_hinted(
+            mut self,
+            from: &str,
+            tactic: &str,
+            logprob: f64,
+            hint: f64,
+            to: MockGoal,
+        ) -> Self {
+            self.live
+                .entry(from.into())
+                .or_default()
+                .push(ScoredTactic::new(tactic, logprob, to).with_hint(hint));
+            self
+        }
     }
     impl TacticScorer for TableScorer {
         type State = MockGoal;
@@ -566,6 +613,41 @@ mod tests {
         assert_eq!(out.proof_tactics(), vec!["tA", "aClose"]);
         // The closed state was reached; B was never on the winning path.
         assert_eq!(out.proof_path().last().unwrap().tactic, "aClose");
+    }
+
+    #[test]
+    fn inline_hint_reorders_the_frontier_only_when_weighted() {
+        let pos = |order: &[String], k: &str| order.iter().position(|s| s == k).unwrap();
+        // "lo" has a far lower log-prob than "hi" but carries a large positive
+        // inline hint. Both leaves are dead ends, so both are expanded.
+        let build = || {
+            TableScorer::new()
+                .edge("root", "hi", 0.9f64.ln(), MockGoal::open("Hi"))
+                .edge_hinted("root", "lo", 0.1f64.ln(), 10.0, MockGoal::open("Lo"))
+        };
+
+        // hint_weight = 0.0 (default): the hint is inert; log-prob decides, so the
+        // frontier expands Hi before Lo -- byte-identical to the policy-only search.
+        let mut s0 = build();
+        let out0 =
+            best_first_search(&mut s0, MockGoal::open("root"), &BestFirstConfig::default());
+        assert!(
+            pos(&out0.order, "Hi") < pos(&out0.order, "Lo"),
+            "with hint_weight=0 the frontier must ignore the hint and follow log-prob"
+        );
+
+        // hint_weight > 0: the large positive hint pulls the low-log-prob branch
+        // ahead, orthogonally to its policy score.
+        let mut s1 = build();
+        let cfg = BestFirstConfig {
+            hint_weight: 1.0,
+            ..BestFirstConfig::default()
+        };
+        let out1 = best_first_search(&mut s1, MockGoal::open("root"), &cfg);
+        assert!(
+            pos(&out1.order, "Lo") < pos(&out1.order, "Hi"),
+            "a large positive hint with hint_weight>0 must schedule Lo before Hi"
+        );
     }
 
     #[test]
