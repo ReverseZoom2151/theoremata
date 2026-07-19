@@ -331,9 +331,14 @@ fn report(
 
 /// Per-system statement-signature preservation check.
 ///
-/// For Lean / Rocq / Isabelle / Candle this delegates verbatim to
-/// [`check_statement_preserved`] (the theorem-signature parser), so their gate
-/// behavior is unchanged. For **Agda** and **Metamath** — whose declarations do
+/// For Lean / Candle this delegates verbatim to [`check_statement_preserved`]
+/// (the theorem-signature parser), so their gate behavior is unchanged.
+/// **Rocq** gets its own [`check_rocq_signature`]: Rocq vernacular is
+/// capitalized (`Theorem` / `Lemma` / …) and period-terminated, which is a
+/// different grammar from Lean's `name binders : type := proof`, so the Lean
+/// parser found NOTHING in a Rocq statement and returned
+/// [`CanonicalUnparsable`](PreservationVerdict::CanonicalUnparsable) for every
+/// Rocq input, live or not. For **Agda** and **Metamath** — whose declarations do
 /// NOT use the `theorem` / `lemma` keyword the Lean-oriented parser looks for, so
 /// they previously fell through to the weak lexical
 /// [`statement_mentioned`](crate::prover::formal) substring fallback where a proof
@@ -367,8 +372,18 @@ pub fn check_entry_signature(
         FormalSystem::Agda => check_agda_signature(canonical_statement, submitted_code),
         FormalSystem::Metamath => check_metamath_signature(canonical_statement, submitted_code),
         FormalSystem::Isabelle => check_isabelle_signature(canonical_statement, submitted_code),
-        // Lean / Rocq / Candle: theorem-signature path.
-        FormalSystem::Lean | FormalSystem::Rocq | FormalSystem::Candle => {
+        FormalSystem::Rocq => check_rocq_signature(canonical_statement, submitted_code),
+        // Lean: the theorem-signature path this module was written for.
+        //
+        // Candle is routed here too, UNCHANGED and knowingly fail-closed: a HOL
+        // Light proof is an OCaml script (`let FOO = prove(`…`, tac);;`) with no
+        // `theorem`/`lemma` keyword at all, so the canonical statement never
+        // parses and the verdict is `CanonicalUnparsable`. That is the safe
+        // direction (no Candle proof can pass on an unchecked signature), but it
+        // means live Candle needs its OWN signature check, in the shape of
+        // `check_rocq_signature` / `check_isabelle_signature`, parsing the
+        // `prove(`term`, …)` form. It is deliberately not half-done here.
+        FormalSystem::Lean | FormalSystem::Candle => {
             check_statement_preserved(canonical_statement, submitted_code)
         }
     }
@@ -546,6 +561,373 @@ fn skip_isabelle_comment(chars: &[char], mut i: usize) -> usize {
         }
     }
     i
+}
+
+// --- Rocq ------------------------------------------------------------------
+//
+// WHY Rocq gets its own parser instead of extra keywords in `parse_all_decls`.
+//
+// The Lean parser assumes Lean's shape: `theorem name binders : type := proof`,
+// terminated by the top-level `:=` that starts the proof term. Rocq's shape is
+// `Theorem name binders : conclusion.` followed by a SEPARATE `Proof. … Qed.`
+// sentence, terminated by a period. Teaching the Lean parser the capitalized
+// keywords alone would leave it looking for a `:=` that a Rocq theorem never
+// has, so the "conclusion" it extracted would run past the period and swallow
+// the whole proof script. Two proofs of the same statement would then compare
+// unequal (a false rejection), and, worse, a comparison that is really over
+// "statement plus proof text" is not the comparison this gate claims to make.
+// A separate parser that knows the real terminator is the honest fix, matching
+// the precedent already set by `check_isabelle_signature` /
+// `check_agda_signature` / `check_metamath_signature`.
+
+/// Rocq declaration vernacular that introduces a named statement. All are
+/// capitalized: Rocq's vernacular is case sensitive, so lowercase `theorem` is
+/// NOT a Rocq declaration and is deliberately not accepted here (a lowercase
+/// canonical statement is Lean input on the Rocq path, which we cannot confirm
+/// and therefore fail closed on).
+const ROCQ_DECL_KEYWORDS: [&str; 8] = [
+    "Theorem",
+    "Lemma",
+    "Corollary",
+    "Remark",
+    "Fact",
+    "Proposition",
+    "Definition",
+    "Example",
+];
+
+/// Sentence keywords that END a declaration's signature region when the period
+/// is missing (a truncated or malformed submission). Purely a safety net: it
+/// stops a runaway signature from absorbing the proof script.
+const ROCQ_SIGNATURE_STOPPERS: [&str; 5] = ["Proof", "Qed", "Defined", "Admitted", "Abort"];
+
+/// Vernacular that introduces a SECTION-scoped binder. These are the reason a
+/// textual signature match is not by itself proof of preservation in Rocq: at
+/// `End <section>` every such binder is discharged INTO the theorems of the
+/// section, so `Section S. Hypothesis h : False. Theorem t : G. … End S.`
+/// exports `t : False -> G` while its source text matches the canonical
+/// `Theorem t : G` character for character. Since we cannot see that
+/// discharge lexically, their presence anywhere in the submission is treated as
+/// unconfirmable and fails closed.
+const ROCQ_SECTION_BINDERS: [&str; 6] = [
+    "Variable",
+    "Variables",
+    "Hypothesis",
+    "Hypotheses",
+    "Context",
+    "Let",
+];
+
+/// Confirm a submitted Rocq (`.v`) proof declares the canonical statement.
+///
+/// Fail-closed exactly like the Lean path: `preserved` is true only when the
+/// canonical statement parsed, the submission declares the SAME name, and the
+/// binders and conclusion agree up to whitespace or a positional alpha-rename.
+/// Anything we cannot confirm (unparsable canonical, absent declaration,
+/// section-scoped binders) is reported NOT preserved.
+///
+/// KNOWN LIMITATION, stated rather than papered over: like the Lean path, this
+/// compares statement TEXT, so it cannot see a `Notation` (or an imported
+/// library) that rebinds a symbol occurring in the conclusion. A submission that
+/// redefines what its own conclusion text means is out of reach of every lexical
+/// checker in this module; the axiom audit and kernel re-check remain the
+/// authority on what was actually proved.
+fn check_rocq_signature(canonical_statement: &str, submitted_code: &str) -> PreservationReport {
+    let canonical_src = sanitize_rocq(canonical_statement);
+    let submitted_src = sanitize_rocq(submitted_code);
+
+    let Some(canonical) = parse_rocq_decls(&canonical_src).into_iter().next() else {
+        return report(
+            PreservationVerdict::CanonicalUnparsable,
+            vec![
+                "Rocq canonical statement did not parse into a capitalized \
+                 `Theorem`/`Lemma`/… signature with a `: <conclusion>` \
+                 (fail-closed: cannot confirm preservation)"
+                    .to_string(),
+            ],
+            None,
+            None,
+        );
+    };
+    // A canonical statement carrying section vernacular is not a self-contained
+    // proposition, so there is nothing well-defined to preserve.
+    if let Some(kw) = rocq_section_binder(&canonical_src) {
+        return report(
+            PreservationVerdict::CanonicalUnparsable,
+            vec![format!(
+                "Rocq canonical statement contains the section-scoped binder `{kw}`, so the \
+                 proposition it denotes depends on section discharge (fail-closed: cannot \
+                 confirm preservation)"
+            )],
+            None,
+            None,
+        );
+    }
+    // See ROCQ_SECTION_BINDERS: a section binder can silently weaken a theorem
+    // whose text is byte-identical to the canonical one, so we refuse to certify
+    // any submission containing one. A legitimate proof that uses sections costs
+    // a retry; the alternative is accepting a proof of `False -> G` as a proof
+    // of `G`.
+    if let Some(kw) = rocq_section_binder(&submitted_src) {
+        return report(
+            PreservationVerdict::BindersChanged,
+            vec![format!(
+                "unconfirmable Rocq section context: the submission declares `{kw}`, and a \
+                 section-scoped binder is discharged into every theorem of its section, so a \
+                 matching signature text does not establish that `{}` is the canonical \
+                 statement (fail-closed)",
+                canonical.name
+            )],
+            Some(canonical),
+            None,
+        );
+    }
+
+    let submitted = parse_rocq_decls(&submitted_src);
+    if let Some(by_name) = submitted.iter().find(|d| d.name == canonical.name) {
+        let (verdict, findings) = classify(&canonical, by_name);
+        return report(verdict, findings, Some(canonical), Some(by_name.clone()));
+    }
+    if let Some(renamed) = submitted
+        .iter()
+        .find(|d| sig_matches(&canonical, d).is_some())
+    {
+        return report(
+            PreservationVerdict::Renamed,
+            vec![format!(
+                "renamed statement: the canonical theorem `{}` is proved under the \
+                 different name `{}`, so the canonical name is never established",
+                canonical.name, renamed.name
+            )],
+            Some(canonical),
+            Some(renamed.clone()),
+        );
+    }
+    report(
+        PreservationVerdict::SubmittedMissing,
+        vec![format!(
+            "missing statement: no Rocq declaration in the submission proves the canonical \
+             theorem `{}` (name + signature not found)",
+            canonical.name
+        )],
+        Some(canonical),
+        None,
+    )
+}
+
+/// Replace Rocq `(* … *)` block comments (which NEST) and `"…"` string literals
+/// with spaces, preserving newlines and the char count.
+///
+/// The shared multi-system [`crate::prover::formal::strip_comments`] is not used
+/// here on purpose: it treats `--` and `//` as line comments, and Rocq has no
+/// line-comment syntax at all, so a conclusion containing either token would be
+/// truncated to end-of-line. That would compare two DIFFERENT texts and reject
+/// correct proofs; worse, it could equate two statements that differ only after
+/// the truncation point.
+fn sanitize_rocq(code: &str) -> String {
+    let chars: Vec<char> = code.chars().collect();
+    let mut out = String::with_capacity(chars.len());
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        if in_string {
+            // Rocq escapes a quote inside a string by doubling it (`""`).
+            if c == '"' {
+                if next == Some('"') {
+                    out.push(' ');
+                    out.push(' ');
+                    i += 2;
+                    continue;
+                }
+                in_string = false;
+            }
+            out.push(if c == '\n' { '\n' } else { ' ' });
+            i += 1;
+            continue;
+        }
+        if depth > 0 {
+            if c == '(' && next == Some('*') {
+                depth += 1;
+                out.push(' ');
+                out.push(' ');
+                i += 2;
+                continue;
+            }
+            if c == '*' && next == Some(')') {
+                depth -= 1;
+                out.push(' ');
+                out.push(' ');
+                i += 2;
+                continue;
+            }
+            out.push(if c == '\n' { '\n' } else { ' ' });
+            i += 1;
+            continue;
+        }
+        if c == '(' && next == Some('*') {
+            depth = 1;
+            out.push(' ');
+            out.push(' ');
+            i += 2;
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            out.push(' ');
+            i += 1;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// Parse every Rocq declaration in ALREADY-SANITIZED source, in source order.
+/// A declaration with no `: <conclusion>` ascription (e.g. `Definition f := 3.`)
+/// is skipped: there is no proposition to compare, and inventing one would be
+/// the permissive direction.
+fn parse_rocq_decls(sanitized: &str) -> Vec<TheoremSig> {
+    let chars: Vec<char> = sanitized.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        // A declaration keyword must sit on a word boundary, so `Factorial` is
+        // not read as `Fact`.
+        let boundary = i == 0 || !is_word(chars[i - 1]);
+        if boundary {
+            if let Some(kw) = rocq_keyword_at(&chars, i, &ROCQ_DECL_KEYWORDS) {
+                let after_kw = i + kw.chars().count();
+                if let Some((sig, consumed)) = parse_rocq_decl_at(&chars, kw, after_kw) {
+                    out.push(sig);
+                    i = consumed;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The keyword from `keywords` starting at `i` as a whole token, if any. The
+/// caller has already checked the LEADING boundary; this checks the trailing one.
+fn rocq_keyword_at(chars: &[char], i: usize, keywords: &[&'static str]) -> Option<&'static str> {
+    for &kw in keywords {
+        let k: Vec<char> = kw.chars().collect();
+        if i + k.len() <= chars.len()
+            && chars[i..i + k.len()] == k[..]
+            && chars.get(i + k.len()).map_or(true, |&c| !is_word(c))
+        {
+            return Some(kw);
+        }
+    }
+    None
+}
+
+/// Parse one Rocq declaration whose keyword ended at `after_kw`, returning the
+/// signature and the index just past it. `None` when there is no name or no
+/// conclusion, in which case the caller records nothing (fail-closed).
+fn parse_rocq_decl_at(chars: &[char], kw: &str, after_kw: usize) -> Option<(TheoremSig, usize)> {
+    let mut j = after_kw;
+    while chars.get(j).is_some_and(|c| c.is_whitespace()) {
+        j += 1;
+    }
+    // A Rocq declaration site names a FRESH identifier, which cannot be dotted:
+    // `is_word` rather than `is_name`, so a `.` is always available to terminate
+    // the sentence.
+    let name_start = j;
+    while chars.get(j).is_some_and(|&c| is_word(c)) {
+        j += 1;
+    }
+    let name: String = chars[name_start..j].iter().collect();
+    if name.is_empty() {
+        return None;
+    }
+    let sig_start = j;
+    let sig_end = rocq_signature_end(chars, sig_start);
+    let sig: &[char] = &chars[sig_start..sig_end];
+    // Same split as the Lean path: the first depth-0 `:` is the statement colon
+    // (binder-local colons sit inside brackets, and a `forall x : T, …` colon in
+    // the conclusion comes AFTER it).
+    let (binders, conclusion) = split_binders_conclusion(sig);
+    let conclusion = norm_ws(&conclusion.iter().collect::<String>());
+    if conclusion.is_empty() {
+        return None;
+    }
+    Some((
+        TheoremSig {
+            kind: kw.to_string(),
+            name,
+            binders: norm_ws(&binders.iter().collect::<String>()),
+            conclusion,
+        },
+        sig_end,
+    ))
+}
+
+/// Index where a Rocq declaration's signature ends: the first depth-0 sentence
+/// period, else a depth-0 sentence keyword (the safety net for a missing
+/// period), else end of input (a canonical statement is often handed to the gate
+/// as a bare `Theorem t : True` with no terminator).
+///
+/// A depth-0 `:=` is deliberately NOT a terminator, even though a `Definition`
+/// body starts with one. Cutting there would also cut a `let x := e in …`
+/// occurring inside a conclusion, and then two DIFFERENT statements sharing a
+/// prefix (`let x := 1 in x = 1` vs `let x := 1 in x = 2`) would both shrink to
+/// the same text and compare equal: a false acceptance, the one direction this
+/// module must never fail in. Ending at the period instead is Rocq's own lexing
+/// rule and keeps the whole statement in view. The price is that a term-mode
+/// declaration (`Definition f : T := body.`) carries its body in the compared
+/// conclusion, so it matches only another declaration with the same body: a
+/// retry at worst, never a false acceptance.
+fn rocq_signature_end(chars: &[char], start: usize) -> usize {
+    let mut depth = 0i32;
+    let mut i = start;
+    while i < chars.len() {
+        match chars[i] {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            '.' if depth == 0 => {
+                // A Rocq sentence ends at a period followed by whitespace or EOF.
+                // The `.` of a qualified name (`Nat.add`) is followed by a name
+                // char, and `..` is recursive-notation syntax, so neither ends a
+                // sentence.
+                let after_ends = chars.get(i + 1).map_or(true, |c| c.is_whitespace());
+                let part_of_ellipsis = i > start && chars[i - 1] == '.';
+                if after_ends && !part_of_ellipsis {
+                    return i;
+                }
+            }
+            _ => {
+                if depth == 0
+                    && (i == 0 || !is_word(chars[i - 1]))
+                    && (rocq_keyword_at(chars, i, &ROCQ_DECL_KEYWORDS).is_some()
+                        || rocq_keyword_at(chars, i, &ROCQ_SIGNATURE_STOPPERS).is_some())
+                {
+                    return i;
+                }
+            }
+        }
+        i += 1;
+    }
+    chars.len()
+}
+
+/// The first section-scoped binder vernacular in ALREADY-SANITIZED source, if
+/// any. See [`ROCQ_SECTION_BINDERS`] for why its presence is fail-closed.
+fn rocq_section_binder(sanitized: &str) -> Option<&'static str> {
+    let chars: Vec<char> = sanitized.chars().collect();
+    ROCQ_SECTION_BINDERS
+        .into_iter()
+        .find(|kw| !token_positions(&chars, kw).is_empty())
 }
 
 // --- Agda ------------------------------------------------------------------
@@ -2454,23 +2836,297 @@ def aux : Nat := 0
         assert!(r.preserved, "{:?}", r);
     }
 
-    // -- per-system entry signature (Agda / Metamath) -----------------------
+    // -- per-system entry signature (Rocq / Agda / Metamath) ----------------
 
-    /// `check_entry_signature` delegates the Lean/Rocq/Isabelle path to
-    /// `check_statement_preserved` unchanged (no regression).
+    /// `check_entry_signature` delegates the Lean and Candle paths to
+    /// `check_statement_preserved` unchanged (no regression). Rocq no longer
+    /// delegates: it has its own parser (see the `rocq_*` tests below).
     #[test]
     fn entry_signature_delegates_for_lean_family() {
         let canonical = "theorem T (n : Nat) (h : n > 0) : n ≥ 1";
         let submitted = "theorem T (n : Nat) : n ≥ 1 := by omega";
-        for sys in [
-            FormalSystem::Lean,
-            FormalSystem::Rocq,
-            FormalSystem::Candle,
-        ] {
+        for sys in [FormalSystem::Lean, FormalSystem::Candle] {
             let a = check_entry_signature(sys, canonical, submitted);
             let b = check_statement_preserved(canonical, submitted);
             assert_eq!(a.verdict, b.verdict, "{sys:?} must delegate unchanged");
         }
+    }
+
+    /// Lean is untouched by the Rocq work: every Lean verdict still comes from
+    /// `check_statement_preserved`, and Lean vernacular is unaffected by the
+    /// capitalized Rocq keywords (which the Lean parser must keep ignoring).
+    #[test]
+    fn lean_path_is_unchanged_by_the_rocq_parser() {
+        let cases = [
+            (
+                "theorem T (n : Nat) : n = n",
+                "theorem T (n : Nat) : n = n := rfl",
+            ),
+            (
+                "theorem T (n : Nat) : n = n",
+                "theorem T (m : Nat) : m = m := rfl",
+            ),
+            (
+                "theorem T (n : Nat) (h : n > 0) : n ≥ 1",
+                "theorem T (n : Nat) : n ≥ 1 := by omega",
+            ),
+            (
+                "theorem T (n : Nat) : n = n + 0",
+                "theorem T (n : Nat) : True := trivial",
+            ),
+            (
+                "theorem T (n : Nat) : n = n",
+                "def helper : True := trivial",
+            ),
+        ];
+        for (canonical, submitted) in cases {
+            let via_entry = check_entry_signature(FormalSystem::Lean, canonical, submitted);
+            let direct = check_statement_preserved(canonical, submitted);
+            assert_eq!(via_entry, direct, "Lean routing must not change: {canonical}");
+        }
+        // Rocq vernacular is not Lean vernacular: the Lean parser sees no
+        // declaration in it, exactly as before.
+        let r = check_statement_preserved(
+            "Theorem t : True",
+            "Theorem t : True.\nProof. exact I. Qed.\n",
+        );
+        assert_eq!(r.verdict, PreservationVerdict::CanonicalUnparsable);
+    }
+
+    // -- Rocq ---------------------------------------------------------------
+
+    /// THE PREVIOUSLY-BROKEN CASE: a correct live Rocq proof of the canonical
+    /// statement now yields `preserved`, so `verify_with_gates` can certify it.
+    /// This is the exact statement/code pair the live Rocq test in
+    /// `crate::prover::tests` feeds to `RocqBackend::live`.
+    #[test]
+    fn rocq_correct_live_proof_is_preserved() {
+        let r = check_entry_signature(
+            FormalSystem::Rocq,
+            "Theorem t : True",
+            "Theorem t : True.\nProof.\n  exact I.\nQed.\n",
+        );
+        assert!(r.preserved, "correct Rocq proof must pass: {:?}", r.findings);
+        assert_eq!(r.verdict, PreservationVerdict::Preserved);
+        assert!(r.into_scan_report().clean);
+    }
+
+    /// A Rocq theorem with binders, proved as asked, is preserved; whitespace and
+    /// the trailing period do not matter, and a qualified name (`Nat.add`) does
+    /// not truncate the conclusion at its dot.
+    #[test]
+    fn rocq_statement_with_binders_is_preserved() {
+        let r = check_entry_signature(
+            FormalSystem::Rocq,
+            "Theorem add_0_r (n : nat) : n + 0 = n",
+            "Theorem add_0_r (n : nat)\n  :  n + 0 = n.\nProof.\n  induction n; auto.\nQed.\n",
+        );
+        assert!(r.preserved, "{r:?}");
+
+        let qualified = check_entry_signature(
+            FormalSystem::Rocq,
+            "Theorem t : Nat.le 0 1",
+            "Theorem t : Nat.le 0 1.\nProof.\n  auto.\nQed.\n",
+        );
+        assert!(qualified.preserved, "{qualified:?}");
+        assert_eq!(
+            qualified.submitted.as_ref().map(|s| s.conclusion.as_str()),
+            Some("Nat.le 0 1"),
+            "the sentence period must end the conclusion, the name dot must not"
+        );
+    }
+
+    /// The signature must be compared WHOLE. A `let x := e in …` inside the
+    /// conclusion contains a `:=`, and cutting the signature there would make
+    /// `… in x = 1` and `… in x = 2` compare equal: a proof of a different
+    /// theorem passing the gate. Also pins that a capitalized identifier sharing
+    /// a prefix with a keyword (`Factorial` / `Fact`) is not read as a keyword.
+    #[test]
+    fn rocq_signature_is_compared_whole() {
+        let same = check_entry_signature(
+            FormalSystem::Rocq,
+            "Theorem t : let x := 1 in x = 1",
+            "Theorem t : let x := 1 in x = 1.\nProof.\n  auto.\nQed.\n",
+        );
+        assert!(same.preserved, "{same:?}");
+
+        let different = check_entry_signature(
+            FormalSystem::Rocq,
+            "Theorem t : let x := 1 in x = 1",
+            "Theorem t : let x := 1 in x = 2.\nProof.\n  auto.\nQed.\n",
+        );
+        assert!(
+            !different.preserved,
+            "a statement differing only after a `:=` must not pass: {different:?}"
+        );
+        assert_eq!(different.verdict, PreservationVerdict::ConclusionChanged);
+
+        let prefix = check_entry_signature(
+            FormalSystem::Rocq,
+            "Theorem t : Factorial 3 = 6",
+            "Theorem t : Factorial 3 = 6.\nProof.\n  auto.\nQed.\n",
+        );
+        assert!(prefix.preserved, "`Factorial` is not the keyword `Fact`: {prefix:?}");
+    }
+
+    /// A pure bound-variable rename is accepted up to alpha, as on the Lean path.
+    #[test]
+    fn rocq_alpha_renamed_binders_are_preserved() {
+        let r = check_entry_signature(
+            FormalSystem::Rocq,
+            "Theorem t (n : nat) : n = n",
+            "Theorem t (m : nat) : m = m.\nProof.\n  auto.\nQed.\n",
+        );
+        assert!(r.preserved, "{r:?}");
+        assert_eq!(r.verdict, PreservationVerdict::PreservedAlpha);
+    }
+
+    /// A Rocq proof of a DIFFERENT statement under the canonical name is rejected.
+    #[test]
+    fn rocq_proof_of_a_different_statement_is_rejected() {
+        let r = check_entry_signature(
+            FormalSystem::Rocq,
+            "Theorem t : forall n : nat, n + 0 = n",
+            "Theorem t : forall n : nat, n = n.\nProof.\n  auto.\nQed.\n",
+        );
+        assert!(!r.preserved);
+        assert_eq!(r.verdict, PreservationVerdict::ConclusionChanged);
+        assert!(!r.into_scan_report().clean);
+    }
+
+    /// A weakened Rocq statement (a dropped hypothesis) is rejected.
+    #[test]
+    fn rocq_weakened_statement_is_rejected() {
+        let r = check_entry_signature(
+            FormalSystem::Rocq,
+            "Theorem t (n : nat) (h : n > 0) : n >= 1",
+            "Theorem t (n : nat) : n >= 1.\nProof.\n  auto with arith.\nQed.\n",
+        );
+        assert!(!r.preserved);
+        assert_eq!(r.verdict, PreservationVerdict::BindersChanged);
+        assert!(r.findings.iter().any(|f| f.contains("weakening")));
+    }
+
+    /// A renamed Rocq statement (right signature, wrong name) is rejected: the
+    /// canonical name is never established.
+    #[test]
+    fn rocq_renamed_statement_is_rejected() {
+        let r = check_entry_signature(
+            FormalSystem::Rocq,
+            "Theorem add_0_r (n : nat) : n + 0 = n",
+            "Theorem my_thm (n : nat) : n + 0 = n.\nProof.\n  auto.\nQed.\n",
+        );
+        assert!(!r.preserved);
+        assert_eq!(r.verdict, PreservationVerdict::Renamed);
+    }
+
+    /// A trivially-restated Rocq goal (`True`, discharged by `exact I`) is
+    /// rejected, and a submission that never declares the theorem fails closed.
+    #[test]
+    fn rocq_trivial_restatement_and_missing_declaration_are_rejected() {
+        let trivial = check_entry_signature(
+            FormalSystem::Rocq,
+            "Theorem t (n : nat) : n + 0 = n",
+            "Theorem t (n : nat) : True.\nProof.\n  exact I.\nQed.\n",
+        );
+        assert!(!trivial.preserved);
+        assert_eq!(trivial.verdict, PreservationVerdict::TriviallyRestated);
+
+        let missing = check_entry_signature(
+            FormalSystem::Rocq,
+            "Theorem t (n : nat) : n + 0 = n",
+            "Definition helper (n : nat) : nat := n.\n",
+        );
+        assert!(!missing.preserved);
+        assert_eq!(missing.verdict, PreservationVerdict::SubmittedMissing);
+    }
+
+    /// A declaration inside a Rocq comment cannot establish preservation, and a
+    /// comment cannot mask a substituted statement either.
+    #[test]
+    fn rocq_comment_cannot_spoof_preservation() {
+        let only_in_comment = check_entry_signature(
+            FormalSystem::Rocq,
+            "Theorem t : True",
+            "(* Theorem t : True. Proof. exact I. Qed. *)\n",
+        );
+        assert!(!only_in_comment.preserved);
+        assert_eq!(
+            only_in_comment.verdict,
+            PreservationVerdict::SubmittedMissing
+        );
+
+        let decoy = check_entry_signature(
+            FormalSystem::Rocq,
+            "Theorem t : True",
+            "(* Theorem t : True. *)\nTheorem t : 0 = 0.\nProof.\n  auto.\nQed.\n",
+        );
+        assert!(!decoy.preserved);
+        assert_eq!(decoy.verdict, PreservationVerdict::ConclusionChanged);
+    }
+
+    /// A section-scoped binder is discharged into the theorem at `End`, so a
+    /// signature that matches character for character still proves something
+    /// else. Fail-closed.
+    #[test]
+    fn rocq_section_scoped_binders_fail_closed() {
+        let r = check_entry_signature(
+            FormalSystem::Rocq,
+            "Theorem t : n >= 1",
+            "Section S.\n\
+             Variable n : nat.\n\
+             Hypothesis h : n > 0.\n\
+             Theorem t : n >= 1.\n\
+             Proof.\n  auto with arith.\nQed.\n\
+             End S.\n",
+        );
+        assert!(
+            !r.preserved,
+            "a section-discharged hypothesis must not certify: {r:?}"
+        );
+        assert_eq!(r.verdict, PreservationVerdict::BindersChanged);
+        assert!(r.findings.iter().any(|f| f.contains("section")));
+    }
+
+    /// The Rocq path does NOT accept lowercase Lean vernacular: mixing the two
+    /// grammars would compare a Lean-shaped signature against a Rocq-shaped one.
+    /// An unparsable canonical fails closed, as everywhere else in this module.
+    #[test]
+    fn rocq_path_rejects_lean_vernacular_and_unparsable_canonicals() {
+        let lean_on_rocq = check_entry_signature(
+            FormalSystem::Rocq,
+            "theorem t : True",
+            "theorem t : True := trivial\n",
+        );
+        assert!(!lean_on_rocq.preserved);
+        assert_eq!(
+            lean_on_rocq.verdict,
+            PreservationVerdict::CanonicalUnparsable
+        );
+
+        // No conclusion to compare (no `:` ascription) is also unparsable.
+        let no_conclusion =
+            check_entry_signature(FormalSystem::Rocq, "Theorem t", "Theorem t : True.\n");
+        assert_eq!(
+            no_conclusion.verdict,
+            PreservationVerdict::CanonicalUnparsable
+        );
+    }
+
+    /// The Rocq check is deterministic and picks the NAMED declaration out of a
+    /// file with several.
+    #[test]
+    fn rocq_matches_the_named_declaration_among_several() {
+        let canonical = "Theorem main (n : nat) : n + 0 = n";
+        let submitted = "Lemma helper (a : nat) : a = a.\n\
+                         Proof. auto. Qed.\n\
+                         Theorem main (n : nat) : n + 0 = n.\n\
+                         Proof. induction n; auto. Qed.\n\
+                         Definition aux : nat := 0.\n";
+        let first = check_entry_signature(FormalSystem::Rocq, canonical, submitted);
+        let second = check_entry_signature(FormalSystem::Rocq, canonical, submitted);
+        assert!(first.preserved, "{first:?}");
+        assert_eq!(first, second, "the check must be deterministic");
     }
 
     #[test]

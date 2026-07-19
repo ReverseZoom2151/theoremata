@@ -625,21 +625,37 @@ mod tests {
         assert!(!r.replays_closed(&seq(&["auto"])));
     }
 
-    /// Pins the REASON Rocq is declined, so this stops being true loudly rather
-    /// than silently: the preservation layer the gate conjoins parses only
-    /// lowercase Lean vernacular, so a live Rocq report can never be
-    /// `lexically_verified`. When this assertion flips, revisit the Rocq arm of
-    /// `assemble_source` (its comment lists what else must land).
+    /// The preservation blocker is GONE: `check_rocq_signature` now parses Rocq
+    /// vernacular, so a live Rocq report can reach `lexically_verified`.
+    ///
+    /// This assertion is inverted from what it was, which is the outcome its old
+    /// comment asked for. Rocq shrink-replay stays declined all the same, because
+    /// preservation was only the first of three conditions: the backend still
+    /// exposes no preamble to render against, and there is no test comparing our
+    /// assembled source byte for byte with what the backend actually compiles.
+    /// Declining costs nothing but a kept original proof, whereas rendering
+    /// against a guessed preamble would reject correct shrinks.
     #[test]
-    fn the_gate_still_cannot_certify_any_rocq_source() {
+    fn rocq_preservation_now_parses_but_replay_stays_declined() {
         let report = crate::prover::statement_preservation::check_entry_signature(
             FormalSystem::Rocq,
             "Theorem t : True",
             "Theorem t : True.\nProof.\n  exact I.\nQed.\n",
         );
         assert!(
-            !report.preserved,
-            "Rocq preservation now parses; `assemble_source` may be able to gate Rocq"
+            report.preserved,
+            "the Rocq signature parser should now recognize this pair"
+        );
+        // The blocker moved, so the refusal must be justified by the remaining
+        // two conditions rather than by preservation.
+        let mut replay = GateReplay::for_system(
+            &Config::default(),
+            FormalSystem::Rocq,
+            "Theorem t : True",
+        );
+        assert!(
+            !replay.replays_closed(&seq(&["exact I"])),
+            "Rocq shrink-replay stays declined until a real preamble is exposed"
         );
     }
 
