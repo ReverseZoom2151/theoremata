@@ -30,8 +30,15 @@
 //! content is treated as opaque data — it is only ever rewritten and rendered,
 //! never executed here.
 
+use crate::config::Config;
+use crate::db::Store;
 use crate::fitness::EloRanker;
+use crate::model::ModelRequest;
+use crate::prover::formal::{backend_for, FormalBackend, FormalSystem};
+use crate::provider::ModelProvider;
 use crate::sketch::InformalSketch;
+use anyhow::Result;
+use serde_json::json;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -650,6 +657,140 @@ pub fn evolve<M: Mutator, E: Evaluator>(
     }
 }
 
+// ---------------------------------------------------------------------------
+// CLI entry point: the production seams for the evolutionary loop
+// ---------------------------------------------------------------------------
+
+/// [`Mutator`] backed by the model provider. This is the production
+/// prover-subagent that rewrites one marked region. Any provider or parse
+/// failure degrades to an
+/// unchanged clone rather than fabricating a mutation, so a broken model can
+/// never manufacture progress it did not produce.
+struct ModelMutator<'a> {
+    provider: &'a dyn ModelProvider,
+}
+
+impl Mutator for ModelMutator<'_> {
+    fn mutate(&self, s: &EditableSketch, block_id: &str, seed: u64) -> EditableSketch {
+        let current = s.block_content(block_id).unwrap_or("");
+        // The current region body is prior model output; fence it as data.
+        let request = ModelRequest {
+            role: "evolve_sketch_block".into(),
+            task: "Rewrite ONLY the marked proof-sketch region so the whole sketch moves \
+                   toward a complete, machine-checkable proof of the target statement. \
+                   Return the new region body verbatim; do not restate the target."
+                .into(),
+            context: json!({
+                "target": s.statement,
+                "block_id": block_id,
+                "current": crate::guard::wrap_untrusted("sketch_block", current),
+                "seed": seed,
+            }),
+            output_schema: json!({
+                "type": "object",
+                "required": ["content"],
+                "properties": {"content": {"type": "string"}}
+            }),
+        };
+        match self.provider.complete(&request) {
+            Ok(resp) => match resp.content.get("content").and_then(|v| v.as_str()) {
+                Some(next) => s.with_block(block_id, next),
+                None => s.clone(),
+            },
+            Err(_) => s.clone(),
+        }
+    }
+}
+
+/// [`Evaluator`] backed by the real formal verifier. A variant counts as
+/// [`Outcome::solved`] ONLY when a LIVE backend passes every gate layer on the
+/// rendered sketch; a mock backend (or an unavailable / erroring toolchain) never
+/// yields a solve. Partial progress is deliberately reported as `0.0`: there is no
+/// sound cheap grade for an incomplete formal proof, so we refuse to invent one.
+/// The Elo ranking still orders solved above unsolved.
+struct BackendEvaluator<'a> {
+    config: &'a Config,
+    system: FormalSystem,
+}
+
+impl Evaluator for BackendEvaluator<'_> {
+    fn evaluate(&self, s: &EditableSketch) -> Outcome {
+        let code = s.render();
+        // Honour offline mode: `prover_mock` builds the mock backend, which reports
+        // `live: false` and therefore can never be mistaken for certification.
+        let backend = backend_for(self.config, self.system, self.config.prover_mock);
+        match backend.verify(self.config, &code, &s.statement) {
+            Ok(report) if report.live && report.lexically_verified => Outcome::solved(),
+            _ => Outcome::none(),
+        }
+    }
+}
+
+/// Run the EVOLVE-BLOCK editable-sketch loop against live seams: the model
+/// provider mutates marked regions, the real formal backend judges each variant.
+///
+/// `template` is marked sketch text (see [`EditableSketch::parse`]); `statement`
+/// is the target it must prove. Returns a JSON summary of the run. `solved` is
+/// true only when a live backend certified the best variant, so it is honest in
+/// offline / mock mode (always false there). This stage never sets any node status
+/// to verified; certification remains the formal gate's sole responsibility, hence
+/// the explicit `"certified": false` in the summary. Emits an `evolve_sketch.*`
+/// run trace to the store.
+pub fn evolve_proof_sketch(
+    store: &Store,
+    config: &Config,
+    provider: &dyn ModelProvider,
+    project_id: &str,
+    statement: &str,
+    template: &str,
+    evolve_config: &EvolveConfig,
+) -> Result<serde_json::Value> {
+    let run = store.begin_run(project_id, "evolve_sketch")?;
+
+    let seed = EditableSketch::parse("seed", statement, template);
+    let mutator = ModelMutator { provider };
+    let evaluator = BackendEvaluator {
+        config,
+        system: config.target_system,
+    };
+    let result = evolve(seed, evolve_config, &mutator, &evaluator);
+
+    store.event(
+        Some(project_id),
+        Some(&run),
+        "evolve_sketch.completed",
+        "evolve_sketch",
+        json!({
+            "solved": result.solved,
+            "generations": result.generations,
+            "population_size": result.population_size,
+            "best_variant_id": result.best.id,
+        }),
+    )?;
+    let state = if result.solved {
+        "completed"
+    } else {
+        "completed_unsolved"
+    };
+    store.update_run(project_id, &run, state, "complete", result.generations)?;
+
+    Ok(json!({
+        "run_id": run,
+        "statement": statement,
+        // `solved`/`live_verified` are true only after a real live backend passed
+        // the 3+1 gate on the best variant; false in offline / mock mode.
+        "solved": result.solved,
+        "live_verified": result.solved,
+        // This stage screens and evolves; it never certifies a graph node.
+        "certified": false,
+        "generations": result.generations,
+        "population_size": result.population_size,
+        "best_elo": result.best_elo,
+        "best_variant_id": result.best.id,
+        "best_render": result.best.render(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -876,6 +1017,81 @@ exact h
             })
             .collect();
         assert_eq!(region_ids, vec!["k", "lemma1", "main"]);
+    }
+
+    // --- entry point (offline: mock provider + mock backend) -----------------
+
+    use crate::model::ModelResponse;
+    use std::path::Path;
+
+    /// A mock provider that rewrites a block to a fixed body. It never claims a
+    /// proof; the (mock) backend is what decides `solved`, so this exercises the
+    /// entry wiring without any live toolchain.
+    struct RewriteProvider;
+    impl ModelProvider for RewriteProvider {
+        fn complete(&self, request: &ModelRequest) -> Result<ModelResponse> {
+            let content = match request.role.as_str() {
+                "evolve_sketch_block" => json!({"content": "exact rfl"}),
+                _ => json!({}),
+            };
+            Ok(ModelResponse {
+                content,
+                model: "test".into(),
+                provider: "test".into(),
+            })
+        }
+        fn name(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[test]
+    fn entry_point_runs_offline_and_never_reports_a_mock_solve() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "P holds").unwrap();
+
+        // Mock backend: offline, so a variant can never be reported as certified.
+        let mut config = Config {
+            prover_mock: true,
+            ..Config::default()
+        };
+        config.workspace = temp.path().join("workspaces");
+
+        let template = "-- Proof of: P holds\n-- EVOLVE-BLOCK goal\nsorry\n-- END-EVOLVE-BLOCK";
+        let evolve_config = EvolveConfig {
+            population_size: 3,
+            max_generations: 2,
+            parents_per_gen: 2,
+            offspring_per_parent: 2,
+            seed: 1,
+        };
+
+        let summary = evolve_proof_sketch(
+            &store,
+            &config,
+            &RewriteProvider,
+            &project.id,
+            "P holds",
+            template,
+            &evolve_config,
+        )
+        .unwrap();
+
+        // Offline runs must never claim a solve or a certification.
+        assert_eq!(summary["solved"], serde_json::json!(false));
+        assert_eq!(summary["live_verified"], serde_json::json!(false));
+        assert_eq!(summary["certified"], serde_json::json!(false));
+        // The loop ran to its budget and returned a real best variant.
+        assert_eq!(summary["generations"], serde_json::json!(2));
+        assert_eq!(summary["population_size"], serde_json::json!(3));
+        assert!(summary["best_render"].as_str().unwrap().contains("P holds"));
+
+        // The run was traced to the store.
+        let events = store.events(&project.id, 50).unwrap();
+        assert!(events
+            .iter()
+            .any(|e| e.event_type == "evolve_sketch.completed"));
     }
 
     #[test]
