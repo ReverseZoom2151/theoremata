@@ -505,6 +505,27 @@ enum Command {
     SearchTelemetry {
         request: String,
     },
+    /// Run the multi-alpha best-first sweep over a statement, optionally
+    /// shrinking the found proof behind a real checker re-check.
+    ///
+    /// A search result is a CANDIDATE. Only the optional minimize pass, which
+    /// runs the full gate, confirms that a tactic sequence closes the goal.
+    AlphaSweep {
+        statement: String,
+        #[arg(long)]
+        project: Option<String>,
+        /// `lean` | `rocq` (`coq`) | `isabelle`.
+        #[arg(long, default_value = "lean")]
+        system: String,
+        /// Comma-separated length-normalization exponents.
+        #[arg(long, default_value = "0.0,0.5,1.0")]
+        alphas: String,
+        #[arg(long, default_value_t = 200)]
+        budget: usize,
+        /// Shrink the proof behind a real gate re-check. Costs prover calls.
+        #[arg(long)]
+        minimize: bool,
+    },
     /// Consult a Wolfram Engine or Wolfram|Alpha as an UNTRUSTED oracle.
     ///
     /// Nothing here certifies anything. A generated certificate is only returned
@@ -1422,6 +1443,37 @@ pub fn run() -> Result<()> {
         }
         Command::ProofLogCheck { file } => {
             print_value(true, &proof_log::check_log_file(&file)?)?
+        }
+        Command::AlphaSweep {
+            statement,
+            project,
+            system,
+            alphas,
+            budget,
+            minimize,
+        } => {
+            let system = parse_system(&system)?;
+            let alphas: Vec<f64> = alphas
+                .split(',')
+                .filter_map(|a| a.trim().parse::<f64>().ok())
+                .collect();
+            if alphas.is_empty() {
+                return Err(anyhow::anyhow!("no parseable alphas in --alphas"));
+            }
+            print_value(
+                true,
+                &hybrid_search::run_alpha_sweep_search(
+                    &store,
+                    &config,
+                    provider.as_ref(),
+                    project.as_deref(),
+                    &statement,
+                    system,
+                    &alphas,
+                    budget,
+                    minimize,
+                )?,
+            )?
         }
         Command::Wolfram { op, input, kind } => {
             // One command over the five oracle tools, because they share a trust
