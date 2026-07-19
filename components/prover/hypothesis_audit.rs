@@ -1339,5 +1339,3 @@ theorem t (hG : Glaisher3) (hT : RamanujanTau) (n : Nat) : n = n := rfl
         assert_eq!(a.unaccounted_count(), 2);
     }
 }
-</content>
-</invoke>

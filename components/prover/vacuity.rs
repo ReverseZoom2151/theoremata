@@ -268,7 +268,10 @@ impl WitnessVerdict {
 
 /// A syntactic contradiction found in a bundle. See the module docs: finding one
 /// is evidence of unsatisfiability; finding NONE proves nothing whatsoever.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// NOTE: Serialize only. `rule` is a `&'static str`, which cannot satisfy
+// Deserialize's `'de` lifetime; these reports are written to the gate's JSON
+// detail and never read back, so the round trip is not needed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Contradiction {
     /// Stable rule id (`numeric_bounds` / `false_hypothesis` /
     /// `literal_negation`).
@@ -683,7 +686,8 @@ impl VacuitySeverity {
 }
 
 /// One vacuity finding: what fired, on which fields, and why.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Serialize only: see the note on `Contradiction`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VacuityFinding {
     pub severity: VacuitySeverity,
     /// Stable rule id (`witness_missing` / `numeric_bounds` / …).
@@ -697,7 +701,8 @@ pub struct VacuityFinding {
 /// `findings` / `detail`) plus the structured verdict and contradictions.
 ///
 /// [`ScanReport`]: crate::prover::formal::ScanReport
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// Serialize only: transitively contains `Contradiction`/`VacuityFinding`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct VacuityReport {
     /// Fail-closed: `true` only when the bundle is trivial, or a supplied witness
     /// survived the audit. A non-trivial bundle with NO witness is `false`.

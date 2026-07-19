@@ -25,7 +25,8 @@ pub use prover::{
 pub use reason::{
     agent, best_first, blueprint, blueprint_generate, blueprint_run, certification, chat,
     checker_cache, concurrent, conjecture_engine, consolidate, context_assembly, critic,
-    critic_scorer, dag_projection, decompose, definition_synthesis, discovery_game,
+    critic_scorer, dag_projection, decompose, decomposition_admission, definition_synthesis,
+    discovery_game,
     distance_critic, driver, evolve_sketch, falsification, fitness, formal_generate,
     formalize_modes, formalize_portfolio, goal_cache, graph_rag, guard, guardrails, hybrid_search,
     informal_defect_prior,
@@ -34,7 +35,7 @@ pub use reason::{
     preference_pairs, process_reward, progress, proof_import, proof_pool, refine_ops, repair,
     research, retry, rewriting, router, sampler, sampling, search_telemetry, skest, sketch,
     statement_validation, statement_validity, subsumption, symmetry_dedup, tactic_outcome, taint,
-    team, trace, ttc,
+    team, trace, ttc, verification_ladder,
 };
 pub use verify::{hardening, lean_session};
 
