@@ -290,6 +290,72 @@ pub struct HoleResult {
     pub goal_state: Option<String>,
 }
 
+/// Where one sketch step's prose sits in the composite defect-scan text.
+///
+/// `[start, end)` are byte offsets into the text produced by
+/// [`defect_scan_text_and_spans`] — the same coordinate space the
+/// [`RiskRegion`] offsets in [`SketchAssembly::defect_hints`] live in.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StepSpan {
+    /// The caller-supplied [`SketchStep::id`] this span belongs to.
+    pub step_id: String,
+    /// Inclusive byte start of this step's prose in the scan text.
+    pub start: usize,
+    /// Exclusive byte end of this step's prose in the scan text.
+    pub end: usize,
+    /// Whether this step carries a hole (a router only dispatches these).
+    pub is_hole: bool,
+}
+
+impl StepSpan {
+    /// Whether `[start, end)` of a scan region overlaps this step's prose.
+    /// Half-open on both sides, so a zero-width span never overlaps anything.
+    fn overlaps(&self, start: usize, end: usize) -> bool {
+        start < self.end && end > self.start
+    }
+}
+
+/// The step → byte-span map for one defect scan.
+///
+/// Without this, the [`RiskRegion`] offsets in a [`RoutingHints`] index a
+/// composite text whose internal structure the consumer cannot see, so it
+/// cannot tell which hints belong to which hole. Built in the same function as
+/// the text it indexes so the two cannot drift apart.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DefectSpanTable {
+    /// Byte end of the statement prefix. Offsets below this belong to the
+    /// statement, not to any step.
+    pub statement_end: usize,
+    /// Total byte length of the scanned composite text.
+    pub scanned_bytes: usize,
+    /// One entry per sketch step, in sketch order.
+    pub steps: Vec<StepSpan>,
+}
+
+impl DefectSpanTable {
+    /// The span recorded for `step_id`, if that step exists.
+    pub fn span_for(&self, step_id: &str) -> Option<&StepSpan> {
+        self.steps.iter().find(|s| s.step_id == step_id)
+    }
+
+    /// The regions of `regions` that overlap `step_id`'s prose, in the order
+    /// they were given. Empty for an unknown step id, and empty for a region
+    /// lying entirely in the statement prefix or in another step.
+    pub fn regions_for_step<'r>(
+        &self,
+        step_id: &str,
+        regions: &'r [RiskRegion],
+    ) -> Vec<&'r RiskRegion> {
+        let Some(span) = self.span_for(step_id) else {
+            return Vec::new();
+        };
+        regions
+            .iter()
+            .filter(|r| span.overlaps(r.start, r.end))
+            .collect()
+    }
+}
+
 /// The outcome of running a sketch: the sub-DAG root, every hole's result, and
 /// the spliced proof only when every hole and the final composition have a live
 /// system-native verification result.
@@ -314,12 +380,54 @@ pub struct SketchAssembly {
     /// `falsify_first` regions with the cheap counterexample gate before
     /// spending proof effort; today they are only computed and recorded.
     pub defect_hints: RoutingHints,
+    /// Where each step's prose sits in the text [`Self::defect_report`] and
+    /// [`Self::defect_hints`] index. Without it those offsets cannot be
+    /// attributed to a hole. See [`SketchAssembly::hints_for_step`].
+    pub defect_spans: DefectSpanTable,
+}
+
+/// The hints attributable to one step, split by bucket exactly as
+/// [`RoutingHints`] splits them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepRoutingHints<'a> {
+    /// The step these regions were attributed to.
+    pub step_id: String,
+    /// Regions overlapping this step's prose that route to falsification.
+    pub falsify_first: Vec<&'a RiskRegion>,
+    /// Regions overlapping this step's prose that route to decomposition.
+    pub decompose_first: Vec<&'a RiskRegion>,
+}
+
+impl StepRoutingHints<'_> {
+    /// Whether any region was attributed to this step.
+    pub fn is_empty(&self) -> bool {
+        self.falsify_first.is_empty() && self.decompose_first.is_empty()
+    }
 }
 
 impl SketchAssembly {
     /// Whether a live verifier certified the complete assembled proof.
     pub fn is_assembled(&self) -> bool {
         self.assembled_proof.is_some()
+    }
+
+    /// The routing hints whose spans land in `step_id`'s prose — the operation
+    /// a router caller actually needs, since the raw hint offsets index the
+    /// whole composite scan text rather than any one step.
+    ///
+    /// Advisory, exactly as [`Self::defect_hints`] is: reading this changes
+    /// nothing in the pipeline. Statement-level regions belong to no step and
+    /// so are returned for none; an unknown step id yields an empty result.
+    pub fn hints_for_step(&self, step_id: &str) -> StepRoutingHints<'_> {
+        StepRoutingHints {
+            step_id: step_id.to_string(),
+            falsify_first: self
+                .defect_spans
+                .regions_for_step(step_id, &self.defect_hints.falsify_first),
+            decompose_first: self
+                .defect_spans
+                .regions_for_step(step_id, &self.defect_hints.decompose_first),
+        }
     }
 }
 
@@ -405,13 +513,16 @@ impl<G: SketchGenerator, P: HoleProver> SketchPipeline<'_, G, P> {
         //
         //     This pass is advisory: it COMPUTES and RECORDS, and nothing below
         //     reads it back. Acting on the hints is a separate, deliberate step.
-        let defect_text = defect_scan_text(sketch);
+        let (defect_text, defect_spans) = defect_scan_text_and_spans(sketch);
         let defect_report = analyze(&defect_text);
         let defect_hints = defect_report.to_routing_hints();
         // Recorded on the sketch root the same way per-hole metadata is recorded
         // on its hole node: an evidence row carrying the full structured payload.
         // Offsets in `findings`/regions index `defect_text` (the statement, then
-        // each step's prose, newline-joined), NOT any single step's prose.
+        // each step's prose, newline-joined), NOT any single step's prose. The
+        // `step_spans` table maps each step id back to its byte range in that
+        // same text, so an out-of-process consumer can attribute a region to a
+        // hole exactly as `SketchAssembly::hints_for_step` does in process.
         self.store.add_evidence(
             project_id,
             &root.id,
@@ -424,6 +535,8 @@ impl<G: SketchGenerator, P: HoleProver> SketchPipeline<'_, G, P> {
                 "falsify_first": defect_hints.falsify_first,
                 "decompose_first": defect_hints.decompose_first,
                 "scanned_bytes": defect_text.len(),
+                "statement_end": defect_spans.statement_end,
+                "step_spans": defect_spans.steps,
             }),
         )?;
 
@@ -661,6 +774,7 @@ impl<G: SketchGenerator, P: HoleProver> SketchPipeline<'_, G, P> {
             open_holes,
             defect_report,
             defect_hints,
+            defect_spans,
         })
     }
 
@@ -689,23 +803,43 @@ impl<G: SketchGenerator, P: HoleProver> SketchPipeline<'_, G, P> {
     }
 }
 
-/// The exact text handed to the informal-defect scanner: the statement followed
-/// by every step's prose, newline-joined, in sketch order.
+/// The exact text handed to the informal-defect scanner, together with the byte
+/// span each step's prose occupies inside it.
 ///
-/// Document-level on purpose. Scanning per step would miss a notion introduced
-/// in one step and never reused in a later one (the `IntroducedNotion`
-/// detector's whole premise), and would produce a report per step rather than
-/// one ordering over the sketch. The join is a plain `\n` so byte offsets stay
-/// meaningful and the concatenation cannot fabricate a match across a boundary
-/// that a space would have allowed.
-fn defect_scan_text(sketch: &InformalSketch) -> String {
+/// The text is the statement followed by every step's prose, newline-joined, in
+/// sketch order. Document-level on purpose: scanning per step would miss a
+/// notion introduced in one step and never reused in a later one (the
+/// `IntroducedNotion` detector's whole premise), and would produce a report per
+/// step rather than one ordering over the sketch. The join is a plain `\n` so
+/// byte offsets stay meaningful and the concatenation cannot fabricate a match
+/// across a boundary that a space would have allowed.
+///
+/// Text and spans are built by this ONE function on purpose: a span table
+/// computed separately from the text it indexes drifts the moment either side
+/// changes. `defect_scan_spans_slice_back` asserts the invariant.
+fn defect_scan_text_and_spans(sketch: &InformalSketch) -> (String, DefectSpanTable) {
     let mut text = String::with_capacity(sketch.statement.len() + 64);
     text.push_str(&sketch.statement);
+    let statement_end = text.len();
+    let mut steps = Vec::with_capacity(sketch.steps.len());
     for step in &sketch.steps {
         text.push('\n');
+        let start = text.len();
         text.push_str(&step.prose);
+        let end = text.len();
+        steps.push(StepSpan {
+            step_id: step.id.clone(),
+            start,
+            end,
+            is_hole: step.hole.is_some(),
+        });
     }
-    text
+    let table = DefectSpanTable {
+        statement_end,
+        scanned_bytes: text.len(),
+        steps,
+    };
+    (text, table)
 }
 
 /// A per-hole prover that dispatches each subgoal through the existing portfolio
@@ -1377,5 +1511,209 @@ mod tests {
             risky_proof.replace(RISKY_PROSE, ""),
             clean_proof.replace(CLEAN_PROSE, "")
         );
+    }
+
+    // ---- per-hole span table ---------------------------------------------
+
+    /// A generator that returns a caller-built sketch verbatim, so a test can
+    /// control the statement AND every step's prose independently.
+    struct VerbatimGenerator {
+        sketch: InformalSketch,
+    }
+    impl SketchGenerator for VerbatimGenerator {
+        fn generate(&self, _statement: &str) -> Result<InformalSketch> {
+            Ok(self.sketch.clone())
+        }
+    }
+
+    fn run_fixed(sketch: InformalSketch) -> SketchAssembly {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", &sketch.statement).unwrap();
+        let statement = sketch.statement.clone();
+        let generator = VerbatimGenerator { sketch };
+        let pipeline = SketchPipeline {
+            store: &store,
+            generator: &generator,
+            prover: &AllClosingProver,
+        };
+        pipeline.run(&project.id, &statement).unwrap()
+    }
+
+    /// A two-step sketch: `s1` prose is the caller's, `s2` prose is the
+    /// caller's, both hole-bearing so a router would see both.
+    fn two_step(statement: &str, first: &str, second: &str) -> InformalSketch {
+        InformalSketch::new(
+            statement,
+            vec![
+                SketchStep::hole("s1", first, "goal : P 0"),
+                SketchStep::hole("s2", second, "goal : P 1"),
+            ],
+        )
+    }
+
+    /// The drift invariant: the span table and the text it indexes are built by
+    /// one function, so every recorded span must slice back to EXACTLY that
+    /// step's prose. If the two ever drift, this fails.
+    #[test]
+    fn every_recorded_span_slices_back_to_its_own_step_prose() {
+        let sketch = InformalSketch::new(
+            "For all n, P n holds",
+            vec![
+                SketchStep::prose("p1", "Let ε > 0 be arbitrary."),
+                SketchStep::hole("h1", RISKY_PROSE, "goal : P 0"),
+                SketchStep::prose("p2", ""),
+                SketchStep::hole("h2", "Then ∑_{k≤n} α_k ≤ β, hence 数学 done.", "goal : P 1"),
+            ],
+        );
+        let expected: Vec<(String, String)> = sketch
+            .steps
+            .iter()
+            .map(|s| (s.id.clone(), s.prose.clone()))
+            .collect();
+        // Rebuild the exact text the scan saw, then slice it with the table.
+        let (text, table) = defect_scan_text_and_spans(&sketch);
+        let assembly = run_fixed(sketch);
+
+        assert_eq!(
+            assembly.defect_spans, table,
+            "the assembly recorded a different span table than the scan built"
+        );
+        assert_eq!(table.steps.len(), expected.len());
+        assert_eq!(table.scanned_bytes, text.len());
+        assert_eq!(table.statement_end, "For all n, P n holds".len());
+        for (span, (id, prose)) in table.steps.iter().zip(&expected) {
+            assert_eq!(&span.step_id, id);
+            assert!(
+                span.start >= table.statement_end && span.end <= table.scanned_bytes,
+                "span {span:?} escapes the scanned text"
+            );
+            assert_eq!(
+                &text[span.start..span.end],
+                prose,
+                "span for {id} does not slice back to its own prose"
+            );
+        }
+        // Steps appear in sketch order and never overlap each other.
+        for pair in table.steps.windows(2) {
+            assert!(pair[0].end < pair[1].start, "spans overlap: {pair:?}");
+        }
+        assert_eq!(
+            table.steps.iter().filter(|s| s.is_hole).count(),
+            2,
+            "hole flags lost"
+        );
+    }
+
+    /// Multi-byte prose must not corrupt offsets: the byte spans are still
+    /// exact, and slicing them is not a panic (which it would be if the
+    /// boundaries fell inside a UTF-8 sequence).
+    #[test]
+    fn multibyte_prose_keeps_byte_offsets_exact() {
+        let unicode = "Ω 数学 — the remaining cases may be checked directly for small n.";
+        let sketch = two_step("∀ε>0, P ε", "首先, fix δ ≔ ε/2 by Lemma 3.2.", unicode);
+        let (text, table) = defect_scan_text_and_spans(&sketch);
+
+        // Byte lengths, not char counts.
+        assert_eq!(table.statement_end, "∀ε>0, P ε".len());
+        assert!(table.statement_end > "∀ε>0, P ε".chars().count());
+        let s2 = table.span_for("s2").unwrap();
+        assert_eq!(&text[s2.start..s2.end], unicode);
+        assert_eq!(s2.end - s2.start, unicode.len());
+
+        // And the hint attributed to s2 slices to a real substring of it.
+        let assembly = run_fixed(sketch);
+        let hints = assembly.hints_for_step("s2");
+        assert!(!hints.falsify_first.is_empty(), "expected a finite-check hint");
+        for region in &hints.falsify_first {
+            assert!(region.start >= s2.start && region.end <= s2.end);
+            let _ = &text[region.start..region.end]; // panics if mid-codepoint
+        }
+    }
+
+    #[test]
+    fn a_hint_in_step_twos_prose_is_returned_for_step_two_and_not_step_one() {
+        let assembly = run_fixed(two_step("P 0", CLEAN_PROSE, RISKY_PROSE));
+
+        let s2 = assembly.hints_for_step("s2");
+        assert!(
+            !s2.falsify_first.is_empty(),
+            "step 2's own hint was not attributed to it: {:?}",
+            assembly.defect_hints
+        );
+        assert_eq!(s2.step_id, "s2");
+        assert!(s2
+            .falsify_first
+            .iter()
+            .any(|r| r.categories.contains(&DefectCategory::HandWavedFiniteCheck)));
+
+        let s1 = assembly.hints_for_step("s1");
+        assert!(s1.is_empty(), "step 1 was handed step 2's hint: {s1:?}");
+
+        // An id that is not in the sketch resolves to nothing rather than to
+        // the whole document.
+        assert!(assembly.hints_for_step("nope").is_empty());
+        assert!(assembly.defect_spans.span_for("nope").is_none());
+    }
+
+    #[test]
+    fn a_statement_level_hint_belongs_to_no_step() {
+        // The risky text is in the STATEMENT; both steps are rigorous.
+        let assembly = run_fixed(two_step(RISKY_PROSE, CLEAN_PROSE, CLEAN_PROSE));
+
+        assert!(
+            !assembly.defect_hints.falsify_first.is_empty(),
+            "the statement-level finding was not detected at all"
+        );
+        for region in &assembly.defect_hints.falsify_first {
+            assert!(
+                region.end <= assembly.defect_spans.statement_end,
+                "a statement region leaked past the statement prefix: {region:?}"
+            );
+        }
+        assert!(assembly.hints_for_step("s1").is_empty());
+        assert!(assembly.hints_for_step("s2").is_empty());
+    }
+
+    #[test]
+    fn span_table_is_recorded_in_the_defect_prior_evidence_payload() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "P 0").unwrap();
+        let generator = ProseGenerator {
+            prose: RISKY_PROSE.into(),
+        };
+        let assembly = {
+            let pipeline = SketchPipeline {
+                store: &store,
+                generator: &generator,
+                prover: &AllClosingProver,
+            };
+            pipeline.run(&project.id, "P 0").unwrap()
+        };
+
+        let rows = store
+            .evidence(&project.id, &assembly.sketch_node_id)
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|e| e.evidence_type == "sketch_defect_prior")
+            .expect("the defect scan was recorded");
+        let payload = &row.payload;
+        assert_eq!(
+            payload["statement_end"],
+            json!(assembly.defect_spans.statement_end)
+        );
+        let spans = payload["step_spans"]
+            .as_array()
+            .expect("step_spans is an array");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0]["step_id"], json!("h1"));
+        let recorded = &assembly.defect_spans.steps[0];
+        assert_eq!(spans[0]["start"], json!(recorded.start));
+        assert_eq!(spans[0]["end"], json!(recorded.end));
+        assert_eq!(spans[0]["is_hole"], json!(true));
+
+        // Recording spans changed nothing about the assembly itself.
+        assert!(assembly.is_assembled());
+        assert!(assembly.open_holes.is_empty());
     }
 }
