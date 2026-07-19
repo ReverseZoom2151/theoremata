@@ -418,6 +418,93 @@ enum Command {
         #[arg(default_value_t = 8)]
         max_polls: u32,
     },
+    /// Run the conjecture engine: propose, falsify, and graduate only
+    /// live-verified conjectures into the project's lemma library.
+    Conjecture {
+        project: String,
+    },
+    /// Detect undefined symbols in a statement and propose (advisory only)
+    /// candidate definitions. Nothing is admitted to the library.
+    DefineSynth {
+        project: String,
+        statement: String,
+    },
+    /// Evolve a marked proof sketch through the evolutionary loop, accepting a
+    /// variant only when a live backend gate closes it.
+    EvolveSketch {
+        project: String,
+        statement: String,
+        /// The sketch template with EVOLVE-BLOCK markers.
+        template: String,
+    },
+    /// Two-mode (fast vs chain-of-thought) formalization of an informal
+    /// statement. Advisory: the screen is a heuristic, nothing is certified.
+    FormalizeModes {
+        project: String,
+        informal: String,
+    },
+    /// Export library skills as a formal file, re-verifying each through the
+    /// live gate first. Offline (no live gate) this exports nothing.
+    MathlibExport {
+        project: String,
+        /// `lean` | `rocq` (`coq`) | `isabelle`.
+        #[arg(long, default_value = "lean")]
+        system: String,
+    },
+    /// Apply a proven method across a family of related problems, proving each
+    /// through the portfolio gate. JSON: a `TransferSpec`.
+    MethodTransfer {
+        request: String,
+    },
+    /// Inverse-method (forward saturation) proof search. Records an unverified
+    /// search outcome as node evidence. JSON:
+    /// `{"node":"...","axioms":[...],"goal":"...","rules":[...]}`.
+    InverseMethod {
+        project: String,
+        request: String,
+    },
+    /// Model-elimination refutation search. Records an unverified search
+    /// outcome. JSON: `{"node":"...","clauses":[...],"max_bound":N}`.
+    ModelElim {
+        project: String,
+        request: String,
+    },
+    /// Discovery-game (residual-reduction) search. JSON:
+    /// `{"basis":[[..]],"root":[..],"seed":N}`. Result is a candidate, not a
+    /// proof.
+    DiscoverySearch {
+        request: String,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// SKEST speculative-ensemble search over a supplied goal graph. JSON:
+    /// `{"closed_goals":[...],"edges":[{"from","tactic","prior","to"}],"root":"...","seed":N}`.
+    SkestSearch {
+        request: String,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Project a search DAG into its MCGS regression tree. JSON: a `DagView`.
+    DagProject {
+        project: String,
+        request: String,
+    },
+    /// Mine Bradley-Terry critic preference pairs from verified winning paths
+    /// only. JSON: an array of `CriticBranch`.
+    PreferencePairs {
+        project: String,
+        request: String,
+    },
+    /// Independently re-check a serialized proof log; reports absent / empty /
+    /// unparseable / rejected / checked distinctly.
+    ProofLogCheck {
+        file: PathBuf,
+    },
+    /// Report search telemetry (proof-length, diversity, round-over-round).
+    /// JSON: `{"proofs":[...],"rounds":[[...]]}`.
+    SearchTelemetry {
+        request: String,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -1158,8 +1245,198 @@ pub fn run() -> Result<()> {
             true,
             &LeanCheck::new(&config).run(serde_json::json!({ "file": file }))?,
         )?,
+        Command::Conjecture { project } => print_value(
+            true,
+            &conjecture_engine::run(&store, &config, provider.as_ref(), &project)?,
+        )?,
+        Command::DefineSynth { project, statement } => print_value(
+            true,
+            &definition_synthesis::synthesize(&store, provider.as_ref(), &project, &statement)?,
+        )?,
+        Command::EvolveSketch {
+            project,
+            statement,
+            template,
+        } => print_value(
+            true,
+            &evolve_sketch::evolve_proof_sketch(
+                &store,
+                &config,
+                provider.as_ref(),
+                &project,
+                &statement,
+                &template,
+                &evolve_sketch::EvolveConfig::default(),
+            )?,
+        )?,
+        Command::FormalizeModes { project, informal } => print_value(
+            true,
+            &formalize_modes::run_two_mode_formalization(
+                &store,
+                &config,
+                provider.as_ref(),
+                &project,
+                &informal,
+                &formalize_modes::TwoModeConfig::default(),
+            )?,
+        )?,
+        Command::MathlibExport { project, system } => {
+            let system = parse_system(&system)?;
+            print_value(
+                true,
+                &mathlib_export::export_verified(
+                    &store,
+                    &config,
+                    &project,
+                    system,
+                    &mathlib_export::ExportConfig::default(),
+                )?,
+            )?
+        }
+        Command::MethodTransfer { request } => {
+            let spec: method_transfer::TransferSpec = serde_json::from_str(&request)?;
+            print_value(
+                true,
+                &method_transfer::transfer(&store, &config, provider.as_ref(), &spec)?,
+            )?
+        }
+        Command::InverseMethod { project, request } => {
+            let request: serde_json::Value = serde_json::from_str(&request)?;
+            let node = request
+                .get("node")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let axioms = json_string_array(&request, "axioms");
+            let goal = request
+                .get("goal")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let rules = json_string_array(&request, "rules");
+            print_value(
+                true,
+                &inverse_method::saturate_spec(
+                    &store,
+                    &project,
+                    node,
+                    &axioms,
+                    goal,
+                    &rules,
+                    &inverse_method::SaturationConfig::default(),
+                )?,
+            )?
+        }
+        Command::ModelElim { project, request } => {
+            let request: serde_json::Value = serde_json::from_str(&request)?;
+            let node = request
+                .get("node")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let clauses = json_string_array(&request, "clauses");
+            let max_bound = request
+                .get("max_bound")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1000) as usize;
+            print_value(
+                true,
+                &model_elimination::refute_clauses(&store, &project, node, &clauses, max_bound)?,
+            )?
+        }
+        Command::DiscoverySearch { request, project } => {
+            let request: serde_json::Value = serde_json::from_str(&request)?;
+            let basis: Vec<Vec<i64>> = request
+                .get("basis")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            let root: Vec<i64> = request
+                .get("root")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            let seed = request.get("seed").and_then(|v| v.as_u64()).unwrap_or(0);
+            print_value(
+                true,
+                &discovery_game::run_discovery_search(
+                    &store,
+                    project.as_deref(),
+                    basis,
+                    root,
+                    discovery_game::DiscoveryConfig::default(),
+                    seed,
+                )?,
+            )?
+        }
+        Command::SkestSearch { request, project } => {
+            let request: serde_json::Value = serde_json::from_str(&request)?;
+            let closed_goals = json_string_array(&request, "closed_goals");
+            let edges: Vec<skest::GraphEdge> = request
+                .get("edges")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            let root = request
+                .get("root")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let seed = request.get("seed").and_then(|v| v.as_u64()).unwrap_or(0);
+            print_value(
+                true,
+                &skest::run_skest_search(
+                    &store,
+                    project.as_deref(),
+                    closed_goals,
+                    edges,
+                    root,
+                    skest::SkestConfig::default(),
+                    seed,
+                )?,
+            )?
+        }
+        Command::DagProject { project, request } => {
+            let dag: dag_projection::DagView = serde_json::from_str(&request)?;
+            print_value(
+                true,
+                &dag_projection::project_search_dag(&store, &project, &dag)?,
+            )?
+        }
+        Command::PreferencePairs { project, request } => {
+            let branches: Vec<preference_pairs::CriticBranch> = serde_json::from_str(&request)?;
+            print_value(
+                true,
+                &preference_pairs::mine_critic_pairs(&store, &project, &branches)?,
+            )?
+        }
+        Command::ProofLogCheck { file } => {
+            print_value(true, &proof_log::check_log_file(&file)?)?
+        }
+        Command::SearchTelemetry { request } => {
+            let request: serde_json::Value = serde_json::from_str(&request)?;
+            print_value(true, &search_telemetry::report(&request)?)?
+        }
     }
     Ok(())
+}
+
+/// Parse a `String` array field out of a request object, empty when absent.
+fn json_string_array(request: &serde_json::Value, key: &str) -> Vec<String> {
+    request
+        .get(key)
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Resolve a system name to a [`FormalSystem`], accepting `coq` for Rocq.
+fn parse_system(name: &str) -> Result<prover::formal::FormalSystem> {
+    use prover::formal::FormalSystem;
+    match name.trim().to_ascii_lowercase().as_str() {
+        "lean" => Ok(FormalSystem::Lean),
+        "rocq" | "coq" => Ok(FormalSystem::Rocq),
+        "isabelle" => Ok(FormalSystem::Isabelle),
+        other => Err(anyhow::anyhow!("unknown formal system: {other}")),
+    }
 }
 
 /// Resolve a caller-selected file path once before passing it across a process
