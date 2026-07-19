@@ -2,6 +2,7 @@ pub mod blueprint;
 pub mod checker_cache;
 pub mod conjecture_engine;
 pub mod decompose;
+pub mod decomposition_admission;
 pub mod definition_synthesis;
 pub mod evolve_sketch;
 pub mod falsification;

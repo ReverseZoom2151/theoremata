@@ -17,8 +17,8 @@ pub use orchestration::{
     team, trace,
 };
 pub use proving::{
-    blueprint, checker_cache, conjecture_engine, decompose, definition_synthesis, evolve_sketch,
-    falsification, formal_generate, formalize_modes, formalize_portfolio, graph_rag, library,
+    blueprint, checker_cache, conjecture_engine, decompose, decomposition_admission,
+    definition_synthesis, evolve_sketch, falsification, formal_generate, formalize_modes, formalize_portfolio, graph_rag, library,
     mathlib_export, model_router, optimize, portfolio, refine_ops, repair, retry, router, sketch,
 };
 pub use search::{
