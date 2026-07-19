@@ -21,7 +21,7 @@
 //!   `alpha`, union the visited states and the solved paths, and return the
 //!   shortest solution together with coverage statistics. It *reuses* best-first
 //!   verbatim; it does not reimplement search.
-//! * [`multi_alpha_union_minimized`] — the same sweep, then a proof shrink gated on
+//! * [`multi_alpha_union_minimized`]: the same sweep, then a proof shrink gated on
 //!   a **caller-supplied** re-check. The re-check is a parameter because nothing in
 //!   this module can execute a tactic: the scorer proposes and ranks, it never
 //!   verifies, so it must never be the gate. See that function's docs.
