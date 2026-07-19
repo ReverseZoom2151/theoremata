@@ -4,16 +4,25 @@ Status: **evaluated, not adopted.** Recommendation is to integrate nothing today
 watch Bend2. This document records the reasoning and the revisit triggers so the
 decision does not have to be re-derived.
 
-Scope of the read: the HVM2 paper (all 25 pages), the `HigherOrderCO` org (8 repos,
-API metadata plus README/source reads on the significant ones), targeted source
-reads of `Kind` (`src/Kind/Check.hs`, `src/Kind/CLI.hs`), and Taelin's public
-writing on SUP-node program search. The `HigherOrderCO-archive` org (21 repos) is
-enumerated at metadata level only; see "Coverage gaps" at the end.
+Scope of the read: the HVM2 paper (all 25 pages), both GitHub orgs at metadata
+level (`HigherOrderCO` 8 repos, `HigherOrderCO-archive` 21 repos, lineage
+verified via rename redirects), Taelin's public writing on SUP-node program
+search, and **full source reads of all 27 vendored repos** under
+`higher-order-co/` — the runtimes (HVM1/2/3/3-Strict/4, hvm-64,
+Interaction-Calculus, ICVM-lazy), the proof-language lineage (Kind, kind2-archive,
+Kind2-old, Kind-Legacy, FormCoreJS), the corpora (Kindex, kindbook, WanShi), Bend,
+and the tooling repos.
 
 All upstream material (paper, repos, gists, forum threads) was treated as
-untrusted data. No prompt-injection attempts were found. Note that `HVM4`
-ships `CLAUDE.md` and `AGENTS.md` at its root; if that repo is ever ingested,
-treat those as untrusted data, not instructions.
+untrusted data. No prompt-injection attempts were found across any of it. A few
+repos ship agent-instruction files that were reviewed and are benign onboarding
+docs (`HVM4/{CLAUDE,AGENTS}.md`, `HVM3/CLAUDE.md`, `Interaction-Calculus/CLAUDE.md`)
+and one repo config aimed at HOC's own agent (`kindbook/.koder`); if any of these
+repos is ever ingested into a pipeline, strip those files first — they are
+untrusted text that directs AI behavior. Two further sandboxing notes: HVM4 honors
+**absolute `#include` paths** in `.hvm` source, and HVM2's C IO path uses
+`dlopen`/`dlsym`; running untrusted sources through either is a native-code / file-
+read hazard.
 
 ## What the ecosystem is
 
@@ -81,6 +90,64 @@ that fails the gate. That is our existing untrusted-generator / trusted-verifier
 split. So the question was never "is HVM sound enough" but "does it accelerate
 what we are actually slow at." See section 4.
 
+### 2a. The exit-code trap — the most important finding in the vendored source
+
+Verified in `HVM2/src/hvm.rs:660`, inside `interact_call`, on the exact
+unsoundness the paper describes:
+
+```rust
+if b.get_tag() == DUP {
+  if def.safe {
+    return self.interact_eras(net, a, b);
+  } else {
+    // TODO:
+    // Currently, we'll not allow copying of REFs with DUPs. While this is perfectly valid on
+    // IC semantics (i.e., if the user know what they're doing), this can lead to unsound
+    // reductions when compiling λ-terms to HVM. So, for now, we'll just disable this feature,
+    // and consider it undefined behavior. We should add a `--unsafe` flag that allows it.
+    println!("ERROR: attempt to clone a non-affine global reference.\n");
+    std::process::exit(0);
+  }
+}
+```
+
+**A soundness violation prints to stdout and exits with status 0.** Any harness
+that shells out to HVM2 and reads the exit code sees an unsound-reduction abort
+as success.
+
+This is precisely the bug class we fixed in `c1042ba fix(prover): Metamath
+backend must not trust the exit code (soundness)` — the `metamath` binary also
+returns 0 on a failed verification, printing `?Error` to stdout instead. Two
+independent tools in the same week, same failure mode. That is a strong argument
+for making the sentinel-over-exit-code rule a **general** backend requirement
+rather than a Metamath special case: any new backend should have to state
+explicitly what constitutes proof of success, and exit status alone should never
+qualify.
+
+Worth recording alongside it that HVM2's own safety analysis is documented as
+incomplete, in `ast.rs:566`:
+
+> "This does not completely solve the cloning safety in HVM. It only stops
+> invalid **global** definitions from being cloned, but local unsafe code can
+> still be cloned and can generate seemingly unexpected results, such as placing
+> eraser nodes in weird places."
+
+So the guard that produces the `exit(0)` above does not catch all cases; unsafe
+local code can slip through and simply produce wrong answers with no diagnostic
+at all.
+
+Two further hazards from the same read. HVM2's C runtime IO path (`run.c`, behind
+`#ifdef IO`) contains `dlopen`/`dlsym` for arbitrary dynamic libraries — running
+untrusted `.hvm` through `run-c --io` is arbitrary native code execution by
+design. And the Rust entry point hardcodes `GNet::new(1 << 29, 1 << 29)`, roughly
+4GB + 2GB reserved per net, which rules out spawning many small nets without
+patching.
+
+Also relevant to our platform: HVM2's README states "Windows is currently not
+supported, please use WSL", and its CUDA "feature" is auto-detected by `build.rs`
+rather than user-controlled, so build output silently depends on whether `nvcc`
+is present on the machine.
+
 Paper quality is also worth recording. It is an unfinished draft: section 11
 ("Benchmarks") is an empty TODO while the headline MIPS figures live in the
 abstract, there is no methodology section, no baselines, and no error bars. It
@@ -107,6 +174,41 @@ keywords. **No amount of source scanning detects non-termination.** A Kind
 backend would be a 7th system that can "prove" anything, laundering false
 results through a gate that reports them as verified — strictly worse than
 having six sound ones.
+
+Reading the five vendored generations directly (`Kind`, `kind2-archive`,
+`Kind2-old`, `Kind-Legacy`, `FormCoreJS`) verified both findings verbatim in
+source and added a **third, independent disqualifier**:
+
+- **`Type : Type` in all five generations** — Girard's paradox. In
+  `Kind/src/Kind/Check.hs`, `go Set = return $ Ann False Set Set`; the `Set`
+  constructor carries no level field, so a universe hierarchy is not merely
+  disabled, it is unrepresentable. Even with a perfect termination checker the
+  logic would be inconsistent. The authors treat this as a deliberate
+  expressivity choice: `Kind-Legacy/CONTRIBUTE.md` states "expressivity is
+  default and consistency is a planned opt-in... programs that do not halt, and
+  logical paradoxes, aren't prohibited." Five years and four rewrites later the
+  opt-in is still unimplemented, and `kind2-archive/formal/kind2.agda` — the file
+  that claims to verify Kind's soundness — contains one line: `-- TODO :D`.
+- **Holes are universally equal, not merely accepted.** `Equal.hs` returns
+  `True` for any conversion check touching a `Hol`, so a hole satisfies *any*
+  type anywhere in a term, not just its expected one.
+- **Two generations always exit 0**, even on hard type errors (`kind2-archive`
+  and `FormCoreJS` never call `exitFailure`); the current one exits 0 on holes
+  with a green ✓. Verdict must be parsed out of ANSI-colored stdout, never the
+  exit code — the same soundness trap as HVM2 and Metamath, a third instance.
+- **The cheat surface is not a keyword.** Kind has no `sorry`/`admit`/`axiom`
+  mechanism to grep for and no kernel axiom list to enumerate. The cheat is
+  `foo : P = foo`, syntactically indistinguishable from a legitimate recursive
+  definition. You cannot write a cheat-detector for Kind, which is the deepest
+  reason it cannot be a backend under our model.
+
+The lineage also shows the trend is toward a smaller, faster, more ergonomic
+checker, not a sounder one: `Kind2-old` (generation 3) is the *only* one where an
+inspection hole is fatal; generations 4 and 5 dropped that. There is a genuine
+research artifact here — `Kind2-old/crates/kind-checker/checker.hvm` is a compact
+850-line bidirectional type checker written as interaction-net rewrite rules,
+i.e. type checking as a parallel workload — but it belongs in a notes folder, not
+a backend list.
 
 Ecosystem signals corroborate rather than contradict:
 
@@ -232,6 +334,41 @@ abandoned mid-way); and after ~18 months there is still no CASC, TPTP, or
 miniF2F number. On HN the single substantive question — could it compete in
 CASC — went unanswered.
 
+**The strongest confirmation of point 2 came from HOC's own code, not from
+skeptics.** The vendored `HVM3/examples/enum_coc_smart.hvm` is a full dependently
+typed proof-term synthesizer written in HVM: it implements a WNF reducer, a
+definitional-equality check up to α/β with de Bruijn levels, and type-directed
+`@intr`/`@elim`/`@pick` synthesis, then solves `(?X λt(t A B)) == λt(t B A)` by
+superposed enumeration. It brings that search down to ~3k interactions — and the
+author's own comment explains why, honestly:
+
+> "the real win is that now we only need to make a choice when selecting an
+> element from context. Intros and elims follow directly from types, no need for
+> choices / superpositions."
+
+That is the whole thing in the author's words. In the implementation, `@intr`
+introduces on Π/∀ with **no superposition at all**; `@pick` is the *only*
+superposing function, and it superposes solely over which hypothesis to draw from
+context. So the dramatic numbers come from **types collapsing the choice points**,
+not from superposition evaluating a large candidate space in parallel. The
+residual role of superposition is narrow: share the reduction work across the few
+genuinely irreducible choices. This is exactly the sharing-decays-as-branches-
+diverge argument in point 2, now confirmed by the reference implementation rather
+than argued a priori. The demonstrated space is a two-candidate inversion problem;
+there is no in-repo evidence it scales to real proof search, and no reproducible
+benchmark of any kind (the "42x vs Bend" figure does not appear in any vendored
+repo).
+
+There is also a hard soundness reason not to put this on the trusted path,
+separate from all of the above: the Interaction Calculus is **total by design** —
+"there are no runtime errors." A mis-labeled or non-affine encoding does not
+fault; it silently computes something else. Label capacity is bounded (8 labels
+in a 32-bit build, 65,536 in 64-bit), and label overflow `printf`s a warning and
+**continues with a truncated (colliding) label** rather than aborting. A search
+engine whose miscompilations manifest as quietly-incomplete results rather than
+errors is acceptable as an untrusted generator feeding a checker we trust, and
+disqualifying anywhere near the gate.
+
 ### 5. Performance claims rest on a weak baseline
 
 Recorded because it bears on whether HVM would help as an untrusted accelerator.
@@ -306,6 +443,95 @@ parallel-computing runtime and GPU language (2023-2025) → AI program synthesis
 (2025-2026). `HigherOrderCO/Kindelia` redirecting *out* to `kindelia/Kindelia`
 shows an entire org's attention redirected to crypto and then divested.
 
+### 8. HVM4 fixes the technical objections — and is still unusable
+
+Reading the vendored HVM4 source (6,435 lines of C, one file, 68 doc files, 218
+tests) overturns two of the technical criticisms above. They applied to the HVM2
+*paper*; they do not apply to the current runtime.
+
+**It is lazy.** `wnf()` is a weak-head-normal-form evaluator; `ALO` terms expand
+the book one layer at a time on demand; only `USE` forces. Ordinary recursion
+works, and decisively, infinite corecursive data works —
+`@X = &Z{#Z{}, #S{@X}}` is an infinite superposition of every natural number and
+it evaluates. That is impossible under HVM2's eager model.
+
+**The higher-order cloning restriction is gone.** HVM4 has 24-bit labels (~16.7M)
+on `SUP`/`DUP`/`DP0`/`DP1`, plus *runtime-computed* labels via `DSU`/`DDU`.
+`DUP-SUP` branches on label equality: same label annihilates, different label
+commutes. The Church 2² term that HVM2 declared out of bounds now evaluates —
+the docs walk it in 14 interactions and call that optimal, with passing tests
+using distinct labels for the two copies. In place of the old silent-wrong-answer
+rule, the parser enforces a **static affinity check**: each variable is used at
+most once, and multiple uses require a `λ&x` annotation that makes the compiler
+insert a fresh-label DUP chain. The obligation moved from "the runtime
+misbehaves" to "annotate, and the compiler picks non-colliding labels."
+
+**The superposed search machinery is real and working.** `-C[N]` collapses a
+superposed term into enumerated solutions via a priority queue ordered by SUP
+depth minus `INC` credit, with `ERA` pruning failed branches.
+`devs/test/enum_nat.hvm` solves `x + 2 = 4` by enumeration over an infinite
+superposed nat; `enum_primes.hvm` factors a 20-bit semiprime the same way. This
+is no longer aspirational — it runs.
+
+None of which makes it adoptable:
+
+- **No license, definitively.** A whole-repo grep for
+  `copyright|licen[sc]e|MIT|Apache|GPL|SPDX` returns **zero matches**. No
+  LICENSE, NOTICE, author, or contact anywhere. All rights reserved.
+- **No library API.** `#define fn static inline` on essentially every function;
+  the whole file exports **one symbol, `main`**. Integration means
+  subprocess-and-scrape-stdout, not FFI. Global mutable state, non-reentrant,
+  not thread-safe, `exit(1)` on every error path.
+- **POSIX-only** (`sys/mman.h`, `mmap`, `realpath`) — will not build on Windows
+  without a shim, which is our platform.
+- **No types, no proof machinery.** It is a substrate. Anything proof-shaped is
+  ours to build on top.
+- **Live wrong-answer bugs.** `devs/issues/` contains `dyn_dup_bug.hvm`
+  (dynamic-label dup crashes on a numeric label, works on a variable one),
+  `fork_syntax_bug.hvm` ("the lines below should be equivalent, but aren't"),
+  and a regression test recording a recently-fixed miscompilation where a 3-use
+  auto-dup had the wrong de Bruijn index, producing "crashes or wrong results."
+- **Two unbounded writes to fixed stack buffers in the parser** — `u32 cs[4096]`
+  for string literals and `Term es[4096]` for list literals, no bounds check.
+  Since any harness would be *machine-generating* `.hvm` source, that is a
+  realistic hazard, not a theoretical one.
+- **An unguarded label-collision path.** Static labels are base64-packed from
+  their name while auto-dup labels allocate upward from `0x800000`, so a 4+
+  character label starting with an uppercase letter F-Z can collide with a
+  compiler-generated one — silently turning a commute into an annihilate, i.e. a
+  wrong answer. Nothing detects it. (Code-reading finding; nothing was executed.)
+
+Also worth noting for sandboxing: `#include` in an `.hvm` file honors **absolute
+paths**, so an untrusted source can make the parser read any file the process
+can read.
+
+### 9. Bend2 is a dependently typed proof assistant — evidence found
+
+The `WanShi` repo was listed in metadata as "Python, undocumented, 248 files."
+That is wrong: it contains **zero Python**. It is 246 `.bend` files, and its
+README reads "WanShi - A Standard Lib for Bend2."
+
+It is largely **dependently typed theorem proving**: `Set/` (`And`, `Or`, `Not`,
+`Iff`, `Exists`, `Forall`, `Implies`, `Iso`, Hilbert axioms, injectivity and
+bijection), `Algebra/` (magma through quasigroup, loop, cancellative,
+distributive), a large `Nat/`, plus `Proof/`, `LC/`, `Lambda/`, `TermRwtSys/`.
+The proofs are real: `Nat/add/commutative.bend` is an inductive proof using
+`match` / `rewrite` / `finally` tactics against an
+`Algebra/commutative<Nat,Nat>(Nat/add)` type. `Bend/Bend_LM.bend` defines Bend's
+own `Term` type in Bend — a self-representation.
+
+This is the strongest public evidence that **Bend2 is a proof assistant**, not
+just a parallel language, and it is a direction entirely absent from Bend 1
+(which greps zero for `dependent`/`theorem`/`proof assistant`). WanShi is the
+library *written in* Bend2, so it leaks the surface syntax and tactic vocabulary
+without disclosing the implementation. Unlicensed, so it is readable as
+intelligence and not usable as a corpus.
+
+Separately, a correction to the public record: **Bend 1 does have a type
+system** — an optional Hindley-Milner checker (`src/fun/check/type_check.rs`,
+785 lines of Algorithm W) enabled by default since 0.2.37. `FEATURES.md` still
+claims Bend is "an untyped language"; that text is stale.
+
 ## What is worth taking: the idea, not the dependency
 
 "Why parallelize when we can share?" is a legitimate critique of our current
@@ -319,6 +545,44 @@ results across candidates, captures the same economics as superposition in plain
 Rust with no soundness cost — caching a *verified* result is safe in a way that
 superposed reduction is not. This composes with the subsumption-dedup item
 already on the adopt list from the paper mining.
+
+The full source reads surfaced four more ideas worth transplanting, all
+independent of adopting any HVM code:
+
+1. **Inline-heuristic best-first enumeration.** `HVM3/src/HVM/Collapse.hs` flattens
+   a search tree with a stable min-priority-queue (`flattenPRI`) where two term
+   constructors, `CInc` and `CDec`, let the *generator emit its own search-priority
+   scores inline* — a promising branch marks itself and is dequeued earlier. That
+   is best-first proof search with the scoring function written in the object
+   language. We can adopt the shape (a priority queue over partial proofs where the
+   generator annotates promise) in Rust without any interaction-net machinery. It
+   is MIT-licensed, so the code is even readable as a reference.
+2. **Type-directed generation that only branches on hypothesis selection.** The
+   `enum_coc_smart.hvm` architecture — introductions and eliminations forced by the
+   goal type, choice confined to "which hypothesis to apply" — is a good template
+   for a tactic generator in any substrate, and it is the real source of its
+   speedups. Our decomposition/sketch pipeline should branch as little as the goal
+   structure forces.
+3. **The repeated-invariant discipline.** Bend's `desugar_book` re-runs
+   `check_unbound_vars()` three times between passes, explicitly commented as a
+   sanity check. Cheap insurance for our own long gate/transform pipelines.
+4. **The Agda interaction protocol.** `agda-cli` drives Agda over
+   `--interaction-json` with hand-written `IOTCM` s-expressions, getting goal
+   types, contexts, and errors back as JSON rather than scraped stderr. If our Agda
+   backend currently batch-runs and regexes stderr, this is the upgrade path — with
+   three fixes the repo itself gets wrong and that matter for a prover: add
+   `--safe`, fail on non-empty `visibleGoals` / `UnsolvedMetas` (not just on
+   `type:'error'`), and never trust the exit code (Agda exits 0 with type errors).
+
+None of these requires vendoring HOC code; item 1 is the only one where reading
+their MIT source helps, and even it is a re-implementation, not a dependency.
+
+Finally, a general hardening item this exercise argues for on its own: **make
+"exit status is not proof of success" a standing backend requirement.** Three
+independent systems in the vendored set — Metamath, HVM2, and two Kind
+generations — return 0 on failure. Our gate should force every backend to declare
+what positively constitutes proof of success (a stdout sentinel, a JSON verdict
+field, an empty-goals check) and treat exit status alone as never sufficient.
 
 ## Revisit triggers
 
@@ -352,23 +616,23 @@ is disproportionate risk for the available upside.
 
 Recorded honestly so the next reader knows what was and was not checked:
 
-- The `HigherOrderCO-archive` org is **fully enumerated**: all 21 repos, with
-  purpose, language, stars, license, creation and last-push dates, fork origin,
-  and lineage verified through rename redirects; plus `Kindex`'s corpus measured
-  at the git-tree level. What was **not** done is a full source read of each
-  archive repo — only `Kindex`, `kindbook`, `kind2-archive`, and `Kind2-old`
-  were opened beyond metadata. Given that every one of them is dead and 10 of 21
+- **All 27 vendored repos were source-read.** Both orgs are also fully enumerated
+  at metadata level (29 repos), with lineage verified through rename redirects.
+  The one thing deliberately not done is a full source read of the archive-org
+  repos that were *not* vendored locally; given that every one is dead and ~half
   are unlicensed, deeper reads would inform nothing actionable.
-- Two items on Taelin's **personal** account are the only artifacts here with
-  ongoing research value, and were not read in depth:
-  `VictorTaelin/Interaction-Calculus` (950 stars, maintained through 2025-11)
-  and `VictorTaelin/interaction-calculus-of-constructions` (81 stars, "a minimal
-  proof checker"). Both are unlicensed, like all 25+ of his personal repos, so
-  they are readable as research literature but not vendorable.
-- `x.com` returned HTTP 402, so all Taelin thread content is from search-engine
-  summaries rather than primary text. Lower confidence; not load-bearing for any
-  conclusion above.
-- HVM4's license absence was verified directly (`contents/LICENSE` 404s, GitHub
-  license field null).
-- No repo in either org was built or executed. All findings are from source
-  reading and published claims.
+- `interaction-calculus-of-constructions` (Taelin's "minimal proof checker", 81
+  stars) was **not** in the local set and was not read. It is the one remaining
+  artifact that could bear on the proof-search question; unlicensed, so readable
+  as literature only. A follow-up read is the single loose end worth picking up
+  if this line is revisited.
+- **Nothing was built or executed.** All findings are from source reading. Two
+  are explicitly code-reading-only and would need a test to confirm: HVM4's
+  label-collision path (4+ char labels colliding with the auto-dup range) and its
+  two fixed-buffer parser overflows.
+- `x.com` returned HTTP 402 during the web pass, so any Taelin thread content is
+  from search-engine summaries rather than primary text. Lower confidence; not
+  load-bearing for any conclusion here — the load-bearing findings are all from
+  vendored source.
+- The "42x faster than Bend" figure is **not present in any vendored repo** and
+  could not be substantiated; treat it as an unverified public claim.
