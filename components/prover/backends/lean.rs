@@ -928,9 +928,23 @@ impl FormalBackend for LeanBackend {
     /// [`SatisfiabilityWitness`]: crate::prover::vacuity::SatisfiabilityWitness
     fn satisfiability_witness(
         &self,
-        _stmt: &str,
+        stmt: &str,
     ) -> Option<crate::prover::vacuity::SatisfiabilityWitness> {
-        None
+        // A witness is CONSTRUCTED and checked here, never asserted. The searcher
+        // enumerates concrete values and evaluates every hypothesis against them,
+        // so a `Some` means an assignment was found that actually satisfies the
+        // bundle. That is the opposite of fabrication: the danger this hook
+        // guards against is claiming satisfiability without exhibiting anything.
+        let bundle = self.hypothesis_bundle(stmt)?;
+
+        // Both non-witness outcomes collapse to `None` on purpose.
+        // `NoWitnessInBounds` means the search ran and found nothing within its
+        // cap; `NotDecidable` means the bundle fell outside the fragment the
+        // searcher can evaluate at all. Neither is a witness, and the gate must
+        // treat them identically. They stay distinguishable via `tag()` for
+        // logging, but turning that distinction into a verdict here would let
+        // "we could not look" become "there is nothing to find".
+        crate::prover::witness_search::search_witness(&bundle).into_witness()
     }
 }
 
@@ -1103,11 +1117,39 @@ mod tier0_tests {
 
     /// No witness is ever fabricated: a fabricated one would rubber-stamp the
     /// proofs this gate exists to reject.
+    ///
+    /// This test used to assert `is_none()` unconditionally, back when the hook
+    /// was a stub. That was the right assertion for a stub and the wrong one for
+    /// a searcher: `(n : Nat) (hn : n > 0)` is satisfiable, and refusing to say
+    /// so is not soundness, it is silence. What must hold is that any witness
+    /// handed back was actually CHECKED, so the assertion is now that the
+    /// returned assignment really does satisfy the bundle.
     #[test]
-    fn no_witness_is_ever_fabricated() {
+    fn a_returned_witness_is_checked_not_fabricated() {
         let backend = LeanBackend::mock();
+        let stmt = "theorem pos (n : Nat) (hn : n > 0) : n ≠ 0";
+        let bundle = backend
+            .hypothesis_bundle(stmt)
+            .expect("this statement's binders and hypotheses are parseable");
+        let witness = backend
+            .satisfiability_witness(stmt)
+            .expect("n > 0 is satisfiable over Nat and lies inside the decidable fragment");
+        assert!(
+            crate::prover::vacuity::check_vacuity(&bundle, Some(&witness)).clean,
+            "a witness this backend hands out must survive the vacuity check it feeds"
+        );
+    }
+
+    /// Outside the searcher's fragment the answer is `None`, and `None` keeps the
+    /// gate fail-closed. The point is that "we cannot decide this" and "there is
+    /// no witness" must reach the gate as the same non-answer, never as a pass.
+    #[test]
+    fn an_undecidable_bundle_yields_no_witness() {
+        let backend = LeanBackend::mock();
+        // `Nat.Prime` is a predicate the searcher cannot evaluate, so the whole
+        // bundle is NotDecidable rather than partially satisfied.
         assert!(backend
-            .satisfiability_witness("theorem pos (n : Nat) (hn : n > 0) : n ≠ 0")
+            .satisfiability_witness("theorem p (n : Nat) (hn : Nat.Prime n) : n ≠ 0")
             .is_none());
     }
 
