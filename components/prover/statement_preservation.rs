@@ -11,7 +11,7 @@
 //!   *trivially-restated* theorem and splices it back onto the canonical name.
 //!   [`check_statement_preserved`] confirms the submitted proof declares the SAME
 //!   theorem signature (name + binders + conclusion, up to whitespace / a
-//!   best-effort alpha-rename) as the canonical statement — fail-closed when it
+//!   best-effort alpha-rename) as the canonical statement -- fail-closed when it
 //!   cannot confirm a match.
 //!
 //! * **Proof-search escape hatches** (DeepSeek-Prover-V2's reward-hacking
@@ -82,6 +82,10 @@ pub enum PreservationVerdict {
     /// The conclusion was replaced by a trivial proposition (`True` / `trivial`
     /// / `⊤`) — the canonical goal is not proved at all.
     TriviallyRestated,
+    /// The signature text matches, but the two sides declare DIFFERENT
+    /// definitional-equality / transparency elaboration options, so the same text
+    /// need not denote the same proposition (fail-closed).
+    ElaborationOptionsChanged,
     /// The canonical statement itself could not be parsed into a signature
     /// (fail-closed: we cannot confirm anything).
     CanonicalUnparsable,
@@ -107,6 +111,7 @@ impl PreservationVerdict {
             PreservationVerdict::BindersChanged => "binders_changed",
             PreservationVerdict::ConclusionChanged => "conclusion_changed",
             PreservationVerdict::TriviallyRestated => "trivially_restated",
+            PreservationVerdict::ElaborationOptionsChanged => "elaboration_options_changed",
             PreservationVerdict::CanonicalUnparsable => "canonical_unparsable",
             PreservationVerdict::SubmittedMissing => "submitted_missing",
         }
@@ -166,6 +171,51 @@ impl PreservationReport {
 /// signature, so an ambiguous or unparsable input fails closed rather than
 /// silently passing.
 pub fn check_statement_preserved(
+    canonical_statement: &str,
+    submitted_code: &str,
+) -> PreservationReport {
+    let base = check_lean_signature(canonical_statement, submitted_code);
+    // The elaboration-option guard can only ever turn an ACCEPTANCE into a
+    // rejection, so it runs last and only on a report that was about to pass.
+    // Applying it to an already-failing report would replace one accurate
+    // fail-closed diagnosis with a less specific one, which helps nobody.
+    if !base.preserved {
+        return base;
+    }
+    let mismatched = defeq_option_mismatches(canonical_statement, submitted_code);
+    if mismatched.is_empty() {
+        return base;
+    }
+    let listed = mismatched
+        .iter()
+        .map(|m| m.describe())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut out = report(
+        PreservationVerdict::ElaborationOptionsChanged,
+        vec![format!(
+            "unconfirmable elaboration options: the canonical statement and the submission \
+             disagree on {listed}. These options change Lean's DEFINITIONAL-EQUALITY / \
+             transparency rules, so the two sides elaborate the same signature TEXT under \
+             different rules and the text match does not establish that the same proposition \
+             was proved (fail-closed)"
+        )],
+        base.canonical.clone(),
+        base.submitted.clone(),
+    );
+    out.detail = json!({
+        "verdict": out.verdict.tag(),
+        "canonical": &out.canonical,
+        "submitted": &out.submitted,
+        "defeq_option_mismatches": &mismatched,
+    });
+    out
+}
+
+/// The Lean theorem-signature comparison, unchanged. Kept separate from
+/// [`check_statement_preserved`] so the elaboration-option guard wraps it rather
+/// than being threaded through every early return.
+fn check_lean_signature(
     canonical_statement: &str,
     submitted_code: &str,
 ) -> PreservationReport {
@@ -326,13 +376,197 @@ fn report(
 }
 
 // ===========================================================================
+// Elaboration-option pinning (Lean)
+// ===========================================================================
+//
+// WHY a purely TEXTUAL comparison is nonetheless affected by `set_option`.
+//
+// The obvious objection is that this module never elaborates anything, so an
+// elaboration option cannot change the strings it compares. That is true and
+// beside the point. The comparison is not the end of the pipeline: its output
+// feeds `verify_with_gates`, which conjoins `statement_preserved` with the
+// verdict of a compiler that DID elaborate the submission. So the claim this
+// module actually makes is not "the two texts are equal" but "the submission
+// proves the canonical proposition", and text equality only supports that claim
+// while both sides denote the same proposition.
+//
+// `set_option backward.isDefEq.respectTransparency false` (and its siblings)
+// changes Lean's definitional-equality rules, which decide which unifications
+// and instance resolutions succeed while a signature is elaborated. Two files
+// whose signature text is byte-identical can therefore elaborate to DIFFERENT
+// terms when only one of them sets such an option. The resource mining found
+// exactly this pairing in the wild: six vendored IMO2026 `problem.lean` files
+// and `RogersRamanujan/jacobi-identity/problem.lean` set the option while their
+// `solution.lean` does not.
+//
+// So the guard is real but narrow, and it is deliberately kept narrow: only
+// options that bear on defeq / transparency / kernel checking count. Resource
+// limits (`maxHeartbeats`, `maxRecDepth`) and pretty-printing options cannot
+// change what a signature MEANS and are ignored, because rejecting on those
+// would cost retries for no soundness.
+//
+// Direction: a MISMATCH in either direction is reported, not just a
+// submission-only setting. The asymmetric rule would miss the mined case, where
+// it is the canonical side that carries the option; and the risk is symmetric,
+// since either way the two sides are elaborated under different rules.
+
+/// Lean options that change definitional equality, transparency, or kernel
+/// checking, i.e. what a signature's TEXT denotes or whether it is checked at
+/// all. Anything not on this list (or under [`DEFEQ_OPTION_PREFIX`]) is treated
+/// as immaterial to preservation.
+const DEFEQ_ELABORATION_OPTIONS: [&str; 3] = [
+    // Controls whether `whnf`/`isDefEq` may unfold through `@[irreducible]` and
+    // friends while elaborating.
+    "smartUnfolding",
+    // Permits reducibility attributes to be changed on declarations that
+    // normally forbid it, which changes defeq for every later elaboration.
+    "allowUnsafeReducibility",
+    // Not defeq but strictly worse: it turns the kernel typecheck OFF, so a
+    // submission carrying it is not checked by the thing the gate trusts.
+    "debug.skipKernelTC",
+];
+
+/// Every `backward.isDefEq.*` compatibility flag (`respectTransparency`,
+/// `lazyProjDelta`, `lazyWhnfCore`, …) restores a pre-change defeq behavior, so
+/// the whole namespace is material.
+const DEFEQ_OPTION_PREFIX: &str = "backward.isDefEq";
+
+/// One option the canonical statement and the submission disagree about.
+// Serialize only: this is written into the gate's JSON report and never read
+// back, matching `DiscardedDecl`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DefeqOptionMismatch {
+    /// The Lean option name (`backward.isDefEq.respectTransparency`, …).
+    pub option: String,
+    /// The value the canonical statement sets, or `None` when it sets none.
+    pub canonical: Option<String>,
+    /// The value the submission sets, or `None` when it sets none.
+    pub submitted: Option<String>,
+}
+
+impl DefeqOptionMismatch {
+    /// A one-line rendering for a finding string.
+    pub fn describe(&self) -> String {
+        let show = |v: &Option<String>| match v {
+            Some(v) => format!("`{v}`"),
+            None => "unset".to_string(),
+        };
+        format!(
+            "`{}` (canonical: {}, submitted: {})",
+            self.option,
+            show(&self.canonical),
+            show(&self.submitted)
+        )
+    }
+}
+
+/// Whether `name` is an option that can change what a signature denotes.
+fn is_defeq_option(name: &str) -> bool {
+    name == DEFEQ_OPTION_PREFIX
+        || name.starts_with(&format!("{DEFEQ_OPTION_PREFIX}."))
+        || DEFEQ_ELABORATION_OPTIONS.contains(&name)
+}
+
+/// Every `set_option <name> <value>` in `code`, in source order, read over
+/// comment/string-stripped source so a `set_option` discussed in a docstring
+/// does not count as one that was set.
+///
+/// The value is the single token after the name, which is what every boolean /
+/// numeric option uses. A `set_option … in <decl>` scoped form is NOT tracked as
+/// scoped: it is recorded like any other setting, so a scoped option counts for
+/// the whole file. That over-counts, and over-counting can only add a
+/// (retry-costing) rejection, never an acceptance.
+fn elaboration_option_settings(code: &str) -> Vec<(String, String)> {
+    let chars: Vec<char> = sanitize_lean(code).chars().collect();
+    let mut out = Vec::new();
+    for pos in token_positions(&chars, "set_option") {
+        let mut i = pos + "set_option".chars().count();
+        while chars.get(i).is_some_and(|c| c.is_whitespace()) {
+            i += 1;
+        }
+        let name_start = i;
+        while chars.get(i).is_some_and(|&c| is_name(c)) {
+            i += 1;
+        }
+        let name: String = chars[name_start..i].iter().collect();
+        if name.is_empty() {
+            continue;
+        }
+        // Only spaces/tabs may separate the name from its value: a value on the
+        // NEXT line would be a different command.
+        while matches!(chars.get(i), Some(' ') | Some('\t')) {
+            i += 1;
+        }
+        let value_start = i;
+        while chars.get(i).is_some_and(|&c| !c.is_whitespace()) {
+            i += 1;
+        }
+        let value: String = chars[value_start..i].iter().collect();
+        out.push((name, value));
+    }
+    out
+}
+
+/// The effective (last-wins) setting of each defeq-material option in `code`.
+fn defeq_option_settings(code: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (name, value) in elaboration_option_settings(code) {
+        if !is_defeq_option(&name) {
+            continue;
+        }
+        match out.iter_mut().find(|(n, _)| *n == name) {
+            Some(slot) => slot.1 = value,
+            None => out.push((name, value)),
+        }
+    }
+    out
+}
+
+/// Options whose effective setting differs between the canonical statement and
+/// the submission, in a deterministic order (canonical-side options first, then
+/// the submission-only ones).
+fn defeq_option_mismatches(
+    canonical_statement: &str,
+    submitted_code: &str,
+) -> Vec<DefeqOptionMismatch> {
+    let canonical = defeq_option_settings(canonical_statement);
+    let submitted = defeq_option_settings(submitted_code);
+    let mut out = Vec::new();
+    for (name, cvalue) in &canonical {
+        let svalue = submitted.iter().find(|(n, _)| n == name).map(|(_, v)| v);
+        if svalue != Some(cvalue) {
+            out.push(DefeqOptionMismatch {
+                option: name.clone(),
+                canonical: Some(cvalue.clone()),
+                submitted: svalue.cloned(),
+            });
+        }
+    }
+    for (name, svalue) in &submitted {
+        if !canonical.iter().any(|(n, _)| n == name) {
+            out.push(DefeqOptionMismatch {
+                option: name.clone(),
+                canonical: None,
+                submitted: Some(svalue.clone()),
+            });
+        }
+    }
+    out
+}
+
+// ===========================================================================
 // Per-system entry-signature preservation (Agda / Metamath)
 // ===========================================================================
 
 /// Per-system statement-signature preservation check.
 ///
-/// For Lean / Candle this delegates verbatim to [`check_statement_preserved`]
-/// (the theorem-signature parser), so their gate behavior is unchanged.
+/// For Lean this delegates verbatim to [`check_statement_preserved`] (the
+/// theorem-signature parser), so its gate behavior is unchanged.
+/// **Candle** gets its own [`check_candle_signature`]: a HOL Light proof is an
+/// OCaml script (`let FOO = prove(`…`, tac);;`) with no `theorem` / `lemma`
+/// keyword anywhere, so the Lean parser found nothing and returned
+/// [`CanonicalUnparsable`](PreservationVerdict::CanonicalUnparsable) for every
+/// Candle input, live or not.
 /// **Rocq** gets its own [`check_rocq_signature`]: Rocq vernacular is
 /// capitalized (`Theorem` / `Lemma` / …) and period-terminated, which is a
 /// different grammar from Lean's `name binders : type := proof`, so the Lean
@@ -373,19 +607,9 @@ pub fn check_entry_signature(
         FormalSystem::Metamath => check_metamath_signature(canonical_statement, submitted_code),
         FormalSystem::Isabelle => check_isabelle_signature(canonical_statement, submitted_code),
         FormalSystem::Rocq => check_rocq_signature(canonical_statement, submitted_code),
+        FormalSystem::Candle => check_candle_signature(canonical_statement, submitted_code),
         // Lean: the theorem-signature path this module was written for.
-        //
-        // Candle is routed here too, UNCHANGED and knowingly fail-closed: a HOL
-        // Light proof is an OCaml script (`let FOO = prove(`…`, tac);;`) with no
-        // `theorem`/`lemma` keyword at all, so the canonical statement never
-        // parses and the verdict is `CanonicalUnparsable`. That is the safe
-        // direction (no Candle proof can pass on an unchecked signature), but it
-        // means live Candle needs its OWN signature check, in the shape of
-        // `check_rocq_signature` / `check_isabelle_signature`, parsing the
-        // `prove(`term`, …)` form. It is deliberately not half-done here.
-        FormalSystem::Lean | FormalSystem::Candle => {
-            check_statement_preserved(canonical_statement, submitted_code)
-        }
+        FormalSystem::Lean => check_statement_preserved(canonical_statement, submitted_code),
     }
 }
 
@@ -926,6 +1150,364 @@ fn rocq_signature_end(chars: &[char], start: usize) -> usize {
 fn rocq_section_binder(sanitized: &str) -> Option<&'static str> {
     let chars: Vec<char> = sanitized.chars().collect();
     ROCQ_SECTION_BINDERS
+        .into_iter()
+        .find(|kw| !token_positions(&chars, kw).is_empty())
+}
+
+// --- Candle (HOL Light) ----------------------------------------------------
+//
+// READ THIS FIRST: **no Candle canonical statement in this repository carries a
+// proposition today.** That is not a guess; it is what the call sites show.
+//
+// * `backends/candle.rs` calls `verify(cfg, code, stmt)` with `stmt` a bare
+//   ENTRY NAME: `"TRUTH_THM"`, `"FAKE"`, `"AX"`, `"T_THM"`. A name asserts
+//   nothing.
+// * In production `stmt` is `job.task.statement`, free-form prose or a bare HOL
+//   term. `reason::proving::formal_generate::assemble_proof` shows the shape the
+//   pipeline actually holds for Candle: it takes a bare `goal` term and builds
+//   ``let t = prove(`{goal}`, {tactic});;`` as the CODE. The `let … = prove(…)`
+//   wrapper is manufactured on the proof side; the statement side never has it.
+//
+// So for every Candle input this checker sees today, the canonical statement
+// parses to NOTHING and the verdict is `CanonicalUnparsable`, which is
+// fail-closed, so a live Candle proof still cannot pass the gate. That outcome is
+// deliberate and must not be "fixed" by relaxing the parser: with no proposition
+// on the canonical side there is nothing to preserve, so an acceptance would
+// certify only that the submission declares a binding with the right NAME. A
+// name match is exactly the statement-substitution attack this module exists to
+// stop.
+//
+// What is built below is therefore the parser for the form a Candle canonical
+// statement MUST take before the gate can ever open: ``let NAME = prove(`term`,
+// …);;``. When a caller starts handing that shape in (the right fix, upstream in
+// whatever renders `task.statement` for Candle), preservation becomes meaningful
+// and this check enforces it. Until then it fails closed, loudly, with a finding
+// that says which shape is missing.
+//
+// Parsing notes specific to HOL Light / OCaml:
+// * the proposition lives inside BACKQUOTES; it is the term `prove` is asked to
+//   establish, and it is the only text worth comparing;
+// * comments are `(* … *)` and NEST; strings are `"…"`; a phrase ends at `;;`;
+// * there is no binder region (HOL Light quantifies inside the term), so the
+//   alpha-rename rescue in `sig_matches` never fires here (it needs a non-empty
+//   binder list) and comparison is exact up to whitespace. A renamed bound
+//   variable inside the term is a rejection, i.e. a retry, never an acceptance.
+
+/// HOL Light commands that REBIND existing term syntax: they change what a
+/// backquoted term text parses to, so a byte-identical conclusion need not be
+/// the same proposition. Their presence is unconfirmable and fails closed.
+///
+/// `new_definition` and `new_recursive_definition` are deliberately NOT here:
+/// HOL Light refuses to redefine an already-defined constant, so a new
+/// definition cannot change the meaning of a canonical term that was written
+/// before it.
+const CANDLE_INTERFACE_COMMANDS: [&str; 7] = [
+    "override_interface",
+    "overload_interface",
+    "make_overloadable",
+    "parse_as_infix",
+    "parse_as_prefix",
+    "parse_as_binder",
+    "new_type_abbrev",
+];
+
+/// Confirm a submitted Candle (HOL Light `.ml`) script proves the canonical
+/// statement.
+///
+/// Fail-closed like every other path here: `preserved` is true only when the
+/// canonical statement parsed into a ``let NAME = prove(`term`, …)`` binding,
+/// the submission binds the SAME name the same way, and the two terms agree up
+/// to whitespace.
+///
+/// KNOWN LIMITATION, stated rather than papered over, and the same one the Rocq
+/// path carries: this compares term TEXT. A submission that loads a theory
+/// rebinding an operator changes what its own term text denotes. The detectable
+/// rebinding commands are refused above; an `#use`d file that does the same
+/// thing out of sight is not, and the kernel run plus the axiom audit remain the
+/// authority on what was actually proved.
+fn check_candle_signature(canonical_statement: &str, submitted_code: &str) -> PreservationReport {
+    let canonical_src = sanitize_candle(canonical_statement);
+    let submitted_src = sanitize_candle(submitted_code);
+
+    let Some(canonical) = parse_candle_decls(&canonical_src).into_iter().next() else {
+        return report(
+            PreservationVerdict::CanonicalUnparsable,
+            vec![
+                "Candle canonical statement carries NO proposition: it did not parse into a \
+                 HOL Light `let NAME = prove(`term`, …);;` binding. Today's Candle callers \
+                 pass a bare entry name or a bare term, neither of which asserts anything, \
+                 so there is nothing to preserve and this fails closed. Fix the caller to \
+                 hand over the `let NAME = prove(`term`, …)` form; do NOT relax this check, \
+                 because accepting a name-only statement would certify a proof of a \
+                 DIFFERENT theorem bound to the right name"
+                    .to_string(),
+            ],
+            None,
+            None,
+        );
+    };
+    // A canonical statement that itself rebinds syntax does not denote a fixed
+    // proposition, so there is nothing well-defined to preserve.
+    if let Some(kw) = candle_interface_command(&canonical_src) {
+        return report(
+            PreservationVerdict::CanonicalUnparsable,
+            vec![format!(
+                "Candle canonical statement calls `{kw}`, which rebinds term syntax, so the \
+                 proposition its term text denotes is not fixed (fail-closed: cannot confirm \
+                 preservation)"
+            )],
+            None,
+            None,
+        );
+    }
+    if let Some(kw) = candle_interface_command(&submitted_src) {
+        return report(
+            PreservationVerdict::ConclusionChanged,
+            vec![format!(
+                "unconfirmable Candle term syntax: the submission calls `{kw}`, which rebinds \
+                 how a term is parsed, so a matching term TEXT does not establish that `{}` \
+                 proves the canonical proposition (fail-closed)",
+                canonical.name
+            )],
+            Some(canonical),
+            None,
+        );
+    }
+
+    let submitted = parse_candle_decls(&submitted_src);
+    if let Some(by_name) = submitted.iter().find(|d| d.name == canonical.name) {
+        // `classify` is shared with the other systems. Its trivial-restatement
+        // vocabulary (`True` / `trivial` / `⊤`) does not include HOL Light's `T`,
+        // so a `T` restatement is reported as `ConclusionChanged` instead. Both
+        // are fail-closed, and teaching the shared helper a new trivial token
+        // would change the Lean path, which this work must not do.
+        let (verdict, findings) = classify(&canonical, by_name);
+        return report(verdict, findings, Some(canonical), Some(by_name.clone()));
+    }
+    if let Some(renamed) = submitted
+        .iter()
+        .find(|d| sig_matches(&canonical, d).is_some())
+    {
+        return report(
+            PreservationVerdict::Renamed,
+            vec![format!(
+                "renamed statement: the canonical theorem `{}` is proved under the \
+                 different name `{}`, so the canonical name is never established",
+                canonical.name, renamed.name
+            )],
+            Some(canonical),
+            Some(renamed.clone()),
+        );
+    }
+    report(
+        PreservationVerdict::SubmittedMissing,
+        vec![format!(
+            "missing statement: no `let {} = prove(`…`, …)` binding in the submission proves \
+             the canonical theorem (name + term not found)",
+            canonical.name
+        )],
+        Some(canonical),
+        None,
+    )
+}
+
+/// Replace HOL Light / OCaml `(* … *)` comments (which NEST) and `"…"` string
+/// literals with spaces, preserving newlines and the char count.
+///
+/// Backquoted TERM regions are copied VERBATIM and nothing inside them is
+/// interpreted as a comment or string delimiter. That is the whole point: the
+/// term is the proposition this check compares, so blanking any part of it would
+/// compare two truncated texts — and two different statements that differ only
+/// inside the blanked region would then compare EQUAL, which is a false
+/// acceptance. An apostrophe or a `(*`-looking glyph inside a term is term
+/// syntax, not a delimiter.
+///
+/// The shared [`crate::prover::formal::strip_comments`] is not used here for the
+/// same reason it is not used for Rocq: it knows `--` and `//` line comments,
+/// which HOL Light does not have, and it does not protect backquoted terms.
+fn sanitize_candle(code: &str) -> String {
+    let chars: Vec<char> = code.chars().collect();
+    let mut out = String::with_capacity(chars.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        if c == '(' && next == Some('*') {
+            out.push(' ');
+            out.push(' ');
+            let end = skip_candle_comment(&chars, i + 2);
+            for &inner in &chars[i + 2..end.min(chars.len())] {
+                out.push(if inner == '\n' { '\n' } else { ' ' });
+            }
+            i = end;
+            continue;
+        }
+        if c == '"' {
+            out.push(' ');
+            i += 1;
+            while i < chars.len() {
+                let s = chars[i];
+                if s == '\\' && i + 1 < chars.len() {
+                    out.push(' ');
+                    out.push(if chars[i + 1] == '\n' { '\n' } else { ' ' });
+                    i += 2;
+                    continue;
+                }
+                out.push(if s == '\n' { '\n' } else { ' ' });
+                i += 1;
+                if s == '"' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if c == '`' {
+            // Copy the whole backquoted term verbatim, delimiters included.
+            out.push('`');
+            i += 1;
+            while i < chars.len() {
+                let t = chars[i];
+                out.push(t);
+                i += 1;
+                if t == '`' {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// Index just past a nested `(* … *)` comment whose body starts at `i`.
+fn skip_candle_comment(chars: &[char], mut i: usize) -> usize {
+    let mut depth = 1usize;
+    while i < chars.len() && depth > 0 {
+        if chars.get(i) == Some(&'(') && chars.get(i + 1) == Some(&'*') {
+            depth += 1;
+            i += 2;
+        } else if chars.get(i) == Some(&'*') && chars.get(i + 1) == Some(&')') {
+            depth -= 1;
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    i
+}
+
+/// Parse every ``let NAME = prove(`term`, …)`` binding in ALREADY-SANITIZED
+/// source, in source order.
+///
+/// A `let` binding whose right-hand side is anything else (`let X = TRUTH;;`,
+/// `let X = REWRITE_RULE [th] y;;`) is SKIPPED, not guessed at: it carries no
+/// term for this check to compare, and inventing one would be the permissive
+/// direction.
+fn parse_candle_decls(sanitized: &str) -> Vec<TheoremSig> {
+    let chars: Vec<char> = sanitized.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let boundary = i == 0 || !is_word(chars[i - 1]);
+        if boundary
+            && i + 3 <= chars.len()
+            && chars[i..i + 3] == ['l', 'e', 't']
+            && chars.get(i + 3).map_or(true, |&c| !is_word(c))
+        {
+            if let Some((sig, consumed)) = parse_candle_decl_at(&chars, i + 3) {
+                out.push(sig);
+                i = consumed;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Parse one binding whose `let` keyword ended at `after_kw`. `None` whenever the
+/// exact ``NAME = prove(`term`` shape is not present (fail-closed).
+fn parse_candle_decl_at(chars: &[char], after_kw: usize) -> Option<(TheoremSig, usize)> {
+    let mut i = after_kw;
+    let skip_ws = |chars: &[char], mut k: usize| {
+        while chars.get(k).is_some_and(|c| c.is_whitespace()) {
+            k += 1;
+        }
+        k
+    };
+    i = skip_ws(chars, i);
+    // `let rec NAME = …` binds the same way.
+    if i + 3 <= chars.len()
+        && chars[i..i + 3] == ['r', 'e', 'c']
+        && chars.get(i + 3).map_or(true, |&c| !is_word(c))
+    {
+        i = skip_ws(chars, i + 3);
+    }
+    // An OCaml binding site names a FRESH identifier, which cannot be dotted, so
+    // `is_word` (not `is_name`) is right here.
+    let name_start = i;
+    while chars.get(i).is_some_and(|&c| is_word(c)) {
+        i += 1;
+    }
+    let name: String = chars[name_start..i].iter().collect();
+    if name.is_empty() {
+        return None;
+    }
+    i = skip_ws(chars, i);
+    // A single `=`; `==` is a comparison, not a binding.
+    if chars.get(i) != Some(&'=') || chars.get(i + 1) == Some(&'=') {
+        return None;
+    }
+    i = skip_ws(chars, i + 1);
+    // The right-hand side must be a `prove` call, and nothing else.
+    if !(i + 5 <= chars.len()
+        && chars[i..i + 5] == ['p', 'r', 'o', 'v', 'e']
+        && chars.get(i + 5).map_or(true, |&c| !is_word(c)))
+    {
+        return None;
+    }
+    i = skip_ws(chars, i + 5);
+    if chars.get(i) != Some(&'(') {
+        return None;
+    }
+    i = skip_ws(chars, i + 1);
+    if chars.get(i) != Some(&'`') {
+        return None;
+    }
+    let term_start = i + 1;
+    let mut term_end = term_start;
+    while term_end < chars.len() && chars[term_end] != '`' {
+        term_end += 1;
+    }
+    if term_end >= chars.len() {
+        // Unterminated term: refuse rather than compare a truncated proposition.
+        return None;
+    }
+    let conclusion = norm_ws(&chars[term_start..term_end].iter().collect::<String>());
+    if conclusion.is_empty() {
+        return None;
+    }
+    // Resume after the phrase terminator so the tactic script cannot be
+    // re-scanned as further declarations.
+    let mut end = term_end + 1;
+    while end + 1 < chars.len() && !(chars[end] == ';' && chars[end + 1] == ';') {
+        end += 1;
+    }
+    let consumed = if end + 1 < chars.len() {
+        end + 2
+    } else {
+        chars.len()
+    };
+    Some((entry_sig("let", &name, &conclusion), consumed))
+}
+
+/// The first syntax-rebinding HOL Light command in ALREADY-SANITIZED source, if
+/// any. See [`CANDLE_INTERFACE_COMMANDS`] for why it is fail-closed.
+fn candle_interface_command(sanitized: &str) -> Option<&'static str> {
+    let chars: Vec<char> = sanitized.chars().collect();
+    CANDLE_INTERFACE_COMMANDS
         .into_iter()
         .find(|kw| !token_positions(&chars, kw).is_empty())
 }
@@ -2030,10 +2612,35 @@ const ESCAPE_HATCHES: &[(&str, &str, &str)] = &[
         "open goal admitted with `admit` (no proof)",
     ),
     (
+        // `sorryAx` is the axiom `sorry` ELABORATES TO, and it does not match the
+        // `sorry` token: matching is word-boundary aware ([`token_positions`]), so
+        // `sorry` deliberately stops at `sorryAx`/`sorry'`. Writing the axiom by
+        // name is therefore a rename that walks past the `sorry` ban unless it is
+        // listed on its own line, which is what this entry is.
+        "sorryAx",
+        "sorryAx",
+        "open goal admitted through the `sorryAx` axiom (the term `sorry` \
+         elaborates to) — no proof",
+    ),
+    (
         "native_decide",
         "native_decide",
         "goal closed by the compiled `native_decide` evaluator — a trust hole the \
          kernel does not re-check (config-level escape hatch)",
+    ),
+    (
+        // Lean's tactic-CONFIG spelling of the line above: `decide +native` (and
+        // `decide +kernel +native`, in any flag order) runs the same compiled
+        // evaluator as `native_decide`. Matched as the bare `+native` flag so the
+        // order of the flags does not matter. The leading `+` is not an
+        // identifier char, so a boundary is required only on the trailing end,
+        // and a preceding identifier char suppresses the match — the arithmetic
+        // `x+native` is not flagged.
+        "+native",
+        "+native",
+        "goal closed by the compiled evaluator via the `+native` tactic config \
+         flag (`decide +native`) -- the same trust hole as `native_decide` under \
+         another spelling",
     ),
     (
         "apply?",
@@ -2838,18 +3445,17 @@ def aux : Nat := 0
 
     // -- per-system entry signature (Rocq / Agda / Metamath) ----------------
 
-    /// `check_entry_signature` delegates the Lean and Candle paths to
-    /// `check_statement_preserved` unchanged (no regression). Rocq no longer
-    /// delegates: it has its own parser (see the `rocq_*` tests below).
+    /// `check_entry_signature` delegates the LEAN path to
+    /// `check_statement_preserved` unchanged (no regression). Rocq and Candle no
+    /// longer delegate: each has its own parser (see the `rocq_*` / `candle_*`
+    /// tests below).
     #[test]
-    fn entry_signature_delegates_for_lean_family() {
+    fn entry_signature_delegates_for_lean() {
         let canonical = "theorem T (n : Nat) (h : n > 0) : n ≥ 1";
         let submitted = "theorem T (n : Nat) : n ≥ 1 := by omega";
-        for sys in [FormalSystem::Lean, FormalSystem::Candle] {
-            let a = check_entry_signature(sys, canonical, submitted);
-            let b = check_statement_preserved(canonical, submitted);
-            assert_eq!(a.verdict, b.verdict, "{sys:?} must delegate unchanged");
-        }
+        let a = check_entry_signature(FormalSystem::Lean, canonical, submitted);
+        let b = check_statement_preserved(canonical, submitted);
+        assert_eq!(a, b, "Lean must delegate unchanged");
     }
 
     /// Lean is untouched by the Rocq work: every Lean verdict still comes from
@@ -3129,6 +3735,433 @@ def aux : Nat := 0
         assert_eq!(first, second, "the check must be deterministic");
     }
 
+    // -- Candle (HOL Light) -------------------------------------------------
+
+    /// THE FINDING, pinned as a test: the canonical statements Candle callers
+    /// pass TODAY carry no proposition, so nothing can be preserved and the gate
+    /// stays shut. `backends/candle.rs` passes a bare entry name; the hammer path
+    /// holds a bare term. Neither asserts that a particular theorem was proved.
+    ///
+    /// If this test ever starts failing because a verdict became `Preserved`,
+    /// the acceptance is WRONG unless the canonical statement gained a real
+    /// `let NAME = prove(`term`, …)` form.
+    #[test]
+    fn candle_canonical_statements_carry_no_proposition_today() {
+        // The shape `backends/candle.rs` uses: a bare entry name.
+        let bare_name = check_entry_signature(
+            FormalSystem::Candle,
+            "TRUTH_THM",
+            "let TRUTH_THM = TRUTH;;\n",
+        );
+        assert!(
+            !bare_name.preserved,
+            "a bare entry name asserts nothing and must never certify: {bare_name:?}"
+        );
+        assert_eq!(bare_name.verdict, PreservationVerdict::CanonicalUnparsable);
+        assert!(
+            bare_name.findings.iter().any(|f| f.contains("NO proposition")),
+            "the finding must say the statement carries no proposition: {:?}",
+            bare_name.findings
+        );
+
+        // The shape the hammer path holds: a bare HOL Light term, no binding.
+        let bare_term = check_entry_signature(
+            FormalSystem::Candle,
+            "!x. x = x",
+            "let t = prove(`!x. x = x`, MESON_TAC[]);;\n",
+        );
+        assert!(!bare_term.preserved, "{bare_term:?}");
+        assert_eq!(bare_term.verdict, PreservationVerdict::CanonicalUnparsable);
+
+        // A non-`prove` binding carries no term either, on either side.
+        let no_term = check_entry_signature(
+            FormalSystem::Candle,
+            "let TRUTH_THM = TRUTH;;",
+            "let TRUTH_THM = TRUTH;;\n",
+        );
+        assert!(!no_term.preserved, "{no_term:?}");
+        assert_eq!(no_term.verdict, PreservationVerdict::CanonicalUnparsable);
+    }
+
+    /// The form the gate CAN check: same name, same term, different tactic.
+    /// This is what a Candle canonical statement has to look like before
+    /// preservation means anything.
+    #[test]
+    fn candle_prove_binding_is_preserved() {
+        let canonical = "let SQ_NONNEG = prove(`!x. &0 <= x * x`, REAL_ARITH_TAC);;";
+        let submitted = "(* a HOL Light script *)\n\
+                         let SQ_NONNEG = prove(`!x. &0 <= x * x`,\n\
+                         \x20 MESON_TAC[REAL_LE_SQUARE; REAL_MUL_SYM]);;\n";
+        let r = check_entry_signature(FormalSystem::Candle, canonical, submitted);
+        assert!(r.preserved, "the same term must certify: {r:?}");
+        assert_eq!(r.verdict, PreservationVerdict::Preserved);
+        assert!(r.findings.is_empty());
+        assert_eq!(
+            r.canonical.as_ref().map(|s| s.kind.as_str()),
+            Some("let"),
+            "the HOL Light declaration keyword is `let`"
+        );
+        assert_eq!(
+            r.submitted.as_ref().map(|s| s.conclusion.as_str()),
+            Some("!x. &0 <= x * x")
+        );
+    }
+
+    /// Whitespace inside the backquoted term is normalized, but the term is
+    /// compared WHOLE: a weakened or altered proposition is rejected.
+    #[test]
+    fn candle_altered_term_is_rejected() {
+        let canonical = "let T1 = prove(`!x. &0 <= x * x`, REAL_ARITH_TAC);;";
+
+        let spaced = check_entry_signature(
+            FormalSystem::Candle,
+            canonical,
+            "let T1 = prove(`!x.   &0 <=   x * x`, REAL_ARITH_TAC);;\n",
+        );
+        assert!(spaced.preserved, "whitespace only: {spaced:?}");
+
+        let weaker = check_entry_signature(
+            FormalSystem::Candle,
+            canonical,
+            "let T1 = prove(`!x. &0 <= x * x + &1`, REAL_ARITH_TAC);;\n",
+        );
+        assert!(!weaker.preserved, "{weaker:?}");
+        assert_eq!(weaker.verdict, PreservationVerdict::ConclusionChanged);
+
+        // HOL Light's trivial proposition is `T`. `classify` does not know that
+        // token (teaching it would change the Lean path), so this lands as an
+        // altered conclusion, a different label for the same fail-closed answer.
+        let trivial = check_entry_signature(
+            FormalSystem::Candle,
+            canonical,
+            "let T1 = prove(`T`, REWRITE_TAC[]);;\n",
+        );
+        assert!(!trivial.preserved, "{trivial:?}");
+        assert_eq!(trivial.verdict, PreservationVerdict::ConclusionChanged);
+    }
+
+    /// A rename cheat and an outright miss are distinguished, both fail-closed.
+    #[test]
+    fn candle_renamed_and_missing_are_rejected() {
+        let canonical = "let T1 = prove(`!x. x = x`, MESON_TAC[]);;";
+
+        let renamed = check_entry_signature(
+            FormalSystem::Candle,
+            canonical,
+            "let OTHER = prove(`!x. x = x`, MESON_TAC[]);;\n",
+        );
+        assert!(!renamed.preserved, "{renamed:?}");
+        assert_eq!(renamed.verdict, PreservationVerdict::Renamed);
+
+        let missing = check_entry_signature(
+            FormalSystem::Candle,
+            canonical,
+            "let OTHER = prove(`!x. x + 0 = x`, ARITH_TAC);;\n",
+        );
+        assert!(!missing.preserved, "{missing:?}");
+        assert_eq!(missing.verdict, PreservationVerdict::SubmittedMissing);
+
+        // The right name bound to something with no term at all is not a proof
+        // of the canonical statement.
+        let no_term = check_entry_signature(
+            FormalSystem::Candle,
+            canonical,
+            "let T1 = TRUTH;;\n",
+        );
+        assert!(!no_term.preserved, "{no_term:?}");
+        assert_eq!(no_term.verdict, PreservationVerdict::SubmittedMissing);
+    }
+
+    /// A binding that exists only inside an OCaml `(* … *)` comment or a string
+    /// literal cannot establish preservation, and a comment cannot mask a
+    /// substituted term.
+    #[test]
+    fn candle_comment_or_string_cannot_spoof_preservation() {
+        let canonical = "let T1 = prove(`!x. x = x`, MESON_TAC[]);;";
+
+        let only_in_comment = check_entry_signature(
+            FormalSystem::Candle,
+            canonical,
+            "(* let T1 = prove(`!x. x = x`, MESON_TAC[]);; *)\n",
+        );
+        assert!(!only_in_comment.preserved, "{only_in_comment:?}");
+        assert_eq!(
+            only_in_comment.verdict,
+            PreservationVerdict::SubmittedMissing
+        );
+
+        let only_in_string = check_entry_signature(
+            FormalSystem::Candle,
+            canonical,
+            "let msg = \"let T1 = prove(`!x. x = x`, MESON_TAC[]);;\";;\n",
+        );
+        assert!(!only_in_string.preserved, "{only_in_string:?}");
+
+        let decoy = check_entry_signature(
+            FormalSystem::Candle,
+            canonical,
+            "(* let T1 = prove(`!x. x = x`, MESON_TAC[]);; *)\n\
+             let T1 = prove(`!x. x = x + 0`, ARITH_TAC);;\n",
+        );
+        assert!(!decoy.preserved, "{decoy:?}");
+        assert_eq!(decoy.verdict, PreservationVerdict::ConclusionChanged);
+
+        // A nested comment must not end early and expose the decoy as code.
+        let nested = check_entry_signature(
+            FormalSystem::Candle,
+            canonical,
+            "(* outer (* inner *) let T1 = prove(`!x. x = x`, MESON_TAC[]);; *)\n",
+        );
+        assert!(!nested.preserved, "{nested:?}");
+    }
+
+    /// A submission that rebinds term syntax fails closed: matching term TEXT
+    /// then does not mean a matching proposition.
+    #[test]
+    fn candle_syntax_rebinding_fails_closed() {
+        let r = check_entry_signature(
+            FormalSystem::Candle,
+            "let T1 = prove(`!x. x <= x`, REAL_ARITH_TAC);;",
+            "override_interface(\"<=\", `subset:A->A->bool`);;\n\
+             let T1 = prove(`!x. x <= x`, MESON_TAC[]);;\n",
+        );
+        assert!(
+            !r.preserved,
+            "a rebound operator must not certify on text alone: {r:?}"
+        );
+        assert_eq!(r.verdict, PreservationVerdict::ConclusionChanged);
+        assert!(r.findings.iter().any(|f| f.contains("override_interface")));
+    }
+
+    /// Candle is deterministic and panic-free on non-ASCII and on truncated
+    /// input (an unterminated term or comment must fail closed, not hang).
+    #[test]
+    fn candle_is_deterministic_and_panic_free() {
+        let canonical = "let Tβ = prove(`!x. x ≤ x`, MESON_TAC[]);;";
+        let submitted = "let Tβ = prove(`!x. x ≤ x`, MESON_TAC[]);;\n";
+        let a = check_entry_signature(FormalSystem::Candle, canonical, submitted);
+        let b = check_entry_signature(FormalSystem::Candle, canonical, submitted);
+        assert_eq!(a, b, "the check must be deterministic");
+
+        let truncated =
+            check_entry_signature(FormalSystem::Candle, "let T1 = prove(`!x. x = x", "let T1 =");
+        assert!(!truncated.preserved);
+        let unterminated_comment =
+            check_entry_signature(FormalSystem::Candle, canonical, "(* let T1 = prove(`x`,");
+        assert!(!unterminated_comment.preserved);
+        let _ = check_entry_signature(FormalSystem::Candle, "", "");
+        let _ = check_entry_signature(FormalSystem::Candle, "λ π ∞", "`` ;; let");
+    }
+
+    /// The Candle work must not touch Lean: every Lean verdict still comes from
+    /// `check_statement_preserved`, byte for byte, and lowercase `let` is not a
+    /// Lean declaration keyword.
+    #[test]
+    fn lean_path_is_unchanged_by_the_candle_parser() {
+        let cases = [
+            (
+                "theorem T (n : Nat) : n = n",
+                "theorem T (n : Nat) : n = n := rfl",
+            ),
+            (
+                "theorem T (n : Nat) : n = n",
+                "theorem T (m : Nat) : m = m := rfl",
+            ),
+            (
+                "theorem T (n : Nat) (h : n > 0) : n ≥ 1",
+                "theorem T (n : Nat) : n ≥ 1 := by omega",
+            ),
+            (
+                "theorem T (n : Nat) : n = n + 0",
+                "theorem T (n : Nat) : True := trivial",
+            ),
+            ("theorem T : True", "let T = prove(`T`, REWRITE_TAC[]);;"),
+        ];
+        for (canonical, submitted) in cases {
+            let via_entry = check_entry_signature(FormalSystem::Lean, canonical, submitted);
+            let direct = check_statement_preserved(canonical, submitted);
+            assert_eq!(via_entry, direct, "Lean routing must not change: {canonical}");
+        }
+        // The exact Lean report, pinned so a future parser change is visible.
+        let r = check_statement_preserved(
+            "theorem add_comm (a b : Nat) : a + b = b + a",
+            "theorem add_comm (a b : Nat) : a + b = b + a := by ring",
+        );
+        assert_eq!(r.verdict, PreservationVerdict::Preserved);
+        assert!(r.preserved && r.findings.is_empty());
+        assert_eq!(
+            r.canonical.as_ref().map(|s| s.kind.as_str()),
+            Some("theorem")
+        );
+        // HOL Light vernacular is not Lean vernacular: the Lean parser sees no
+        // declaration in it, exactly as before.
+        let hol = check_statement_preserved(
+            "let T1 = prove(`T`, REWRITE_TAC[]);;",
+            "let T1 = prove(`T`, REWRITE_TAC[]);;\n",
+        );
+        assert_eq!(hol.verdict, PreservationVerdict::CanonicalUnparsable);
+    }
+
+    // -- elaboration options -------------------------------------------------
+
+    /// A submission that sets a defeq/transparency option the canonical
+    /// statement does not is NOT preserved: identical signature text elaborates
+    /// under different definitional-equality rules.
+    #[test]
+    fn submission_only_defeq_option_is_not_preserved() {
+        let canonical = "theorem T (n : Nat) : n = n";
+        let submitted = "set_option backward.isDefEq.respectTransparency false\n\
+                         theorem T (n : Nat) : n = n := rfl\n";
+        let r = check_statement_preserved(canonical, submitted);
+        assert!(
+            !r.preserved,
+            "a submission-only defeq option must fail closed: {r:?}"
+        );
+        assert_eq!(r.verdict, PreservationVerdict::ElaborationOptionsChanged);
+        assert!(r
+            .findings
+            .iter()
+            .any(|f| f.contains("backward.isDefEq.respectTransparency")));
+        assert!(!r.into_scan_report().clean);
+    }
+
+    /// The mined pairing is the OTHER direction (the `problem.lean` sets the
+    /// option and the `solution.lean` does not) and it is just as unconfirmable,
+    /// so the check is symmetric. A matching setting on both sides passes.
+    #[test]
+    fn defeq_option_mismatch_is_symmetric_and_agreement_passes() {
+        let with_option = "set_option backward.isDefEq.respectTransparency false\n\
+                           theorem T (n : Nat) : n = n";
+        let without = "theorem T (n : Nat) : n = n := rfl\n";
+        let canonical_only = check_statement_preserved(with_option, without);
+        assert!(!canonical_only.preserved, "{canonical_only:?}");
+        assert_eq!(
+            canonical_only.verdict,
+            PreservationVerdict::ElaborationOptionsChanged
+        );
+
+        let both = check_statement_preserved(
+            with_option,
+            "set_option backward.isDefEq.respectTransparency false\n\
+             theorem T (n : Nat) : n = n := rfl\n",
+        );
+        assert!(both.preserved, "agreeing options must pass: {both:?}");
+        assert_eq!(both.verdict, PreservationVerdict::Preserved);
+
+        // Disagreeing VALUES are a mismatch too.
+        let flipped = check_statement_preserved(
+            with_option,
+            "set_option backward.isDefEq.respectTransparency true\n\
+             theorem T (n : Nat) : n = n := rfl\n",
+        );
+        assert!(!flipped.preserved, "{flipped:?}");
+    }
+
+    /// The guard is narrow on purpose: options that cannot change what a
+    /// signature MEANS must not cost a retry, and an option named only in a
+    /// comment was never set.
+    #[test]
+    fn immaterial_options_and_commented_options_do_not_trip_the_check() {
+        let canonical = "theorem T (n : Nat) : n = n";
+
+        for immaterial in [
+            "set_option maxHeartbeats 1000000\n",
+            "set_option maxRecDepth 4000\n",
+            "set_option pp.all true\n",
+            "set_option trace.Meta.synthInstance true\n",
+        ] {
+            let submitted = format!("{immaterial}theorem T (n : Nat) : n = n := rfl\n");
+            let r = check_statement_preserved(canonical, &submitted);
+            assert!(r.preserved, "`{immaterial}` must not gate: {r:?}");
+            assert_eq!(r.verdict, PreservationVerdict::Preserved);
+        }
+
+        let commented = "-- set_option backward.isDefEq.respectTransparency false\n\
+                         /- set_option smartUnfolding false -/\n\
+                         theorem T (n : Nat) : n = n := rfl\n";
+        let r = check_statement_preserved(canonical, commented);
+        assert!(
+            r.preserved,
+            "an option discussed in a comment was never set: {r:?}"
+        );
+
+        // A materially different option still fails closed, so the narrowness
+        // above is a scoping decision and not a hole.
+        let unsafe_reducibility = check_statement_preserved(
+            canonical,
+            "set_option allowUnsafeReducibility true\ntheorem T (n : Nat) : n = n := rfl\n",
+        );
+        assert!(!unsafe_reducibility.preserved, "{unsafe_reducibility:?}");
+        let skip_kernel = check_statement_preserved(
+            canonical,
+            "set_option debug.skipKernelTC true\ntheorem T (n : Nat) : n = n := rfl\n",
+        );
+        assert!(!skip_kernel.preserved, "{skip_kernel:?}");
+    }
+
+    /// The option guard never rescues a statement that already failed: an
+    /// already-rejected pair keeps its specific diagnosis.
+    #[test]
+    fn defeq_option_guard_only_narrows_acceptance() {
+        let r = check_statement_preserved(
+            "theorem T (n : Nat) (h : n > 0) : n ≥ 1",
+            "set_option backward.isDefEq.respectTransparency false\n\
+             theorem T (n : Nat) : n ≥ 1 := by omega\n",
+        );
+        assert!(!r.preserved);
+        assert_eq!(
+            r.verdict,
+            PreservationVerdict::BindersChanged,
+            "the weakening diagnosis must survive, not be replaced"
+        );
+    }
+
+    /// Only Lean carries `set_option`, so the other systems' paths are untouched
+    /// by the guard.
+    #[test]
+    fn defeq_option_guard_does_not_reach_the_other_systems() {
+        let rocq = check_entry_signature(
+            FormalSystem::Rocq,
+            "Theorem t : True",
+            "Theorem t : True.\nProof. exact I. Qed.\n",
+        );
+        assert!(rocq.preserved, "{rocq:?}");
+        let candle = check_entry_signature(
+            FormalSystem::Candle,
+            "let T1 = prove(`T`, REWRITE_TAC[]);;",
+            "let T1 = prove(`T`, REWRITE_TAC[]);;\n",
+        );
+        assert!(candle.preserved, "{candle:?}");
+    }
+
+    /// THE TanArctan CASE: a correct proof whose PROSE COMMENT contains the word
+    /// `sorry` must not be rejected. The gating scan here already runs over
+    /// comment/string-stripped source, so this confirms the policy rather than
+    /// changing it, and the smell is still surfaced, as a NON-gating advisory.
+    #[test]
+    fn prose_comment_mentioning_sorry_is_not_a_violation() {
+        let code = "\
+/-- The sketch phase produced three named sub-lemmas, each a `sorry`,
+which the final proof discharges. -/
+theorem tan_arctan (x : Real) : Real.tan (Real.arctan x) = x := by
+  -- the earlier draft left a sorry here; it is gone now
+  exact Real.tan_arctan x
+";
+        assert!(
+            escape_hatches_clean(code),
+            "a prose comment must not gate: {:?}",
+            scan_escape_hatches(code)
+        );
+        assert!(escape_hatch_scan_report(code).clean);
+        // The signal is not thrown away, it is demoted.
+        let advisory = commented_escape_hatch_advisory(code);
+        assert_eq!(advisory.len(), 2, "both mentions are advisory: {advisory:?}");
+        assert!(advisory.iter().all(|a| a.contains("non-gating")));
+        // A REAL `sorry` in code still gates.
+        let real = "theorem t : True := by sorry\n";
+        assert!(!escape_hatches_clean(real));
+    }
+
     #[test]
     fn isabelle_quoted_signature_is_preserved_and_comment_cannot_spoof_it() {
         let canonical = "theorem t: \"x = x\"";
@@ -3307,6 +4340,50 @@ def aux : Nat := 0
         let report = escape_hatch_scan_report(code);
         assert!(!report.clean);
         assert!(report.findings.iter().all(|f| f.contains("CRITICAL")));
+    }
+
+    /// ALIAS EXPANSION. The base tokens above stay caught (asserted in
+    /// `sorry_and_admit_are_critical` / `search_tactics_and_native_decide_are_critical`);
+    /// here their RENAMES are caught too. `sorryAx` is the axiom `sorry`
+    /// elaborates to, and `decide +native` is `native_decide` in tactic-config
+    /// syntax. Word-boundary matching means neither is reachable as a substring
+    /// of the base token, so each has to be banned by name.
+    #[test]
+    fn renamed_escape_hatches_are_caught() {
+        for (code, rule) in [
+            ("theorem T : P := sorryAx _ false\n", "sorryAx"),
+            ("theorem T : P := by decide +native\n", "+native"),
+            ("theorem T : P := by decide +kernel +native\n", "+native"),
+        ] {
+            let hatches = scan_escape_hatches(code);
+            assert!(!escape_hatches_clean(code), "alias must gate: {code:?}");
+            assert!(
+                hatches.iter().any(|h| h.rule == rule),
+                "expected rule `{rule}` in {hatches:?}"
+            );
+        }
+    }
+
+    /// The boundary trade-off, asserted in the OVER-matching direction. A plain
+    /// `decide` is kernel-checked and legitimate, and an identifier that merely
+    /// CONTAINS a banned token is ordinary Lean. Every false flag here would
+    /// cost a retry on an artifact that was already fine.
+    #[test]
+    fn identifiers_containing_a_hatch_token_are_not_flagged() {
+        for code in [
+            "theorem T : 2 + 2 = 4 := by decide\n",
+            "instance : DecidableEq Foo := decidable_eq_foo\n",
+            "theorem admits_a_root : True := trivial\n",
+            "theorem sorry_free' : True := trivial\n",
+            "theorem ring_hom_comp : True := trivial\n",
+            "theorem T (x native : Nat) : x + native = native + x := by ring\n",
+        ] {
+            assert!(
+                escape_hatches_clean(code),
+                "innocent source must not be flagged ({code:?}): {:?}",
+                scan_escape_hatches(code)
+            );
+        }
     }
 
     /// The `apply?` / `exact?` / `rfl?` suggestion tactics (DeepSeek erratum) are
