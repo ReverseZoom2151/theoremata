@@ -343,6 +343,14 @@ class LeanSession:
         # fallback mode
         res = self._lean_compile(source_or_theorem)
         res["elapsed"] = time.time() - t0
+        if infotree:
+            # Batch `lean` emits no infotree at all. Report that as None rather
+            # than omitting the key, so the caller sees the same "asked, got
+            # nothing" shape it gets from a REPL that does not implement the
+            # field. An absent key would instead read as "never requested",
+            # which is a different fact and the one distinction this flag exists
+            # to preserve.
+            res["infotree"] = None
         return res
 
     # ---------------------------------------------------- fallback lean mode
