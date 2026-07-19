@@ -44,7 +44,14 @@
 //! instead. See the module-level integration note (and the crate REPORT) for the
 //! one-liner accessor the driver should grow to hand one out.
 
-use super::process_reward::{gate_reward, SearchTree, TreeNode};
+use super::process_reward::{backup_q, gate_reward, q_targets, SearchTree, TreeNode};
+use crate::db::Store;
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+/// Event type under which a projection summary is persisted.
+const EVENT_TYPE: &str = "search.dag_projection";
 
 /// Max unroll depth — a guard against a DAG whose cycles or deep sharing would
 /// otherwise unroll without bound. Real proof DAGs are shallow; this only caps
@@ -56,45 +63,57 @@ pub const MAX_UNROLL_DEPTH: usize = 64;
 /// projects. Mirrors the fields of the driver's private `DagNode`/`Edge` that the
 /// process-reward selectors care about (identity, closure, value signals, visit
 /// statistics, and out-edges), and nothing else.
-#[derive(Debug, Clone, Default)]
+/// Serde lives on the view (not on the driver's private arena) so a CLI arm can
+/// hand a finished search DAG in as JSON until the driver grows its own accessor.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DagView {
     /// The DAG's nodes, indexed exactly as the driver indexes its arena (edge
     /// `child` fields point into this vector).
+    #[serde(default)]
     pub nodes: Vec<DagViewNode>,
     /// Arena index of the root goal (the driver always pushes it first, so this is
     /// normally `0`).
+    #[serde(default)]
     pub root: usize,
 }
 
 /// One node of a [`DagView`] — the public echo of the driver's `DagNode`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DagViewNode {
     /// The state's canonical dedup key (the transposition-table key). Used only as
     /// a stable human-readable label; identity in the tree is positional.
     pub key: String,
     /// Whether the proof is complete at this state (`is_closed`). A closed node
     /// projects to a `+1` terminal leaf — the formal-gate PASS verdict.
+    #[serde(default)]
     pub closed: bool,
     /// LeanProgress-style progress estimate in `[0, 1]`.
+    #[serde(default)]
     pub progress: f64,
     /// Trained-critic `V(s)` in `[0, 1]` (defaults to `progress` when no critic is
     /// injected, exactly as the driver stores it).
+    #[serde(default)]
     pub critic: f64,
     /// Simulations that passed through this node during search.
+    #[serde(default)]
     pub visits: usize,
     /// Sum of backed-up rewards over those simulations. Mean `Q = value_sum /
     /// visits`.
+    #[serde(default)]
     pub value_sum: f64,
     /// Out-edges (tactic applications) to (possibly shared) child nodes.
+    #[serde(default)]
     pub edges: Vec<DagViewEdge>,
 }
 
 /// One out-edge of a [`DagViewNode`] — the public echo of the driver's `Edge`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DagViewEdge {
     /// The tactic text applied.
+    #[serde(default)]
     pub tactic: String,
     /// The prior / weight this tactic carried.
+    #[serde(default)]
     pub prior: f64,
     /// Arena index of the child node this edge points at.
     pub child: usize,
@@ -322,10 +341,52 @@ pub fn project_dag_nodes(dag: &DagView) -> Vec<TreeNode> {
         .collect()
 }
 
+/// CLI entry point: project a finished search [`DagView`] into the process-reward
+/// world and persist the result.
+///
+/// A thin adapter over the two projections in this module plus the already-tested
+/// backup pipeline: [`project_dag_to_tree`] unrolls the DAG, [`backup_q`] turns the
+/// closed-goal `+1` verdicts into a mean reward on every ancestor, and
+/// [`q_targets`] reads off the per-step regression labels a value head trains on.
+/// [`project_dag_nodes`] is reported alongside so the caller can see the DAG's own
+/// statistics survived the projection unchanged.
+///
+/// Offline and deterministic: no model, no Lean, no wall-clock in the projection
+/// itself. The returned JSON is also what is written to the store under
+/// `search.dag_projection`, so a run is inspectable from the event log alone.
+pub fn project_search_dag(
+    store: &Store,
+    project_id: &str,
+    dag: &DagView,
+) -> Result<serde_json::Value> {
+    let mut tree = project_dag_to_tree(dag);
+    backup_q(&mut tree);
+    let targets = q_targets(&tree);
+    let mirror = project_dag_nodes(dag);
+
+    let terminal_leaves = tree.nodes().iter().filter(|n| n.is_terminal()).count();
+    // The unroll duplicates transposed nodes, so a tree larger than the DAG is the
+    // signal that the search actually shared states. Worth reporting, not an error.
+    let summary = json!({
+        "project_id": project_id,
+        "dag_nodes": dag.nodes.len(),
+        "tree_nodes": tree.nodes().len(),
+        "mirror_nodes": mirror.len(),
+        "terminal_leaves": terminal_leaves,
+        "unrolled_duplicates": tree.nodes().len().saturating_sub(dag.nodes.len()),
+        "root_q": if tree.nodes().is_empty() { 0.0 } else { tree.q(0) },
+        "q_targets": targets,
+        "max_unroll_depth": MAX_UNROLL_DEPTH,
+    });
+    store.event(Some(project_id), None, EVENT_TYPE, "dag_projection", summary.clone())?;
+    Ok(summary)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::process_reward::{backup_q, q_targets, step_beam_select, REWARD_PASS};
+    use super::super::process_reward::{step_beam_select, REWARD_PASS};
     use super::*;
+    use std::path::Path;
 
     /// A solvable chain `g3 -> g2 -> g1 -> g0(closed)`, the DAG a driver would
     /// produce for a linear proof — with crafted visit statistics on each node.
@@ -595,6 +656,65 @@ mod tests {
             tree.nodes().len(),
             3,
             "the cycle is broken, not unrolled forever"
+        );
+    }
+
+    #[test]
+    fn entry_point_projects_chain_and_persists_summary() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "a linear proof").unwrap();
+
+        let summary = project_search_dag(&store, &project.id, &chain_view()).unwrap();
+        assert_eq!(summary["dag_nodes"], 4);
+        assert_eq!(summary["tree_nodes"], 4, "a chain has no transposition");
+        assert_eq!(summary["terminal_leaves"], 1);
+        assert_eq!(summary["unrolled_duplicates"], 0);
+        assert!((summary["root_q"].as_f64().unwrap() - 1.0).abs() < 1e-12);
+        assert!(
+            !summary["q_targets"].as_array().unwrap().is_empty(),
+            "the backed-up chain yields step targets"
+        );
+
+        // The summary is readable back off the event log with no other reader.
+        let events = store.events(&project.id, 50).unwrap();
+        assert!(events.iter().any(|e| e.event_type == "search.dag_projection"));
+    }
+
+    #[test]
+    fn entry_point_reports_unrolled_transpositions() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "a diamond").unwrap();
+
+        let summary = project_search_dag(&store, &project.id, &diamond_view()).unwrap();
+        // 4 DAG nodes unroll to 5 tree nodes because D is shared by two paths.
+        assert_eq!(summary["dag_nodes"], 4);
+        assert_eq!(summary["tree_nodes"], 5);
+        assert_eq!(summary["unrolled_duplicates"], 1);
+        assert_eq!(summary["terminal_leaves"], 2);
+    }
+
+    #[test]
+    fn entry_point_on_empty_view_reports_nothing_rather_than_failing() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "no search ran").unwrap();
+
+        let summary = project_search_dag(&store, &project.id, &DagView::new()).unwrap();
+        assert_eq!(summary["dag_nodes"], 0);
+        assert_eq!(summary["tree_nodes"], 0);
+        assert_eq!(summary["terminal_leaves"], 0);
+        assert_eq!(summary["q_targets"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn view_round_trips_through_json_for_cli_input() {
+        // The CLI hands a finished DAG in as JSON, so the view must survive a
+        // serialize/deserialize round trip with the projection unchanged.
+        let dag = chain_view();
+        let text = serde_json::to_string(&dag).unwrap();
+        let back: DagView = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            format!("{:?}", project_dag_nodes(&dag)),
+            format!("{:?}", project_dag_nodes(&back))
         );
     }
 
