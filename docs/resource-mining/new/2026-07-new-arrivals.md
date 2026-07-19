@@ -277,9 +277,127 @@ Flagged for operational awareness, all treated as data:
   treat as trusted proof content. If we ingest this corpus, `task.md` and inline
   scratchpads will land in context as instructions. Fence as data.
 
+## Where informal proofs actually break (the highest-value finding)
+
+`lattice-triangle`'s README notes its human informal draft "contained some correctable
+mistakes", and the 9,938-line solution flags **none of them** (zero comments in the
+whole file), so the repairs are recoverable only by diffing the TeX against the Lean.
+Having done that, the defects cluster sharply:
+
+1. A hand-waved finite check -- *"the claimed bound may be checked directly for
+   2 ≤ n ≤ 9"* -- was **not** formalized as a case check. It was replaced by a uniform
+   argument valid for all n ≥ 2: **~400 lines replacing one parenthetical.**
+2. A sieve computation that is **commented out in the LaTeX source** drops an additive
+   error (each prime contributes `⌊L/ℓ⌋+1`, not `L/ℓ`). The formal proof keeps the `+1`.
+3. *"since φ(n) → ∞"* -- five words, not in Mathlib, ~150 lines.
+4. A subregion introduced as necessary is a red herring; the constraint holds
+   everywhere. The formal file has no such notion.
+
+**The analytic core was right. Every defect sat at the counting / elementary-estimate
+boundary, and the most expensive one was exactly where the human wrote "may be checked
+directly."** That is a targetable prior: when ingesting an informal proof, the
+highest-yield nodes to attack are not the hard lemmas but the phrases *"checked
+directly for small n"*, *"standard estimate"*, *"since X → ∞"*, and any displayed
+computation the author commented out. Weight those for decomposition and for
+falsify-before-prove routing.
+
+## Gap 1 has a dual: stated-but-unused hypotheses
+
+Gap 1 is a hypothesis *assumed but never discharged*. The mirror image is a hypothesis
+*stated but never used*, and this corpus is full of it: `_hP₁₂` (measurability of a
+join) unused in AgreeToDisagree; **both** coprimality hypotheses unused in
+parity-differential's main theorem (the identity holds unconditionally); `θ < 1` unused
+in lattice-triangle; 12 markers in partial-regularity, 20+ in lattice-triangle. The
+AgreeToDisagree paper's subtitle is literally *"Assumption Accounting in Lean."*
+
+A proof that ignores a stated hypothesis is **either a stronger theorem than requested
+or a mis-formalized statement**, and the two need distinguishing. Lean's
+`linter.unusedSectionVars` gives this for free; both cases are currently invisible to a
+pass/fail gate. Worth surfacing as certificate metadata alongside the Gap 1 audit.
+
+## Corrections to the cluster's names and my own priors
+
+- **`partial-regularity` is not PDE partial regularity.** It is a pun on Kummer's
+  **regular primes** -- analytic number theory (almost all primes are regular up to
+  ~√p/(log p)^α Bernoulli numerators). No Navier-Stokes anywhere.
+- **The corpus contains essentially no falsification machinery.** `plausible` is a
+  transitive Mathlib dep in all six manifests and is **never invoked**; zero
+  `slim_check`, `#eval`, `#guard`. I expected counterexample search and there is none.
+- **My "certified finite search" prior was wrong, and the inverse is the lesson.** Real
+  finite checking across the cluster is one `fin_cases` over 15 states plus `decide` on
+  trivia. Worse, the *prose* computational claims (kaprekar4: "checked computationally
+  for odd bases up to 39 / 61 / 199 / 5000") **are not in the repos at all** -- the code
+  does not exist, the kernel never sees it, and it is not load-bearing. What replaces
+  enumeration is **structural conjugacy**: kaprekar4 builds `Φ : T_B ≅ binom(P_B,2)`
+  conjugating Kaprekar's map to doubling on projective residues and transports
+  `minimalPeriod` across it. Nothing is enumerated.
+
+Two salvage patterns worth keeping anyway: **density-zero failure sets** (lattice-triangle
+proves `#badPairs / #region < ε` via Markov, counting bad configurations without ever
+exhibiting one -- the right move when a claim is false only on a sparse set), and
+kaprekar4's `-- SANITY CHECK PASSED (no counterexample; exhaustive over odd B≤61)`
+comments, which are a falsification pass that ran inside the agent loop where **only the
+verdict survived into the artifact**. That is the workflow we want, badly logged.
+
+## Three more patterns to adopt
+
+25. **Anti-mismodelling sanity theorems.** `record-compositions` ships 8 statements:
+    4 real results and **4 deliberate characterization checks** -- Euler numbers match
+    OEIS A000111, `euler_recurrence` proved the *hard* way from a genuine bijection
+    rather than from the definition, and the paper's own worked example discharged by
+    `decide`. When a claim introduces bespoke definitions, nobody can cross-check them
+    against a library, so you ship theorems whose only job is to pin the definitions to
+    external ground truth. **Make this a required node type for any claim that
+    introduces its own definitions.** (A skeptical pass found no vacuity here, and they
+    declined the available cheat of indexing NSym by compositions, which would have made
+    the main theorem a coefficient tautology.)
+26. **Constant extractability as a certificate-quality axis.** partial-regularity ships
+    two proofs of nearly the same theorem: the main one (3,527 lines) proves only
+    `IsBigO` with the constant buried behind `∃A, ∃C₀, ∃C₁` plus an unquantified
+    `Finset.sup'` -- **not extractable**; the extension (635 lines, 18% of the size)
+    declares the constant as `10` and proves the bound explicitly, via a route that
+    never needs von Staudt-Clausen, `padicValRat`, `ZMod`, or Faulhaber. Shorter *and*
+    stronger. Re-running a solved problem can yield a materially better proof, and
+    "is the constant extractable" is a dimension the gate should score.
+27. **Cost model: predict from bijection count, not library presence.** `record-compositions`
+    inverts the expected answer -- building NSym/Sym from scratch was *cheap*
+    (~20% of the file) because `FreeAlgebra`/`MvPolynomial` already ship `lift` and
+    `map_prod`, while the *unnamed* missing structure (alternating permutations, zigzag
+    numbers, standardization of permutation segments, with a hand-rolled André
+    split-at-the-maximum) was ~67%. The algebraic-structure gap is cheap when it is
+    free-object-shaped; the `Finset`-bijection-shaped gap is expensive.
+
+## Evidence on harness behavior, and one more statement-preservation hit
+
+`AgreeToDisagree` is the only repo shipping an **input / raw-output / hand-cleaned
+triple**, which makes it the sole place the harness's unfiltered output is visible next
+to what humans accepted. Diffing it:
+
+- **Raw output modified the given context rather than only filling the `sorry`.** It
+  stripped all docstrings from the human-supplied prerequisites and made gratuitous
+  edits to code it was not asked to touch (rewrote `Measurable.sup` from tactic to term
+  mode, changed `⟨a, ha⟩` to `⟨a, _⟩`). **That is a statement-preservation violation of
+  exactly the kind our gate exists to catch, and theirs did not.** It argues for
+  scoping preservation checks over the *whole submission*, not just the target theorem.
+- Human cleanup then *generalized* the theorem (single global `[MeasureSpace Ω]` with
+  `ℙ` → `[MeasurableSpace Ω] {μ μ₁ μ₂ : Measure Ω}`), which forced adding an explicit
+  hypothesis that the join-probabilities agree.
+- **Context accumulation works.** Round 2's input contains round 1's *human-cleaned*
+  output as scaffolding, and round 2's raw output needed **no cleanup at all** (its
+  `output/` and final files are byte-identical). That is the growing-lemma-library loop
+  with a human gate, empirically working.
+
+One gate seam worth stress-testing on our side: the problem/solution contract is **not
+textual identity** (`ℕ` vs `Nat`, docstrings dropped, binders renamed `hn_coprime` →
+`_hn_coprime`), so the checker must compare post-elaboration terms, binder-name
+insensitive. And in `record-compositions` the two files elaborate under **different
+options** -- `problem.lean` sets `backward.isDefEq.respectTransparency false` and
+`solution.lean` does not.
+
 ## Coverage
 
-34 repos read across 7 parallel readers. Nothing was built, compiled, or executed; no
-git operations. The `AgreeToDisagree` / `partial-regularity` / `lattice-triangle` /
-`parity-differential` / `kaprekar4` / `record-compositions` cluster is pending and will
-be appended.
+All 34 repos read across 7 parallel readers. Nothing was built, compiled, or executed;
+no git operations; findings are textual verification, not typechecking. Two repos
+(`kaprekar4`, `record-compositions`) contain dangling references to files absent from
+the tree (`CONTEXT.md`, `research/cannot_close_euler_recurrence_*.tex`), confirming the
+published repos are filtered slices of a larger private workspace.
