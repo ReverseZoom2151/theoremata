@@ -14,6 +14,11 @@ pub struct Config {
     pub artifacts: PathBuf,
     pub resources: PathBuf,
     pub model_command: Option<String>,
+    /// Optional concrete endpoint ladder for difficulty-aware model routing.
+    /// Disabled by default, so existing single-command provider behavior is
+    /// preserved until a caller explicitly opts in to `enabled: true`.
+    #[serde(default)]
+    pub model_routing: crate::model_router::ModelRoutingConfig,
     pub max_iterations: u32,
     pub command_timeout_seconds: u64,
     /// A Lake project that provides Mathlib. When set (and present), Lean checks
@@ -142,7 +147,10 @@ fn default_abstain_threshold() -> Option<f64> {
 /// explicit `0`/`false`/`off`.
 fn default_pool_meta_gate() -> bool {
     match std::env::var("THEOREMATA_POOL_META_GATE") {
-        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"),
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
         Err(_) => true,
     }
 }
@@ -171,9 +179,13 @@ fn default_candle_bin() -> String {
     "candle".into()
 }
 
-fn default_agda_bin() -> String { "agda".into() }
+fn default_agda_bin() -> String {
+    "agda".into()
+}
 
-fn default_metamath_bin() -> String { "metamath".into() }
+fn default_metamath_bin() -> String {
+    "metamath".into()
+}
 
 fn default_k_consecutive_clean() -> u32 {
     3
@@ -203,6 +215,7 @@ impl Default for Config {
             artifacts: default_artifacts(),
             resources: PathBuf::from("resources"),
             model_command: std::env::var("THEOREMATA_MODEL_COMMAND").ok(),
+            model_routing: crate::model_router::ModelRoutingConfig::default(),
             max_iterations: 3,
             command_timeout_seconds: 60,
             lean_project: default_lean_project(),
@@ -231,6 +244,12 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Resolve the explicitly configured endpoint ladder. `None` deliberately
+    /// means use the historical `model_command` call path unchanged.
+    pub fn model_routing_plan(&self) -> Option<crate::model_router::ModelPlan> {
+        self.model_routing.plan()
+    }
+
     pub fn load(path: Option<&Path>) -> Result<Self> {
         let path = path.unwrap_or_else(|| Path::new(".theoremata/config.json"));
         if !path.exists() {
@@ -253,5 +272,35 @@ impl Config {
             fs::write(path, serde_json::to_string_pretty(self)?)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model_router::{ModelEndpoint, ModelTier};
+
+    #[test]
+    fn model_routing_is_disabled_by_default() {
+        let config = Config::default();
+        assert!(config.model_routing_plan().is_none());
+    }
+
+    #[test]
+    fn model_routing_round_trips_concrete_tiered_endpoints() {
+        let mut config = Config::default();
+        config.model_routing.enabled = true;
+        config.model_routing.endpoints = vec![
+            ModelEndpoint::new("command", "fast-model", ModelTier::Fast),
+            ModelEndpoint::new("command", "strong-model", ModelTier::Strong),
+        ];
+
+        let decoded: Config =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        let plan = decoded
+            .model_routing_plan()
+            .expect("explicitly enabled ladder");
+        assert_eq!(plan.select(0.0, 0).primary(), Some(0));
+        assert_eq!(plan.select(1.0, 0).primary(), Some(1));
     }
 }

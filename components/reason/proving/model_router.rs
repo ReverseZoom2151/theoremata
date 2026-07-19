@@ -32,11 +32,17 @@
 //! `[0, 1]` difficulty (the TTC signal) and, crucially, adds the attempt-count
 //! escalation *and* the provider fallback ladder that `guard` has no notion of.
 
-use serde::Serialize;
+use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    model::{ModelRequest, ModelResponse},
+    provider::ModelProvider,
+};
 
 /// A model cost/capability tier. `Fast` is the cheapest model, `Strong` the most
 /// capable; the ordinal (`as_index`) is the escalation order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelTier {
     Fast,
@@ -83,14 +89,29 @@ impl ModelTier {
 /// thresholds (in `[0, 1]`) at which the base tier steps up, and
 /// `escalate_every_attempts` is how many *failed* attempts bump the tier by one
 /// rung (`0` disables attempt escalation).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct RouteConfig {
     /// Difficulty at or above which an un-escalated goal starts at [`ModelTier::Balanced`].
+    #[serde(default = "default_balanced_at")]
     pub balanced_at: f64,
     /// Difficulty at or above which an un-escalated goal starts at [`ModelTier::Strong`].
+    #[serde(default = "default_strong_at")]
     pub strong_at: f64,
     /// Failed attempts per one-tier bump. `0` disables attempt-count escalation.
+    #[serde(default = "default_escalate_every_attempts")]
     pub escalate_every_attempts: usize,
+}
+
+fn default_balanced_at() -> f64 {
+    0.34
+}
+
+fn default_strong_at() -> f64 {
+    0.67
+}
+
+fn default_escalate_every_attempts() -> usize {
+    2
 }
 
 impl Default for RouteConfig {
@@ -99,9 +120,9 @@ impl Default for RouteConfig {
         // attempts (so the third attempt on an easy goal is already Balanced, and a
         // persistently failing goal reaches Strong).
         Self {
-            balanced_at: 0.34,
-            strong_at: 0.67,
-            escalate_every_attempts: 2,
+            balanced_at: default_balanced_at(),
+            strong_at: default_strong_at(),
+            escalate_every_attempts: default_escalate_every_attempts(),
         }
     }
 }
@@ -172,10 +193,33 @@ impl ProviderErrorKind {
                 | ProviderErrorKind::EmptyOutput
         )
     }
+
+    /// Classify an opaque provider failure conservatively. Unknown failures are
+    /// treated as invalid requests so the ladder does not spray a malformed or
+    /// policy-rejected prompt across every configured endpoint.
+    pub fn classify_error(error: &anyhow::Error) -> Self {
+        let message = format!("{error:#}").to_ascii_lowercase();
+        if message.contains("429")
+            || message.contains("rate limit")
+            || message.contains("rate-limit")
+            || message.contains("quota")
+        {
+            Self::RateLimit
+        } else if message.contains("timed out")
+            || message.contains("timeout")
+            || message.contains("connection reset")
+            || message.contains("connection refused")
+            || message.contains("network unreachable")
+        {
+            Self::Timeout
+        } else {
+            Self::InvalidRequest
+        }
+    }
 }
 
 /// One concrete provider/model endpoint on the fallback ladder.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelEndpoint {
     /// Provider identifier (matches [`crate::provider::ModelProvider::name`],
     /// e.g. `"command"`, or a named vendor).
@@ -184,6 +228,43 @@ pub struct ModelEndpoint {
     pub model: String,
     /// The tier this endpoint serves (used to anchor a [`ModelPlan`]).
     pub tier: ModelTier,
+}
+
+/// Persisted, opt-in router configuration. It deliberately lives beside the
+/// routing algorithm rather than provider credentials: endpoints name a
+/// provider/model pair, while each provider owns how its credentials and API
+/// are resolved.
+///
+/// `enabled = false` or an empty endpoint list means callers must use their
+/// historical single-provider path. This keeps adding the field to [`Config`]
+/// backward compatible.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelRoutingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub route: RouteConfig,
+    #[serde(default)]
+    pub endpoints: Vec<ModelEndpoint>,
+}
+
+impl Default for ModelRoutingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            route: RouteConfig::default(),
+            endpoints: Vec::new(),
+        }
+    }
+}
+
+impl ModelRoutingConfig {
+    /// Build an executable plan only for an explicitly enabled, non-empty
+    /// ladder. An absent/default config therefore changes no existing call.
+    pub fn plan(&self) -> Option<ModelPlan> {
+        (self.enabled && !self.endpoints.is_empty())
+            .then(|| ModelPlan::new(self.route, FallbackLadder::new(self.endpoints.clone())))
+    }
 }
 
 impl ModelEndpoint {
@@ -260,9 +341,10 @@ impl FallbackLadder {
             return None;
         }
         let next = current.checked_add(1)?;
-        self.rungs
-            .get(next)
-            .map(|endpoint| NextModel { index: next, endpoint })
+        self.rungs.get(next).map(|endpoint| NextModel {
+            index: next,
+            endpoint,
+        })
     }
 
     /// The first rung whose tier is at least `tier`, i.e. where a goal routed to
@@ -359,9 +441,103 @@ impl ModelPlan {
     }
 }
 
+/// Successful result of an endpoint-aware provider call.
+#[derive(Debug, Clone)]
+pub struct RoutedResponse {
+    pub response: ModelResponse,
+    pub endpoint: ModelEndpoint,
+    pub tier: ModelTier,
+    /// Number of endpoints attempted, including the successful one.
+    pub attempts: usize,
+}
+
+/// Execute an opt-in model plan against one provider implementation.
+///
+/// The provider must own the selected endpoint name. A provider registry can
+/// later dispatch multiple implementations; this narrow API refuses a mismatch
+/// rather than silently routing a request to the wrong vendor. Each request is
+/// passed through [`ModelProvider::complete_at`], which places the exact
+/// endpoint in `ModelRequest.context` for command-backed providers.
+///
+/// Only rate-limit, timeout, and empty-output failures advance the ladder.
+/// Everything else fails immediately, preserving request safety and avoiding
+/// duplicate work for deterministic errors.
+pub fn execute_with_fallback(
+    provider: &dyn ModelProvider,
+    request: &ModelRequest,
+    plan: &ModelPlan,
+    difficulty: f64,
+    attempt: usize,
+) -> Result<RoutedResponse> {
+    let selection = plan.select(difficulty, attempt);
+    if selection.order.is_empty() {
+        return Err(anyhow!(
+            "model routing is enabled but its endpoint ladder is empty"
+        ));
+    }
+
+    let mut last_error = None;
+    for (calls, index) in selection.order.iter().copied().enumerate() {
+        let endpoint = plan
+            .endpoint(index)
+            .expect("ModelPlan selections always reference its ladder");
+        if endpoint.provider != provider.name() {
+            return Err(anyhow!(
+                "configured endpoint provider '{}' is unavailable on provider '{}'",
+                endpoint.provider,
+                provider.name()
+            ));
+        }
+
+        match provider.complete_at(endpoint, request) {
+            Ok(response) if response_is_empty(&response.content) => {
+                let error = anyhow!("model provider returned empty output");
+                last_error = Some(error);
+                if plan
+                    .ladder()
+                    .next_on_failure(index, ProviderErrorKind::EmptyOutput)
+                    .is_none()
+                {
+                    break;
+                }
+            }
+            Ok(response) => {
+                return Ok(RoutedResponse {
+                    response,
+                    endpoint: endpoint.clone(),
+                    tier: selection.tier,
+                    attempts: calls + 1,
+                });
+            }
+            Err(error) => {
+                let kind = ProviderErrorKind::classify_error(&error);
+                last_error = Some(error);
+                if plan.ladder().next_on_failure(index, kind).is_none() {
+                    break;
+                }
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("model routing exhausted without an endpoint call")))
+}
+
+fn response_is_empty(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(text) => text.trim().is_empty(),
+        serde_json::Value::Array(values) => values.is_empty(),
+        serde_json::Value::Object(values) => {
+            values.is_empty() || values.values().all(response_is_empty)
+        }
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
 
     fn ladder() -> FallbackLadder {
         FallbackLadder::new(vec![
@@ -430,7 +606,9 @@ mod tests {
         assert_eq!(step0.endpoint.model, "fast-b");
         let step1 = l.next_on_failure(1, ProviderErrorKind::RateLimit).unwrap();
         assert_eq!(step1.index, 2);
-        let step2 = l.next_on_failure(2, ProviderErrorKind::EmptyOutput).unwrap();
+        let step2 = l
+            .next_on_failure(2, ProviderErrorKind::EmptyOutput)
+            .unwrap();
         assert_eq!(step2.index, 3);
         // Past the last rung there is nothing left to try.
         assert!(l.next_on_failure(3, ProviderErrorKind::Timeout).is_none());
@@ -441,15 +619,21 @@ mod tests {
     fn rate_limit_and_timeout_both_advance() {
         let l = ladder();
         assert_eq!(
-            l.next_on_failure(0, ProviderErrorKind::RateLimit).unwrap().index,
+            l.next_on_failure(0, ProviderErrorKind::RateLimit)
+                .unwrap()
+                .index,
             1
         );
         assert_eq!(
-            l.next_on_failure(0, ProviderErrorKind::Timeout).unwrap().index,
+            l.next_on_failure(0, ProviderErrorKind::Timeout)
+                .unwrap()
+                .index,
             1
         );
         assert_eq!(
-            l.next_on_failure(0, ProviderErrorKind::EmptyOutput).unwrap().index,
+            l.next_on_failure(0, ProviderErrorKind::EmptyOutput)
+                .unwrap()
+                .index,
             1
         );
     }
@@ -478,7 +662,10 @@ mod tests {
         let easy = plan.select(0.0, 0);
         assert_eq!(easy.tier, ModelTier::Fast);
         assert_eq!(easy.order, vec![0, 1, 2, 3]);
-        assert_eq!(plan.endpoint(easy.primary().unwrap()).unwrap().model, "fast-a");
+        assert_eq!(
+            plan.endpoint(easy.primary().unwrap()).unwrap().model,
+            "fast-a"
+        );
 
         // Balanced goal → anchors at the first Balanced rung (index 2), then below.
         let mid = plan.select(0.5, 0);
@@ -546,5 +733,107 @@ mod tests {
         };
         assert_eq!(walk(), walk(), "ladder walk must reproduce");
         assert_eq!(walk(), vec![0, 1, 2, 3]);
+    }
+
+    struct ScriptedProvider {
+        outcomes: RefCell<Vec<Result<ModelResponse>>>,
+        seen_models: RefCell<Vec<String>>,
+    }
+
+    impl ScriptedProvider {
+        fn new(outcomes: Vec<Result<ModelResponse>>) -> Self {
+            Self {
+                outcomes: RefCell::new(outcomes),
+                seen_models: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ModelProvider for ScriptedProvider {
+        fn complete(&self, request: &ModelRequest) -> Result<ModelResponse> {
+            self.seen_models.borrow_mut().push(
+                request.context["model_endpoint"]["model"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            );
+            self.outcomes.borrow_mut().remove(0)
+        }
+
+        fn name(&self) -> &str {
+            "scripted"
+        }
+    }
+
+    fn request() -> ModelRequest {
+        ModelRequest {
+            role: "test".into(),
+            task: "route endpoint".into(),
+            context: serde_json::json!({"goal": "True"}),
+            output_schema: serde_json::json!({}),
+        }
+    }
+
+    fn scripted_plan() -> ModelPlan {
+        ModelPlan::new(
+            RouteConfig {
+                escalate_every_attempts: 0,
+                ..RouteConfig::default()
+            },
+            FallbackLadder::new(vec![
+                ModelEndpoint::new("scripted", "first", ModelTier::Fast),
+                ModelEndpoint::new("scripted", "second", ModelTier::Fast),
+            ]),
+        )
+    }
+
+    fn response(content: serde_json::Value) -> ModelResponse {
+        ModelResponse {
+            content,
+            model: "test".into(),
+            provider: "scripted".into(),
+        }
+    }
+
+    #[test]
+    fn execution_retries_timeout_and_carries_the_selected_endpoint() {
+        let provider = ScriptedProvider::new(vec![
+            Err(anyhow!("request timed out")),
+            Ok(response(serde_json::json!({"proof": "by trivial"}))),
+        ]);
+        let routed = execute_with_fallback(&provider, &request(), &scripted_plan(), 0.0, 0)
+            .expect("timeout should fall through to the next endpoint");
+        assert_eq!(routed.endpoint.model, "second");
+        assert_eq!(routed.attempts, 2);
+        assert_eq!(provider.seen_models.into_inner(), vec!["first", "second"]);
+    }
+
+    #[test]
+    fn execution_retries_empty_output_but_not_invalid_requests() {
+        let empty = ScriptedProvider::new(vec![
+            Ok(response(serde_json::json!({"message": "  "}))),
+            Ok(response(serde_json::json!("usable"))),
+        ]);
+        let routed = execute_with_fallback(&empty, &request(), &scripted_plan(), 0.0, 0)
+            .expect("empty output should retry");
+        assert_eq!(routed.endpoint.model, "second");
+
+        let invalid = ScriptedProvider::new(vec![
+            Err(anyhow!("request schema is malformed")),
+            Ok(response(serde_json::json!("must not run"))),
+        ]);
+        assert!(execute_with_fallback(&invalid, &request(), &scripted_plan(), 0.0, 0).is_err());
+        assert_eq!(invalid.seen_models.into_inner(), vec!["first"]);
+    }
+
+    #[test]
+    fn disabled_or_empty_routing_config_has_no_plan() {
+        assert!(ModelRoutingConfig::default().plan().is_none());
+        assert!(ModelRoutingConfig {
+            enabled: true,
+            ..ModelRoutingConfig::default()
+        }
+        .plan()
+        .is_none());
     }
 }
