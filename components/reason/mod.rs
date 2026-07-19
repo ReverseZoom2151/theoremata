@@ -26,4 +26,5 @@ pub use search::{
     fitness, goal_cache, hybrid_search, inverse_method, mcts, minimize, model_elimination,
     preference_pairs, process_reward, progress, proof_pool, rewriting, sampler, sampling,
     search_telemetry, skest, subsumption, symmetry_dedup, tactic_outcome, ttc,
+    verification_ladder,
 };
