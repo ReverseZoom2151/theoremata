@@ -295,6 +295,11 @@ impl FormalBackend for IsabelleBackend {
         SYSTEM
     }
 
+    fn compile_success_signal(&self) -> crate::prover::formal::SuccessSignal {
+        // Isabelle's batch build sets a correct non-zero exit code on failure.
+        crate::prover::formal::SuccessSignal::NonZeroExitIsHonest
+    }
+
     fn is_mock(&self) -> bool {
         self.mock
     }
@@ -363,7 +368,12 @@ impl FormalBackend for IsabelleBackend {
         let per_unit =
             crate::prover::formal::per_declaration_status(SYSTEM, &code, out.success(), &errors);
         Ok(CompileReport {
-            compiled: out.success(),
+            compiled: self.compile_success_signal().is_pass(
+                out.launched,
+                out.success(),
+                &out.stdout,
+                &out.stderr,
+            ),
             errors,
             per_unit,
             detail: json!({

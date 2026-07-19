@@ -236,6 +236,22 @@ impl FormalBackend for ExternalBackend {
         self.system
     }
 
+    fn compile_success_signal(&self) -> crate::prover::formal::SuccessSignal {
+        match self.system {
+            // The `metamath` reference binary returns exit code 0 even when
+            // `verify proof *` FAILS (failures only print `?Error` to stdout;
+            // its `main()` unconditionally returns 0). Only stdout distinguishes
+            // a pass, so require the success sentinel and forbid error/warning
+            // markers.
+            FormalSystem::Metamath => crate::prover::formal::SuccessSignal::StdoutSentinel {
+                must_contain: &["All proofs in the database were verified"],
+                must_not_contain: &["?Error", "?Warning", "were not proved", "no source file"],
+            },
+            // Agda under `--safe` sets a correct non-zero exit on failure.
+            _ => crate::prover::formal::SuccessSignal::NonZeroExitIsHonest,
+        }
+    }
+
     fn is_mock(&self) -> bool {
         self.mock
     }
@@ -319,15 +335,15 @@ impl FormalBackend for ExternalBackend {
         // even when `verify proof *` FAILS (failures only print `?Error` to stdout;
         // its `main()` unconditionally returns 0). So the exit code is NOT a
         // reliable pass signal for Metamath, and trusting it (`out.success()`) would
-        // mark a failed proof as verified. Require the explicit success sentinel and
-        // the absence of any error/warning markers instead (fail-closed). Agda's
-        // `--safe` sets a correct non-zero exit on failure, so it keeps `success()`.
-        let verified = match self.system {
-            FormalSystem::Metamath => {
-                metamath_output_verified(&out.stdout, &out.stderr, out.launched)
-            }
-            _ => out.success(),
-        };
+        // mark a failed proof as verified. The per-backend `compile_success_signal`
+        // declares the correct positive signal (sentinel for Metamath, honest exit
+        // for Agda), so exit status is never trusted on its own (fail-closed).
+        let verified = self.compile_success_signal().is_pass(
+            out.launched,
+            out.success(),
+            &out.stdout,
+            &out.stderr,
+        );
         let errors = if verified {
             vec![]
         } else {
@@ -497,21 +513,6 @@ fn metamath_includes(code: &str) -> Vec<PathBuf> {
     includes
 }
 
-/// Decide whether a Metamath `verify proof *` run actually PASSED. The `metamath`
-/// reference binary returns exit code 0 even on failure (failures only print
-/// `?Error` to stdout), so the exit code is not a reliable pass signal. A genuine
-/// pass requires the explicit success sentinel and no error/warning markers.
-fn metamath_output_verified(stdout: &str, stderr: &str, launched: bool) -> bool {
-    let combined = format!("{stdout}\n{stderr}");
-    let lc = combined.to_lowercase();
-    launched
-        && combined.contains("All proofs in the database were verified")
-        && !combined.contains("?Error")
-        && !combined.contains("?Warning")
-        && !lc.contains("were not proved")
-        && !lc.contains("no source file")
-}
-
 impl ProofSession for ExternalBackend {
     fn start(&mut self, _project: &FormalProject) -> Result<()> {
         Ok(())
@@ -547,33 +548,31 @@ mod tests {
     // (with no error/warning markers) counts.
     #[test]
     fn metamath_verified_requires_the_success_sentinel() {
-        // Genuine pass.
-        assert!(metamath_output_verified(
+        // Exercise the real production signal for the Metamath backend, which
+        // must NOT read a failed run as verified even though the binary exits 0.
+        let sig = ExternalBackend::new(&Config::default(), FormalSystem::Metamath, true)
+            .compile_success_signal();
+        // Genuine pass (binary exited 0 with the sentinel).
+        assert!(sig.is_pass(
+            true,
+            true,
             "All proofs in the database were verified in 0.01 s.",
-            "",
-            true
+            ""
         ));
         // Failure that (like the real binary) still exited 0 -> must be rejected.
-        assert!(!metamath_output_verified(
-            "?Error on line 5: ... proof does not verify.",
-            "",
-            true
-        ));
+        assert!(!sig.is_pass(true, true, "?Error on line 5: ... proof does not verify.", ""));
         // Silent / empty output (missing file, no sentinel) -> rejected.
-        assert!(!metamath_output_verified("", "", true));
-        assert!(!metamath_output_verified("No source file was read in.", "", true));
+        assert!(!sig.is_pass(true, true, "", ""));
+        assert!(!sig.is_pass(true, true, "No source file was read in.", ""));
         // Warnings (e.g. an incomplete `? ` proof) -> rejected (fail-closed).
-        assert!(!metamath_output_verified(
+        assert!(!sig.is_pass(
+            true,
+            true,
             "?Warning: proof is incomplete.\nAll proofs in the database were verified.",
-            "",
-            true
+            ""
         ));
-        // Never launched -> rejected.
-        assert!(!metamath_output_verified(
-            "All proofs in the database were verified.",
-            "",
-            false
-        ));
+        // Never launched -> rejected regardless of a clean-looking exit.
+        assert!(!sig.is_pass(false, false, "All proofs in the database were verified.", ""));
     }
 
     // GAP 1 — Metamath source scan. These exercise the pure lexical helper

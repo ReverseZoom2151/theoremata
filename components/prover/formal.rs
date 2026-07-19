@@ -354,6 +354,15 @@ pub struct ScanReport {
 pub trait FormalBackend {
     fn system(&self) -> FormalSystem;
 
+    /// The positive signal that constitutes a PASSING compile for this backend.
+    /// Required (there is deliberately no default): exit status alone is never a
+    /// sufficient pass signal, because several real checkers return 0 on a
+    /// FAILED check -- Metamath's reference binary, and the HVM/Kind-family tools
+    /// surveyed in `docs/resource-mining/new/higher-order-co.md`. Forcing every
+    /// backend to declare its signal stops a new backend from silently
+    /// inheriting exit-code trust. See [`SuccessSignal`].
+    fn compile_success_signal(&self) -> SuccessSignal;
+
     /// Whether this backend is a MOCK (canned compile/axiom/kernel layers) rather
     /// than a live toolchain. The default is `false` (a real backend); every
     /// mock-capable backend overrides this to return `self.mock`. The default
@@ -471,6 +480,50 @@ pub trait FormalBackend {
                 "whitelist": whitelist,
             }),
         })
+    }
+}
+
+/// What positively constitutes a passing compile (see
+/// [`FormalBackend::compile_success_signal`]). Exit status is never trusted on
+/// its own; this makes each backend's success criterion explicit and auditable.
+#[derive(Debug, Clone)]
+pub enum SuccessSignal {
+    /// The checker sets a correct non-zero exit code on failure, so a clean exit
+    /// is a trustworthy pass (Lean, Rocq, Isabelle, Candle, and Agda under
+    /// `--safe`, which all fail with a non-zero status).
+    NonZeroExitIsHonest,
+    /// The exit code is unreliable, so a pass requires the combined stdout+stderr
+    /// to contain every `must_contain` marker and none of the `must_not_contain`
+    /// markers (Metamath: the "All proofs ... verified" sentinel, and no
+    /// `?Error`/`?Warning`). `must_not_contain` is matched case-insensitively.
+    StdoutSentinel {
+        must_contain: &'static [&'static str],
+        must_not_contain: &'static [&'static str],
+    },
+}
+
+impl SuccessSignal {
+    /// Evaluate the signal against a run. `launched` is whether the process
+    /// actually started; `exit_success` is the backend's exit-code verdict
+    /// (`ExecOutcome::success()`: launched, not timed out, exited zero).
+    pub fn is_pass(&self, launched: bool, exit_success: bool, stdout: &str, stderr: &str) -> bool {
+        match self {
+            SuccessSignal::NonZeroExitIsHonest => exit_success,
+            SuccessSignal::StdoutSentinel {
+                must_contain,
+                must_not_contain,
+            } => {
+                if !launched {
+                    return false;
+                }
+                let combined = format!("{stdout}\n{stderr}");
+                let lc = combined.to_lowercase();
+                must_contain.iter().all(|m| combined.contains(m))
+                    && must_not_contain
+                        .iter()
+                        .all(|m| !lc.contains(&m.to_lowercase()))
+            }
+        }
     }
 }
 
