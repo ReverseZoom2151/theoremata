@@ -295,6 +295,35 @@ mod tests {
     use super::*;
     use crate::prover::formal::FormalBackend;
 
+    /// Candle needs NO comment-policy fix: its offline path is not a raw
+    /// substring scan but `axiom_audit::audit_hol_light`, which already runs
+    /// over comment/string-stripped source. This test pins that, in the same
+    /// pair-form as the other backends: a commented escape hatch passes, a real
+    /// one still fails — i.e. it already matches
+    /// [`crate::prover::statement_preservation::ESCAPE_HATCH_COMMENT_POLICY`].
+    #[test]
+    fn offline_fallback_matches_comment_policy() {
+        assert!(
+            !crate::prover::statement_preservation::commented_escape_hatch_is_a_violation(),
+            "this test encodes ESCAPE_HATCH_COMMENT_POLICY == CodeOnly"
+        );
+        let wl = SYSTEM.axiom_whitelist();
+        // Commented / string-literal escape hatches: the kernel never sees them.
+        let commented = "(* mk_thm and CHEAT_TAC are forbidden here *)\n\
+                         let msg = \"new_axiom\";;\n\
+                         let TRUTH_THM = TRUTH;;\n";
+        let report = crate::prover::axiom_audit::audit_hol_light(commented, &wl).into_scan_report();
+        assert!(
+            report.clean,
+            "commented escape hatch must not gate: {:?}",
+            report.findings
+        );
+        // A REAL kernel bypass still fails.
+        let real = crate::prover::axiom_audit::audit_hol_light("let BAD = mk_thm([],`F`);;\n", &wl)
+            .into_scan_report();
+        assert!(!real.clean, "a real `mk_thm` must still fail offline");
+    }
+
     /// Under the mock backend, a trivial HOL Light theorem certifies through the
     /// whole 3+1-layer gate (canned kernel layers + the REAL source scan), and
     /// the reported system is Candle.

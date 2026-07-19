@@ -444,19 +444,32 @@ impl FormalBackend for IsabelleBackend {
         if let Some(report) = crate::prover::formal::worker_source_scan(SYSTEM, code) {
             return Ok(report);
         }
-        // Isabelle escape hatches NOT caught by thm_oracles / clean build.
-        let low = code.to_lowercase();
-        let patterns = ["sorry", "oops", "quick_and_dirty", "skip_proof", "oracle"];
-        let findings: Vec<String> = patterns
-            .iter()
-            .filter(|p| low.contains(**p))
-            .map(|p| (*p).to_string())
-            .collect();
-        Ok(ScanReport {
-            clean: findings.is_empty(),
-            findings,
-            detail: json!({"system": SYSTEM.as_str(), "fallback": true}),
-        })
+        Ok(fallback_source_scan(code))
+    }
+}
+
+/// Offline lexical fallback for [`IsabelleBackend::source_scan`]: the Isabelle
+/// escape hatches NOT caught by `thm_oracles` / a clean build.
+///
+/// Matched over COMMENT-STRIPPED source so this offline path agrees with the
+/// online (worker) path and with
+/// [`crate::prover::statement_preservation::ESCAPE_HATCH_COMMENT_POLICY`]
+/// (`CodeOnly`): a `(* sorry *)` inside a comment is never seen by the kernel
+/// and so is not a soundness violation. This LOOSENS the gate with respect to
+/// commented text ONLY — a real `sorry` in code is untouched by stripping and
+/// still fails here.
+fn fallback_source_scan(code: &str) -> ScanReport {
+    let low = crate::prover::formal::strip_comments(code).to_lowercase();
+    let patterns = ["sorry", "oops", "quick_and_dirty", "skip_proof", "oracle"];
+    let findings: Vec<String> = patterns
+        .iter()
+        .filter(|p| low.contains(**p))
+        .map(|p| (*p).to_string())
+        .collect();
+    ScanReport {
+        clean: findings.is_empty(),
+        findings,
+        detail: json!({"system": SYSTEM.as_str(), "fallback": true}),
     }
 }
 
@@ -521,4 +534,34 @@ fn write_artifact(dir: &std::path::Path, rel: &str, value: &impl serde::Serializ
     }
     std::fs::write(path, serde_json::to_string_pretty(value)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The offline fallback must implement the SAME comment policy as the
+    /// online scan: a commented escape hatch passes, a real one still fails.
+    #[test]
+    fn offline_fallback_matches_comment_policy() {
+        assert!(
+            !crate::prover::statement_preservation::commented_escape_hatch_is_a_violation(),
+            "this test encodes ESCAPE_HATCH_COMMENT_POLICY == CodeOnly"
+        );
+        // Commented-out escape hatches: the kernel never sees them -> clean.
+        let commented = "(* sorry *)\n(* avoid oops / quick_and_dirty here *)\nlemma t: \"True\" by simp\n";
+        let report = fallback_source_scan(commented);
+        assert!(
+            report.clean,
+            "commented escape hatch must not gate: {:?}",
+            report.findings
+        );
+        // A REAL one in code still fails, offline as well as online.
+        let real = fallback_source_scan("lemma t: \"True\"\n  sorry\n");
+        assert!(!real.clean);
+        assert!(real.findings.iter().any(|f| f == "sorry"));
+        let real2 = fallback_source_scan("lemma t: \"True\"\n  oops\n");
+        assert!(!real2.clean);
+        assert!(real2.findings.iter().any(|f| f == "oops"));
+    }
 }

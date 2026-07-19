@@ -594,6 +594,40 @@ fn norm_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Offline lexical fallback for [`LeanBackend::source_scan`]: the Lean escape
+/// hatches NOT caught cleanly by the kernel / `#print axioms`.
+///
+/// Matched over COMMENT-STRIPPED source, so this offline path agrees with the
+/// online (worker) path and with the single authoritative policy in
+/// [`crate::prover::statement_preservation`]
+/// (`ESCAPE_HATCH_COMMENT_POLICY == CommentPolicy::CodeOnly`,
+/// `commented_escape_hatch_is_a_violation() == false`). A `-- sorry` in a
+/// comment is never seen by the kernel, so it cannot make an unproved theorem
+/// look proved; flagging it only produced offline-only failures on files that
+/// passed online. This LOOSENS the gate with respect to commented text ONLY —
+/// a real `sorry` in code is untouched by stripping and still fails here.
+fn fallback_source_scan(code: &str) -> ScanReport {
+    let low = crate::prover::formal::strip_comments(code).to_lowercase();
+    let patterns = [
+        "sorry",
+        "sorryax",
+        "admit",
+        "native_decide",
+        "ofreducebool",
+        "trustcompiler",
+    ];
+    let findings: Vec<String> = patterns
+        .iter()
+        .filter(|p| low.contains(**p))
+        .map(|p| (*p).to_string())
+        .collect();
+    ScanReport {
+        clean: findings.is_empty(),
+        findings,
+        detail: json!({"system": SYSTEM.as_str(), "fallback": true}),
+    }
+}
+
 impl FormalBackend for LeanBackend {
     fn system(&self) -> FormalSystem {
         SYSTEM
@@ -773,26 +807,7 @@ impl FormalBackend for LeanBackend {
         if let Some(report) = crate::prover::formal::worker_source_scan(SYSTEM, code) {
             return Ok(report);
         }
-        // Lean escape hatches NOT caught by the kernel / `#print axioms` cleanly.
-        let low = code.to_lowercase();
-        let patterns = [
-            "sorry",
-            "sorryax",
-            "admit",
-            "native_decide",
-            "ofreducebool",
-            "trustcompiler",
-        ];
-        let findings: Vec<String> = patterns
-            .iter()
-            .filter(|p| low.contains(**p))
-            .map(|p| (*p).to_string())
-            .collect();
-        Ok(ScanReport {
-            clean: findings.is_empty(),
-            findings,
-            detail: json!({"system": SYSTEM.as_str(), "fallback": true}),
-        })
+        Ok(fallback_source_scan(code))
     }
 
     /// Tier-0 layer 2d channel — see [`LeanBackend::designated_inputs`] (the
@@ -957,6 +972,31 @@ impl ProofSession for LeanBackend {
 mod tier0_tests {
     use super::*;
     use crate::prover::vacuity::{check_vacuity, FieldKind};
+
+    /// The offline fallback must implement the SAME comment policy as the
+    /// online scan: a commented escape hatch passes, a real one still fails.
+    #[test]
+    fn offline_fallback_matches_comment_policy() {
+        assert!(
+            !crate::prover::statement_preservation::commented_escape_hatch_is_a_violation(),
+            "this test encodes ESCAPE_HATCH_COMMENT_POLICY == CodeOnly"
+        );
+        // Commented-out escape hatches: the kernel never sees them -> clean.
+        let commented = "-- sorry\n/- native_decide, admit -/\ntheorem t : True := trivial\n";
+        let report = fallback_source_scan(commented);
+        assert!(
+            report.clean,
+            "commented escape hatch must not gate: {:?}",
+            report.findings
+        );
+        // A REAL one in code still fails, offline as well as online.
+        let real = fallback_source_scan("theorem t : True := by\n  sorry\n");
+        assert!(!real.clean);
+        assert!(real.findings.iter().any(|f| f == "sorry"));
+        let real2 = fallback_source_scan("theorem t : P := by native_decide\n");
+        assert!(!real2.clean);
+        assert!(real2.findings.iter().any(|f| f == "native_decide"));
+    }
 
     fn bundle(stmt: &str) -> Option<crate::prover::vacuity::HypothesisBundle> {
         LeanBackend::mock().hypothesis_bundle(stmt)

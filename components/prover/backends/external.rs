@@ -1036,28 +1036,51 @@ impl FormalBackend for ExternalBackend {
         if let Some(report) = crate::prover::formal::worker_source_scan(self.system, code) {
             return Ok(report);
         }
-        let mut findings = Vec::new();
-        if self.system == FormalSystem::Agda {
-            for (needle, reason) in [
-                ("postulate", "Agda postulates widen the trusted base"),
-                ("--allow-unsolved-metas", "unsolved metas are not proofs"),
-                (
-                    "{-# COMPILED",
-                    "foreign compilation pragma bypasses Agda semantics",
-                ),
-            ] {
-                if code.contains(needle) {
-                    findings.push(format!("{needle}: {reason}"));
-                }
+        Ok(fallback_source_scan(self.system, code))
+    }
+}
+
+/// Offline lexical fallback for [`ExternalBackend::source_scan`] (Agda and
+/// Metamath).
+///
+/// Matched over COMMENT-STRIPPED source so this offline path agrees with the
+/// online (worker) path and with the authoritative policy in
+/// [`crate::prover::statement_preservation`]
+/// (`ESCAPE_HATCH_COMMENT_POLICY == CommentPolicy::CodeOnly`): a commented-out
+/// escape hatch is never seen by the checker, so it must not gate. This
+/// LOOSENS the gate with respect to commented text ONLY — real constructs are
+/// untouched by stripping and still fail.
+///
+/// **Agda pragmas are the subtle case.** `--allow-unsolved-metas` and
+/// `{-# COMPILED ... #-}` live inside `{-# ... #-}`, which is a PRAGMA that the
+/// checker acts on, not a comment. Blanket stripping would erase both and blind
+/// these checks, so [`crate::prover::formal::strip_comments`] exempts pragmas
+/// (copying them through verbatim, `--` options included). Metamath's
+/// `$( ... $)` needs no special handling — `strip_comments` already covers it.
+fn fallback_source_scan(system: FormalSystem, code: &str) -> ScanReport {
+    let stripped = crate::prover::formal::strip_comments(code);
+    let code = stripped.as_str();
+    let mut findings = Vec::new();
+    if system == FormalSystem::Agda {
+        for (needle, reason) in [
+            ("postulate", "Agda postulates widen the trusted base"),
+            ("--allow-unsolved-metas", "unsolved metas are not proofs"),
+            (
+                "{-# COMPILED",
+                "foreign compilation pragma bypasses Agda semantics",
+            ),
+        ] {
+            if code.contains(needle) {
+                findings.push(format!("{needle}: {reason}"));
             }
-        } else if self.system == FormalSystem::Metamath {
-            findings.extend(metamath_source_findings(code));
         }
-        Ok(ScanReport {
-            clean: findings.is_empty(),
-            findings,
-            detail: json!({"system": self.system.as_str(), "fallback": true}),
-        })
+    } else if system == FormalSystem::Metamath {
+        findings.extend(metamath_source_findings(code));
+    }
+    ScanReport {
+        clean: findings.is_empty(),
+        findings,
+        detail: json!({"system": system.as_str(), "fallback": true}),
     }
 }
 
@@ -1159,6 +1182,63 @@ impl ProofSession for ExternalBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Agda's offline fallback must implement the SAME comment policy as the
+    /// online scan: a commented escape hatch passes, a real one still fails.
+    /// Crucially, `{-# ... #-}` is a PRAGMA, not a comment, so pragma-based
+    /// checks must keep firing.
+    #[test]
+    fn agda_offline_fallback_matches_comment_policy() {
+        assert!(
+            !crate::prover::statement_preservation::commented_escape_hatch_is_a_violation(),
+            "this test encodes ESCAPE_HATCH_COMMENT_POLICY == CodeOnly"
+        );
+        let sys = FormalSystem::Agda;
+        // Commented-out escape hatches: Agda never acts on them -> clean.
+        let commented = "-- postulate absurd : Set\n\
+                         {- was: --allow-unsolved-metas, and a {-# COMPILED f g #-} -}\n\
+                         thm : Set\nthm = Set\n";
+        let report = fallback_source_scan(sys, commented);
+        assert!(
+            report.clean,
+            "commented escape hatch must not gate: {:?}",
+            report.findings
+        );
+        // A REAL postulate in code still fails.
+        let real = fallback_source_scan(sys, "postulate absurd : Set\n");
+        assert!(!real.clean);
+        assert!(real.findings.iter().any(|f| f.starts_with("postulate")));
+        // PRAGMAS still fail — they are not comments and are NOT stripped.
+        let opts = fallback_source_scan(sys, "{-# OPTIONS --allow-unsolved-metas #-}\nthm : Set\n");
+        assert!(!opts.clean, "pragma must not be stripped away");
+        assert!(opts
+            .findings
+            .iter()
+            .any(|f| f.starts_with("--allow-unsolved-metas")));
+        let compiled = fallback_source_scan(sys, "{-# COMPILED f g #-}\n");
+        assert!(!compiled.clean, "pragma must not be stripped away");
+        assert!(compiled.findings.iter().any(|f| f.starts_with("{-# COMPILED")));
+    }
+
+    /// Metamath's offline fallback under the same policy. `$( ... $)` is
+    /// already handled by `strip_comments`.
+    #[test]
+    fn metamath_offline_fallback_matches_comment_policy() {
+        let sys = FormalSystem::Metamath;
+        let commented = "$( an old draft: badax $a |- ph $. and a ? step $)\n\
+                         mp2 $p |- ph $= wph wps mp1 mp3 $.\n";
+        let report = fallback_source_scan(sys, commented);
+        assert!(
+            report.clean,
+            "commented escape hatch must not gate: {:?}",
+            report.findings
+        );
+        // Real ones still fail.
+        let real = fallback_source_scan(sys, "badax $a |- ph $.\n");
+        assert!(!real.clean);
+        let incomplete = fallback_source_scan(sys, "foo $p wff ph $= ? $.\n");
+        assert!(!incomplete.clean);
+    }
 
     #[test]
     fn agda_interaction_parser_extracts_structured_goals_and_warnings() {
