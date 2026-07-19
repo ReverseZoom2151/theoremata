@@ -279,14 +279,21 @@ class LeanSession:
         }
 
     # ----------------------------------------------------------------- check
-    def check(self, source_or_theorem: str, print_axioms: str | None = None) -> dict:
+    def check(self, source_or_theorem: str, print_axioms: str | None = None,
+              infotree: bool = False) -> dict:
         """Type-check ``source_or_theorem`` against the warm imports.
 
-        Returns ``{ok, messages, sorries, [axioms], elapsed, mode}``. In repl
-        mode reuses warm env 0 (fast). If the process died it is restarted and
-        the imports re-warmed transparently. ``print_axioms`` (a declaration
-        name) additionally runs ``#print axioms <name>`` and reports the result
-        under ``axioms``."""
+        Returns ``{ok, messages, sorries, [axioms], [infotree], elapsed, mode}``.
+        In repl mode reuses warm env 0 (fast). If the process died it is
+        restarted and the imports re-warmed transparently. ``print_axioms`` (a
+        declaration name) additionally runs ``#print axioms <name>`` and reports
+        the result under ``axioms``.
+
+        ``infotree`` requests the source-ranged elaboration tree, which is what
+        lets a caller attach a goal state to a specific error position. It is
+        opt-in because the tree is large and most callers only want the verdict.
+        The verdict itself is unaffected either way: the tree is advisory
+        output, never an input to ``ok``."""
         t0 = time.time()
         if self.mode == "repl":
             if not (self._warmed and self._alive()):
@@ -295,7 +302,13 @@ class LeanSession:
                     return {"ok": False, "mode": self.mode, "messages": [], "sorries": [],
                             "error": w.get("error", "warm failed"), "elapsed": time.time() - t0}
             try:
-                self._send({"cmd": source_or_theorem, "env": self._base_env})
+                cmd: dict[str, Any] = {"cmd": source_or_theorem, "env": self._base_env}
+                if infotree:
+                    # "original" is the only mode that keeps source ranges;
+                    # the other modes elide them, and without ranges there is
+                    # nothing to match an error position against.
+                    cmd["infotree"] = "original"
+                self._send(cmd)
                 resp = self._await(self.timeout)
             except (BrokenPipeError, TimeoutError) as exc:
                 return {"ok": False, "mode": self.mode, "messages": [], "sorries": [],
@@ -312,6 +325,13 @@ class LeanSession:
                 "env": resp.get("env"),
                 "elapsed": time.time() - t0,
             }
+            if infotree:
+                # Absent means this REPL build does not implement the field.
+                # Report that as None rather than an empty tree: "no goals were
+                # recorded" and "we never got a tree" are different facts, and a
+                # consumer that cannot tell them apart will read the second as
+                # the first.
+                out["infotree"] = resp.get("infotree")
             if print_axioms:
                 try:
                     self._send({"cmd": f"#print axioms {print_axioms}", "env": resp.get("env", self._base_env)})
@@ -443,7 +463,11 @@ def run(request: dict) -> dict:
             if not w.get("ok"):
                 return {"ok": False, "mode": session.mode, "error": w.get("error", "warm failed"),
                         "warm": w}
-            res = session.check(request["source"], print_axioms=request.get("print_axioms"))
+            res = session.check(
+                request["source"],
+                print_axioms=request.get("print_axioms"),
+                infotree=bool(request.get("infotree", False)),
+            )
             res["warm_elapsed"] = w.get("elapsed")
             return res
         raise ValueError(f"unknown op: {op!r}")
@@ -536,7 +560,8 @@ def serve(stdin: Any = None, stdout: Any = None) -> int:
                 continue
             if op == "check":
                 theorem = request.get("theorem")
-                result = session.check(request.get("source", ""), print_axioms=theorem)
+                result = session.check(request.get("source", ""), print_axioms=theorem,
+                                       infotree=bool(request.get("infotree", False)))
                 axioms = _parse_axiom_names(result.get("axioms")) if theorem else []
                 axioms_clean = bool(result.get("ok")) and (
                     not theorem or all(a in _ALLOWED_AXIOMS for a in axioms)

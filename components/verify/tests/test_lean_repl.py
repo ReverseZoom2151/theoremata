@@ -78,3 +78,35 @@ def test_run_dispatch_warm():
     assert "mode" in out
     if out.get("ok"):
         assert out.get("warmed") is True
+
+
+def test_infotree_flag_does_not_change_the_verdict(session):
+    # The tree is advisory output. Requesting it must not alter ok, because a
+    # goal-state consumer that also moved the verdict would be a soundness hole.
+    plain = session.check("theorem t : True := trivial")
+    with_tree = session.check("theorem t : True := trivial", infotree=True)
+    assert plain["ok"] == with_tree["ok"] is True
+
+
+def test_infotree_absent_is_none_not_empty(session):
+    # A REPL build that does not implement the field reports None, distinct from
+    # an empty tree. The check itself must still succeed either way.
+    res = session.check("theorem t : True := trivial", infotree=True)
+    assert res["ok"] is True
+    # Present-and-populated or explicitly absent, never a silent empty stand-in
+    # for "never received".
+    assert "infotree" in res
+    assert res["infotree"] is None or res["infotree"]
+
+
+def test_run_dispatch_accepts_infotree_key():
+    # The worker envelope must thread the flag through without rejecting it, so
+    # the Rust side can request the tree by adding one key.
+    out = lean_repl.run(
+        {"op": "check", "imports": ["Init"], "source": "theorem u : True := trivial",
+         "infotree": True}
+    )
+    if not out.get("ok") and out.get("error"):
+        pytest.skip(f"check dispatch unavailable: {out.get('error')}")
+    assert out["ok"] is True
+    assert "infotree" in out
