@@ -40,6 +40,20 @@ struct Candidate {
     cache_hit: bool,
 }
 
+/// Candidate sources prepared on the caller thread for a later verification
+/// stage. This keeps model/provider calls and any hammer invocation out of the
+/// owned-worker boundary used by the formal-system portfolio.
+///
+/// `attempts` includes generation failures, matching [`sampling::best_of_n`].
+/// The candidates themselves retain generation order; callers select the first
+/// verifier-approved source in that order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedProofCandidates {
+    pub candidates: Vec<String>,
+    pub attempts: usize,
+    pub hammer_candidate: bool,
+}
+
 // Process-default cache used by the existing production API. The proving path is
 // sequential today, so a thread-local cache avoids global locking while still
 // reusing identical candidates across portfolio/agent calls on that thread.
@@ -163,6 +177,55 @@ pub fn generate_and_verify_with_cache(
     )?;
 
     Ok((sampled.value.code, sampled.value.report))
+}
+
+/// Generate every candidate needed for a portfolio verification stage without
+/// invoking a checker. Generation and any optional hammer call remain on the
+/// caller thread; only the returned owned source strings may cross into worker
+/// threads.
+///
+/// This is intentionally not used by [`generate_and_verify_with_cache`]: that
+/// API preserves its established sequential best-of-N short-circuit behavior.
+/// The portfolio uses this preparation path only after an explicit concurrency
+/// opt-in, where running independent verifier jobs in parallel requires all
+/// candidate inputs up front.
+pub fn generate_candidates_for_verification(
+    config: &Config,
+    provider: &dyn ModelProvider,
+    system: FormalSystem,
+    statement: &str,
+    live_backend_available: bool,
+) -> Result<GeneratedProofCandidates> {
+    // This mirrors the candidate ordering in generate_and_verify_with_cache:
+    // a live hammer result occupies slot zero, followed by model candidates.
+    // Failed generations are skipped but still count as attempts.
+    let hammer_candidate = if !config.prover_mock && live_backend_available {
+        hammer_prove(config, system, statement)
+    } else {
+        None
+    };
+    let total = N + hammer_candidate.is_some() as usize;
+    let mut candidates = Vec::with_capacity(total);
+
+    for i in 0..total {
+        let code = match (i, &hammer_candidate) {
+            (0, Some(h)) => Ok(h.clone()),
+            _ => generate_once(provider, system, statement),
+        };
+        if let Ok(code) = code {
+            candidates.push(code);
+        }
+    }
+
+    if candidates.is_empty() {
+        anyhow::bail!("no proof candidate could be generated");
+    }
+
+    Ok(GeneratedProofCandidates {
+        candidates,
+        attempts: total,
+        hammer_candidate: hammer_candidate.is_some(),
+    })
 }
 
 /// Return a cached live verdict or run the real verifier on a miss. The helper is
@@ -457,6 +520,34 @@ mod tests {
             prover_mock: true,
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn preparation_generates_ordered_candidates_without_invoking_a_checker() {
+        let config = mock_config();
+        let provider = CannedProvider {
+            code: "theorem t : True := trivial".into(),
+        };
+
+        let prepared = generate_candidates_for_verification(
+            &config,
+            &provider,
+            FormalSystem::Lean,
+            "True",
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(prepared.attempts, N);
+        assert!(
+            !prepared.hammer_candidate,
+            "mock preparation never invokes hammer"
+        );
+        assert_eq!(prepared.candidates.len(), N);
+        assert!(prepared
+            .candidates
+            .iter()
+            .all(|candidate| candidate == "theorem t : True := trivial"));
     }
 
     fn live_verified_report(marker: &str) -> VerificationReport {

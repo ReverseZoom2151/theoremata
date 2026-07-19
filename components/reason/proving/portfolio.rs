@@ -7,16 +7,21 @@
 //! per-system verdict, and names the WINNER — the first system whose report is
 //! `lexically_verified`.
 //!
-//! It is deliberately simple and SEQUENTIAL (a real race across prover processes
-//! is out of scope; sequential is deterministic and reproducible), but each
-//! system's attempt is INDEPENDENT: a system whose toolchain is absent
+//! It is sequential and deterministic by default. An explicitly enabled owned
+//! verification stage can run already-generated candidates on worker threads;
+//! provider calls, database writes, result order, and winner selection remain
+//! deterministic on the caller thread. A system whose toolchain is absent
 //! contributes an `available: false` entry, and a system that errors out records
 //! its error — neither aborts the sibling attempts.
 
 use crate::{
+    concurrent::ConcurrentConfig,
     config::Config,
     db::Store,
-    formal_generate::generate_and_verify,
+    formal_generate::{generate_and_verify, generate_candidates_for_verification},
+    formalize_portfolio::{
+        run_owned_formal_system_verifications, OwnedVerificationTask, VerificationMode,
+    },
     prover::{
         formal::{backend_for, FormalSystem},
         model::VerificationReport,
@@ -29,8 +34,11 @@ use serde_json::json;
 use std::time::Instant;
 
 /// The three systems attempted when the caller does not restrict the portfolio.
-pub const ALL_SYSTEMS: [FormalSystem; 3] =
-    [FormalSystem::Lean, FormalSystem::Rocq, FormalSystem::Isabelle];
+pub const ALL_SYSTEMS: [FormalSystem; 3] = [
+    FormalSystem::Lean,
+    FormalSystem::Rocq,
+    FormalSystem::Isabelle,
+];
 
 /// One system's independent attempt at the conjecture.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +95,18 @@ pub fn portfolio_prove(
     } else {
         systems.to_vec()
     };
+
+    let concurrency = portfolio_verification_concurrency();
+    if concurrency.enabled {
+        return portfolio_prove_with_owned_verification(
+            store,
+            config,
+            provider,
+            statement,
+            systems,
+            &concurrency,
+        );
+    }
 
     let mut per_system = Vec::with_capacity(systems.len());
     let mut winner: Option<FormalSystem> = None;
@@ -170,6 +190,218 @@ pub fn portfolio_prove(
     })
 }
 
+/// Parse the explicit environment-only opt-in for owned verifier workers.
+///
+/// `THEOREMATA_PORTFOLIO_VERIFY_THREADS` is disabled when absent, empty, false,
+/// or zero. `true`/`on`/`1` uses the machine parallelism; a positive integer
+/// selects an explicit worker cap. There is deliberately no implicit platform
+/// default: the established portfolio API stays sequential unless an operator
+/// opts in.
+fn portfolio_verification_concurrency() -> ConcurrentConfig {
+    concurrency_from_value(
+        std::env::var("THEOREMATA_PORTFOLIO_VERIFY_THREADS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn concurrency_from_value(value: Option<&str>) -> ConcurrentConfig {
+    let Some(value) = value.map(str::trim) else {
+        return ConcurrentConfig::sequential();
+    };
+    let normalized = value.to_ascii_lowercase();
+    if matches!(normalized.as_str(), "" | "0" | "false" | "off" | "no") {
+        return ConcurrentConfig::sequential();
+    }
+    if matches!(normalized.as_str(), "1" | "true" | "on" | "yes") {
+        return ConcurrentConfig::with_threads(ConcurrentConfig::default_parallelism());
+    }
+    match normalized.parse::<usize>() {
+        Ok(threads) if threads > 0 => ConcurrentConfig::with_threads(threads),
+        _ => ConcurrentConfig::sequential(),
+    }
+}
+
+/// Run the opt-in portfolio shape. Candidate generation and all store writes
+/// remain sequential; only owned backend verification jobs cross to workers.
+/// Results retain the requested system order, and each system selects the first
+/// source that passed the gate in generation order.
+fn portfolio_prove_with_owned_verification(
+    store: &Store,
+    config: &Config,
+    provider: &dyn ModelProvider,
+    statement: &str,
+    systems: Vec<FormalSystem>,
+    concurrency: &ConcurrentConfig,
+) -> Result<PortfolioResult> {
+    struct PreparedSystem {
+        output_index: usize,
+        task_start: usize,
+        task_end: usize,
+        generation_duration_ms: u128,
+    }
+
+    let mut attempts: Vec<Option<SystemAttempt>> = vec![None; systems.len()];
+    let mut prepared = Vec::new();
+    let mut tasks = Vec::new();
+
+    // Provider/model calls are intentionally in requested-system order and stay
+    // on this thread. The worker receives only the owned verification input.
+    for (output_index, system) in systems.iter().copied().enumerate() {
+        let live_available = !config.prover_mock && backend_for(config, system, false).available();
+        if !config.prover_mock && !live_available {
+            attempts[output_index] = Some(SystemAttempt {
+                system,
+                verified: false,
+                available: false,
+                code: None,
+                report: None,
+                duration_ms: 0,
+                error: None,
+            });
+            continue;
+        }
+
+        let generation_started = Instant::now();
+        let generated = match generate_candidates_for_verification(
+            config,
+            provider,
+            system,
+            statement,
+            live_available,
+        ) {
+            Ok(generated) => generated,
+            Err(error) => {
+                attempts[output_index] = Some(SystemAttempt {
+                    system,
+                    verified: false,
+                    available: true,
+                    code: None,
+                    report: None,
+                    duration_ms: generation_started.elapsed().as_millis(),
+                    error: Some(error.to_string()),
+                });
+                continue;
+            }
+        };
+        let generation_duration_ms = generation_started.elapsed().as_millis();
+        let task_start = tasks.len();
+        let mode = if config.prover_mock {
+            VerificationMode::Mock
+        } else {
+            VerificationMode::Live
+        };
+        for code in generated.candidates {
+            tasks.push(match mode {
+                VerificationMode::Live => {
+                    OwnedVerificationTask::live(config.clone(), system, code, statement.to_string())
+                }
+                VerificationMode::Mock => {
+                    OwnedVerificationTask::mock(config.clone(), system, code, statement.to_string())
+                }
+            });
+        }
+        prepared.push(PreparedSystem {
+            output_index,
+            task_start,
+            task_end: tasks.len(),
+            generation_duration_ms,
+        });
+    }
+
+    let results = run_owned_formal_system_verifications(tasks, concurrency);
+    for prepared_system in prepared {
+        let system_results = &results[prepared_system.task_start..prepared_system.task_end];
+        // This matches best_of_n: accept the first passing candidate, otherwise
+        // retain the final candidate that produced a verifier report. A worker
+        // error is skipped rather than becoming a false verification result.
+        let selected = system_results
+            .iter()
+            .find(|result| result.gate_passed())
+            .or_else(|| {
+                system_results
+                    .iter()
+                    .rev()
+                    .find(|result| result.report.is_some())
+            });
+
+        let attempt = match selected {
+            Some(selected) => SystemAttempt {
+                system: selected.system,
+                verified: selected.gate_passed(),
+                available: selected.available,
+                code: Some(selected.code.clone()),
+                report: selected.report.clone(),
+                duration_ms: prepared_system.generation_duration_ms
+                    + system_results
+                        .iter()
+                        .map(|result| result.duration_ms)
+                        .max()
+                        .unwrap_or(0),
+                error: selected.error.clone(),
+            },
+            None => SystemAttempt {
+                system: systems[prepared_system.output_index],
+                verified: false,
+                available: system_results.iter().any(|result| result.available),
+                code: None,
+                report: None,
+                duration_ms: prepared_system.generation_duration_ms
+                    + system_results
+                        .iter()
+                        .map(|result| result.duration_ms)
+                        .max()
+                        .unwrap_or(0),
+                error: Some("no proof candidate reached a verification verdict".into()),
+            },
+        };
+        attempts[prepared_system.output_index] = Some(attempt);
+    }
+
+    let per_system: Vec<SystemAttempt> = attempts
+        .into_iter()
+        .map(|attempt| attempt.expect("every requested system receives one portfolio result"))
+        .collect();
+    let winner = per_system
+        .iter()
+        .find(|attempt| attempt.verified)
+        .map(|attempt| attempt.system);
+    let any_verified = winner.is_some();
+
+    store.event(
+        None,
+        None,
+        "portfolio_prove.completed",
+        winner.map(|system| system.as_str()).unwrap_or("none"),
+        json!({
+            "statement": statement,
+            "winner": winner.map(|system| system.as_str()),
+            "any_verified": any_verified,
+            "verification_concurrency": {
+                "enabled": concurrency.enabled,
+                "max_threads": concurrency.max_threads,
+            },
+            "attempts": per_system
+                .iter()
+                .map(|attempt| json!({
+                    "system": attempt.system.as_str(),
+                    "verified": attempt.verified,
+                    "available": attempt.available,
+                    "duration_ms": attempt.duration_ms,
+                    "live": attempt.report.as_ref().map(|report| report.live),
+                }))
+                .collect::<Vec<_>>(),
+        }),
+    )?;
+
+    Ok(PortfolioResult {
+        statement: statement.to_string(),
+        winner,
+        any_verified,
+        per_system,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,13 +454,20 @@ mod tests {
         let config = mock_config();
         // OfflineProvider → each system generates its native trivially-true stub,
         // which the mock backend (canned kernel + REAL source scan) certifies.
-        let result =
-            portfolio_prove(&store, &config, &OfflineProvider, "True", &[]).unwrap();
+        let result = portfolio_prove(&store, &config, &OfflineProvider, "True", &[]).unwrap();
 
         assert_eq!(result.per_system.len(), 3, "all three systems attempted");
         for attempt in &result.per_system {
-            assert!(attempt.available, "{}: mock backend is available", attempt.system);
-            assert!(attempt.verified, "{}: trivial stub should certify", attempt.system);
+            assert!(
+                attempt.available,
+                "{}: mock backend is available",
+                attempt.system
+            );
+            assert!(
+                attempt.verified,
+                "{}: trivial stub should certify",
+                attempt.system
+            );
         }
         assert!(result.any_verified);
         // The winner is the FIRST verifying system in ALL_SYSTEMS order (Lean).
@@ -239,8 +478,7 @@ mod tests {
     fn no_winner_when_every_candidate_has_an_escape_hatch() {
         let store = store();
         let config = mock_config();
-        let result =
-            portfolio_prove(&store, &config, &EscapeHatchProvider, "True", &[]).unwrap();
+        let result = portfolio_prove(&store, &config, &EscapeHatchProvider, "True", &[]).unwrap();
 
         assert_eq!(result.per_system.len(), 3, "all three still attempted");
         for attempt in &result.per_system {
@@ -252,7 +490,11 @@ mod tests {
             );
             // The mandatory source scan flags the escape hatch.
             let report = attempt.report.as_ref().unwrap();
-            assert!(!report.lexical_clean, "{}: scan must flag it", attempt.system);
+            assert!(
+                !report.lexical_clean,
+                "{}: scan must flag it",
+                attempt.system
+            );
         }
         assert!(!result.any_verified);
         assert_eq!(result.winner, None);
@@ -278,6 +520,63 @@ mod tests {
     }
 
     #[test]
+    fn owned_verification_keeps_system_order_and_mock_provenance() {
+        let store = store();
+        let config = mock_config();
+        let result = portfolio_prove_with_owned_verification(
+            &store,
+            &config,
+            &OfflineProvider,
+            "True",
+            vec![FormalSystem::Rocq, FormalSystem::Lean],
+            &ConcurrentConfig::with_threads(2),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result
+                .per_system
+                .iter()
+                .map(|attempt| attempt.system)
+                .collect::<Vec<_>>(),
+            vec![FormalSystem::Rocq, FormalSystem::Lean],
+            "worker completion order must never affect portfolio order"
+        );
+        assert_eq!(result.winner, Some(FormalSystem::Rocq));
+        for attempt in &result.per_system {
+            assert!(attempt.verified);
+            assert!(
+                !attempt.report.as_ref().unwrap().live,
+                "mock mode must remain visibly mock after owned verification"
+            );
+        }
+    }
+
+    #[test]
+    fn verification_thread_opt_in_is_disabled_unless_explicitly_enabled() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("bogus"),
+        ] {
+            assert!(
+                !concurrency_from_value(value).enabled,
+                "{value:?} must preserve the sequential default"
+            );
+        }
+        for value in [Some("1"), Some("true"), Some("on"), Some("3")] {
+            assert!(
+                concurrency_from_value(value).enabled,
+                "{value:?} must explicitly enable owned verifier workers"
+            );
+        }
+        assert_eq!(concurrency_from_value(Some("3")).max_threads, 3);
+    }
+
+    #[test]
     fn live_portfolio_certifies_a_trivial_statement_when_a_toolchain_is_present() {
         let config = Config::default();
         // Probe: only meaningful if at least one live backend is available.
@@ -291,8 +590,7 @@ mod tests {
         let store = store();
         // OfflineProvider → per-system trivially-true stubs; live gates compile
         // them, unavailable systems degrade to `available: false` (not errors).
-        let result =
-            portfolio_prove(&store, &config, &OfflineProvider, "True", &[]).unwrap();
+        let result = portfolio_prove(&store, &config, &OfflineProvider, "True", &[]).unwrap();
 
         assert_eq!(result.per_system.len(), 3);
         assert!(
