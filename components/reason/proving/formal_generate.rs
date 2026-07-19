@@ -16,11 +16,12 @@
 //! `Admitted` candidate is still rejected).
 
 use crate::{
+    checker_cache::{CheckerCache, VerificationCacheKey},
     config::Config,
     db::Store,
     model::ModelRequest,
     prover::{
-        formal::{backend_for, FormalSystem},
+        formal::{backend_for, FormalBackend, FormalSystem},
         model::VerificationReport,
     },
     provider::ModelProvider,
@@ -36,6 +37,15 @@ const N: usize = 3;
 struct Candidate {
     code: String,
     report: VerificationReport,
+    cache_hit: bool,
+}
+
+// Process-default cache used by the existing production API. The proving path is
+// sequential today, so a thread-local cache avoids global locking while still
+// reusing identical candidates across portfolio/agent calls on that thread.
+// Callers needing explicit lifetime/isolation use generate_and_verify_with_cache.
+thread_local! {
+    static DEFAULT_CHECKER_CACHE: CheckerCache = CheckerCache::new();
 }
 
 /// Generate a proof of `statement` in `system` and verify it through the live
@@ -53,6 +63,24 @@ pub fn generate_and_verify(
     system: FormalSystem,
     statement: &str,
 ) -> Result<(String, VerificationReport)> {
+    DEFAULT_CHECKER_CACHE.with(|cache| {
+        generate_and_verify_with_cache(store, config, provider, system, statement, &[], Some(cache))
+    })
+}
+
+/// Cache-aware variant of [`generate_and_verify`]. `ordered_context` is part of
+/// the verification identity and is never sorted. Passing `None` preserves the
+/// pre-cache behavior exactly; an empty cache merely adds a lookup before the
+/// same live gate call. Only complete LIVE successes are inserted.
+pub fn generate_and_verify_with_cache(
+    store: &Store,
+    config: &Config,
+    provider: &dyn ModelProvider,
+    system: FormalSystem,
+    statement: &str,
+    ordered_context: &[String],
+    cache: Option<&CheckerCache>,
+) -> Result<(String, VerificationReport)> {
     // Prefer the live backend (real compile/audit/recheck) when its toolchain is
     // present; degrade to the mock backend when it is absent or when
     // `config.prover_mock` forces offline mode. Either way the source scan runs
@@ -64,6 +92,8 @@ pub fn generate_and_verify(
     } else {
         backend_for(config, system, true)
     };
+    let checker_identity = checker_identity(config, backend.as_ref());
+    let policy_fingerprint = policy_fingerprint(config, backend.as_ref());
 
     // An ADDITIONAL best-of-N candidate: a hammer-assisted proof. We ask the
     // `hammer` worker (Sledgehammer / CoqHammer / aesop) to FIND a tactic for the
@@ -93,8 +123,21 @@ pub fn generate_and_verify(
                 (0, Some(h)) => h.clone(),
                 _ => generate_once(provider, system, statement)?,
             };
-            let report = backend.verify(config, &code, statement)?;
-            Ok(Candidate { code, report })
+            let key = VerificationCacheKey {
+                system,
+                canonical_statement: statement,
+                ordered_context,
+                proof_source: &code,
+                checker_identity: &checker_identity,
+                policy_fingerprint: &policy_fingerprint,
+            };
+            let (report, cache_hit) =
+                verify_candidate(cache, &key, || backend.verify(config, &code, statement))?;
+            Ok(Candidate {
+                code,
+                report,
+                cache_hit,
+            })
         },
         |c: &Candidate| c.report.lexically_verified,
     )?;
@@ -114,10 +157,98 @@ pub fn generate_and_verify(
             "verified": sampled.value.report.lexically_verified,
             "backend": if used_live { "live" } else { "mock" },
             "hammer_candidate": hammer_candidate.is_some(),
+            "checker_cache_enabled": cache.is_some(),
+            "checker_cache_hit": sampled.value.cache_hit,
         }),
     )?;
 
     Ok((sampled.value.code, sampled.value.report))
+}
+
+/// Return a cached live verdict or run the real verifier on a miss. The helper is
+/// deliberately small so its safety properties are unit-testable without an
+/// external prover: no cache/empty cache runs `verify`, failures and mock reports
+/// are refused by `CheckerCache`, and only an exact key can hit.
+fn verify_candidate<F>(
+    cache: Option<&CheckerCache>,
+    key: &VerificationCacheKey<'_>,
+    verify: F,
+) -> Result<(VerificationReport, bool)>
+where
+    F: FnOnce() -> Result<VerificationReport>,
+{
+    if let Some(report) = cache.and_then(|cache| cache.get(key)) {
+        return Ok((report, true));
+    }
+
+    let report = verify()?;
+    if let Some(cache) = cache {
+        // Defensive insertion policy lives in CheckerCache: incomplete, failed,
+        // and mock reports are all refused and therefore never become hits.
+        cache.insert_verified(key, report.clone());
+    }
+    Ok((report, false))
+}
+
+/// Stable identity for the checker installation and corpus selected by config.
+/// The optional epoch is an explicit cache-buster for an in-place tool/corpus
+/// replacement whose path and configured toolchain string did not change.
+fn checker_identity(config: &Config, backend: &dyn FormalBackend) -> String {
+    let system = backend.system();
+    let env_or = crate::prover::exec::env_or;
+    let binaries = match system {
+        FormalSystem::Lean => json!({
+            "lean": env_or("THEOREMATA_LEAN", &config.lean_bin),
+            "lake": env_or("THEOREMATA_LAKE", "lake"),
+        }),
+        FormalSystem::Rocq => json!({
+            "coqc": env_or("THEOREMATA_COQC", &config.coqc_bin),
+            "coqchk": env_or("THEOREMATA_COQCHK", &config.coqchk_bin),
+        }),
+        FormalSystem::Isabelle => json!({
+            "isabelle": env_or("THEOREMATA_ISABELLE", &config.isabelle_bin),
+        }),
+        FormalSystem::Candle => json!({
+            "candle": env_or("THEOREMATA_CANDLE", &config.candle_bin),
+        }),
+        FormalSystem::Agda => json!({
+            "agda": env_or("THEOREMATA_AGDA", &config.agda_bin),
+        }),
+        FormalSystem::Metamath => json!({
+            "metamath": env_or("THEOREMATA_METAMATH", &config.metamath_bin),
+            "secondary": std::env::var("THEOREMATA_METAMATH_SECONDARY").ok(),
+        }),
+    };
+    json!({
+        "schema": "theoremata.checker-identity.v1",
+        "system": system.as_str(),
+        "mode": if backend.is_mock() { "mock" } else { "live" },
+        "runner": config.formal_runners.for_system(system).tag(),
+        "binaries": binaries,
+        "expected_toolchain": backend.expected_toolchain(),
+        "lean_project": config.lean_project.as_ref().map(|p| p.display().to_string()),
+        "resources": config.resources.display().to_string(),
+        "cache_epoch": std::env::var("THEOREMATA_CHECKER_CACHE_EPOCH").ok(),
+    })
+    .to_string()
+}
+
+/// Fingerprint policy that can change gate acceptance independently of the
+/// candidate text or checker installation.
+fn policy_fingerprint(config: &Config, backend: &dyn FormalBackend) -> String {
+    let limits = crate::prover::exec::ResourceLimits::from_env();
+    json!({
+        "schema": "theoremata.formal-gate-policy.v1",
+        "crate_version": env!("CARGO_PKG_VERSION"),
+        "system": backend.system().as_str(),
+        "axiom_whitelist": backend.system().axiom_whitelist(),
+        "success_signal": format!("{:?}", backend.compile_success_signal()),
+        "kernel_validate_proof": config.kernel_validate_proof,
+        "timeout_secs": limits.timeout.as_secs(),
+        "max_output_bytes": limits.max_output_bytes,
+        "source_policy": "mandatory-scan+statement-preservation+no-suggestion-tactics",
+    })
+    .to_string()
 }
 
 /// Ask the `hammer` worker (Sledgehammer / CoqHammer / aesop) to FIND a proof of
@@ -138,7 +269,11 @@ pub fn hammer_prove(config: &Config, system: FormalSystem, goal: &str) -> Option
     }
     // `null` mode = auto (live if the toolchain is present); force `mock` only when
     // the whole prover is pinned to mock so offline runs are deterministic.
-    let mode: Option<&str> = if config.prover_mock { Some("mock") } else { None };
+    let mode: Option<&str> = if config.prover_mock {
+        Some("mock")
+    } else {
+        None
+    };
     let result = py
         .run(json!({
             "tool": "hammer",
@@ -153,7 +288,11 @@ pub fn hammer_prove(config: &Config, system: FormalSystem, goal: &str) -> Option
         return None;
     }
     let output = v.get("output")?;
-    if !output.get("success").and_then(Value::as_bool).unwrap_or(false) {
+    if !output
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
         return None;
     }
     let tactic = output
@@ -181,9 +320,9 @@ pub fn assemble_proof(system: FormalSystem, goal: &str, tactic: &str) -> String 
     let goal = goal.trim();
     let tactic = tactic.trim();
     match system {
-        FormalSystem::Isabelle => format!(
-            "theory T\n  imports Main\nbegin\n\ntheorem t: \"{goal}\"\n  {tactic}\n\nend\n"
-        ),
+        FormalSystem::Isabelle => {
+            format!("theory T\n  imports Main\nbegin\n\ntheorem t: \"{goal}\"\n  {tactic}\n\nend\n")
+        }
         FormalSystem::Rocq => {
             // The Rocq reconstruction is a tactic script; normalize a single
             // terminating `.` so `sauto` and `sauto.` both yield one period.
@@ -252,7 +391,10 @@ fn task_for(system: FormalSystem, statement: &str) -> String {
         FormalSystem::Isabelle => ("Isabelle/Isar", "sorry, oops, or an oracle"),
         FormalSystem::Candle => ("HOL Light (Candle)", "mk_thm or new_axiom"),
         FormalSystem::Agda => ("Agda", "postulate, unsafe, or unsolved metas"),
-        FormalSystem::Metamath => ("Metamath", "unverified proof shortcuts or malformed $p declarations"),
+        FormalSystem::Metamath => (
+            "Metamath",
+            "unverified proof shortcuts or malformed $p declarations",
+        ),
     };
     format!(
         "Write a complete, self-contained {lang} proof of: {statement}. \
@@ -284,6 +426,7 @@ fn stub_for(system: FormalSystem) -> String {
 mod tests {
     use super::*;
     use crate::model::ModelResponse;
+    use std::cell::Cell;
     use std::path::Path;
 
     /// A mock provider that returns a caller-chosen proof body for every role.
@@ -316,13 +459,183 @@ mod tests {
         }
     }
 
+    fn live_verified_report(marker: &str) -> VerificationReport {
+        VerificationReport {
+            lexically_verified: true,
+            axioms_clean: true,
+            statement_preserved: true,
+            lexical_clean: true,
+            hardening_clean: Some(true),
+            live: true,
+            detail: json!({"marker": marker}),
+        }
+    }
+
+    fn failed_report() -> VerificationReport {
+        VerificationReport {
+            lexically_verified: false,
+            axioms_clean: false,
+            statement_preserved: false,
+            lexical_clean: false,
+            hardening_clean: Some(false),
+            live: true,
+            detail: json!({"marker": "failed"}),
+        }
+    }
+
+    fn mock_verified_report() -> VerificationReport {
+        VerificationReport {
+            live: false,
+            ..live_verified_report("mock")
+        }
+    }
+
+    #[test]
+    fn exact_live_success_is_reused_without_reinvoking_the_verifier() {
+        let cache = CheckerCache::new();
+        let context = vec!["h : P".to_string()];
+        let key = VerificationCacheKey {
+            system: FormalSystem::Lean,
+            canonical_statement: "P",
+            ordered_context: &context,
+            proof_source: "theorem p : P := h",
+            checker_identity: "lean:live:v4.19",
+            policy_fingerprint: "gate-v1",
+        };
+        let calls = Cell::new(0);
+
+        let (first, first_hit) = verify_candidate(Some(&cache), &key, || {
+            calls.set(calls.get() + 1);
+            Ok(live_verified_report("fresh"))
+        })
+        .unwrap();
+        let (second, second_hit) = verify_candidate(Some(&cache), &key, || {
+            calls.set(calls.get() + 1);
+            Ok(live_verified_report("must-not-run"))
+        })
+        .unwrap();
+
+        assert!(!first_hit);
+        assert!(second_hit);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(first.detail, second.detail);
+    }
+
+    #[test]
+    fn absent_cache_preserves_verifier_behavior() {
+        let context = Vec::new();
+        let key = VerificationCacheKey {
+            system: FormalSystem::Lean,
+            canonical_statement: "True",
+            ordered_context: &context,
+            proof_source: "theorem t : True := trivial",
+            checker_identity: "lean:live",
+            policy_fingerprint: "gate-v1",
+        };
+        let calls = Cell::new(0);
+        for marker in ["first", "second"] {
+            let (report, hit) = verify_candidate(None, &key, || {
+                calls.set(calls.get() + 1);
+                Ok(live_verified_report(marker))
+            })
+            .unwrap();
+            assert!(!hit);
+            assert_eq!(report.detail["marker"], marker);
+        }
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn failures_and_mock_successes_are_rechecked_not_cached() {
+        let cache = CheckerCache::new();
+        let context = Vec::new();
+        let live_key = VerificationCacheKey {
+            system: FormalSystem::Lean,
+            canonical_statement: "False",
+            ordered_context: &context,
+            proof_source: "theorem bad : False := candidate",
+            checker_identity: "lean:live",
+            policy_fingerprint: "gate-v1",
+        };
+        let mock_key = VerificationCacheKey {
+            checker_identity: "lean:mock",
+            ..live_key
+        };
+        let calls = Cell::new(0);
+
+        for _ in 0..2 {
+            let (_, hit) = verify_candidate(Some(&cache), &live_key, || {
+                calls.set(calls.get() + 1);
+                Ok(failed_report())
+            })
+            .unwrap();
+            assert!(!hit);
+        }
+        for _ in 0..2 {
+            let (_, hit) = verify_candidate(Some(&cache), &mock_key, || {
+                calls.set(calls.get() + 1);
+                Ok(mock_verified_report())
+            })
+            .unwrap();
+            assert!(!hit);
+        }
+        assert_eq!(calls.get(), 4);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn checker_identity_and_policy_separate_mode_and_gate_configuration() {
+        let base = Config::default();
+        let live = backend_for(&base, FormalSystem::Lean, false);
+        let mock_backend = backend_for(&base, FormalSystem::Lean, true);
+        assert_ne!(
+            checker_identity(&base, live.as_ref()),
+            checker_identity(&base, mock_backend.as_ref())
+        );
+
+        let stricter = Config {
+            kernel_validate_proof: !base.kernel_validate_proof,
+            ..base.clone()
+        };
+        assert_ne!(
+            policy_fingerprint(&base, live.as_ref()),
+            policy_fingerprint(&stricter, live.as_ref())
+        );
+    }
+
+    #[test]
+    fn real_mock_candidate_path_never_populates_the_checker_cache() {
+        let store = store();
+        let config = mock_config();
+        let cache = CheckerCache::new();
+        let provider = CannedProvider {
+            code: "theorem t : True := trivial".into(),
+        };
+        let (_, report) = generate_and_verify_with_cache(
+            &store,
+            &config,
+            &provider,
+            FormalSystem::Lean,
+            "True",
+            &[],
+            Some(&cache),
+        )
+        .unwrap();
+        assert!(report.lexically_verified);
+        assert!(!report.live);
+        assert!(cache.is_empty());
+    }
+
     #[test]
     fn returns_code_and_report_for_each_system() {
         let store = store();
         let config = mock_config();
         for (system, code) in [
             (FormalSystem::Lean, "theorem t : True := trivial"),
-            (FormalSystem::Rocq, "Theorem t : True.\nProof. exact I. Qed."),
+            (
+                FormalSystem::Rocq,
+                "Theorem t : True.\nProof. exact I. Qed.",
+            ),
             (
                 FormalSystem::Isabelle,
                 "theory Scratch\n imports Main\nbegin\ntheorem t: \"True\" by simp\nend",
