@@ -1301,7 +1301,10 @@ impl SpliceVerdict {
 
 /// A piece of model output the splice deliberately did NOT carry into the
 /// compiled file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Serialize only: `position` is a `&'static str`, which cannot satisfy
+// Deserialize's `'de` lifetime. These are written into a JSON report and never
+// read back, so the round trip is not needed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DiscardedDecl {
     /// Declaration name, or `"<trailing>"` for column-0 material that trailed the
     /// proof body without a declaration keyword.
@@ -1314,7 +1317,8 @@ pub struct DiscardedDecl {
 
 /// Result of [`splice_canonical_statement`].
 // No `Eq`: `detail` is a `serde_json::Value`, which is only `PartialEq`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// Serialize only: transitively contains `DiscardedDecl`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SpliceOutcome {
     /// Structured verdict.
     pub verdict: SpliceVerdict,
