@@ -22,7 +22,13 @@
 //! function of `(informal, config, seams)`.
 
 use super::formalize_portfolio::{ScreenResult, StatementScreen};
+use crate::config::Config;
+use crate::db::Store;
+use crate::model::ModelRequest;
+use crate::provider::ModelProvider;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 /// Which formalizer pass produced a candidate, with its cost/latency metadata.
 ///
@@ -334,6 +340,176 @@ fn candidate_score(c: &ModeCandidate) -> (bool, i64) {
     (c.valid(), -(c.mode.cost() as i64))
 }
 
+// ---------------------------------------------------------------------------
+// CLI entry point: the production seams for the two-mode portfolio
+// ---------------------------------------------------------------------------
+
+/// [`ModeFormalizer`] backed by the model provider. The two modes map to two
+/// distinct roles/prompts (a cheap direct pass vs an explicit chain-of-thought
+/// pass), exactly the production split the module documents. Any provider or
+/// parse failure yields NO candidates rather than a fabricated one.
+struct ModelModeFormalizer<'a> {
+    provider: &'a dyn ModelProvider,
+}
+
+impl ModeFormalizer for ModelModeFormalizer<'_> {
+    fn formalize_mode(&self, mode: FormalizeMode, informal: &str, seed: u64) -> Vec<String> {
+        let task = if mode.uses_cot() {
+            "Formalize the informal statement. Reason step by step, then output candidate \
+             formal statements (statements only, not proofs)."
+        } else {
+            "Formalize the informal statement directly, without chain-of-thought. Output \
+             candidate formal statements (statements only, not proofs)."
+        };
+        let request = ModelRequest {
+            role: match mode {
+                FormalizeMode::FastNoCot => "formalize_fast".into(),
+                FormalizeMode::PreciseCot => "formalize_precise".into(),
+            },
+            task: task.into(),
+            context: json!({
+                "informal": informal,
+                "mode": mode.label(),
+                "seed": seed,
+            }),
+            output_schema: json!({
+                "type": "object",
+                "required": ["candidates"],
+                "properties": {
+                    "candidates": {"type": "array", "items": {"type": "string"}}
+                }
+            }),
+        };
+        match self.provider.complete(&request) {
+            Ok(resp) => resp
+                .content
+                .get("candidates")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+/// [`StatementScreen`] backed by the model provider: an ADVISORY well-formedness
+/// + triviality judge, NOT a compiler. It fails CLOSED: if the provider errors or
+/// omits a required verdict, the candidate is treated as not well-formed (hence
+/// invalid), so an absent screen can never let a candidate be recommended. The
+/// production upgrade is to wire the real compiler + triviality tool here; the
+/// seam and this module are unchanged by that swap.
+struct ModelScreen<'a> {
+    provider: &'a dyn ModelProvider,
+}
+
+impl StatementScreen for ModelScreen<'_> {
+    fn screen(&self, formal: &str) -> ScreenResult {
+        let request = ModelRequest {
+            role: "formalize_screen".into(),
+            task: "Judge this candidate FORMAL statement. Report `well_formed` (is it a \
+                   syntactically valid, type-plausible statement?) and `trivial` (is it \
+                   vacuous or trivially true?). This is ADVISORY; it does NOT certify the \
+                   statement."
+                .into(),
+            // The candidate is model output; fence it as data before re-prompting.
+            context: json!({"formal": crate::guard::wrap_untrusted("formal_candidate", formal)}),
+            output_schema: json!({
+                "type": "object",
+                "required": ["well_formed", "trivial"],
+                "properties": {
+                    "well_formed": {"type": "boolean"},
+                    "trivial": {"type": "boolean"},
+                    "note": {"type": "string"}
+                }
+            }),
+        };
+        match self.provider.complete(&request) {
+            Ok(resp) => {
+                let well_formed = resp.content.get("well_formed").and_then(|v| v.as_bool());
+                let trivial = resp.content.get("trivial").and_then(|v| v.as_bool());
+                match (well_formed, trivial) {
+                    (Some(well_formed), Some(trivial)) => ScreenResult {
+                        well_formed,
+                        trivial,
+                        note: resp
+                            .content
+                            .get("note")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("advisory model screen")
+                            .to_string(),
+                    },
+                    // A missing verdict is not evidence of well-formedness: fail closed.
+                    _ => ScreenResult {
+                        well_formed: false,
+                        trivial: false,
+                        note: "screen incomplete: verdict missing, treated as not well-formed"
+                            .into(),
+                    },
+                }
+            }
+            Err(e) => ScreenResult {
+                well_formed: false,
+                trivial: false,
+                note: format!("screen unavailable: {e}"),
+            },
+        }
+    }
+}
+
+/// Run the fast-first / precise-on-failure formalization portfolio against live
+/// seams: the model provider generates candidates per mode, an advisory model
+/// screen judges them.
+///
+/// Returns a JSON summary wrapping the full [`TwoModeOutcome`]. The result is
+/// strictly ADVISORY: the chosen candidate is the best-SCREENED formalization for
+/// downstream verification, never a certified one, hence the explicit
+/// `"certified": false`. `config` names the target formal system the chosen
+/// candidate is intended for (context only; nothing is verified here). Emits a
+/// `formalize_two_mode.*` run trace to the store.
+pub fn run_two_mode_formalization(
+    store: &Store,
+    config: &Config,
+    provider: &dyn ModelProvider,
+    project_id: &str,
+    informal: &str,
+    two_mode_config: &TwoModeConfig,
+) -> Result<serde_json::Value> {
+    let run = store.begin_run(project_id, "formalize_two_mode")?;
+
+    let formalizer = ModelModeFormalizer { provider };
+    let screen = ModelScreen { provider };
+    let outcome = TwoModePortfolio::new(&formalizer, &screen).run(informal, two_mode_config);
+
+    let chosen_is_valid = outcome.chosen.as_ref().is_some_and(ModeCandidate::valid);
+    store.event(
+        Some(project_id),
+        Some(&run),
+        "formalize_two_mode.completed",
+        "formalize_modes",
+        json!({
+            "winning_mode": outcome.winning_mode.map(|m| m.label()),
+            "escalated": outcome.escalated,
+            "spent": outcome.spent,
+            "chosen_is_valid": chosen_is_valid,
+        }),
+    )?;
+    store.update_run(project_id, &run, "completed", "complete", 0)?;
+
+    Ok(json!({
+        "run_id": run,
+        "target_system": config.target_system.as_str(),
+        // Advisory only: the best-screened candidate is not a verified statement.
+        "advisory": true,
+        "certified": false,
+        "chosen_is_valid": chosen_is_valid,
+        "outcome": serde_json::to_value(&outcome)?,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,6 +738,116 @@ mod tests {
         assert_ne!(a.chosen, c.chosen, "distinct seeds must diverge");
         assert_eq!(a.chosen.unwrap().formal, "H7 ⊢ phi");
         assert_eq!(c.chosen.unwrap().formal, "H9 ⊢ phi");
+    }
+
+    // --- entry point (offline: mock provider + in-memory store) --------------
+
+    use crate::model::ModelResponse;
+    use std::path::Path;
+
+    /// A mock provider driving the entry point end to end: the fast pass emits a
+    /// valid candidate (so no escalation), and the screen judges by markers.
+    struct EntryProvider;
+    impl ModelProvider for EntryProvider {
+        fn complete(&self, request: &ModelRequest) -> Result<ModelResponse> {
+            let content = match request.role.as_str() {
+                "formalize_fast" => json!({"candidates": ["theorem valid_stmt : P x"]}),
+                "formalize_precise" => json!({"candidates": ["theorem precise_stmt : P y"]}),
+                "formalize_screen" => {
+                    // The screen only sees the (fenced) candidate text.
+                    let formal = request.context["formal"].as_str().unwrap_or("");
+                    json!({
+                        "well_formed": formal.contains("valid"),
+                        "trivial": formal.contains("True"),
+                        "note": "mock"
+                    })
+                }
+                _ => json!({}),
+            };
+            Ok(ModelResponse {
+                content,
+                model: "test".into(),
+                provider: "test".into(),
+            })
+        }
+        fn name(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[test]
+    fn entry_point_runs_offline_and_is_advisory_only() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "phi holds").unwrap();
+        let config = Config::default();
+
+        let summary = run_two_mode_formalization(
+            &store,
+            &config,
+            &EntryProvider,
+            &project.id,
+            "phi holds",
+            &TwoModeConfig::default(),
+        )
+        .unwrap();
+
+        // The valid fast candidate wins without paying for the precise pass.
+        assert_eq!(summary["chosen_is_valid"], serde_json::json!(true));
+        assert_eq!(summary["outcome"]["winning_mode"], serde_json::json!("FastNoCot"));
+        assert_eq!(summary["outcome"]["escalated"], serde_json::json!(false));
+        // The stage never certifies: it only surfaces the best-screened candidate.
+        assert_eq!(summary["advisory"], serde_json::json!(true));
+        assert_eq!(summary["certified"], serde_json::json!(false));
+
+        // The run was traced to the store.
+        let events = store.events(&project.id, 50).unwrap();
+        assert!(events
+            .iter()
+            .any(|e| e.event_type == "formalize_two_mode.completed"));
+    }
+
+    #[test]
+    fn entry_point_screen_fails_closed_when_provider_errors() {
+        // A provider that errors on the screen call must never yield a valid
+        // candidate: absence of evidence is not a pass.
+        struct ScreenErrs;
+        impl ModelProvider for ScreenErrs {
+            fn complete(&self, request: &ModelRequest) -> Result<ModelResponse> {
+                match request.role.as_str() {
+                    "formalize_fast" => Ok(ModelResponse {
+                        content: json!({"candidates": ["theorem valid_stmt : P x"]}),
+                        model: "test".into(),
+                        provider: "test".into(),
+                    }),
+                    "formalize_precise" => Ok(ModelResponse {
+                        content: json!({"candidates": ["theorem valid_stmt2 : P y"]}),
+                        model: "test".into(),
+                        provider: "test".into(),
+                    }),
+                    _ => anyhow::bail!("screen unavailable"),
+                }
+            }
+            fn name(&self) -> &str {
+                "test"
+            }
+        }
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "phi holds").unwrap();
+        let config = Config::default();
+
+        let summary = run_two_mode_formalization(
+            &store,
+            &config,
+            &ScreenErrs,
+            &project.id,
+            "phi holds",
+            &TwoModeConfig::default(),
+        )
+        .unwrap();
+
+        // No candidate can be valid when the screen could not judge it.
+        assert_eq!(summary["chosen_is_valid"], serde_json::json!(false));
+        assert_eq!(summary["certified"], serde_json::json!(false));
     }
 
     #[test]
