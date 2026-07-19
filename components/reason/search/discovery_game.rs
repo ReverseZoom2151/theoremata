@@ -34,7 +34,10 @@
 
 use super::driver::{GoalState, ProofSearchDriver, TacticExpander, TacticStep};
 use super::mcts::SearchConfig;
+use crate::db::Store;
+use anyhow::{bail, Result};
 use serde::Serialize;
+use serde_json::{json, Value};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 
@@ -412,6 +415,185 @@ pub fn confirm_reachable_via_mcgs<G: DiscoveryGame>(
     driver.run(root_goal).solved
 }
 
+// ---------------------------------------------------------------------------
+// CLI entry point.
+//
+// `search_discovery` is generic over `DiscoveryGame`, so a command line cannot
+// call it without a concrete game. The residual-reduction game below is the one
+// domain this repository can instantiate from plain CLI arguments (a basis and a
+// root residual, both integer vectors); it is the AlphaTensor framing in its
+// smallest honest form. Real domain games implement the same trait and can be
+// dispatched through their own entry points later.
+// ---------------------------------------------------------------------------
+
+/// A residual-reduction discovery game: the state is an integer residual vector
+/// and each move subtracts one vector of `basis` from it. A certified terminal is
+/// a fully zeroed residual, i.e. an exact decomposition of the root into basis
+/// vectors; the discovery cost is the number of moves (AlphaTensor's "rank").
+///
+/// Moves that would drive any coordinate below zero are illegal, which keeps the
+/// reachable space finite for a non-negative basis and makes every move progress.
+#[derive(Debug, Clone)]
+pub struct ResidualReductionGame {
+    basis: Vec<Vec<i64>>,
+    /// Largest single-coordinate decrement any one move can achieve. The cost
+    /// heuristic divides by this so it stays a LOWER bound on the moves remaining
+    /// (admissible) for any basis, not only a 0/1 one.
+    max_step: i64,
+}
+
+impl ResidualReductionGame {
+    /// Build a game over `basis`. All basis vectors must share one dimension;
+    /// enforcing that is what keeps [`DiscoveryGame::apply`]'s coordinatewise
+    /// subtraction from silently truncating the residual to a shorter length.
+    pub fn new(basis: Vec<Vec<i64>>) -> Result<Self> {
+        let dim = match basis.first() {
+            Some(b) => b.len(),
+            None => bail!("discovery game needs at least one basis vector"),
+        };
+        if dim == 0 {
+            bail!("discovery game basis vectors must be non-empty");
+        }
+        if basis.iter().any(|b| b.len() != dim) {
+            bail!("all discovery game basis vectors must have dimension {dim}");
+        }
+        let max_step = basis
+            .iter()
+            .flat_map(|b| b.iter().copied())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        Ok(Self { basis, max_step })
+    }
+
+    /// The dimension every state and basis vector shares.
+    pub fn dimension(&self) -> usize {
+        self.basis[0].len()
+    }
+
+    /// The basis vector a move index refers to.
+    pub fn basis_vector(&self, mv: usize) -> &[i64] {
+        &self.basis[mv]
+    }
+}
+
+impl DiscoveryGame for ResidualReductionGame {
+    type State = Vec<i64>;
+    type Move = usize;
+
+    fn legal_moves(&self, state: &Vec<i64>) -> Vec<usize> {
+        if state.iter().all(|&x| x == 0) {
+            return Vec::new();
+        }
+        (0..self.basis.len())
+            .filter(|&i| state.iter().zip(&self.basis[i]).all(|(&s, &b)| s - b >= 0))
+            .collect()
+    }
+
+    fn apply(&self, state: &Vec<i64>, mv: &usize) -> Vec<i64> {
+        state
+            .iter()
+            .zip(&self.basis[*mv])
+            .map(|(&s, &b)| s - b)
+            .collect()
+    }
+
+    fn certificate(&self, state: &Vec<i64>) -> Option<Certificate<usize>> {
+        if state.iter().all(|&x| x == 0) {
+            Some(Certificate {
+                moves: Vec::new(),
+                cost: 0.0,
+                verified: true,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn cost(&self, state: &Vec<i64>) -> f64 {
+        // Ceiling division: no move takes more than `max_step` off one coordinate,
+        // so this many moves are needed at minimum. Admissible for any basis.
+        let peak = state.iter().copied().max().unwrap_or(0).max(0);
+        ((peak + self.max_step - 1) / self.max_step) as f64
+    }
+
+    fn dedup_key(&self, state: &Vec<i64>) -> String {
+        format!("{state:?}")
+    }
+}
+
+/// Run a bounded discovery-game search over the residual-reduction game and record
+/// the outcome, returning a JSON summary for the CLI.
+///
+/// The result is a SEARCH CANDIDATE. The certificate the game checks is internal
+/// to the game (the residual is zeroed); it is not a proof checked by Lean, Rocq,
+/// or Isabelle, and nothing downstream may treat it as one. The summary therefore
+/// carries `status: "candidate"` and `formally_verified: false` unconditionally.
+///
+/// Deterministic in `(basis, root, config, seed)`: the underlying search uses no
+/// wall-clock and no unseeded randomness.
+pub fn run_discovery_search(
+    store: &Store,
+    project_id: Option<&str>,
+    basis: Vec<Vec<i64>>,
+    root: Vec<i64>,
+    config: DiscoveryConfig,
+    seed: u64,
+) -> Result<Value> {
+    let game = ResidualReductionGame::new(basis)?;
+    if root.len() != game.dimension() {
+        bail!(
+            "root residual has dimension {} but the basis has dimension {}",
+            root.len(),
+            game.dimension()
+        );
+    }
+
+    let result = search_discovery(&game, root.clone(), config, seed);
+
+    let moves: Vec<usize> = result
+        .certificate
+        .as_ref()
+        .map(|c| c.moves.clone())
+        .unwrap_or_default();
+    let move_vectors: Vec<Vec<i64>> = moves
+        .iter()
+        .map(|&m| game.basis_vector(m).to_vec())
+        .collect();
+
+    let summary = json!({
+        "kind": "discovery_game_search",
+        // A search surfaces candidates. These two keys are the guard against a
+        // downstream reader promoting a sampled result to a checked proof.
+        "status": "candidate",
+        "formally_verified": false,
+        "game": "residual_reduction",
+        "dimension": game.dimension(),
+        "root": root,
+        "seed": seed,
+        "max_states": config.max_states,
+        "max_depth": config.max_depth,
+        "found": result.certificate.is_some(),
+        // The game's own zero-residual check, NOT a formal-system verdict.
+        "game_certified": result.certified,
+        "cost": result.best_cost,
+        "moves": moves,
+        "move_vectors": move_vectors,
+        "states_explored": result.states_explored,
+        "note": "Search candidate. The certificate is the game's internal \
+                 zero-residual check; no formal system verified anything here.",
+    });
+
+    store.event(
+        project_id,
+        None,
+        "discovery_game.searched",
+        "discovery_game",
+        summary.clone(),
+    )?;
+    Ok(summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,5 +843,146 @@ mod tests {
         // No state is ever certified, so the driver never closes — reachability is
         // false, matching search_discovery's None.
         assert!(!confirm_reachable_via_mcgs(&game, &5, 500, 1));
+    }
+
+    // ---- CLI entry point ----------------------------------------------------
+
+    use std::path::Path;
+
+    fn store_with_project() -> (Store, String) {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "discovery entry point").unwrap();
+        (store, project.id)
+    }
+
+    fn unit_basis() -> Vec<Vec<i64>> {
+        vec![vec![1, 0], vec![0, 1], vec![1, 1]]
+    }
+
+    #[test]
+    fn entry_point_reports_a_candidate_and_never_a_verified_proof() {
+        let (store, project) = store_with_project();
+        let summary = run_discovery_search(
+            &store,
+            Some(&project),
+            unit_basis(),
+            vec![2, 2],
+            DiscoveryConfig::default(),
+            7,
+        )
+        .unwrap();
+
+        assert_eq!(summary["found"], json!(true));
+        assert_eq!(summary["game_certified"], json!(true));
+        // The framing keys are what stop a search hit reading as a checked proof.
+        assert_eq!(summary["status"], json!("candidate"));
+        assert_eq!(summary["formally_verified"], json!(false));
+        // The lower-cost (rank 2) discovery is the one reported.
+        assert_eq!(summary["cost"], json!(2.0));
+        assert_eq!(summary["move_vectors"], json!([[1, 1], [1, 1]]));
+    }
+
+    #[test]
+    fn entry_point_emits_a_store_event() {
+        let (store, project) = store_with_project();
+        run_discovery_search(
+            &store,
+            Some(&project),
+            unit_basis(),
+            vec![1, 1],
+            DiscoveryConfig::default(),
+            1,
+        )
+        .unwrap();
+        let events = store.events(&project, 100).unwrap();
+        assert!(events
+            .iter()
+            .any(|e| e.event_type == "discovery_game.searched"));
+    }
+
+    #[test]
+    fn entry_point_reports_no_discovery_rather_than_a_false_one() {
+        let (store, project) = store_with_project();
+        let cfg = DiscoveryConfig {
+            max_states: 1,
+            max_depth: 64,
+        };
+        let summary =
+            run_discovery_search(&store, Some(&project), unit_basis(), vec![3, 3], cfg, 0).unwrap();
+        assert_eq!(summary["found"], json!(false));
+        assert_eq!(summary["game_certified"], json!(false));
+        assert_eq!(summary["cost"], json!(null));
+        assert_eq!(summary["moves"], json!([]));
+        assert_eq!(summary["formally_verified"], json!(false));
+    }
+
+    #[test]
+    fn entry_point_rejects_mismatched_dimensions() {
+        let (store, project) = store_with_project();
+        // A shorter basis vector would make the coordinatewise subtraction truncate
+        // the residual, so it must be refused rather than searched.
+        assert!(run_discovery_search(
+            &store,
+            Some(&project),
+            vec![vec![1, 0], vec![1]],
+            vec![2, 2],
+            DiscoveryConfig::default(),
+            0,
+        )
+        .is_err());
+        // A root of the wrong dimension is refused for the same reason.
+        assert!(run_discovery_search(
+            &store,
+            Some(&project),
+            unit_basis(),
+            vec![2, 2, 2],
+            DiscoveryConfig::default(),
+            0,
+        )
+        .is_err());
+        assert!(run_discovery_search(
+            &store,
+            Some(&project),
+            Vec::new(),
+            vec![2, 2],
+            DiscoveryConfig::default(),
+            0,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn entry_point_heuristic_stays_admissible_for_a_wide_basis() {
+        // With a basis whose entries exceed 1 the naive max-coordinate heuristic
+        // would overestimate; the ceiling division keeps it a lower bound, so the
+        // cheapest decomposition (two [2,2] moves) is still the reported one.
+        let (store, project) = store_with_project();
+        let summary = run_discovery_search(
+            &store,
+            Some(&project),
+            vec![vec![1, 1], vec![2, 2]],
+            vec![4, 4],
+            DiscoveryConfig::default(),
+            5,
+        )
+        .unwrap();
+        assert_eq!(summary["cost"], json!(2.0));
+    }
+
+    #[test]
+    fn entry_point_is_deterministic_for_a_fixed_seed() {
+        let (store, project) = store_with_project();
+        let run = || {
+            run_discovery_search(
+                &store,
+                Some(&project),
+                unit_basis(),
+                vec![3, 2],
+                DiscoveryConfig::default(),
+                42,
+            )
+            .unwrap()
+        };
+        assert_eq!(run(), run());
     }
 }
