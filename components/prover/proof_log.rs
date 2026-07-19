@@ -764,6 +764,97 @@ pub fn check_proof(proof: &Proof) -> CheckResult<Sequent> {
 }
 
 // ===========================================================================
+// CLI entry point.
+// ===========================================================================
+
+/// Read a proof log from `path`, independently check it, and return a JSON
+/// report. This is the CLI-reachable surface over [`check_proof`]; it adds no
+/// logical judgment of its own.
+///
+/// `anyhow` appears here and nowhere else in this module: the trust boundary
+/// stays `std`-only, and the error type is only widened at the edge where the
+/// CLI needs it.
+///
+/// The report separates five states that a reader must not conflate. Only
+/// `checked` is evidence that something was proved; the other four say that the
+/// log cannot support a claim, each for a different reason:
+///
+/// * `absent`: nothing exists at `path`. Live emission from a HOL Light image
+///   is toolchain-gated (see the module docs), so an absent log normally means
+///   no log was ever written. That is a different fact from a log that ran and
+///   recorded nothing.
+/// * `unparseable`: a file exists but does not deserialize into a [`Proof`].
+///   Whatever wrote it did not write a proof log, so no step can be replayed.
+/// * `empty`: a well-formed log carrying zero steps. The format is right and
+///   there is simply no derivation to accept or reject. [`check_proof`] reports
+///   this as an error; surfacing it as `rejected` would read as "the checker
+///   refused a proof", which is not what happened.
+/// * `rejected`: the log has steps and the checker refused one of them.
+/// * `checked`: every step re-derived; `sequent` is the theorem the log proves.
+///
+/// Returns `Err` only for an I/O failure other than a missing file, since an
+/// unreadable path is a fact about the machine, not about the proof.
+pub fn check_log_file(path: &std::path::Path) -> anyhow::Result<serde_json::Value> {
+    use anyhow::Context as _;
+
+    let display = path.display().to_string();
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(serde_json::json!({
+                "path": display,
+                "status": "absent",
+                "checked": false,
+                "detail": "no proof log at this path; none was written",
+            }));
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("reading proof log {display}"));
+        }
+    };
+
+    let proof: Proof = match serde_json::from_str(&text) {
+        Ok(proof) => proof,
+        Err(err) => {
+            return Ok(serde_json::json!({
+                "path": display,
+                "status": "unparseable",
+                "checked": false,
+                "detail": err.to_string(),
+            }));
+        }
+    };
+
+    let steps = proof.steps.len();
+    if steps == 0 {
+        return Ok(serde_json::json!({
+            "path": display,
+            "status": "empty",
+            "checked": false,
+            "steps": 0,
+            "detail": "the log is well formed but records no inference steps",
+        }));
+    }
+
+    match check_proof(&proof) {
+        Ok(sequent) => Ok(serde_json::json!({
+            "path": display,
+            "status": "checked",
+            "checked": true,
+            "steps": steps,
+            "sequent": serde_json::to_value(&sequent)?,
+        })),
+        Err(err) => Ok(serde_json::json!({
+            "path": display,
+            "status": "rejected",
+            "checked": false,
+            "steps": steps,
+            "detail": err.0,
+        })),
+    }
+}
+
+// ===========================================================================
 // Tests.
 // ===========================================================================
 
@@ -989,6 +1080,89 @@ mod tests {
         let seq_json = serde_json::to_string(&seq).unwrap();
         let seq_back: Sequent = serde_json::from_str(&seq_json).unwrap();
         assert_eq!(seq, seq_back);
+    }
+
+    // --- CLI entry point: check_log_file ---------------------------------
+
+    /// A valid on-disk log checks, and the report carries the derived sequent.
+    #[test]
+    fn check_log_file_reports_a_checked_proof() {
+        let x = v("x", tya());
+        let proof = Proof::new(vec![Step::Refl { term: x.clone() }]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proof.json");
+        std::fs::write(&path, serde_json::to_string(&proof).unwrap()).unwrap();
+
+        let report = check_log_file(&path).unwrap();
+        assert_eq!(report["status"], "checked");
+        assert_eq!(report["checked"], true);
+        assert_eq!(report["steps"], 1);
+        // The reported sequent is exactly what check_proof derives.
+        let seq: Sequent = serde_json::from_value(report["sequent"].clone()).unwrap();
+        assert_eq!(seq, check_proof(&proof).unwrap());
+    }
+
+    /// A missing path is `absent`, NOT an error and NOT `empty`: no log was ever
+    /// written, which is a different fact from a log that recorded nothing.
+    #[test]
+    fn check_log_file_missing_path_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.json");
+        let report = check_log_file(&path).unwrap();
+        assert_eq!(report["status"], "absent");
+        assert_eq!(report["checked"], false);
+        // No steps field: we cannot claim a step count for a log that is not there.
+        assert!(report.get("steps").is_none());
+    }
+
+    /// A well-formed but zero-step log is `empty`, distinct from `rejected`: the
+    /// checker refused nothing, there was simply no derivation.
+    #[test]
+    fn check_log_file_empty_log_is_not_rejected() {
+        let proof = Proof::new(vec![]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.json");
+        std::fs::write(&path, serde_json::to_string(&proof).unwrap()).unwrap();
+
+        let report = check_log_file(&path).unwrap();
+        assert_eq!(report["status"], "empty");
+        assert_eq!(report["checked"], false);
+        assert_eq!(report["steps"], 0);
+    }
+
+    /// A file that is not a proof log is `unparseable`, distinct from a log whose
+    /// steps were rejected.
+    #[test]
+    fn check_log_file_garbage_is_unparseable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("garbage.json");
+        std::fs::write(&path, "not a proof log at all").unwrap();
+
+        let report = check_log_file(&path).unwrap();
+        assert_eq!(report["status"], "unparseable");
+        assert_eq!(report["checked"], false);
+    }
+
+    /// A log with steps that the checker refuses is `rejected` (with the checker's
+    /// own message), and it carries the step count so the reader sees it was a
+    /// non-empty, genuinely-refused log.
+    #[test]
+    fn check_log_file_reports_a_rejected_proof() {
+        let x = v("x", tya());
+        // MK_COMB references a forward step: the checker rejects it.
+        let proof = Proof::new(vec![
+            Step::Refl { term: x.clone() },
+            Step::MkComb { left: 0, right: 2 },
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.json");
+        std::fs::write(&path, serde_json::to_string(&proof).unwrap()).unwrap();
+
+        let report = check_log_file(&path).unwrap();
+        assert_eq!(report["status"], "rejected");
+        assert_eq!(report["checked"], false);
+        assert_eq!(report["steps"], 2);
+        assert!(report["detail"].as_str().unwrap().contains("premise index"));
     }
 
     /// Checking is deterministic: the same proof yields byte-identical results.
