@@ -939,8 +939,10 @@ mod tests {
         let value = transfer(&store, &mock_config(), &OfflineProvider, &spec).unwrap();
 
         assert_eq!(value["method"], "erdos-728-sieve");
-        assert_eq!(value["n_items"], 2);
-        assert_eq!(value["n_solved"], 0, "no live gate offline ⇒ no false solve");
+        // The returned value is the serialized FamilyReport; item count lives in
+        // the `items` array (n_items is a method, absent from the JSON).
+        assert_eq!(value["items"].as_array().unwrap().len(), 2);
+        assert_eq!(value["n_solved"], 0, "no live gate offline means no false solve");
         assert_eq!(value["n_failed"], 2);
         assert_eq!(value["coverage"], 0.0);
         // Dependency order is still honoured in the report.
