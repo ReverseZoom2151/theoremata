@@ -648,11 +648,11 @@ mod tests {
         );
         // The blocker moved, so the refusal must be justified by the remaining
         // two conditions rather than by preservation.
-        let mut replay = GateReplay::for_system(
-            &Config::default(),
-            FormalSystem::Rocq,
-            "Theorem t : True",
-        );
+        // Bound to a local: as a temporary the Config would be dropped while the
+        // replay still borrows it.
+        let config = Config::default();
+        let mut replay =
+            GateReplay::for_system(&config, FormalSystem::Rocq, "Theorem t : True");
         assert!(
             !replay.replays_closed(&seq(&["exact I"])),
             "Rocq shrink-replay stays declined until a real preamble is exposed"
