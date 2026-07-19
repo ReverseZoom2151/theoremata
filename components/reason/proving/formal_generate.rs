@@ -263,6 +263,7 @@ fn generate_and_verify_inner(
         let (mut report, cache_hit) =
             verify_candidate(cache, &key, || backend.verify(config, &code, statement))?;
         attach_error_feedback(system, &code, &mut report);
+        attach_declaration_hints(system, config, &mut report);
         if !report.lexically_verified {
             failures.borrow_mut().push(FailedCandidate {
                 code: code.clone(),
@@ -543,6 +544,169 @@ fn attach_error_feedback(system: FormalSystem, code: &str, report: &mut Verifica
                 "proved": false,
             }),
         );
+    }
+}
+
+/// Detail key under which declaration-existence hints are published.
+const DECL_HINTS_KEY: &str = "declaration_hints";
+
+/// Environment opt-in for the declaration-hint pass.
+///
+/// Off by default because the pass dumps the environment through the Lean
+/// worker, which costs real time per failed candidate. It is a live-toolchain
+/// aid, not something CI or an offline run should pay for.
+const DECL_HINTS_ENV: &str = "THEOREMATA_DECL_HINTS";
+
+/// Resolve the identifiers a failed attempt named but the checker could not
+/// find, and record whether each one exists elsewhere in the library.
+///
+/// The point is to separate two failures the model conflates. `Nat.sub_one_lt`
+/// coming back `unknown identifier` can mean the name is wrong (abandon it) or
+/// that it is real but unimported (add the import and keep the branch). Only the
+/// index can tell them apart, and until now nothing asked it.
+///
+/// Strictly advisory and strictly additive, mirroring [`attach_error_feedback`]:
+/// it never touches a verdict field, never runs on a passing report, and gates
+/// itself off unless a live Lean project is configured AND the operator opted
+/// in. The lookup uses the FAST path only (the candidate's own import manifest),
+/// never the wide-library dump, so the cost stays one bounded query per unknown
+/// name rather than a full Mathlib scan.
+///
+/// Every non-`UnknownDeclaration` verdict is reported as-is. In particular an
+/// `EnvironmentError` is published verbatim and never rewritten into "absent":
+/// a broken worker is evidence of nothing, and letting it read as a missing
+/// declaration is exactly the false negative the index type exists to prevent.
+fn attach_declaration_hints(
+    system: FormalSystem,
+    config: &Config,
+    report: &mut VerificationReport,
+) {
+    use crate::prover::declaration_lookup::{check, ImportManifest};
+
+    if report.lexically_verified {
+        return;
+    }
+    // Only Lean has a decl_index worker behind it today. Other systems would
+    // resolve every name to ToolchainUnavailable, which is noise, not a hint.
+    if system != FormalSystem::Lean {
+        return;
+    }
+    // Both conditions are required: a real checkout to dump, and an explicit
+    // opt-in, since the dump is not free.
+    let Some(root) = config.lean_project.as_ref() else {
+        return;
+    };
+    if !env_flag_on(DECL_HINTS_ENV) {
+        return;
+    }
+
+    let Some(detail) = report.detail.as_object_mut() else {
+        return;
+    };
+    let names = unknown_identifier_names(system, detail.get(ERROR_FEEDBACK_KEY));
+    if names.is_empty() {
+        return;
+    }
+
+    let index = crate::prover::decl_index_adapter::PythonDeclIndex::new(Some(
+        root.to_string_lossy().into_owned(),
+    ));
+    let manifest = ImportManifest::new(system, system.default_imports());
+
+    let hints: Vec<Value> = names
+        .iter()
+        .map(|name| {
+            // deep = false: consult only the manifest tier. A wide-library dump
+            // per candidate would dwarf the proof attempt it is meant to inform.
+            let verdict = check(&index, system, name, &manifest, false);
+            json!({
+                "name": name,
+                "verdict": verdict.tag(),
+                "exists_somewhere": verdict.exists_somewhere(),
+                "add_import": match &verdict {
+                    crate::prover::declaration_lookup::Verdict::NotInCurrentImportScope {
+                        add_import,
+                        ..
+                    } => add_import.clone(),
+                    _ => None,
+                },
+                // Surfaced so a consumer never treats a lookup failure as a
+                // decision about the library.
+                "is_evidence_of_absence": verdict.is_evidence_of_absence(),
+            })
+        })
+        .collect();
+
+    detail.insert(
+        DECL_HINTS_KEY.to_string(),
+        json!({
+            "schema": "theoremata.declaration-hints.v1",
+            "system": system.as_str(),
+            "hints": hints,
+        }),
+    );
+}
+
+/// Whether an environment flag is set to an affirmative value.
+fn env_flag_on(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Pull the identifiers out of `unknown identifier 'X'` diagnostics in the
+/// already-rendered error-feedback payload.
+///
+/// Reads the structured diagnostics rather than re-parsing raw checker text, so
+/// it stays in step with whatever `error_feedback` produced. Deduplicated,
+/// order preserved, so the same missing name is looked up once.
+fn unknown_identifier_names(system: FormalSystem, feedback: Option<&Value>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let Some(diags) = feedback
+        .and_then(|f| f.get("diagnostics"))
+        .and_then(|d| d.as_array())
+    else {
+        return out;
+    };
+    for diag in diags {
+        let Some(message) = diag.get("message").and_then(|m| m.as_str()) else {
+            continue;
+        };
+        if let Some(name) = quoted_unknown_identifier(system, message) {
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+/// Extract the quoted name from a Lean `unknown identifier 'X'` message.
+///
+/// Returns `None` for any other message, including the sibling
+/// `unknown constant` and `unknown namespace` forms, which name things a
+/// declaration index does not resolve the same way.
+fn quoted_unknown_identifier(system: FormalSystem, message: &str) -> Option<String> {
+    if system != FormalSystem::Lean {
+        return None;
+    }
+    let lowered = message.to_ascii_lowercase();
+    if !lowered.contains("unknown identifier") {
+        return None;
+    }
+    let start = message.find('\'')?;
+    let rest = &message[start + 1..];
+    let end = rest.find('\'')?;
+    let name = rest[..end].trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
     }
 }
 
@@ -1571,5 +1735,83 @@ mod tests {
             report.lexically_verified,
             "live Lean gate should verify a trivial proof"
         );
+    }
+
+    #[test]
+    fn quoted_unknown_identifier_extracts_lean_names() {
+        assert_eq!(
+            quoted_unknown_identifier(FormalSystem::Lean, "unknown identifier 'Nat.sub_one_lt'"),
+            Some("Nat.sub_one_lt".to_string())
+        );
+        // Case-insensitive on the phrase, exact on the name.
+        assert_eq!(
+            quoted_unknown_identifier(FormalSystem::Lean, "Unknown Identifier 'foo'"),
+            Some("foo".to_string())
+        );
+    }
+
+    #[test]
+    fn quoted_unknown_identifier_ignores_sibling_and_foreign_messages() {
+        // A different diagnostic entirely.
+        assert_eq!(
+            quoted_unknown_identifier(FormalSystem::Lean, "unsolved goals"),
+            None
+        );
+        // The sibling forms name things the index does not resolve alike.
+        assert_eq!(
+            quoted_unknown_identifier(FormalSystem::Lean, "unknown constant 'Foo.bar'"),
+            None
+        );
+        assert_eq!(
+            quoted_unknown_identifier(FormalSystem::Lean, "unknown namespace 'Foo'"),
+            None
+        );
+        // Only Lean is backed by a decl index; other systems opt out here.
+        assert_eq!(
+            quoted_unknown_identifier(FormalSystem::Rocq, "unknown identifier 'foo'"),
+            None
+        );
+    }
+
+    #[test]
+    fn unknown_identifier_names_dedupes_and_preserves_order() {
+        let feedback = json!({
+            "diagnostics": [
+                {"message": "unknown identifier 'b'"},
+                {"message": "unsolved goals"},
+                {"message": "unknown identifier 'a'"},
+                {"message": "unknown identifier 'b'"},
+            ]
+        });
+        assert_eq!(
+            unknown_identifier_names(FormalSystem::Lean, Some(&feedback)),
+            vec!["b".to_string(), "a".to_string()]
+        );
+    }
+
+    #[test]
+    fn unknown_identifier_names_empty_without_diagnostics() {
+        assert!(unknown_identifier_names(FormalSystem::Lean, None).is_empty());
+        assert!(unknown_identifier_names(FormalSystem::Lean, Some(&json!({}))).is_empty());
+    }
+
+    #[test]
+    fn declaration_hints_skipped_on_a_passing_report() {
+        // A lexically-verified report is never annotated, regardless of config.
+        let mut report = live_verified_report("pass");
+        report.detail = json!({ ERROR_FEEDBACK_KEY: {"diagnostics": []} });
+        let config = Config::default();
+        attach_declaration_hints(FormalSystem::Lean, &config, &mut report);
+        assert!(report.detail.get(DECL_HINTS_KEY).is_none());
+    }
+
+    #[test]
+    fn declaration_hints_skipped_for_non_lean_systems() {
+        // Rocq/Isabelle have no decl index; the pass must not annotate them even
+        // when it would otherwise run.
+        let mut report = failed_report();
+        let config = Config::default();
+        attach_declaration_hints(FormalSystem::Rocq, &config, &mut report);
+        assert!(report.detail.get(DECL_HINTS_KEY).is_none());
     }
 }
