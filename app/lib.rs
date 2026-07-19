@@ -28,6 +28,7 @@ pub use reason::{
     critic_scorer, dag_projection, decompose, definition_synthesis, discovery_game,
     distance_critic, driver, evolve_sketch, falsification, fitness, formal_generate,
     formalize_modes, formalize_portfolio, goal_cache, graph_rag, guard, guardrails, hybrid_search,
+    informal_defect_prior,
     inverse_method, library, live_plan, mathlib_export, mcts, memory, meta_tools, method_transfer,
     minimize, model_elimination, model_router, observe, optimize, plan_history, portfolio,
     preference_pairs, process_reward, progress, proof_import, proof_pool, refine_ops, repair,

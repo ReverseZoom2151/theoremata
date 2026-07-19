@@ -10,6 +10,7 @@ pub mod formal_generate;
 pub mod formalize_modes;
 pub mod formalize_portfolio;
 pub mod graph_rag;
+pub mod informal_defect_prior;
 pub mod library;
 pub mod mathlib_export;
 pub mod model_router;
