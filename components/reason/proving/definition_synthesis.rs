@@ -33,8 +33,12 @@
 //! `def_source` text is untrusted data: it is only ever stored, screened, and
 //! reported — never executed here.
 
+use crate::db::Store;
 use crate::library::ProposedLemma;
+use crate::model::ModelRequest;
+use crate::provider::ModelProvider;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::BTreeSet;
 
 /// A referenced identifier that the corpus / library does not define.
@@ -317,9 +321,188 @@ fn synthesize_one(
     }
 }
 
+// ---------------------------------------------------------------------------
+// CLI entry point: model-backed seams over the deterministic scaffold
+// ---------------------------------------------------------------------------
+
+/// A [`DefinitionProposer`] that asks an injected model for candidate
+/// definitions. An offline or erroring provider yields NO candidates rather than
+/// a fabricated one, so a missing definition simply stays on the worklist and is
+/// never invented. The `seed` is threaded into the request context so a re-run
+/// under the same seed asks for the same thing; the model is the only
+/// nondeterminism.
+struct ModelDefinitionProposer<'a> {
+    provider: &'a dyn ModelProvider,
+}
+
+impl DefinitionProposer for ModelDefinitionProposer<'_> {
+    fn propose(&self, symbol: &MissingSymbol, seed: u64) -> Vec<CandidateDef> {
+        let request = ModelRequest {
+            role: "definition_proposer".into(),
+            task: "Propose candidate definitions for the missing symbol so a human \
+                   can admit one. Each candidate is the source text of a single \
+                   definition plus a one-line rationale. Do not prove anything."
+                .into(),
+            context: json!({
+                "symbol": symbol.name,
+                "statement_context": symbol.context,
+                "seed": seed,
+            }),
+            output_schema: json!({
+                "type":"object","required":["candidates"],"properties":{
+                    "candidates":{"type":"array","items":{"type":"object",
+                        "required":["name","def_source","doc"],
+                        "properties":{
+                            "name":{"type":"string"},
+                            "def_source":{"type":"string"},
+                            "doc":{"type":"string"}}}}}
+            }),
+        };
+        // A provider error is an absence of evidence, not a signal: return an
+        // empty candidate list so nothing is proposed for this symbol.
+        let Ok(response) = self.provider.complete(&request) else {
+            return Vec::new();
+        };
+        response.content["candidates"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|c| CandidateDef {
+                        name: c["name"].as_str().unwrap_or(&symbol.name).into(),
+                        def_source: c["def_source"].as_str().unwrap_or("").into(),
+                        doc: c["doc"].as_str().unwrap_or("").into(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// A [`DefinitionScreen`] backed by a model. This is only a HEURISTIC advisory,
+/// never a compiler's verdict (see the module scope note): a model asserting a
+/// definition type-checks is not the same as it type-checking. It is admissible
+/// here solely because this module never auto-commits, so a weak screen weakens
+/// only the advisory recommendation and cannot admit anything. Fail closed: when
+/// the screen cannot run, the candidate is marked NOT well-formed so it is never
+/// recommended.
+struct ModelDefinitionScreen<'a> {
+    provider: &'a dyn ModelProvider,
+}
+
+impl DefinitionScreen for ModelDefinitionScreen<'_> {
+    fn screen(&self, def: &CandidateDef) -> ScreenResult {
+        let request = ModelRequest {
+            role: "definition_screen".into(),
+            task: "Judge whether this candidate definition is well-formed (would \
+                   type-check as a definition) and whether it is degenerate \
+                   (vacuous, trivially true, or content-free). Report both flags."
+                .into(),
+            context: json!({ "name": def.name, "def_source": def.def_source, "doc": def.doc }),
+            output_schema: json!({
+                "type":"object","required":["well_formed","degenerate"],"properties":{
+                    "well_formed":{"type":"boolean"},
+                    "degenerate":{"type":"boolean"},
+                    "note":{"type":"string"}}
+            }),
+        };
+        match self.provider.complete(&request) {
+            Ok(response) => ScreenResult {
+                // Absent flags default to the conservative verdict: unknown
+                // well-formedness is treated as ill-formed, unknown degeneracy as
+                // degenerate, so an under-specified response never recommends.
+                well_formed: response.content["well_formed"].as_bool().unwrap_or(false),
+                degenerate: response.content["degenerate"].as_bool().unwrap_or(true),
+                note: response.content["note"]
+                    .as_str()
+                    .unwrap_or("model screen advisory")
+                    .into(),
+            },
+            Err(_) => ScreenResult {
+                well_formed: false,
+                degenerate: true,
+                note: "screen unavailable".into(),
+            },
+        }
+    }
+}
+
+/// Detect the missing symbols in `statement`, ask the model to propose and screen
+/// candidate definitions for each, and return an advisory JSON worklist. Nothing
+/// is admitted to the corpus or the library: the recommendation per symbol is the
+/// first well-formed, non-degenerate candidate, surfaced for a human to accept.
+///
+/// The known-symbols corpus is not yet wired, so detection runs against an EMPTY
+/// known set: every non-keyword, multi-character identifier is surfaced as a
+/// worklist item. That is the conservative (over-inclusive) default; a real
+/// corpus would prune already-defined symbols.
+///
+/// Offline (no model) the proposer returns nothing, so the report is
+/// detection-only: the missing symbols are listed with no candidates and no
+/// recommendation.
+///
+/// Emits a `definition_synthesis.completed` store event and closes a run row.
+pub fn synthesize(
+    store: &Store,
+    provider: &dyn ModelProvider,
+    project_id: &str,
+    statement: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let run = store.begin_run(project_id, "definition_synthesis")?;
+
+    let known: BTreeSet<String> = BTreeSet::new();
+    let proposer = ModelDefinitionProposer { provider };
+    let screen = ModelDefinitionScreen { provider };
+    let report =
+        synthesize_definitions(statement, &known, &proposer, &screen, &SynthConfig::default());
+
+    let recommended = report
+        .synthesized
+        .iter()
+        .filter(|s| s.chosen.is_some())
+        .count();
+    let offline = provider.name() == "offline";
+    let state = if offline {
+        "completed_no_model"
+    } else {
+        "completed"
+    };
+
+    let summary = json!({
+        "project_id": project_id,
+        "run_id": run,
+        "statement": statement,
+        "model": provider.name(),
+        "missing_count": report.missing.len(),
+        "recommended_count": recommended,
+        "report": serde_json::to_value(&report)?,
+        // The recommendation is advisory only; the screen is a model heuristic,
+        // not a compiler gate, and nothing here is admitted anywhere.
+        "caveat": "advisory worklist: screen flags are a model heuristic, not a compiler gate; nothing is admitted to the library",
+    });
+
+    store.event(
+        Some(project_id),
+        Some(&run),
+        "definition_synthesis.completed",
+        "definition_synthesis",
+        json!({
+            "missing_count": report.missing.len(),
+            "recommended_count": recommended,
+            "model": provider.name(),
+        }),
+    )?;
+    store.update_run(project_id, &run, state, "complete", 0)?;
+    Ok(summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ModelResponse;
+    use crate::provider::OfflineProvider;
+    use anyhow::Result;
+    use std::path::Path;
 
     fn known(symbols: &[&str]) -> BTreeSet<String> {
         symbols.iter().map(|s| s.to_string()).collect()
@@ -573,5 +756,77 @@ mod tests {
             proposed.proof.is_empty(),
             "a definition admits by well-formedness"
         );
+    }
+
+    /// A provider that drives the two model seams: it proposes one content-bearing
+    /// and one vacuous definition, and screens each by the same `def `/`:= True`
+    /// markers the deterministic tests use, so the recommendation is predictable.
+    struct SynthProvider;
+    impl ModelProvider for SynthProvider {
+        fn complete(&self, request: &ModelRequest) -> Result<ModelResponse> {
+            let content = match request.role.as_str() {
+                "definition_proposer" => {
+                    let name = request.context["symbol"].as_str().unwrap_or("Sym");
+                    json!({"candidates":[
+                        {"name":name,"def_source":format!("def {name} := structure with content"),"doc":"content"},
+                        {"name":name,"def_source":format!("def {name} := True"),"doc":"vacuous"}
+                    ]})
+                }
+                "definition_screen" => {
+                    let src = request.context["def_source"].as_str().unwrap_or("");
+                    json!({
+                        "well_formed": src.trim_start().starts_with("def "),
+                        "degenerate": src.trim_end().ends_with(":= True"),
+                        "note": "marker screen"
+                    })
+                }
+                _ => json!({}),
+            };
+            Ok(ModelResponse {
+                content,
+                model: "test".into(),
+                provider: "command".into(),
+            })
+        }
+        fn name(&self) -> &str {
+            "command"
+        }
+    }
+
+    #[test]
+    fn synthesize_recommends_the_screened_candidate_and_emits_a_run() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "IsPerfectoid R").unwrap();
+        let out = synthesize(&store, &SynthProvider, &project.id, "IsPerfectoid R").unwrap();
+
+        // `IsPerfectoid` is the one missing symbol (`R` is a bound single letter).
+        assert_eq!(out["missing_count"], 1);
+        assert_eq!(out["recommended_count"], 1);
+        assert_eq!(out["model"], "command");
+        // The recommended candidate is the content-bearing one, not `:= True`.
+        let chosen = &out["report"]["synthesized"][0]["chosen"]["def_source"];
+        assert!(chosen.as_str().unwrap().contains("structure with content"));
+
+        // The run row was closed and the completion event recorded.
+        let events = store.events(&project.id, 100).unwrap();
+        assert!(events
+            .iter()
+            .any(|e| e.event_type == "definition_synthesis.completed"));
+    }
+
+    #[test]
+    fn synthesize_offline_is_detection_only_and_recommends_nothing() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "IsPerfectoid R").unwrap();
+        let out = synthesize(&store, &OfflineProvider, &project.id, "IsPerfectoid R").unwrap();
+
+        // Detection still runs (it is pure), but no candidate is fabricated.
+        assert_eq!(out["missing_count"], 1);
+        assert_eq!(out["recommended_count"], 0);
+        assert_eq!(out["model"], "offline");
+        assert!(out["report"]["synthesized"][0]["candidates"]
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 }
