@@ -4,8 +4,9 @@
 //! Where [`generate_and_verify`](crate::formal_generate::generate_and_verify)
 //! produces-and-verifies a proof for ONE [`FormalSystem`], [`portfolio_prove`]
 //! fans the same conjecture out across Lean, Rocq, and Isabelle, records a
-//! per-system verdict, and names the WINNER — the first system whose report is
-//! `lexically_verified`.
+//! per-system verdict, and names the WINNER — the first system whose live report
+//! passes the verification gate. Mock/source-scan successes remain useful
+//! diagnostics, but are never certification.
 //!
 //! It is sequential and deterministic by default. An explicitly enabled owned
 //! verification stage can run already-generated candidates on worker threads;
@@ -44,7 +45,7 @@ pub const ALL_SYSTEMS: [FormalSystem; 3] = [
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemAttempt {
     pub system: FormalSystem,
-    /// Whether the attempt's report is `lexically_verified`.
+    /// Whether this is a LIVE, gate-verified proof suitable for certification.
     pub verified: bool,
     /// Whether this system's toolchain was usable (mock mode is always
     /// available; in live mode this reflects a real toolchain probe). An
@@ -78,9 +79,8 @@ pub struct PortfolioResult {
 /// Each system is attempted independently and sequentially:
 /// * If its toolchain is absent (live mode only), it contributes an
 ///   `available: false` entry and is skipped — no error.
-/// * Otherwise [`generate_and_verify`] runs; its `lexically_verified` verdict
-///   (from the mock backend's real source-scan gate offline, or the live
-///   3+1-layer gate when the toolchain is present) decides whether it verified.
+/// * Otherwise [`generate_and_verify`] runs. Only a LIVE 3+1-layer gate pass
+///   decides whether it verified; mock source-scan results remain diagnostics.
 /// * A generation/backend error is recorded on the entry, not propagated — one
 ///   failing system never aborts the others.
 pub fn portfolio_prove(
@@ -132,7 +132,7 @@ pub fn portfolio_prove(
         let started = Instant::now();
         let attempt = match generate_and_verify(store, config, provider, system, statement) {
             Ok((code, report)) => {
-                let verified = report.lexically_verified;
+                let verified = report.live && report.lexically_verified;
                 if verified && winner.is_none() {
                     winner = Some(system);
                 }
@@ -328,7 +328,7 @@ fn portfolio_prove_with_owned_verification(
         let attempt = match selected {
             Some(selected) => SystemAttempt {
                 system: selected.system,
-                verified: selected.gate_passed(),
+                verified: selected.live_verified(),
                 available: selected.available,
                 code: Some(selected.code.clone()),
                 report: selected.report.clone(),
@@ -449,11 +449,11 @@ mod tests {
     }
 
     #[test]
-    fn attempts_all_three_and_picks_a_winner_offline() {
+    fn mock_gate_successes_are_not_portfolio_certifications() {
         let store = store();
         let config = mock_config();
         // OfflineProvider → each system generates its native trivially-true stub,
-        // which the mock backend (canned kernel + REAL source scan) certifies.
+        // which the mock backend accepts lexically. That is diagnostic only.
         let result = portfolio_prove(&store, &config, &OfflineProvider, "True", &[]).unwrap();
 
         assert_eq!(result.per_system.len(), 3, "all three systems attempted");
@@ -463,15 +463,11 @@ mod tests {
                 "{}: mock backend is available",
                 attempt.system
             );
-            assert!(
-                attempt.verified,
-                "{}: trivial stub should certify",
-                attempt.system
-            );
+            assert!(!attempt.verified, "mock proof must not certify");
+            assert!(!attempt.report.as_ref().unwrap().live);
         }
-        assert!(result.any_verified);
-        // The winner is the FIRST verifying system in ALL_SYSTEMS order (Lean).
-        assert_eq!(result.winner, Some(FormalSystem::Lean));
+        assert!(!result.any_verified);
+        assert_eq!(result.winner, None);
     }
 
     #[test]
@@ -515,8 +511,8 @@ mod tests {
 
         assert_eq!(result.per_system.len(), 1);
         assert_eq!(result.per_system[0].system, FormalSystem::Rocq);
-        assert!(result.any_verified);
-        assert_eq!(result.winner, Some(FormalSystem::Rocq));
+        assert!(!result.any_verified);
+        assert_eq!(result.winner, None);
     }
 
     #[test]
@@ -542,9 +538,9 @@ mod tests {
             vec![FormalSystem::Rocq, FormalSystem::Lean],
             "worker completion order must never affect portfolio order"
         );
-        assert_eq!(result.winner, Some(FormalSystem::Rocq));
+        assert_eq!(result.winner, None);
         for attempt in &result.per_system {
-            assert!(attempt.verified);
+            assert!(!attempt.verified);
             assert!(
                 !attempt.report.as_ref().unwrap().live,
                 "mock mode must remain visibly mock after owned verification"
