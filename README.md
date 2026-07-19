@@ -273,7 +273,13 @@ the full evaluation of the ecosystem, including what was rejected and why.
   holds.
 - Proof minimization: a solved tactic sequence is shrunk to a shorter one that is
   RE-CHECKED against the gate, never merely guessed. A shrink is accepted only
-  when it still verifies; otherwise the original stands.
+  when it still verifies; otherwise the original stands. The re-check is a real
+  one: the candidate sequence is assembled under the original statement and run
+  through the full 3+1-layer gate, and it fails closed on every other outcome, so
+  a mock backend, an absent toolchain, or a checker error all decline the shrink
+  rather than confirm it. Notably it is NOT built on per-tactic stepping, because
+  the current session backends decide "did this close the goal" lexically from the
+  tactic text, which would let the substring `trivial` certify any shrink.
 - Blueprint and paper-scale runs: drive a whole multi-lemma `leanblueprint`
   `content.tex` end to end, proving dependencies before dependents, with
   content-addressed theorem import for tamper-evident reassembly.
@@ -306,6 +312,11 @@ the full evaluation of the ecosystem, including what was rejected and why.
   over the verified-lemma library.
 - A novelty and prior-work check, so a conjecture can be screened against what is
   already known before effort is spent proving it.
+- Cheap triage in front of the expensive lookups: a sub-10ms classifier decides
+  whether an external oracle is likely to cover a query at all, so the slow call
+  is only paid for when it is worth making. Its answer is a routing hint about
+  coverage and is deliberately impossible to read as a claim about the
+  mathematics.
 
 **Learning (self-improvement flywheel)**
 
@@ -506,6 +517,13 @@ theoremata preference-pairs <project> '[{"states":[...],"verdict":"Passing"}]'
 theoremata dag-project <project> '<DagView JSON>'  # project a search DAG to its MCGS tree
 theoremata proof-log-check <file>                  # re-check a proof log independently
 theoremata search-telemetry '{"proofs":[...],"rounds":[[...]]}'
+
+# Untrusted oracles. Nothing here certifies: a certificate comes back only when
+# one of our own checkers accepts it, a counterexample only after we re-verify it.
+theoremata wolfram probe                       # is an engine or API key configured
+theoremata wolfram recognize "integral of x^2" # sub-10ms triage before paying
+theoremata wolfram alpha "population of france"
+theoremata wolfram cert '{"polynomial":"x^2-2*x+2","var":"x"}' --kind sos
 ```
 
 The distinction the CLI keeps visible is the one the whole system turns on: a
