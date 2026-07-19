@@ -30,9 +30,87 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
+use std::cell::RefCell;
 
 /// How many candidate proofs to sample before giving up (best-of-N).
 const N: usize = 3;
+
+/// Default number of CORRECTION rounds run after an all-failed initial round.
+///
+/// Deliberately `0`: correction is strictly opt-in, so the established
+/// generate/verify path behaves exactly as it did before this loop existed.
+/// Operators enable it with `THEOREMATA_FORMAL_CORRECTION_ROUNDS` (the mined
+/// system that measured a gain used 2 rounds).
+const DEFAULT_MAX_CORRECTION_ROUNDS: usize = 0;
+
+/// Default sample budget for EACH correction round, once enabled.
+///
+/// Correction rounds are deliberately much cheaper than round 0 (the mined
+/// system used 8 initial samples and 2 per correction round): a corrected
+/// candidate starts from concrete checker diagnostics, so it does not need the
+/// same blind-sampling width.
+const DEFAULT_CORRECTION_SAMPLES: usize = 2;
+
+/// Budget for the feedback-driven correction loop.
+///
+/// `max_rounds == 0` disables the loop entirely and is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CorrectionConfig {
+    /// How many correction rounds may run after an all-failed initial round.
+    max_rounds: usize,
+    /// How many candidates each correction round may sample.
+    samples_per_round: usize,
+}
+
+impl Default for CorrectionConfig {
+    fn default() -> Self {
+        Self {
+            max_rounds: DEFAULT_MAX_CORRECTION_ROUNDS,
+            samples_per_round: DEFAULT_CORRECTION_SAMPLES,
+        }
+    }
+}
+
+impl CorrectionConfig {
+    /// Read the opt-in from the environment.
+    ///
+    /// This is read locally rather than from [`Config`] on purpose: the field is
+    /// not yet part of the shared config struct. See the module report for the
+    /// preferred name (`Config::formal_correction_rounds`).
+    fn from_env() -> Self {
+        let default = Self::default();
+        Self {
+            max_rounds: usize_from_env(
+                "THEOREMATA_FORMAL_CORRECTION_ROUNDS",
+                default.max_rounds,
+            ),
+            samples_per_round: usize_from_env(
+                "THEOREMATA_FORMAL_CORRECTION_SAMPLES",
+                default.samples_per_round,
+            ),
+        }
+    }
+
+    /// Whether any correction work is possible under this budget.
+    fn enabled(&self) -> bool {
+        self.max_rounds > 0 && self.samples_per_round > 0
+    }
+}
+
+/// Parse a non-negative integer setting, falling back on absent/blank/invalid.
+fn usize_from_env(key: &str, default: usize) -> usize {
+    match std::env::var(key) {
+        Ok(raw) => raw.trim().parse::<usize>().unwrap_or(default),
+        Err(_) => default,
+    }
+}
+
+/// A rejected candidate plus the checker feedback rendered for it.
+#[derive(Debug, Clone)]
+struct FailedCandidate {
+    code: String,
+    feedback: String,
+}
 
 /// One generated candidate together with its verification verdict.
 struct Candidate {
@@ -96,6 +174,35 @@ pub fn generate_and_verify_with_cache(
     ordered_context: &[String],
     cache: Option<&CheckerCache>,
 ) -> Result<(String, VerificationReport)> {
+    generate_and_verify_inner(
+        store,
+        config,
+        provider,
+        system,
+        statement,
+        ordered_context,
+        cache,
+        CorrectionConfig::from_env(),
+    )
+}
+
+/// Implementation of [`generate_and_verify_with_cache`] with an explicit
+/// correction budget, so tests can exercise the loop without touching global
+/// process environment state.
+///
+/// With `correction.max_rounds == 0` (the default) this is exactly the original
+/// single-round best-of-N: same generation count, same selection, same event.
+#[allow(clippy::too_many_arguments)]
+fn generate_and_verify_inner(
+    store: &Store,
+    config: &Config,
+    provider: &dyn ModelProvider,
+    system: FormalSystem,
+    statement: &str,
+    ordered_context: &[String],
+    cache: Option<&CheckerCache>,
+    correction: CorrectionConfig,
+) -> Result<(String, VerificationReport)> {
     // Prefer the live backend (real compile/audit/recheck) when its toolchain is
     // present; degrade to the mock backend when it is absent or when
     // `config.prover_mock` forces offline mode. Either way the source scan runs
@@ -134,6 +241,40 @@ pub fn generate_and_verify_with_cache(
     };
     let total = N + hammer_candidate.is_some() as usize;
 
+    // Every rejected candidate, recorded with its rendered checker feedback so a
+    // later correction round can generate against the checker's own words. This
+    // is generation-side only: it never reaches `accept` below.
+    let failures: RefCell<Vec<FailedCandidate>> = RefCell::new(Vec::new());
+
+    // THE GATE. Identical for an initial candidate and a corrected one: the same
+    // key, the same cache policy, the same `FormalBackend::verify` call. Feedback
+    // influences only what source we hand the checker, never the verdict.
+    let verify_one = |code: String| -> Result<Candidate> {
+        let key = VerificationCacheKey {
+            system,
+            canonical_statement: statement,
+            ordered_context,
+            proof_source: &code,
+            checker_identity: &checker_identity,
+            policy_fingerprint: &policy_fingerprint,
+            import_manifest: &import_manifest,
+        };
+        let (mut report, cache_hit) =
+            verify_candidate(cache, &key, || backend.verify(config, &code, statement))?;
+        attach_error_feedback(system, &code, &mut report);
+        if !report.lexically_verified {
+            failures.borrow_mut().push(FailedCandidate {
+                code: code.clone(),
+                feedback: feedback_text(&report).unwrap_or_default(),
+            });
+        }
+        Ok(Candidate {
+            code,
+            report,
+            cache_hit,
+        })
+    };
+
     let selection = sampling::best_of_n(
         total,
         |i| -> Result<Candidate> {
@@ -143,48 +284,125 @@ pub fn generate_and_verify_with_cache(
                 (0, Some(h)) => h.clone(),
                 _ => generate_once(provider, system, statement)?,
             };
-            let key = VerificationCacheKey {
-                system,
-                canonical_statement: statement,
-                ordered_context,
-                proof_source: &code,
-                checker_identity: &checker_identity,
-                policy_fingerprint: &policy_fingerprint,
-                import_manifest: &import_manifest,
-            };
-            let (mut report, cache_hit) =
-                verify_candidate(cache, &key, || backend.verify(config, &code, statement))?;
-            attach_error_feedback(system, &code, &mut report);
-            Ok(Candidate {
-                code,
-                report,
-                cache_hit,
-            })
+            verify_one(code)
         },
         |c: &Candidate| c.report.lexically_verified,
     )?;
 
-    let sampled = selection.context("no proof candidate could be generated")?;
+    let mut sampled = selection.context("no proof candidate could be generated")?;
+    let mut attempts = sampled.attempts;
+    let mut rounds_run = 0usize;
+    let mut corrected_accepted = false;
 
-    store.event(
-        None,
-        None,
-        "formal_generate.completed",
-        system.as_str(),
-        json!({
-            "system": system.as_str(),
-            "accepted": sampled.accepted,
-            "attempts": sampled.attempts,
-            "index": sampled.index,
-            "verified": sampled.value.report.lexically_verified,
-            "backend": if used_live { "live" } else { "mock" },
-            "hammer_candidate": hammer_candidate.is_some(),
-            "checker_cache_enabled": cache.is_some(),
-            "checker_cache_hit": sampled.value.cache_hit,
-        }),
-    )?;
+    // CORRECTION ROUNDS. Retire-on-any-sibling-pass: entered only when the whole
+    // initial round failed, and abandoned the moment any candidate verifies, so
+    // no correction budget is ever spent on an already-solved problem.
+    if correction.enabled() && !sampled.accepted {
+        for _ in 0..correction.max_rounds {
+            // Per-variant branching: correct each DISTINCT failed candidate, not
+            // just the last one, round-robin across this round's budget.
+            let variants = distinct_failures(&failures.borrow());
+            if variants.is_empty() {
+                break;
+            }
+            rounds_run += 1;
+            let round = sampling::best_of_n(
+                correction.samples_per_round,
+                |i| -> Result<Candidate> {
+                    let variant = &variants[i % variants.len()];
+                    let prompt = correction_feedback(system, variant);
+                    let code =
+                        generate_once_with_feedback(provider, system, statement, Some(&prompt))?;
+                    verify_one(code)
+                },
+                |c: &Candidate| c.report.lexically_verified,
+            )?;
+            let Some(round) = round else {
+                // Every generation in this round errored; keep the incumbent
+                // fallback and stop spending budget.
+                break;
+            };
+            attempts += round.attempts;
+            let accepted = round.accepted;
+            // The corrected candidate supersedes the fallback either way: it is
+            // the most recent, best-informed attempt.
+            sampled.index = round.index;
+            sampled.accepted = accepted;
+            sampled.value = round.value;
+            if accepted {
+                corrected_accepted = true;
+                break;
+            }
+        }
+    }
+
+    let mut event = json!({
+        "system": system.as_str(),
+        "accepted": sampled.accepted,
+        "attempts": attempts,
+        "index": sampled.index,
+        "verified": sampled.value.report.lexically_verified,
+        "backend": if used_live { "live" } else { "mock" },
+        "hammer_candidate": hammer_candidate.is_some(),
+        "checker_cache_enabled": cache.is_some(),
+        "checker_cache_hit": sampled.value.cache_hit,
+    });
+    // Additive only when the opt-in is on, so the default event payload is
+    // byte-identical to the pre-correction one.
+    if correction.enabled() {
+        if let Some(obj) = event.as_object_mut() {
+            obj.insert("correction_rounds".into(), json!(rounds_run));
+            obj.insert("correction_budget".into(), json!(correction.max_rounds));
+            obj.insert("correction_samples".into(), json!(correction.samples_per_round));
+            obj.insert("corrected_accepted".into(), json!(corrected_accepted));
+        }
+    }
+    store.event(None, None, "formal_generate.completed", system.as_str(), event)?;
 
     Ok((sampled.value.code, sampled.value.report))
+}
+
+/// Deduplicate recorded failures by source text, preserving generation order and
+/// keeping only those that actually carry checker feedback worth acting on.
+fn distinct_failures(failures: &[FailedCandidate]) -> Vec<FailedCandidate> {
+    let mut seen: Vec<&str> = Vec::new();
+    let mut out: Vec<FailedCandidate> = Vec::new();
+    for failure in failures {
+        if failure.feedback.trim().is_empty() {
+            continue;
+        }
+        if seen.iter().any(|code| *code == failure.code.as_str()) {
+            continue;
+        }
+        seen.push(failure.code.as_str());
+        out.push(failure.clone());
+    }
+    out
+}
+
+/// Read the rendered feedback text published by [`attach_error_feedback`].
+fn feedback_text(report: &VerificationReport) -> Option<String> {
+    report
+        .detail
+        .get(ERROR_FEEDBACK_KEY)?
+        .get("text")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Render one failed candidate into the prompt fragment a correction generation
+/// is given: the rejected source plus the checker's own diagnostics.
+fn correction_feedback(system: FormalSystem, failure: &FailedCandidate) -> String {
+    format!(
+        "Your previous {system} attempt was REJECTED by the checker.\n\n\
+         Previous attempt:\n```\n{code}\n```\n\n\
+         Checker diagnostics:\n{feedback}\n\n\
+         Fix the specific errors above and output a complete corrected proof. \
+         Do not restate the errors; do not weaken or restate the theorem.",
+        system = system.as_str(),
+        code = failure.code.trim(),
+        feedback = failure.feedback.trim(),
+    )
 }
 
 /// Generate every candidate needed for a portfolio verification stage without
@@ -487,13 +705,40 @@ fn generate_once(
     system: FormalSystem,
     statement: &str,
 ) -> Result<String> {
+    generate_once_with_feedback(provider, system, statement, None)
+}
+
+/// [`generate_once`] with an optional checker-feedback channel.
+///
+/// `feedback` is prompt material ONLY: it is appended to the task and published
+/// in the request context so the model can repair a specific rejection. It has
+/// no effect on verification — the caller runs the result through exactly the
+/// same gate as any other candidate. `None` reproduces `generate_once` verbatim.
+fn generate_once_with_feedback(
+    provider: &dyn ModelProvider,
+    system: FormalSystem,
+    statement: &str,
+    feedback: Option<&str>,
+) -> Result<String> {
     if provider.name() == "offline" {
         return Ok(stub_for(system));
     }
+    let task = match feedback {
+        Some(feedback) if !feedback.trim().is_empty() => {
+            format!("{}\n\n{}", task_for(system, statement), feedback.trim())
+        }
+        _ => task_for(system, statement),
+    };
+    let mut context = json!({ "statement": statement, "system": system.as_str() });
+    if let (Some(feedback), Some(obj)) = (feedback, context.as_object_mut()) {
+        if !feedback.trim().is_empty() {
+            obj.insert(ERROR_FEEDBACK_KEY.to_string(), json!(feedback));
+        }
+    }
     let response = provider.complete(&ModelRequest {
         role: role_for(system).into(),
-        task: task_for(system, statement),
-        context: json!({ "statement": statement, "system": system.as_str() }),
+        task,
+        context,
         output_schema: json!({
             "type": "object",
             "required": ["code"],
@@ -982,6 +1227,217 @@ mod tests {
             .as_str()
             .expect("a rejected candidate must publish feedback text");
         assert!(!text.is_empty());
+    }
+
+    /// A provider whose first `fail_first` responses are checker-rejected
+    /// (`sorry`) and whose later responses are clean, recording every call and
+    /// the feedback it was given.
+    struct ScriptedProvider {
+        fail_first: usize,
+        calls: Cell<usize>,
+        feedback_seen: RefCell<Vec<Option<String>>>,
+    }
+
+    impl ScriptedProvider {
+        fn new(fail_first: usize) -> Self {
+            Self {
+                fail_first,
+                calls: Cell::new(0),
+                feedback_seen: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ModelProvider for ScriptedProvider {
+        fn complete(&self, req: &ModelRequest) -> Result<ModelResponse> {
+            let n = self.calls.get();
+            self.calls.set(n + 1);
+            self.feedback_seen.borrow_mut().push(
+                req.context
+                    .get(ERROR_FEEDBACK_KEY)
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            );
+            let code = if n < self.fail_first {
+                "theorem t : True := by sorry"
+            } else {
+                "theorem t : True := trivial"
+            };
+            Ok(ModelResponse {
+                content: json!({ "code": code }),
+                model: "mock".into(),
+                provider: "mock".into(),
+            })
+        }
+        fn name(&self) -> &str {
+            "command"
+        }
+    }
+
+    #[test]
+    fn default_correction_budget_reproduces_todays_behavior() {
+        // The opt-in is off by default: no extra generations, no feedback in any
+        // request, and the same all-failed outcome as before the loop existed.
+        assert_eq!(CorrectionConfig::default().max_rounds, 0);
+        assert!(!CorrectionConfig::default().enabled());
+
+        let store = store();
+        let config = mock_config();
+        let provider = ScriptedProvider::new(usize::MAX);
+        let (code, report) = generate_and_verify_inner(
+            &store,
+            &config,
+            &provider,
+            FormalSystem::Lean,
+            "True",
+            &[],
+            None,
+            CorrectionConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(provider.calls.get(), N, "default must sample exactly N");
+        assert!(!report.lexically_verified);
+        assert!(code.contains("sorry"), "fallback is the last candidate");
+        assert!(
+            provider
+                .feedback_seen
+                .borrow()
+                .iter()
+                .all(Option::is_none),
+            "no request may carry feedback at the default budget"
+        );
+    }
+
+    #[test]
+    fn correction_round_receives_feedback_and_verifies() {
+        let store = store();
+        let config = mock_config();
+        // All N initial candidates are rejected; the first corrected one is clean.
+        let provider = ScriptedProvider::new(N);
+        let (code, report) = generate_and_verify_inner(
+            &store,
+            &config,
+            &provider,
+            FormalSystem::Lean,
+            "True",
+            &[],
+            None,
+            CorrectionConfig {
+                max_rounds: 2,
+                samples_per_round: 2,
+            },
+        )
+        .unwrap();
+
+        assert!(report.lexically_verified, "corrected candidate must verify");
+        assert!(code.contains("trivial"));
+        // Round 0 spent N; the correction round accepted on its first sample and
+        // retired immediately rather than spending the rest of its budget.
+        assert_eq!(provider.calls.get(), N + 1);
+
+        let seen = provider.feedback_seen.borrow();
+        assert!(seen[..N].iter().all(Option::is_none));
+        let corrective = seen[N].as_deref().expect("correction must carry feedback");
+        assert!(!corrective.trim().is_empty());
+        assert!(corrective.contains("REJECTED"), "{corrective}");
+        // The failed source itself is handed back to the model.
+        assert!(corrective.contains("sorry"), "{corrective}");
+    }
+
+    #[test]
+    fn a_first_round_pass_spends_zero_correction_budget() {
+        let store = store();
+        let config = mock_config();
+        let provider = ScriptedProvider::new(0);
+        let (_, report) = generate_and_verify_inner(
+            &store,
+            &config,
+            &provider,
+            FormalSystem::Lean,
+            "True",
+            &[],
+            None,
+            CorrectionConfig {
+                max_rounds: 2,
+                samples_per_round: 2,
+            },
+        )
+        .unwrap();
+
+        assert!(report.lexically_verified);
+        assert_eq!(
+            provider.calls.get(),
+            1,
+            "an early sibling pass must retire the problem"
+        );
+    }
+
+    #[test]
+    fn exhausted_correction_rounds_stay_bounded_and_fail_closed() {
+        let store = store();
+        let config = mock_config();
+        // Nothing ever passes: 3 initial + 2 rounds x 2 samples = 7 generations.
+        let provider = ScriptedProvider::new(usize::MAX);
+        let (_, report) = generate_and_verify_inner(
+            &store,
+            &config,
+            &provider,
+            FormalSystem::Lean,
+            "True",
+            &[],
+            None,
+            CorrectionConfig {
+                max_rounds: 2,
+                samples_per_round: 2,
+            },
+        )
+        .unwrap();
+
+        assert!(!report.lexically_verified, "correction never fakes a pass");
+        assert_eq!(provider.calls.get(), N + 4);
+    }
+
+    #[test]
+    fn distinct_failures_dedups_by_source_and_drops_empty_feedback() {
+        let failures = vec![
+            FailedCandidate {
+                code: "a".into(),
+                feedback: "err a".into(),
+            },
+            FailedCandidate {
+                code: "a".into(),
+                feedback: "err a again".into(),
+            },
+            FailedCandidate {
+                code: "b".into(),
+                feedback: "   ".into(),
+            },
+            FailedCandidate {
+                code: "c".into(),
+                feedback: "err c".into(),
+            },
+        ];
+        let distinct = distinct_failures(&failures);
+        assert_eq!(distinct.len(), 2);
+        assert_eq!(distinct[0].code, "a");
+        assert_eq!(distinct[1].code, "c");
+    }
+
+    #[test]
+    fn correction_config_reads_bounded_values_from_env() {
+        // Absent/blank/invalid all fall back to the (disabled) default.
+        assert_eq!(usize_from_env("THEOREMATA_NO_SUCH_VAR_XYZ", 7), 7);
+        assert!(!CorrectionConfig {
+            max_rounds: 2,
+            samples_per_round: 0,
+        }
+        .enabled());
+        assert!(CorrectionConfig {
+            max_rounds: 1,
+            samples_per_round: 1,
+        }
+        .enabled());
     }
 
     #[test]
