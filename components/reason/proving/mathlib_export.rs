@@ -24,7 +24,12 @@
 //! block-comment delimiters so a hostile provenance string cannot break out of
 //! the `/-- … -/` comment.
 
+use crate::config::Config;
 use crate::db::LibraryLemma as Lemma;
+use crate::db::Store;
+use crate::prover::formal::{backend_for, FormalSystem};
+use anyhow::Result;
+use serde_json::{json, Value};
 use std::collections::HashSet;
 
 /// How to shape an export run.
@@ -164,6 +169,137 @@ pub fn export_library(lemmas: &[Lemma], cfg: &ExportConfig) -> ExportBundle {
         decls,
         skipped,
     }
+}
+
+// --- CLI entry point -------------------------------------------------------
+
+/// Export a project's verified-lemma library as a Mathlib-style Lean module,
+/// RE-VERIFYING every declaration through the real formal gate first.
+///
+/// SOUNDNESS. Exporting a declaration outward is a claim that it is proved. The
+/// persisted [`Lemma`] records carry a `provenance` string but NO verification
+/// verdict: nothing in the row proves the 3+1 gate ever passed on it. So this
+/// entry point does not trust the row. It renders each skill to a full theorem
+/// (via [`export_lemma`] + [`MathlibDecl::render`]) and runs that source through
+/// the LIVE backend gate ([`FormalBackend::verify`](crate::prover::formal::FormalBackend::verify)):
+/// only a declaration whose report is BOTH `live` AND `lexically_verified` is
+/// emitted. Everything else is refused with a reason: a skill we could not
+/// actually check is never emitted, because "we did not check" must never read as
+/// "it passed".
+///
+/// Fail-closed when there is no live gate: if `system`'s toolchain is unavailable
+/// or the config is in mock mode (a mock pass is at most informal, never a
+/// certification), EVERY skill is refused and the module is not written. Offline,
+/// this therefore exports nothing, which is the safe result.
+///
+/// Returns a JSON summary: the module/namespace, the names actually exported, the
+/// refused skills with their reasons, the trivial skills skipped by config, and
+/// the rendered Lean `file` (present only when at least one declaration verified,
+/// and containing ONLY verified declarations). `all_verified` is true iff nothing
+/// was refused. Emits one `mathlib_export.completed` store event.
+pub fn export_verified(
+    store: &Store,
+    config: &Config,
+    project_id: &str,
+    system: FormalSystem,
+    cfg: &ExportConfig,
+) -> Result<Value> {
+    // Validate the project exists (and scope the event to it).
+    store.project(project_id)?;
+    let lemmas = store.library_lemmas(project_id)?;
+
+    // The live gate. A mock backend or an absent toolchain is NOT a gate we may
+    // certify an outward export against, so treat either as "no live gate" and
+    // refuse everything rather than emit an unchecked declaration.
+    let backend = backend_for(config, system, false);
+    let gate_live = !config.prover_mock && backend.available();
+
+    let mut exported: Vec<MathlibDecl> = Vec::new();
+    let mut refused: Vec<Value> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for lemma in &lemmas {
+        if cfg.skip_trivial && is_trivial(lemma) {
+            skipped.push(lemma.statement.clone());
+            continue;
+        }
+        let decl = export_lemma(lemma, cfg);
+        // Dedup by derived name, exactly as `export_library` does.
+        if !seen.insert(decl.name.clone()) {
+            continue;
+        }
+
+        if !gate_live {
+            refused.push(json!({
+                "name": decl.name,
+                "statement": lemma.statement,
+                "reason": "no live formal gate available; refusing to export unverified",
+            }));
+            continue;
+        }
+
+        // Re-verify the RENDERED theorem (the exact source we would emit) against
+        // the stated statement, through the full 3+1 gate.
+        let report = backend.verify(config, &decl.render(), &lemma.statement)?;
+        if report.live && report.lexically_verified {
+            exported.push(decl);
+        } else {
+            refused.push(json!({
+                "name": decl.name,
+                "statement": lemma.statement,
+                "reason": "live gate did not certify the rendered declaration",
+                "report": report,
+            }));
+        }
+    }
+
+    // Build the module from ONLY the verified declarations.
+    let bundle = ExportBundle {
+        module: cfg.module.clone(),
+        namespace: cfg.namespace.clone(),
+        decls: exported,
+        skipped: skipped.clone(),
+    };
+    let file = if bundle.decls.is_empty() {
+        Value::Null
+    } else {
+        Value::String(bundle.render_file())
+    };
+    let exported_names: Vec<String> = bundle.decls.iter().map(|d| d.name.clone()).collect();
+    let all_verified = refused.is_empty();
+
+    let summary = json!({
+        "project_id": project_id,
+        "system": system.as_str(),
+        "module": bundle.module,
+        "namespace": bundle.namespace,
+        "gate_live": gate_live,
+        "n_library": lemmas.len(),
+        "exported": exported_names,
+        "n_exported": bundle.decls.len(),
+        "refused": refused,
+        "n_refused": refused.len(),
+        "skipped_trivial": skipped,
+        "all_verified": all_verified,
+        "file": file,
+    });
+
+    store.event(
+        Some(project_id),
+        None,
+        "mathlib_export.completed",
+        "mathlib_export",
+        json!({
+            "system": system.as_str(),
+            "gate_live": gate_live,
+            "n_exported": bundle.decls.len(),
+            "n_refused": refused.len(),
+            "all_verified": all_verified,
+        }),
+    )?;
+
+    Ok(summary)
 }
 
 // --- name derivation -------------------------------------------------------
@@ -453,5 +589,121 @@ mod tests {
         // Exactly one docstring open and close: the injected `-/` was neutralized.
         assert_eq!(rendered.matches("-/").count(), 1);
         assert!(!rendered.contains("evil -/"));
+    }
+
+    // --- CLI entry point --------------------------------------------------
+    // `Config`, `Store`, `FormalSystem` come through `use super::*`.
+
+    use std::path::Path;
+
+    /// Mock config: no live toolchain is assumed, so the export gate is offline
+    /// and must fail closed.
+    fn mock_config() -> Config {
+        Config {
+            prover_mock: true,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn export_refuses_everything_without_a_live_gate() {
+        // The soundness property: with no live gate (mock/offline), a perfectly
+        // well-formed, non-trivial library skill is REFUSED, never exported. An
+        // unchecked proof is never emitted as if it had passed.
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "t").unwrap();
+        store
+            .add_library_lemma(
+                &project.id,
+                "a + b = b + a",
+                "by ring",
+                "evolver:comm",
+                "emb1:0",
+            )
+            .unwrap();
+
+        let summary = export_verified(
+            &store,
+            &mock_config(),
+            &project.id,
+            FormalSystem::Lean,
+            &ExportConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(summary["gate_live"], false);
+        assert_eq!(summary["n_exported"], 0);
+        assert_eq!(summary["n_refused"], 1);
+        assert_eq!(summary["all_verified"], false);
+        // No module is written when nothing verified.
+        assert!(summary["file"].is_null());
+        // The refusal names the skill and gives a reason (never a silent drop).
+        assert_eq!(summary["refused"][0]["statement"], "a + b = b + a");
+        assert!(summary["refused"][0]["reason"].is_string());
+
+        // The completion event landed, scoped to the project.
+        let events = store.events(&project.id, 10).unwrap();
+        assert!(events
+            .iter()
+            .any(|e| e.event_type == "mathlib_export.completed"));
+    }
+
+    #[test]
+    fn export_skips_trivial_and_still_refuses_the_rest_offline() {
+        // Trivial skills are filtered by config into `skipped_trivial`; the
+        // non-trivial one is not trivially dropped but still refused offline
+        // (no live gate). The two buckets are disjoint and nothing is exported.
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "t").unwrap();
+        // Trivial: `n = n` is a 2-token statement AND `rfl` is a canned closer.
+        store
+            .add_library_lemma(&project.id, "n = n", "rfl", "seed:refl", "emb1:1")
+            .unwrap();
+        // Non-trivial.
+        store
+            .add_library_lemma(
+                &project.id,
+                "sum of two even numbers is even",
+                "by parity",
+                "evolver:parity",
+                "emb1:2",
+            )
+            .unwrap();
+
+        let summary = export_verified(
+            &store,
+            &mock_config(),
+            &project.id,
+            FormalSystem::Lean,
+            &ExportConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(summary["n_library"], 2);
+        assert_eq!(summary["skipped_trivial"][0], "n = n");
+        assert_eq!(summary["n_exported"], 0);
+        assert_eq!(summary["n_refused"], 1, "the non-trivial skill is refused offline");
+        assert!(summary["file"].is_null());
+    }
+
+    #[test]
+    fn export_of_empty_library_is_vacuously_all_verified() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "t").unwrap();
+        let summary = export_verified(
+            &store,
+            &mock_config(),
+            &project.id,
+            FormalSystem::Lean,
+            &ExportConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(summary["n_library"], 0);
+        assert_eq!(summary["n_exported"], 0);
+        assert_eq!(summary["n_refused"], 0);
+        // Nothing was refused, so all_verified is vacuously true, but no file is
+        // emitted because there is nothing to export.
+        assert_eq!(summary["all_verified"], true);
+        assert!(summary["file"].is_null());
     }
 }
