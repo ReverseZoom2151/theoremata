@@ -669,7 +669,7 @@ impl AgentLoop<'_> {
                     self.verify_existing_target(project_id, node, certified)
                 } else if let Some(formal) = &node.formal_statement {
                     let theorem = extract_theorem(formal);
-                    let (compiles, axioms_clean) =
+                    let (compiles, axioms_clean, goal_states) =
                         self.verify_source(formal, theorem.as_deref(), session)?;
                     self.store.add_evidence(
                         project_id,
@@ -681,7 +681,14 @@ impl AgentLoop<'_> {
                         } else {
                             "fail"
                         },
-                        json!({"compiles":compiles,"axioms_clean":axioms_clean}),
+                        json!({
+                            "compiles": compiles,
+                            "axioms_clean": axioms_clean,
+                            // Goal states at the failure, when the warm session
+                            // recovered any. Advisory feedback for the next attempt
+                            // or a human; never a claim about verification.
+                            "goal_states": goal_states,
+                        }),
                     )?;
                     if compiles && axioms_clean {
                         self.certify_k_consecutive(
@@ -814,7 +821,7 @@ impl AgentLoop<'_> {
         // statement faithfully encode the node's informal statement?
         self.validate_new_statement(project_id, run, &node.id, &node.statement, &lean)?;
         let theorem = extract_theorem(&lean);
-        let (compiles, axioms_clean) = self.verify_source(&lean, theorem.as_deref(), session)?;
+        let (compiles, axioms_clean, _goals) = self.verify_source(&lean, theorem.as_deref(), session)?;
         if compiles && axioms_clean {
             let fresh = self
                 .store
@@ -861,7 +868,7 @@ impl AgentLoop<'_> {
             n,
             |attempt| -> Result<Formalization> {
                 let lean = self.formalize_once(node, attempt)?;
-                let (compiles, axioms_clean) =
+                let (compiles, axioms_clean, _goals) =
                     self.verify_source(&lean, extract_theorem(&lean).as_deref(), session)?;
                 Ok(Formalization {
                     lean,
@@ -1037,7 +1044,7 @@ impl AgentLoop<'_> {
     ) -> Result<bool> {
         let k = self.config.k_consecutive_clean;
         let gate = k_consecutive_clean(k, k.max(1), |_round| {
-            let (compiles, axioms_clean) = self.verify_source(lean, theorem, session)?;
+            let (compiles, axioms_clean, _goals) = self.verify_source(lean, theorem, session)?;
             Ok(compiles && axioms_clean)
         })?;
         self.store.add_evidence(
@@ -1407,15 +1414,21 @@ impl AgentLoop<'_> {
     }
 
     /// Compile a Lean source and audit its axioms, preferring the warm session.
+    ///
+    /// The third return is the goal states the warm session recovered at the error
+    /// positions (empty on a pass, on the cold path, or when the REPL returned no
+    /// infotree). It is failure feedback, never an input to the two gate booleans.
     fn verify_source(
         &self,
         source: &str,
         theorem: Option<&str>,
         session: &mut Option<LeanSession>,
-    ) -> Result<(bool, bool)> {
+    ) -> Result<(bool, bool, Vec<String>)> {
         if let Some(s) = session.as_mut() {
             match s.check(source, theorem) {
-                Ok(outcome) => return Ok((outcome.ok, outcome.axioms_clean)),
+                Ok(outcome) => {
+                    return Ok((outcome.ok, outcome.axioms_clean, outcome.goal_states))
+                }
                 Err(_) => {
                     // Session died; drop it and fall back to cold checks.
                     *session = None;
@@ -1455,7 +1468,9 @@ impl AgentLoop<'_> {
         } else {
             false
         };
-        Ok((compiles, axioms_clean))
+        // The cold path compiles a temp file with batch `lean`, which emits no
+        // infotree, so there is no goal state to recover here.
+        Ok((compiles, axioms_clean, Vec::new()))
     }
 }
 
