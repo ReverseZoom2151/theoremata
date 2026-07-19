@@ -22,6 +22,7 @@ use crate::{
     model::ModelRequest,
     prover::{
         error_feedback::{render_feedback, FeedbackConfig},
+        subgoal_extract::{extract_subgoals, to_obligations},
         formal::{backend_for, FormalBackend, FormalSystem},
         model::VerificationReport,
     },
@@ -481,6 +482,11 @@ where
 
 /// The `detail` key under which rendered checker feedback is published.
 const ERROR_FEEDBACK_KEY: &str = "error_feedback";
+
+/// Detail key for subgoals lifted off a failed attempt. Separate from
+/// [`ERROR_FEEDBACK_KEY`] so a consumer of the rendered text never has to skip
+/// past obligations, and so absent-because-clean stays distinguishable.
+const SUBGOALS_KEY: &str = "extracted_subgoals";
 
 /// Enrich a FAILED verification's `detail` with prompt-ready checker feedback.
 ///
