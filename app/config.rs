@@ -117,6 +117,26 @@ pub struct Config {
     /// Runtime reads this field, not the env.
     #[serde(default = "default_pool_meta_gate")]
     pub pool_meta_gate: bool,
+    /// Whether the Tier-0 hypothesis-discharge audit REFUSES a proof that leaves
+    /// a hypothesis undischarged. Promoted from `THEOREMATA_HYPOTHESIS_GATE` to a
+    /// Config field so the runtime reads this field, not the process env. OFF by
+    /// default (env-derived): this gate is staged off, and defaulting it on would
+    /// reject every proof lacking an explicit discharge witness.
+    #[serde(default = "default_hypothesis_gate")]
+    pub hypothesis_gate: bool,
+    /// Whether the Tier-0 vacuous-success guard REFUSES a proof that succeeds
+    /// only because its hypotheses are unsatisfiable. Promoted from
+    /// `THEOREMATA_VACUITY_GATE` to a Config field. OFF by default (env-derived),
+    /// for the same staging reason as [`Config::hypothesis_gate`].
+    #[serde(default = "default_vacuity_gate")]
+    pub vacuity_gate: bool,
+    /// Whether decomposition-admission violations REFUSE a decomposition (rather
+    /// than only being recorded for observability). Promoted from
+    /// `THEOREMATA_ENFORCE_DECOMPOSITION_ADMISSION` to a Config field. OFF by
+    /// default (env-derived): enforcing without an allowlist in place would halt
+    /// the pipeline on ordinary decompositions.
+    #[serde(default = "default_enforce_decomposition_admission")]
+    pub enforce_decomposition_admission: bool,
 }
 
 /// Env-derived default for [`Config::validate_statements`]. Read ONCE at Config
@@ -153,6 +173,44 @@ fn default_pool_meta_gate() -> bool {
         ),
         Err(_) => true,
     }
+}
+
+/// Shared default-OFF env truthiness for the staged soundness gates: absent /
+/// empty / `0`/`false`/`off` means OFF, anything else means ON. Read ONCE at
+/// Config construction (mirrors `default_validate_statements`).
+fn default_off_gate(var: &str) -> bool {
+    default_off_gate_from(std::env::var(var).ok())
+}
+
+/// Pure core of [`default_off_gate`], so the truthiness policy is testable
+/// without mutating the process env (which races under the parallel harness).
+fn default_off_gate_from(raw: Option<String>) -> bool {
+    match raw {
+        Some(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "off"
+        ),
+        None => false,
+    }
+}
+
+/// Env-derived default for [`Config::hypothesis_gate`] (mirrors the old
+/// `prover::formal::TierZeroGates::from_env`). OFF unless explicitly truthy.
+fn default_hypothesis_gate() -> bool {
+    default_off_gate("THEOREMATA_HYPOTHESIS_GATE")
+}
+
+/// Env-derived default for [`Config::vacuity_gate`] (mirrors the old
+/// `prover::formal::TierZeroGates::from_env`). OFF unless explicitly truthy.
+fn default_vacuity_gate() -> bool {
+    default_off_gate("THEOREMATA_VACUITY_GATE")
+}
+
+/// Env-derived default for [`Config::enforce_decomposition_admission`] (mirrors
+/// the old `proving::decompose::admission_enforced`). OFF unless explicitly
+/// truthy.
+fn default_enforce_decomposition_admission() -> bool {
+    default_off_gate("THEOREMATA_ENFORCE_DECOMPOSITION_ADMISSION")
 }
 
 fn default_lean_bin() -> String {
@@ -239,6 +297,9 @@ impl Default for Config {
             validate_statements: default_validate_statements(),
             abstain_threshold: default_abstain_threshold(),
             pool_meta_gate: default_pool_meta_gate(),
+            hypothesis_gate: default_hypothesis_gate(),
+            vacuity_gate: default_vacuity_gate(),
+            enforce_decomposition_admission: default_enforce_decomposition_admission(),
         }
     }
 }
@@ -302,5 +363,86 @@ mod tests {
             .expect("explicitly enabled ladder");
         assert_eq!(plan.select(0.0, 0).primary(), Some(0));
         assert_eq!(plan.select(1.0, 0).primary(), Some(1));
+    }
+
+    /// Absent env => the gate is OFF. This is the load-bearing case: all three
+    /// staged soundness gates must default false, since a default-on would
+    /// refuse every proof lacking a witness/allowlist and halt the pipeline.
+    #[test]
+    fn staged_gates_default_off_when_env_is_unset() {
+        assert!(!default_off_gate_from(None));
+    }
+
+    #[test]
+    fn staged_gates_are_on_for_a_truthy_value() {
+        for truthy in ["1", "true", "on", "yes", "TRUE", " 1 "] {
+            assert!(
+                default_off_gate_from(Some(truthy.to_string())),
+                "expected {truthy:?} to enable the gate"
+            );
+        }
+    }
+
+    /// The falsey table, matching `default_validate_statements`: empty / `0` /
+    /// `false` / `off`, case- and whitespace-insensitive.
+    #[test]
+    fn staged_gates_falsey_table_is_off() {
+        for falsey in ["", "0", "false", "off", "FALSE", "Off", "  false  "] {
+            assert!(
+                !default_off_gate_from(Some(falsey.to_string())),
+                "expected {falsey:?} to leave the gate off"
+            );
+        }
+    }
+
+    /// Each field is wired to its own env-derived default, and the three names
+    /// exist on `Config` (compile-time proof of the promotion).
+    #[test]
+    fn staged_gate_fields_track_their_env_derived_defaults() {
+        let config = Config::default();
+        assert_eq!(config.hypothesis_gate, default_hypothesis_gate());
+        assert_eq!(config.vacuity_gate, default_vacuity_gate());
+        assert_eq!(
+            config.enforce_decomposition_admission,
+            default_enforce_decomposition_admission()
+        );
+    }
+
+    /// Backward compatibility: an existing `config.json` written before these
+    /// keys existed still deserializes, with all three gates off.
+    #[test]
+    fn config_json_missing_the_gate_keys_deserializes_with_all_three_off() {
+        let raw = r#"{
+            "database": ".theoremata/theoremata.db",
+            "workspace": ".theoremata/workspaces",
+            "resources": "resources",
+            "model_command": null,
+            "max_iterations": 3,
+            "command_timeout_seconds": 60
+        }"#;
+        let config: Config = serde_json::from_str(raw).expect("legacy config still parses");
+        assert!(!config.hypothesis_gate);
+        assert!(!config.vacuity_gate);
+        assert!(!config.enforce_decomposition_admission);
+    }
+
+    /// Explicit `true` in a config file wins over the (off) env-derived default.
+    #[test]
+    fn config_json_can_turn_the_gates_on_explicitly() {
+        let raw = r#"{
+            "database": ".theoremata/theoremata.db",
+            "workspace": ".theoremata/workspaces",
+            "resources": "resources",
+            "model_command": null,
+            "max_iterations": 3,
+            "command_timeout_seconds": 60,
+            "hypothesis_gate": true,
+            "vacuity_gate": true,
+            "enforce_decomposition_admission": true
+        }"#;
+        let config: Config = serde_json::from_str(raw).expect("config parses");
+        assert!(config.hypothesis_gate);
+        assert!(config.vacuity_gate);
+        assert!(config.enforce_decomposition_admission);
     }
 }
