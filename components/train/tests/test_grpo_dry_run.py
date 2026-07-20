@@ -46,6 +46,14 @@ def _dataset():
 
 def test_dry_run_scores_and_skips_without_gpu():
     cfg = grpo_config("tiny/model", "data.jsonl", max_steps=10)
+    # The contract is that the dry run itself pulls in neither trl nor torch.
+    # That must be measured as a delta across the call, not as global absence:
+    # sibling tests legitimately import torch (via importorskip) to exercise
+    # their torch backends, and torch cannot be un-imported, so a global
+    # "torch not in sys.modules" check is order-dependent and tests the wrong
+    # thing. Snapshot before, compare after.
+    trl_loaded_before = "trl" in sys.modules
+    torch_loaded_before = "torch" in sys.modules
     out = dry_run_grpo(_dataset(), make_reward_fn(tool_weight=0.1), cfg)
     assert out["ok"] is True
     assert out["dry_run"] is True
@@ -57,9 +65,9 @@ def test_dry_run_scores_and_skips_without_gpu():
     assert out["groups_kept"] == 1
     assert out["temperature_schedule"]["start"] == 1.2
     assert out["temperature_schedule"]["end"] == 0.7
-    # dry run must not import trl / torch
-    assert "trl" not in sys.modules
-    assert "torch" not in sys.modules
+    # dry run must not import trl / torch: no NEW import across the call.
+    assert ("trl" in sys.modules) is trl_loaded_before
+    assert ("torch" in sys.modules) is torch_loaded_before
 
 
 def test_dry_run_drops_all_pass_group_via_goldilocks():
