@@ -1,3 +1,4 @@
+pub mod alignment;
 pub mod blueprint;
 pub mod checker_cache;
 pub mod conjecture_engine;
