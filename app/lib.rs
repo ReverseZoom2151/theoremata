@@ -301,6 +301,17 @@ enum Command {
         #[arg(long)]
         run: Option<String>,
     },
+    /// Phase 1.4 staleness census: walk stored verified results and classify each
+    /// as Fresh / RepairCandidate / MathematicsMoved / Unknown under the current
+    /// environment. Honest census only: it does not re-verify or repair.
+    Sweep {
+        /// Restrict to one project; omit to sweep every project.
+        #[arg(long)]
+        project: Option<String>,
+        /// Max events read per project (newest first).
+        #[arg(long, default_value_t = 100_000)]
+        limit: usize,
+    },
     Tactics {
         goal: String,
     },
@@ -1023,6 +1034,15 @@ pub fn run() -> Result<()> {
         Command::Replay { project, run } => print_value(
             true,
             &observe::Observer { store: &store }.replay(&project, run.as_deref())?,
+        )?,
+        Command::Sweep { project, limit } => print_value(
+            true,
+            &reason::proving::staleness_sweep::sweep(
+                &store,
+                &config,
+                project.as_deref(),
+                limit,
+            )?,
         )?,
         Command::Tactics { goal } => print_value(
             true,

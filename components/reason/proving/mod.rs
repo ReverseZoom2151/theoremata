@@ -25,3 +25,4 @@ pub mod retry;
 pub mod router;
 pub mod sketch;
 pub mod staleness;
+pub mod staleness_sweep;
