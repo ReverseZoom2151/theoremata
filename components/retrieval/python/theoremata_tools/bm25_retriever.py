@@ -157,13 +157,21 @@ def retrieve(
     scorer = _build_scorer(corpus, backend)
     scores = scorer.get_scores(q_terms)
 
+    # Inclusion must key off real lexical overlap, not the sign of the BM25
+    # score. Standard Okapi IDF (rank_bm25) goes non-positive for a term that
+    # occurs in every document, which happens on a tiny post-mask corpus where
+    # the query term is ubiquitous. Gating on ``score > 0`` there would drop
+    # premises that genuinely share query tokens; the two backends would also
+    # disagree, since the pure-Python fallback uses a shifted IDF that stays
+    # positive. The BM25 score still decides ordering; overlap decides presence.
+    q_set = set(q_terms)
     ranked: list[tuple[float, int, dict[str, Any]]] = []
     for i, d in enumerate(decls):
         if not (d.get("name")):
             continue
-        s = float(scores[i])
-        if s > 0.0:
-            ranked.append((s, i, d))
+        if not (q_set & set(corpus[i])):
+            continue
+        ranked.append((float(scores[i]), i, d))
     ranked.sort(key=lambda t: (-t[0], t[1]))
 
     out: list[dict[str, Any]] = []
