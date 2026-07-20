@@ -335,6 +335,21 @@ impl<E: TacticExpander> ProofSearchDriver<E> {
         self
     }
 
+    /// Attach a critic only if one was produced, otherwise leave the driver
+    /// untouched. This is the production hookup: a construction site pairs it with
+    /// [`super::critic_scorer::critic_from_config`], which returns `None` unless
+    /// `SearchConfig::critic_weight` is non-zero. So a caller writes a single
+    /// unconditional line and still gets byte-identical behaviour by default,
+    /// because `None` here is a no-op and the injected-critic gate in
+    /// [`run_attempt`](Self::run_attempt) forces `critic_weight` to zero whenever
+    /// no critic is present.
+    pub fn with_optional_critic(self, critic: Option<Arc<dyn CriticScorer>>) -> Self {
+        match critic {
+            Some(c) => self.with_critic(c),
+            None => self,
+        }
+    }
+
     /// Set the base seed threaded into expansion (per-node seeds are derived
     /// deterministically from it, so the whole search is reproducible).
     pub fn with_seed(mut self, seed: u64) -> Self {

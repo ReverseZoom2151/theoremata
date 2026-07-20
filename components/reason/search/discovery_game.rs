@@ -409,9 +409,14 @@ pub fn confirm_reachable_via_mcgs<G: DiscoveryGame>(
         max_nodes: budget.max(1),
         ..SearchConfig::default()
     };
+    // Resolve the critic BEFORE cfg is moved into the builder. Default
+    // critic_weight is 0.0, which yields None, which with_optional_critic treats
+    // as a no-op, so the default confirmation path stays byte-identical.
+    let critic = super::critic_scorer::critic_from_config(&cfg);
     let mut driver = ProofSearchDriver::new(GameExpander { game })
         .with_seed(seed)
-        .with_config(cfg);
+        .with_config(cfg)
+        .with_optional_critic(critic);
     driver.run(root_goal).solved
 }
 

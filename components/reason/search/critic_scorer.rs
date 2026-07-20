@@ -60,6 +60,7 @@
 
 use super::mcts::SearchConfig;
 use super::progress;
+use std::sync::Arc;
 
 /// The minimal view of a proof state a critic needs to score it.
 ///
@@ -172,6 +173,35 @@ pub fn blend_priority_with_cfg(
     blend_priority(q, progress, cfg.progress_weight, critic, critic_weight, u)
 }
 
+/// Build the state-value critic to inject into a [`crate::search::driver`] for a
+/// given [`SearchConfig`], or `None` when the critic seam is switched off.
+///
+/// This is the production gate that keeps the whole seam OFF by default. The
+/// driver only reads a critic when one is injected, so returning `None` here
+/// leaves search byte-identical to the pre-seam behaviour. The gate is
+/// `cfg.critic_weight`:
+///
+/// * `critic_weight == 0.0` (the [`SearchConfig`] default) ⇒ `None`. Nothing is
+///   injected, and even if a future config path also flips on `eta_mcts` the
+///   driver still sees no critic, so no config can change the default behaviour.
+/// * `critic_weight != 0.0` ⇒ the concrete [`HeuristicCritic`], which is the
+///   documented, deterministic default value head. It delegates to the same
+///   LeanProgress heuristic the driver already blends, so turning the weight up is
+///   an additive, bounded change rather than a new signal. The point of wiring it
+///   now is that the seam becomes LIVE end to end, and swapping the trained value
+///   head in later is a one-line change to this factory (return the trained
+///   `CriticScorer` instead), with no edit to the driver or its callers.
+///
+/// Returned behind an [`Arc`] because the driver holds `Option<Arc<dyn
+/// CriticScorer>>` so one critic can be shared across concurrent searches.
+pub fn critic_from_config(cfg: &SearchConfig) -> Option<Arc<dyn CriticScorer>> {
+    if cfg.critic_weight == 0.0 {
+        None
+    } else {
+        Some(Arc::new(HeuristicCritic))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +298,36 @@ mod tests {
         let tie_hi = blend_priority_with_cfg(q, progress_v, hi, 0.0, u, &cfg);
         let tie_lo = blend_priority_with_cfg(q, progress_v, lo, 0.0, u, &cfg);
         assert!((tie_hi - tie_lo).abs() < 1e-12);
+    }
+
+    /// The production gate: no critic at the default weight, the heuristic critic
+    /// once the weight is switched on.
+    #[test]
+    fn critic_from_config_is_gated_on_the_weight() {
+        // Default config has critic_weight == 0.0, so the seam stays off.
+        assert!(critic_from_config(&SearchConfig::default()).is_none());
+
+        let on = SearchConfig {
+            critic_weight: 0.5,
+            ..SearchConfig::default()
+        };
+        let critic = critic_from_config(&on).expect("a non-zero weight injects a critic");
+        // The injected critic is the heuristic default: it agrees with the raw
+        // progress heuristic on any state text.
+        let goal = "n : ℕ\n⊢ n + 0 = n";
+        assert_eq!(
+            critic.score(&TextState2(goal)),
+            progress::progress_value_from_state(goal)
+        );
+    }
+
+    /// A tiny state for the gate test; separate from `TextState` only to keep each
+    /// test's fixtures local and obvious.
+    struct TextState2(&'static str);
+    impl GoalStateLike for TextState2 {
+        fn state_text(&self) -> String {
+            self.0.to_string()
+        }
     }
 
     /// Everything is deterministic: repeated scoring / blending of the same inputs
