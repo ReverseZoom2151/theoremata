@@ -9,6 +9,22 @@ use crate::{
 };
 use anyhow::Result;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+
+/// Stable content hash for provenance payloads.
+///
+/// Lives here rather than in each backend because all three external-prover
+/// backends already depend on this module and all three need the SAME hash: a
+/// provenance record is only useful if two backends hashing the same Lean agree.
+pub fn provenance_hash(text: &str) -> String {
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(text.as_bytes());
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
 
 /// Everything the real [`hardening::harden`] step needs and that a bare
 /// `(config, source)` pair cannot supply: a `Store` to write the evidence row
@@ -185,7 +201,7 @@ fn verify_lean_round_trip_inner(
     // Lexical pre-screen only — the real compile happens at the certify step.
     let lexically_verified = lexical && axioms_clean && !hardening_flagged;
 
-    Ok(VerificationReport {
+    let report = VerificationReport {
         lexically_verified,
         axioms_clean,
         statement_preserved,
@@ -209,7 +225,64 @@ fn verify_lean_round_trip_inner(
             "statement_guard": statement_guard::guard_report_json(&guard),
             "statement_restore": restore,
         }),
-    })
+    };
+
+    // Audit trail: record that the local re-check of external-producer output
+    // actually ran, and what it saw.
+    //
+    // Only the `ctx` path writes. The storeless entry points have no store and,
+    // more importantly, no graph coordinates: an evidence row hangs off a node,
+    // so filing one without a node id (or against a fabricated one) would put a
+    // real audit record on a node that does not exist. Writing nothing is the
+    // honest outcome there, and it is also what those callers did before.
+    if let Some(ctx) = ctx {
+        record_producer_checked(ctx, &report)?;
+    }
+    Ok(report)
+}
+
+/// File the `external_producer_checked` row for one completed local re-check.
+///
+/// This is a RECORD that the trust-but-verify step ran, not a certification.
+/// The verdict is deliberately scoped to the lexical pre-screen, because that is
+/// all this function computes: `report.live` is always false here and the
+/// authoritative compile happens later at the certify step. A verdict of
+/// "verified"/"passed" would read as a gate result that was never taken.
+fn record_producer_checked(ctx: &HardeningContext<'_>, report: &VerificationReport) -> Result<()> {
+    // `HardeningContext` makes both ids non-optional, but an empty string is not
+    // a node id. Treat it exactly like an absent id: no node to attach to, so no
+    // row, rather than a row filed against nothing.
+    if ctx.project_id.is_empty() || ctx.node_id.is_empty() {
+        return Ok(());
+    }
+    let verdict = if report.lexically_verified {
+        "lexical_screen_clean"
+    } else {
+        "lexical_screen_flagged"
+    };
+    ctx.store.add_evidence(
+        ctx.project_id,
+        ctx.node_id,
+        // Written as a literal, not as `evidence::EXTERNAL_PRODUCER_CHECKED`,
+        // because the drift guard in `components/graph/evidence.rs` only counts
+        // a statically visible `kind` argument. The test below pins the literal
+        // to the declared constant so the two cannot drift apart.
+        "external_producer_checked",
+        "prover_verify",
+        verdict,
+        json!({
+            "lexically_verified": report.lexically_verified,
+            "axioms_clean": report.axioms_clean,
+            "statement_preserved": report.statement_preserved,
+            "lexical_clean": report.lexical_clean,
+            "hardening_clean": report.hardening_clean,
+            "hardening": report.detail.get("hardening"),
+            "live": report.live,
+            "note": "local re-check of external-producer output: lexical pre-screen \
+                     plus statement guard, NOT a live compile",
+        }),
+    )?;
+    Ok(())
 }
 
 /// Resolve the hardening layer into (state, `hardening_clean`, detail).
@@ -461,6 +534,113 @@ mod tests {
         assert_eq!(
             report_detail(&report).get("state").and_then(Value::as_str),
             Some("requested_but_could_not_run")
+        );
+    }
+
+    // --- the external_producer_checked audit row -------------------------
+
+    fn node(store: &Store) -> (String, String) {
+        let project = store.create_project("p", "t").unwrap();
+        let node = store
+            .add_node(&project.id, NodeKind::FormalStatement, "f", "s", "test")
+            .unwrap();
+        (project.id, node.id)
+    }
+
+    #[test]
+    fn a_row_is_written_when_both_graph_ids_are_present() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let (project_id, node_id) = node(&store);
+        let ctx = HardeningContext {
+            store: &store,
+            project_id: &project_id,
+            node_id: &node_id,
+        };
+        let report =
+            verify_lean_output_hardened(&ctx, &disabled(), PROOF, "theorem t : True").unwrap();
+        let rows = store
+            .evidence_of_kind(&project_id, &node_id, "external_producer_checked")
+            .unwrap();
+        assert_eq!(rows.len(), 1, "the re-check that ran must be recorded once");
+        assert_eq!(rows[0].source, "prover_verify");
+        assert_eq!(
+            rows[0].payload.get("live").and_then(Value::as_bool),
+            Some(false),
+            "the payload must keep saying this was not a live compile"
+        );
+        // The verdict names the pre-screen it came from, so it cannot be read as
+        // a certification that never happened.
+        assert!(
+            rows[0].verdict.starts_with("lexical_screen_"),
+            "verdict {:?} must stay scoped to the lexical screen",
+            rows[0].verdict
+        );
+        assert_eq!(
+            rows[0]
+                .payload
+                .get("lexically_verified")
+                .and_then(Value::as_bool),
+            Some(report.lexically_verified),
+            "the row must report what the screen actually decided"
+        );
+    }
+
+    #[test]
+    fn an_empty_id_writes_no_row_and_does_not_panic() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let (project_id, node_id) = node(&store);
+        // An empty id is not a node. Both halves are required together, so each
+        // of these must behave exactly like the storeless path: no row.
+        for (p, n) in [
+            ("", node_id.as_str()),
+            (project_id.as_str(), ""),
+            ("", ""),
+        ] {
+            let ctx = HardeningContext {
+                store: &store,
+                project_id: p,
+                node_id: n,
+            };
+            let report =
+                verify_lean_output_hardened(&ctx, &disabled(), PROOF, "theorem t : True").unwrap();
+            assert!(!report.live);
+        }
+        assert!(
+            store.project_evidence(&project_id).unwrap().is_empty(),
+            "a missing id must never be papered over with a placeholder row"
+        );
+    }
+
+    #[test]
+    fn the_storeless_paths_still_write_nothing() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let (project_id, _node_id) = node(&store);
+        // These entry points have no store at all; they must stay silent rather
+        // than file a weaker row.
+        verify_lean_output(&disabled(), PROOF, "theorem t : True").unwrap();
+        verify_lean_output(&enabled(), PROOF, "theorem t : True").unwrap();
+        verify_lean_round_trip(&enabled(), PROOF, PROOF, "theorem t : True").unwrap();
+        assert!(store.project_evidence(&project_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_emitted_kind_matches_the_declared_constant() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let (project_id, node_id) = node(&store);
+        let ctx = HardeningContext {
+            store: &store,
+            project_id: &project_id,
+            node_id: &node_id,
+        };
+        verify_lean_output_hardened(&ctx, &disabled(), PROOF, "theorem t : True").unwrap();
+        let rows = store.evidence(&project_id, &node_id).unwrap();
+        assert_eq!(
+            rows.iter()
+                .filter(|e| e.evidence_type
+                    == crate::graph::evidence::EXTERNAL_PRODUCER_CHECKED)
+                .count(),
+            1,
+            "the literal `kind` and the registry constant must not drift apart"
         );
     }
 

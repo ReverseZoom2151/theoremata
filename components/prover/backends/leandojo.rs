@@ -5,7 +5,9 @@ use crate::{
     db::Store,
     prover::{
         model::{ProofJob, ProofResult, ProofTask, ProverJobStatus, VerificationReport},
-        verify::{verify_lean_output, verify_lean_output_hardened, HardeningContext},
+        verify::{
+            provenance_hash, verify_lean_output, verify_lean_output_hardened, HardeningContext,
+        },
     },
     tools::{PythonCheck, Tool},
 };
@@ -130,6 +132,10 @@ pub fn poll(store: &Store, config: &Config, job_id: &str) -> Result<ProofJob> {
             message: tactic["status"].as_str().map(str::to_owned),
             provenance: json!({"backend": BACKEND, "session": session, "tactic": tactic}),
         };
+        // Mirror of the aristotle site: the completion branch, where the store,
+        // the result and the graph coordinates are all in hand. Written before
+        // the result is moved into the job.
+        record_artifact_evidence(store, &job, &result)?;
         job.result = Some(result);
     }
     store.update_proof_job(&job)?;
@@ -168,6 +174,54 @@ fn verify_output(
         ),
         _ => verify_lean_output(config, code, &job.task.statement),
     }
+}
+
+/// File the artifact-provenance row for a completed external-prover job.
+///
+/// Called from the completion branch of `poll`, the mirror of the aristotle
+/// site: that is the only point where the store, the result and the graph
+/// coordinates are all in hand at once.
+///
+/// Both graph ids are required together. An evidence row hangs off a node, so if
+/// either id is absent there is no node to attach it to; inventing a placeholder
+/// would file real provenance against a node that does not exist. We write
+/// nothing in that case, which is what "this job has no graph coordinates"
+/// honestly means.
+fn record_artifact_evidence(store: &Store, job: &ProofJob, result: &ProofResult) -> Result<()> {
+    let (Some(project_id), Some(node_id)) = (job.project_id.as_deref(), job.node_id.as_deref())
+    else {
+        return Ok(());
+    };
+    let output_hash = result.formal_code.as_deref().map(provenance_hash);
+    store.add_evidence(
+        project_id,
+        node_id,
+        // Written as a literal, not as `evidence::EXTERNAL_PROVER_ARTIFACT`,
+        // because the drift guard in `components/graph/evidence.rs` only counts
+        // a statically visible `kind` argument. The test below pins the literal
+        // to the declared constant so the two cannot drift apart.
+        "external_prover_artifact",
+        BACKEND,
+        // An audit-trail record that provenance was captured, NOT a verdict on
+        // the proof. The session's own claimed status goes in the payload, where
+        // it cannot be misread as a gate this row never ran.
+        "recorded",
+        crate::graph::evidence::external_prover_payload(
+            BACKEND,
+            job.external_id.as_deref(),
+            Some(&provenance_hash(&job.task.statement)),
+            output_hash.as_deref(),
+            Some(result.duration_ms),
+            result.cost,
+            json!({
+                "job_id": job.id,
+                "task_id": result.task_id,
+                "claimed_status": result.status,
+                "artifacts_dir": job.artifacts_dir,
+            }),
+        ),
+    )?;
+    Ok(())
 }
 
 pub fn cancel(store: &Store, job_id: &str) -> Result<ProofJob> {
@@ -314,6 +368,86 @@ mod tests {
         assert!(
             !Config::default().harden_proofs,
             "this change must not flip the default on"
+        );
+    }
+
+    // --- the external_prover_artifact audit row ---------------------------
+
+    fn completed(job: &ProofJob) -> ProofResult {
+        ProofResult {
+            task_id: job.task.id.clone(),
+            job_id: job.id.clone(),
+            status: ProverJobStatus::Proved,
+            formal_code: Some(PROOF.into()),
+            counterexample: None,
+            verification: None,
+            artifacts_dir: None,
+            duration_ms: 7,
+            cost: None,
+            message: None,
+            provenance: json!({}),
+        }
+    }
+
+    #[test]
+    fn a_row_is_written_when_both_graph_ids_are_present() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let ids = graph_ids(&store);
+        let job = job_with(&store, ids.clone());
+        record_artifact_evidence(&store, &job, &completed(&job)).unwrap();
+        let rows = store
+            .evidence_of_kind(
+                ids.0.as_deref().unwrap(),
+                ids.1.as_deref().unwrap(),
+                "external_prover_artifact",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, BACKEND);
+        assert_eq!(
+            rows[0].verdict, "recorded",
+            "an audit-trail row must not read as a gate verdict"
+        );
+        assert_eq!(
+            rows[0].payload.get("service").and_then(Value::as_str),
+            Some(BACKEND),
+            "the payload builder in graph::evidence must be the one used"
+        );
+    }
+
+    #[test]
+    fn a_missing_graph_id_writes_no_row_and_does_not_panic() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let (project, node) = graph_ids(&store);
+        for ids in [(None, node.clone()), (project.clone(), None), (None, None)] {
+            let job = job_with(&store, ids);
+            record_artifact_evidence(&store, &job, &completed(&job)).unwrap();
+        }
+        assert!(
+            store
+                .project_evidence(project.as_deref().unwrap())
+                .unwrap()
+                .is_empty(),
+            "no node to attach to means no row, never a fabricated node id"
+        );
+    }
+
+    #[test]
+    fn the_emitted_kind_matches_the_declared_constant() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let ids = graph_ids(&store);
+        let job = job_with(&store, ids.clone());
+        record_artifact_evidence(&store, &job, &completed(&job)).unwrap();
+        let rows = store
+            .evidence(ids.0.as_deref().unwrap(), ids.1.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .filter(|e| e.evidence_type
+                    == crate::graph::evidence::EXTERNAL_PROVER_ARTIFACT)
+                .count(),
+            1,
+            "the literal `kind` and the registry constant must not drift apart"
         );
     }
 }

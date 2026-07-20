@@ -63,23 +63,28 @@ pub const RETRIEVAL: &str = "retrieval";
 
 /// Externally generated Lean plus request provenance.
 ///
-/// RESERVED, currently unemitted. Intended producer: the external-prover
-/// backends that already write artifact directories, i.e. the completion branch
-/// of `poll` in `components/prover/backends/{aristotle,leandojo,reprover}.rs`,
-/// right after `write_artifact(dir, "result.json", &result)`. That is the only
-/// point where the request id, the artifact directory and the graph coordinates
-/// (`job.project_id`, `job.node_id`) are all in hand. Payload should be
-/// [`external_prover_payload`].
+/// EMITTED by the completion branch of `poll` in
+/// `components/prover/backends/{aristotle,leandojo,reprover}.rs`, which is the
+/// only point where the request id, the artifact directory and the graph
+/// coordinates (`job.project_id`, `job.node_id`) are all in hand. Payload is
+/// [`external_prover_payload`]. Note leandojo and reprover write no artifact
+/// directory at all, so their site is the completion branch itself rather than
+/// a `write_artifact` line.
+///
+/// Verdict is `recorded`, deliberately not a gate result: the prover's own
+/// claimed status travels in the payload as `claimed_status`, because an
+/// external producer's opinion of its own output is not a verdict of ours.
 pub const EXTERNAL_PROVER_ARTIFACT: &str = "external_prover_artifact";
 
 /// Output of an external producer locally re-verified (trust-but-verify).
 ///
-/// RESERVED, currently unemitted. Intended producer:
-/// `components/prover/session/verify.rs`, which is the local gate over
-/// external-prover output. It already receives a `HardeningContext` carrying
-/// `store`/`project_id`/`node_id` precisely so it can file rows, and it already
-/// computes the verdict; only the storeless entry points would have to keep
-/// abstaining.
+/// EMITTED by `components/prover/session/verify.rs` on the round-trip path, in
+/// the branch where a `HardeningContext` is available. The storeless entry
+/// points still write nothing rather than a weaker row.
+///
+/// Verdict is scoped to what was actually established: `lexical_screen_clean`
+/// or `lexical_screen_flagged`, because `report.live` is always false on this
+/// path and a verdict reading like a certification would overstate it.
 pub const EXTERNAL_PRODUCER_CHECKED: &str = "external_producer_checked";
 
 /// MILP reformulation equivalence attempt.
@@ -91,13 +96,15 @@ pub const REFORMULATION_CHECK: &str = "reformulation_check";
 
 /// Structured verifier stderr/stdout from a repair loop.
 ///
-/// RESERVED, currently unemitted. Intended producer:
-/// `components/reason/proving/repair.rs`. `repair_proof` is deliberately
-/// storeless (its verifier and repairer are injected so tests stay
-/// deterministic), so the row belongs at its call site, or `repair_proof` needs
-/// an optional store handle in the same shape as
-/// `verify.rs::HardeningContext`. The payload is the per-round record already
-/// built in `RepairReport::rounds`.
+/// EMITTED by `components/reason/proving/refine_ops.rs::record_repair_evidence`,
+/// at the call site rather than inside `repair_proof`, which stays storeless so
+/// its injected verifier and repairer keep tests deterministic. The call site is
+/// also the only place holding both the graph coordinates and the finished trace.
+///
+/// Verdict is `repaired` or `unrepaired`, never `pass`: a repair is not a
+/// verification, and a repaired proof still faces the normal gate. The payload
+/// carries the per-round trace from `RepairReport::rounds` and deliberately
+/// excludes proof and candidate bodies, which are untrusted model text.
 pub const REPAIR_LOOP: &str = "repair_loop";
 
 /// Every canonical type declared above. The guard checks that this list and the
@@ -125,10 +132,7 @@ pub const ALL: &[&str] = &[
 /// the guard.
 pub const RESERVED_UNEMITTED: &[&str] = &[
     AXIOM_AUDIT,
-    EXTERNAL_PROVER_ARTIFACT,
-    EXTERNAL_PRODUCER_CHECKED,
     REFORMULATION_CHECK,
-    REPAIR_LOOP,
 ];
 
 /// True when nothing in the tree writes rows of this type. Callers that render
@@ -516,7 +520,7 @@ mod drift_guard {
 
     #[test]
     fn is_reserved_unemitted_agrees_with_the_list() {
-        assert!(super::is_reserved_unemitted(super::REPAIR_LOOP));
+        assert!(super::is_reserved_unemitted(super::AXIOM_AUDIT));
         assert!(!super::is_reserved_unemitted(super::LEAN_COMPILE));
         assert!(!super::is_reserved_unemitted("not_an_evidence_type"));
     }

@@ -30,6 +30,25 @@
 //! report carries the best failing attempt plus the final error instead. All
 //! candidate text is treated as UNTRUSTED DATA: it is only ever verifier-checked
 //! and returned as text, never executed by this module.
+//!
+//! **What this module does NOT enforce.** [`Repairer`] returns whole-proof
+//! rewrites and [`repair_proof`] gates them on the injected verifier and nothing
+//! else. So if that verifier only answers "does this compile", a repairer that
+//! WEAKENS, RENAMES or trivially restates the theorem until the toolchain is
+//! happy will be accepted here. That is the dominant failure mode of automated proof
+//! repair in the literature. Repair may rewrite a SCRIPT; it must never rewrite a
+//! STATEMENT, and this module cannot tell the difference on its own because it is
+//! deliberately given no notion of the canonical statement.
+//!
+//! The guard therefore lives one layer up, at the only place repair is driven
+//! from: [`crate::refine_ops::inner_repair_move`] wraps the injected verifier in
+//! [`crate::refine_ops::statement_preserving_verifier`], which rejects any
+//! candidate that stops declaring the canonical statement. Call `repair_proof`
+//! directly only with a verifier that already checks statement preservation.
+//!
+//! Nor does a repair establish correctness. `repaired == Some(..)` means the
+//! INJECTED verifier stopped rejecting the script; the result still has to pass
+//! the normal gate downstream, and nothing here writes a verification verdict.
 
 // ---------------------------------------------------------------------------
 // Verification outcome (the correctness gate's result)
@@ -251,6 +270,13 @@ impl RepairReport {
 ///
 /// If the input already passes, returns success with `repaired == input` and no
 /// rounds. NEVER returns a proof that fails `verify` as `repaired`.
+///
+/// STATEMENT SAFETY: `verify` is the ONLY filter on candidate text, so a
+/// candidate that weakened or restated the theorem is accepted whenever `verify`
+/// accepts it. Drive this through
+/// [`crate::refine_ops::inner_repair_move`], which wraps `verify` in
+/// [`crate::refine_ops::statement_preserving_verifier`], or pass a `verify` that
+/// already checks preservation itself.
 pub fn repair_proof(
     proof: &str,
     verify: &dyn Fn(&str) -> VerifyOutcome,

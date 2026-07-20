@@ -27,13 +27,25 @@
 //!    inner loop stalls, all under a hard move budget, returning the exact
 //!    schedule of moves it took for audit.
 //!
+//! 4. [`inner_repair_move`], the wiring that makes (3) true rather than merely
+//!    documented: it actually runs [`crate::repair::repair_proof`], behind a
+//!    statement-preservation guard, and classifies the resulting report into the
+//!    [`MoveOutcome`] the scheduler switches on. [`record_repair_evidence`] then
+//!    files the `repair_loop` audit row from the returned report.
+//!
 //! Everything here is a pure function of its inputs — no wall-clock, no unseeded
 //! randomness — so the whole refinement loop is exercised deterministically. All
 //! proof / sketch / feedback text is treated as UNTRUSTED DATA: it is only ever
 //! parsed for structure and re-emitted as prose / seed text, never executed.
 
-use super::repair::VerifyError;
+use super::repair::{
+    repair_proof, RepairConfig, RepairReport, Repairer, VerifyError, VerifyOutcome,
+};
 use super::sketch::{InformalSketch, SketchStep};
+use crate::db::Store;
+use crate::prover::statement_preservation::check_statement_preserved;
+use anyhow::Result;
+use serde_json::json;
 
 // ===========================================================================
 // 1. summarize_progress — self-summarization / restart seed
@@ -625,6 +637,202 @@ impl RefinementScheduler {
     }
 }
 
+// ===========================================================================
+// 4. Inner-loop wiring: driving repair_proof, and its evidence row
+// ===========================================================================
+
+/// Wrap a correctness gate so a candidate is only ever considered while it still
+/// declares `statement`.
+///
+/// WHY this exists at all: the dominant failure mode of automated proof repair is
+/// not a bad tactic, it is a repairer that WEAKENS, renames or trivially restates
+/// the theorem until the toolchain stops complaining. [`repair_proof`] hands the
+/// repairer whole-proof rewrites and filters them through the injected verifier
+/// and nothing else, so a verifier that only asks "does this compile" will accept
+/// a rewritten statement. Repair may rewrite a SCRIPT, never a STATEMENT, so the
+/// preservation check runs FIRST and a candidate that fails it is reported as a
+/// verification failure, so the loop treats it as a dead end rather than a fix.
+///
+/// The span is `None` because "you changed the theorem" does not localize to a
+/// step, and pointing the repairer at a line would invite it to keep editing there.
+///
+/// Fail-closed on purpose: `check_statement_preserved` reports NOT preserved when
+/// it cannot parse either side, so an unparsable statement rejects every
+/// candidate. Repairing nothing is the safe outcome; silently admitting a
+/// statement rewrite is not.
+///
+/// Pure and deterministic: the check is lexical and offline, so the wrapped gate
+/// keeps the property that the repair loop runs with no model and no toolchain.
+pub fn statement_preserving_verifier<'a>(
+    statement: &'a str,
+    verify: &'a dyn Fn(&str) -> VerifyOutcome,
+) -> impl Fn(&str) -> VerifyOutcome + 'a {
+    move |candidate: &str| {
+        let preservation = check_statement_preserved(statement, candidate);
+        if !preservation.preserved {
+            return VerifyOutcome::Err(VerifyError::new(
+                format!(
+                    "statement not preserved ({}): repair may rewrite a script, never a statement",
+                    preservation.verdict.tag()
+                ),
+                None,
+            ));
+        }
+        verify(candidate)
+    }
+}
+
+/// Classify a finished [`RepairReport`] into the [`MoveOutcome`] the scheduler
+/// switches on.
+///
+/// WHY these three map this way: [`RepairReport::repaired`] is `Some` only once
+/// the gate accepted a proof, so that is the only honest `Solved`. Otherwise, a
+/// `best_attempt` that moved off the original means the loop advanced onto a
+/// different failing proof, which is exactly the condition for staying in the
+/// inner loop; a `best_attempt` still equal to the original means the repairer
+/// converged with nothing to show, which is the stall that should escalate.
+pub fn repair_outcome(report: &RepairReport) -> MoveOutcome {
+    if report.succeeded() {
+        MoveOutcome::Solved
+    } else if report.best_attempt != report.original {
+        MoveOutcome::Progressed
+    } else {
+        MoveOutcome::Stalled
+    }
+}
+
+/// Execute one [`RefinementMove::InnerRepair`]: run the repair loop this module
+/// documents as its inner loop, and report both its audit trail and the outcome
+/// the scheduler needs.
+///
+/// `statement` is the CANONICAL statement the proof must keep proving; `verify`
+/// is wrapped by [`statement_preserving_verifier`] before it reaches
+/// [`repair_proof`], so no candidate that rewrote the statement can be accepted
+/// on this path. That wrapping is done here rather than left to callers because a
+/// caller that forgets it gets a silently weaker guarantee with no visible sign.
+///
+/// A [`MoveOutcome::Solved`] means the INJECTED gate accepted the repaired
+/// script. It is not a certification and it does not exempt the result from the
+/// normal gate downstream: nothing on this path writes a verification verdict.
+///
+/// Deterministic given a deterministic `verify` / `repairer`, with no IO.
+pub fn inner_repair_move(
+    statement: &str,
+    proof: &str,
+    verify: &dyn Fn(&str) -> VerifyOutcome,
+    repairer: &dyn Repairer,
+    config: RepairConfig,
+) -> (RepairReport, MoveOutcome) {
+    let guarded = statement_preserving_verifier(statement, verify);
+    let mut report = repair_proof(proof, &guarded, repairer, config);
+
+    // The guard above stops a rewritten statement from being ACCEPTED, but the
+    // loop still carries the first CHANGED candidate forward as `best_attempt`,
+    // and that field is what a caller seeds its next attempt from. Leaving a
+    // weakened statement there would launder the rewrite into the next round
+    // through the back door, so a non-preserving best attempt is rolled back to
+    // the original. The round trace and `final_error` are left untouched: they
+    // are the audit record of what the repairer actually proposed.
+    if !report.succeeded() && !check_statement_preserved(statement, &report.best_attempt).preserved
+    {
+        report.best_attempt = report.original.clone();
+    }
+
+    let outcome = repair_outcome(&report);
+    (report, outcome)
+}
+
+/// Graph coordinates a `repair_loop` evidence row is filed under. Shaped exactly
+/// like `components/prover/session/verify.rs::HardeningContext`, for the same
+/// reason: the work itself is not a pure function of a store, so the store and
+/// the coordinates travel together as an explicit context.
+///
+/// WHY the context lives here and not on [`repair_proof`]: that loop's verifier
+/// and repairer are injected precisely so it runs with no model, no toolchain and
+/// no database, and threading a `Store` into it would put IO on that pure path.
+/// The row is written at the CALL SITE instead, from the returned report, which
+/// is the only place that has both the graph coordinates and the finished trace.
+pub struct RepairEvidenceContext<'a> {
+    pub store: &'a Store,
+    pub project_id: &'a str,
+    pub node_id: &'a str,
+}
+
+/// Verdict string for a repair-loop evidence row.
+///
+/// WHY not `pass` / `fail`: `pass` is the vocabulary of the verification gate,
+/// and a reader (and `docs/TRUST_BOUNDARIES.md`) treats a `pass` row as a record
+/// that a named check established correctness. A repair establishes nothing of
+/// the sort. It says only that a rewrite was found which the injected gate
+/// stopped rejecting. `repaired` / `unrepaired` keeps the two verdict vocabularies
+/// from being confused by anyone reading the audit trail.
+pub fn repair_verdict(report: &RepairReport) -> &'static str {
+    if report.succeeded() {
+        "repaired"
+    } else {
+        "unrepaired"
+    }
+}
+
+/// The audit payload for a repair run: the per-round record [`RepairReport`]
+/// already built, plus the final error.
+///
+/// Proof and candidate BODIES are deliberately left out. They are untrusted model
+/// text and the evidence table is an audit trail, not a proof store; the localized
+/// failing step is kept because that localization is the whole point of the trace.
+pub fn repair_evidence_payload(report: &RepairReport) -> serde_json::Value {
+    let rounds: Vec<serde_json::Value> = report
+        .rounds
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            json!({
+                "round": i,
+                "seed": r.seed,
+                "failing_line": r.failing_step.as_ref().map(|s| s.line),
+                "failing_step": r.failing_step.as_ref().map(|s| s.text.clone()),
+                "candidates_seen": r.candidates_seen,
+                "accepted": r.accepted,
+            })
+        })
+        .collect();
+
+    json!({
+        "succeeded": report.succeeded(),
+        "rounds_run": report.rounds_run(),
+        "rounds": rounds,
+        "final_error": report.final_error.as_ref().map(|e| json!({
+            "message": e.message,
+            "line": e.span.as_ref().map(|s| s.line),
+        })),
+        // Stated in the row itself so a later reader cannot mistake a repair for
+        // a verification: a repaired script still has to pass the normal gate.
+        "note": "repair loop only; the resulting script is not verified by this row",
+    })
+}
+
+/// File the `repair_loop` evidence row for a finished repair run.
+///
+/// Separate from [`inner_repair_move`] rather than an optional parameter on it,
+/// so the repair path stays a pure function and the IO is a distinct call a
+/// caller makes only when it has a store.
+pub fn record_repair_evidence(
+    ctx: &RepairEvidenceContext<'_>,
+    report: &RepairReport,
+) -> Result<String> {
+    ctx.store.add_evidence(
+        ctx.project_id,
+        ctx.node_id,
+        // Spelled out rather than `crate::evidence::REPAIR_LOOP` because the
+        // drift guard in components/graph/evidence.rs only recognises a literal
+        // `kind` argument as a producer.
+        "repair_loop",
+        "repair",
+        repair_verdict(report),
+        repair_evidence_payload(report),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -940,5 +1148,304 @@ mod tests {
         fn record_kind(&self, kind: RefinementMove) {
             self.kinds.borrow_mut().push(kind);
         }
+    }
+
+    // -- inner_repair_move: the scheduler's inner loop really drives repair ---
+
+    use crate::model::NodeKind;
+    use crate::repair::Span;
+    use std::path::Path;
+
+    /// The canonical statement every candidate below must keep proving.
+    const STATEMENT: &str = "theorem sq_nonneg_like (x : Int) : 0 ≤ x * x";
+
+    /// The failing script: the statement plus one broken step.
+    const BROKEN_PROOF: &str =
+        "theorem sq_nonneg_like (x : Int) : 0 ≤ x * x := by\n  BROKEN\n  exact h";
+
+    /// Gate mock: fails iff some trimmed line is `BROKEN`, localizing to it.
+    fn broken_line_verifier() -> impl Fn(&str) -> VerifyOutcome {
+        |proof: &str| {
+            for (i, line) in proof.lines().enumerate() {
+                if line.trim() == "BROKEN" {
+                    return VerifyOutcome::Err(VerifyError::new(
+                        format!("unsolved goal at line {i}"),
+                        Some(Span::line(i)),
+                    ));
+                }
+            }
+            VerifyOutcome::Ok
+        }
+    }
+
+    /// Rewrites only the SCRIPT: replaces the failing line with a real tactic.
+    struct ScriptRepairer;
+    impl Repairer for ScriptRepairer {
+        fn repair(&self, proof: &str, error: &VerifyError, _seed: u64) -> Vec<String> {
+            let Some(span) = &error.span else {
+                return Vec::new();
+            };
+            let mut lines: Vec<String> = proof.lines().map(|s| s.to_string()).collect();
+            if span.line >= lines.len() {
+                return Vec::new();
+            }
+            lines[span.line] = "  exact mul_self_nonneg x".to_string();
+            vec![lines.join("\n")]
+        }
+    }
+
+    /// Rewrites the STATEMENT: replaces the goal with `True` so the script
+    /// compiles. This is the cheat the guard exists to stop.
+    struct WeakeningRepairer;
+    impl Repairer for WeakeningRepairer {
+        fn repair(&self, _proof: &str, _error: &VerifyError, _seed: u64) -> Vec<String> {
+            vec!["theorem sq_nonneg_like (x : Int) : True := by\n  trivial".to_string()]
+        }
+    }
+
+    /// Changes the script every round but never fixes it (still `BROKEN`).
+    struct ChurnRepairer;
+    impl Repairer for ChurnRepairer {
+        fn repair(&self, proof: &str, _error: &VerifyError, seed: u64) -> Vec<String> {
+            vec![format!("{proof}\n  churn {seed}")]
+        }
+    }
+
+    /// Proposes the unchanged proof: the repairer has nothing left to offer.
+    struct NoProgressRepairer;
+    impl Repairer for NoProgressRepairer {
+        fn repair(&self, proof: &str, _error: &VerifyError, _seed: u64) -> Vec<String> {
+            vec![proof.to_string()]
+        }
+    }
+
+    #[test]
+    fn inner_repair_move_runs_the_repair_loop_and_reports_solved() {
+        let verify = broken_line_verifier();
+        let (report, outcome) = inner_repair_move(
+            STATEMENT,
+            BROKEN_PROOF,
+            &verify,
+            &ScriptRepairer,
+            RepairConfig::default(),
+        );
+
+        assert_eq!(outcome, MoveOutcome::Solved);
+        assert!(report.succeeded());
+        let repaired = report.repaired.as_ref().unwrap();
+        assert!(repaired.contains("mul_self_nonneg"));
+        // The reported script genuinely passes the injected gate.
+        assert!(verify(repaired).is_ok());
+        // The trace localized the broken step (line 1).
+        assert_eq!(report.rounds.len(), 1);
+        assert_eq!(report.rounds[0].failing_step.as_ref().unwrap().line, 1);
+    }
+
+    #[test]
+    fn inner_repair_move_reports_progressed_when_the_loop_only_advances() {
+        let verify = broken_line_verifier();
+        let (report, outcome) = inner_repair_move(
+            STATEMENT,
+            BROKEN_PROOF,
+            &verify,
+            &ChurnRepairer,
+            RepairConfig { rounds: 3, seed: 7 },
+        );
+        assert_eq!(outcome, MoveOutcome::Progressed);
+        assert!(!report.succeeded());
+        assert_ne!(report.best_attempt, report.original);
+        assert_eq!(report.rounds_run(), 3);
+    }
+
+    #[test]
+    fn inner_repair_move_reports_stalled_so_the_scheduler_escalates() {
+        let verify = broken_line_verifier();
+        let (report, outcome) = inner_repair_move(
+            STATEMENT,
+            BROKEN_PROOF,
+            &verify,
+            &NoProgressRepairer,
+            RepairConfig::default(),
+        );
+        assert_eq!(outcome, MoveOutcome::Stalled);
+        assert_eq!(report.best_attempt, report.original);
+    }
+
+    #[test]
+    fn scheduler_inner_move_is_backed_by_the_real_repair_loop() {
+        // The inner move is the stalling repair run above, so the scheduler must
+        // take one inner move and then escalate to the outer loop, which solves.
+        let verify = broken_line_verifier();
+        let sched = RefinementScheduler::new(4, true);
+        let inner_runs = RefCell::new(0usize);
+        let schedule = sched.run(|kind, _i| match kind {
+            RefinementMove::InnerRepair => {
+                *inner_runs.borrow_mut() += 1;
+                let (_report, outcome) = inner_repair_move(
+                    STATEMENT,
+                    BROKEN_PROOF,
+                    &verify,
+                    &NoProgressRepairer,
+                    RepairConfig::default(),
+                );
+                outcome
+            }
+            RefinementMove::OuterRedecompose => MoveOutcome::Solved,
+        });
+
+        assert_eq!(*inner_runs.borrow(), 1);
+        assert!(schedule.solved);
+        let kinds: Vec<RefinementMove> = schedule.moves.iter().map(|m| m.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                RefinementMove::InnerRepair,
+                RefinementMove::OuterRedecompose,
+            ]
+        );
+    }
+
+    // -- statement safety ----------------------------------------------------
+
+    #[test]
+    fn unguarded_repair_proof_accepts_a_weakened_statement() {
+        // Pinned deliberately: `repair_proof` filters candidates through the
+        // injected gate ALONE, so a gate that only checks the script accepts a
+        // rewritten theorem. This is why the guard below is not optional.
+        let verify = broken_line_verifier();
+        let report = repair_proof(
+            BROKEN_PROOF,
+            &verify,
+            &WeakeningRepairer,
+            RepairConfig::default(),
+        );
+        assert!(report.succeeded());
+        assert!(report.repaired.as_ref().unwrap().contains(": True"));
+    }
+
+    #[test]
+    fn inner_repair_move_never_accepts_a_rewritten_statement() {
+        let verify = broken_line_verifier();
+        let (report, outcome) = inner_repair_move(
+            STATEMENT,
+            BROKEN_PROOF,
+            &verify,
+            &WeakeningRepairer,
+            RepairConfig::default(),
+        );
+        // Same repairer, same gate, opposite result: the guard rejected it.
+        assert!(!report.succeeded());
+        assert!(report.repaired.is_none());
+        assert_eq!(outcome, MoveOutcome::Stalled);
+        let err = report.final_error.as_ref().unwrap();
+        assert!(err.message.contains("statement not preserved"), "{err:?}");
+        // The weakened text is not carried forward as the seed for the next
+        // attempt either, so the rewrite cannot re-enter through `best_attempt`.
+        assert_eq!(report.best_attempt, report.original);
+        assert!(!report.best_attempt.contains(": True"));
+        // The trace still records that the repairer proposed something.
+        assert_eq!(report.rounds[0].candidates_seen, 1);
+        assert!(!report.rounds[0].accepted);
+    }
+
+    #[test]
+    fn statement_preserving_verifier_passes_script_only_rewrites() {
+        let verify = broken_line_verifier();
+        let guarded = statement_preserving_verifier(STATEMENT, &verify);
+        // Script changed, statement identical: the inner gate decides.
+        assert!(guarded("theorem sq_nonneg_like (x : Int) : 0 ≤ x * x := by\n  exact h").is_ok());
+        assert!(!guarded(BROKEN_PROOF).is_ok());
+        // Statement dropped entirely: rejected without consulting the gate.
+        assert!(!guarded("  exact mul_self_nonneg x").is_ok());
+    }
+
+    // -- repair_loop evidence ------------------------------------------------
+
+    fn solved_report() -> RepairReport {
+        let verify = broken_line_verifier();
+        let (report, _) = inner_repair_move(
+            STATEMENT,
+            BROKEN_PROOF,
+            &verify,
+            &ScriptRepairer,
+            RepairConfig::default(),
+        );
+        report
+    }
+
+    fn stalled_report() -> RepairReport {
+        let verify = broken_line_verifier();
+        let (report, _) = inner_repair_move(
+            STATEMENT,
+            BROKEN_PROOF,
+            &verify,
+            &NoProgressRepairer,
+            RepairConfig::default(),
+        );
+        report
+    }
+
+    #[test]
+    fn repair_verdict_never_uses_verification_vocabulary() {
+        assert_eq!(repair_verdict(&solved_report()), "repaired");
+        assert_eq!(repair_verdict(&stalled_report()), "unrepaired");
+        // A repair is not a verification, so `pass` must never appear.
+        for r in [solved_report(), stalled_report()] {
+            assert_ne!(repair_verdict(&r), "pass");
+            assert_ne!(repair_verdict(&r), "fail");
+        }
+    }
+
+    #[test]
+    fn repair_evidence_payload_carries_the_round_trace_not_the_proof_text() {
+        let report = solved_report();
+        let payload = repair_evidence_payload(&report);
+        assert_eq!(payload["succeeded"], json!(true));
+        assert_eq!(payload["rounds_run"], json!(1));
+        assert_eq!(payload["rounds"][0]["failing_line"], json!(1));
+        assert_eq!(payload["rounds"][0]["failing_step"], json!("BROKEN"));
+        assert_eq!(payload["rounds"][0]["accepted"], json!(true));
+        assert_eq!(payload["final_error"], json!(null));
+        // Untrusted candidate/proof bodies stay out of the audit row.
+        let rendered = payload.to_string();
+        assert!(!rendered.contains("mul_self_nonneg"), "{rendered}");
+    }
+
+    #[test]
+    fn repair_evidence_payload_records_the_final_error_on_failure() {
+        let payload = repair_evidence_payload(&stalled_report());
+        assert_eq!(payload["succeeded"], json!(false));
+        assert_eq!(payload["final_error"]["line"], json!(1));
+    }
+
+    #[test]
+    fn record_repair_evidence_writes_one_repair_loop_row() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store.create_project("p", "t").unwrap();
+        let node = store
+            .add_node(&project.id, NodeKind::Obligation, "n", STATEMENT, "test")
+            .unwrap();
+        let ctx = RepairEvidenceContext {
+            store: &store,
+            project_id: &project.id,
+            node_id: &node.id,
+        };
+
+        record_repair_evidence(&ctx, &solved_report()).unwrap();
+        record_repair_evidence(&ctx, &stalled_report()).unwrap();
+
+        let rows = store
+            .evidence_of_kind(&project.id, &node.id, "repair_loop")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].source, "repair");
+        assert_eq!(rows[0].verdict, "repaired");
+        assert_eq!(rows[1].verdict, "unrepaired");
+        assert_eq!(rows[0].payload["rounds_run"], json!(1));
+        // The row states its own limits: it is not a verification record.
+        assert!(rows[0].payload["note"]
+            .as_str()
+            .unwrap()
+            .contains("not verified"));
     }
 }
