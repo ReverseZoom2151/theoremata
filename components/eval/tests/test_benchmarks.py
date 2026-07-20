@@ -99,6 +99,10 @@ _CORPUS_GLOB = {
     "higher_dyson": "HigherDyson-main",
     "erdos_public": "erdos-public-main",
     "ramanujan_tau": "ramanujan-tau-misses-primes-main",
+    # trivial_existential ships a committed clean-room Lean pair (no resources
+    # corpus); glob a never-present dir so `_corpus_present` reports absent and the
+    # loader is handled via `_COMMITTED_FIXTURE` below.
+    "trivial_existential": "trivial-existential-none",
 }
 
 # corpora that exist but ship no structured problems (PDF-only data cards)
@@ -106,7 +110,7 @@ _STRUCTURELESS = {"aime24", "aime25", "aime26"}
 
 # benchmarks whose data is a committed fixture beside the loader (not under
 # resources/), so they legitimately return items even with resources/ absent.
-_COMMITTED_FIXTURE = {"formalizing_100"}
+_COMMITTED_FIXTURE = {"formalizing_100", "trivial_existential"}
 
 
 def _corpus_present(name: str) -> bool:
@@ -132,7 +136,7 @@ def test_registry_lists_all_tracks():
         "adversarial",
         "open_conjecture",
     }
-    assert len(ALL_NAMES) == 39
+    assert len(ALL_NAMES) == 40
 
 
 def test_load_unknown_benchmark_raises():

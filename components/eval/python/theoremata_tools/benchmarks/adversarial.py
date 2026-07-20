@@ -38,6 +38,11 @@ downstream prompt assembler cannot mistake corpus prose for direction.
 
 Like every loader in this package, each entry point returns ``[]`` when its
 corpus is missing, because ``resources/`` is gitignored and absent in CI.
+
+The one exception is :func:`load_trivial_existential`, whose two Lean files are
+first-party and committed under ``components/eval/fixtures/``. Nothing about them
+is untrusted, nothing about them is optional, and absence there means a broken
+checkout rather than the usual unvendored corpus, so it raises instead.
 """
 from __future__ import annotations
 
@@ -75,6 +80,15 @@ REJECT_REASONS: frozenset[str] = frozenset(
         "unencoded_side_condition",
         # hypotheses are assumed with nothing anywhere exhibiting an inhabitant
         "missing_witness",
+        # the statement is trivially true and the theorem's NAME is the only place
+        # the substantive claim appears. Distinct from the three above: the
+        # hypotheses are fine, no side condition was dropped, nothing is
+        # unwitnessed. What is wrong is that the proposition carries less than the
+        # identifier in front of it advertises, so the content sits where nothing
+        # checks it. Spelled as a relation between name and statement rather than
+        # as "trivial_conclusion", because a trivial conclusion on its own is not a
+        # defect: plenty of honest lemmas are trivial and are named accordingly.
+        "name_claims_more_than_statement",
     }
 )
 
@@ -105,6 +119,16 @@ def _fenced(text: str, limit: int = 4000) -> str:
 
 def _read(path: Path, limit: int = 4000) -> str:
     return _fenced(path.read_text(encoding="utf-8", errors="replace"), limit)
+
+
+# this file: components/eval/python/theoremata_tools/benchmarks/adversarial.py
+# parents:  [0]=benchmarks [1]=theoremata_tools [2]=python [3]=eval
+#
+# Fixtures we WROTE live in the repo, not under the gitignored ``resources/``.
+# Resolved from this file rather than from the repo root so the path survives a
+# checkout at any location and ignores ``$THEOREMATA_RESOURCES``, which has no
+# authority over our own tree.
+_FIXTURES_ROOT = Path(__file__).resolve().parents[3] / "fixtures"
 
 
 def make_adversarial_item(
@@ -546,15 +570,132 @@ def load_ramanujan_tau() -> list[dict[str, Any]]:
     return items
 
 
+# --------------------------------------------------------------------------- #
+# 6. trivial_existential: OUR OWN clean-room pair, always on disk
+# --------------------------------------------------------------------------- #
+
+TRIVIAL_EXISTENTIAL_PAIR = "trivial_existential_spectrum"
+
+#: Where the pair lives. Distinct from every other fixture in this module, which
+#: are globbed out of ``resources/``.
+TRIVIAL_EXISTENTIAL_DIR = _FIXTURES_ROOT / "trivial_existential"
+
+#: role -> (filename, verdict). The pair is fixed and small, so it is spelled out
+#: rather than globbed: a glob over our own directory could silently pick up a
+#: stray file and register it with someone else's verdict.
+_TRIVIAL_EXISTENTIAL_FILES: dict[str, tuple[str, str]] = {
+    "probe": ("probe.lean", EXPECT_REJECT),
+    "control": ("control.lean", EXPECT_ACCEPT),
+}
+
+
+def load_trivial_existential() -> list[dict[str, Any]]:
+    """A theorem named for a property it does not state, plus an honest control.
+
+    Written by us from a description of a pattern found during mining, in which a
+    theorem named for a spectral property of a PDE system was stated as "there
+    exists a real equal to <expression>" and proved by an anonymous constructor.
+    That is true by reflexivity whatever the expression is, so the name carries the
+    entire claim. The source corpus ships NO LICENCE, which grants strictly fewer
+    rights than GPL, so nothing was copied from it: these two files are our own
+    mathematics exhibiting our own restatement of the shape, and the corpus is a
+    citation in ``docs/resource-mining/new/2026-07-latest-batch.md`` §3.1 rather
+    than a fixture on disk.
+
+    Both files are Mathlib-free and import nothing, so the pair compiles under any
+    Lean 4 in about a second. It is therefore the only adversarial fixture we can
+    afford to run on every commit.
+
+    EXPECTED TO FAIL TODAY, and recorded as such on the probe item. We hold no gate
+    that catches this. It has no ``sorry``, no ``admit``, no custom ``axiom`` and no
+    ``native_decide``; ``#print axioms`` on the probe's theorem reports no axioms at
+    all. Statement preservation passes, because the statement was preserved: the
+    statement is simply empty. Catching it needs a check we have not built, of the
+    form "is this proposition trivial relative to what its name and docstring
+    assert" -- roughly, does the statement still hold when the definitions it names
+    are replaced by unrelated constants. The probe file demonstrates exactly that
+    substitution, so it also serves as the specification of the missing check.
+
+    Unlike every other loader here, this one RAISES when a file is absent. The other
+    corpora live under gitignored ``resources/`` where absence is the CI norm; these
+    two files are version-controlled in our own tree, so a missing one is a broken
+    checkout or a bad rename, and degrading to an empty list would hide it.
+    """
+    items: list[dict[str, Any]] = []
+    for role, (filename, verdict) in sorted(_TRIVIAL_EXISTENTIAL_FILES.items()):
+        path = TRIVIAL_EXISTENTIAL_DIR / filename
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"trivial_existential fixture missing: {path}. These files are "
+                "committed to this repo, not vendored under resources/, so their "
+                "absence is a bug rather than the usual absent-corpus case."
+            )
+        is_probe = verdict == EXPECT_REJECT
+        items.append(
+            make_adversarial_item(
+                id=f"trivial_existential:{role}",
+                verdict=verdict,
+                reason="name_claims_more_than_statement" if is_probe else None,
+                corpus="trivial_existential",
+                path=path,
+                informal=(
+                    "A theorem named spectrumIsOrdered, asserting that a system's "
+                    "spectrum has its lower endpoint below its upper endpoint."
+                    + (
+                        " Its statement says only that some integer equals the "
+                        "lower endpoint, which holds by reflexivity for any "
+                        "expression whatsoever, so the ordering claim exists "
+                        "nowhere but in the name."
+                        if is_probe
+                        else " Its statement is the ordering inequality itself, "
+                        "under the non-negativity hypothesis the property needs."
+                    )
+                ),
+                notes=(
+                    "Probe half. WE EXPECT TO FAIL THIS TODAY: the file is "
+                    "sorry-free, axiom-free and statement-preserving, so no gate "
+                    "we currently run objects to it. Catching it requires a "
+                    "triviality check on the statement relative to its name, which "
+                    "we have not built."
+                    if is_probe
+                    else "Control half, stating the same named property honestly. "
+                    "Rejecting this is a false positive, and a triviality heuristic "
+                    "crude enough to flag every short existential would produce one "
+                    "here."
+                ),
+                extra_provenance={
+                    "pair": TRIVIAL_EXISTENTIAL_PAIR,
+                    "role": role,
+                    # Ours, so the third-party defaults on make_adversarial_item do
+                    # not apply: this is first-party source under the repo's own
+                    # terms, and it is not untrusted data. It stays fenced anyway,
+                    # because a uniform fence is cheaper to reason about than a
+                    # per-item exception in whatever assembles a prompt.
+                    "license": "first_party",
+                    "untrusted": False,
+                    "clean_room": True,
+                    "in_tree": True,
+                    "mathlib_free": True,
+                    # Machine-readable form of the note above, matching the
+                    # convention borwein_vacuity uses for the same admission.
+                    "expected_to_fail_today": is_probe,
+                },
+            )
+        )
+    _loaded("trivial_existential", len(items), "clean-room name/claim pair")
+    return items
+
+
 ADVERSARIAL_LOADERS: dict[str, Callable[[], list[dict[str, Any]]]] = {
     "borwein_vacuity": load_borwein_vacuity,
     "partition_elliptic": load_partition_elliptic,
     "higher_dyson": load_higher_dyson,
     "erdos_public": load_erdos_public,
     "ramanujan_tau": load_ramanujan_tau,
+    "trivial_existential": load_trivial_existential,
 }
 
-#: Track/kind catalogue entries, consumed by :mod:`.registry`. All five sit on the
+#: Track/kind catalogue entries, consumed by :mod:`.registry`. All six sit on the
 #: ``adversarial`` track because what they test is gate behaviour, not a corpus.
 ADVERSARIAL_TRACK_KIND: dict[str, tuple[str, str]] = {
     "borwein_vacuity": (TRACK, "expected_verdict"),
@@ -562,4 +703,5 @@ ADVERSARIAL_TRACK_KIND: dict[str, tuple[str, str]] = {
     "higher_dyson": (TRACK, "expected_verdict"),
     "erdos_public": (TRACK, "expected_verdict"),
     "ramanujan_tau": (TRACK, "expected_verdict"),
+    "trivial_existential": (TRACK, "expected_verdict"),
 }
