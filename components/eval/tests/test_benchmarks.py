@@ -622,6 +622,62 @@ def test_proof_completion_without_comparator_scores_nothing(monkeypatch, tmp_pat
     assert out["correct"] == 0
     assert out["solved"] == 0
     assert out["results"][0]["detail"]["ungraded"] is True
+    # Nothing was graded, so there is no accuracy to report. 0.0 would assert
+    # that the item failed, which is not what happened.
+    assert out["n"] == 1
+    assert out["n_ungraded"] == 1
+    assert out["n_graded"] == 0
+    assert out["accuracy"] is None
+
+
+def test_proof_completion_all_graded_accuracy_unchanged(monkeypatch, tmp_path):
+    formal = "theorem smoke_thm (n : Nat) : n = n := by sorry"
+    _write_minif2f_split(
+        tmp_path,
+        "test",
+        [{"id": 7, "name": "smoke_thm", "natural": "n=n", "formal": formal}],
+    )
+    monkeypatch.setenv("THEOREMATA_RESOURCES", str(tmp_path))
+    monkeypatch.setenv("THEOREMATA_COMPARATOR", str(_fake_passing_comparator(tmp_path)))
+    items = load_benchmark("minif2f_test")
+    good = "theorem smoke_thm (n : Nat) : n = n := by exact rfl"
+    out = run_proof_completion(benchmark="minif2f_test", responses={items[0]["id"]: good})
+    assert out["n"] == 1
+    assert out["n_graded"] == 1
+    assert out["n_ungraded"] == 0
+    assert out["accuracy"] == 1.0
+    assert out["results"][0]["ungraded"] is False
+
+
+def test_proof_completion_mixed_accuracy_over_graded_subset(monkeypatch, tmp_path):
+    # Without a comparator a clean response is UNGRADED, while a response with a
+    # residual `sorry` still fails the axiom gate definitively: a real mix.
+    _write_minif2f_split(
+        tmp_path,
+        "test",
+        [
+            {"id": 1, "name": "a_thm", "natural": "a", "formal": "theorem a_thm : True := by sorry"},
+            {"id": 2, "name": "b_thm", "natural": "b", "formal": "theorem b_thm : True := by sorry"},
+        ],
+    )
+    monkeypatch.setenv("THEOREMATA_RESOURCES", str(tmp_path))
+    _no_comparator(monkeypatch)
+    items = load_benchmark("minif2f_test")
+    out = run_proof_completion(
+        benchmark="minif2f_test",
+        responses={
+            items[0]["id"]: "theorem a_thm : True := by sorry",
+            items[1]["id"]: "theorem b_thm : True := by trivial",
+        },
+    )
+    assert out["n"] == 2
+    assert out["n_ungraded"] == 1
+    assert out["n_graded"] == 1
+    # One graded item, and it failed: 0.0 over the graded subset, and the
+    # ungraded item is visible on its own rather than folded into the failure.
+    assert out["accuracy"] == 0.0
+    assert out["accuracy_basis"]["denominator"] == "graded"
+    assert [r["ungraded"] for r in out["results"]] == [False, True]
 
 
 # --------------------------------------------------------------------------- #

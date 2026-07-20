@@ -96,11 +96,32 @@ def _normalize_outcome(raw: Any) -> dict[str, Any]:
     out: dict[str, Any] = {"status": status, "detail": raw.get("detail", "")}
     if "oracle_results" in raw:
         out["oracle_results"] = raw["oracle_results"]
+    # Carry the ungraded flag through when a runner sets it at the top level
+    # (a grader-backed runner mirrors it there as well as in `detail`); dropping
+    # it here would silently turn "not measured" back into "failed".
+    if raw.get("ungraded") is True:
+        out["ungraded"] = True
     return out
 
 
 def _is_pass(outcome: dict[str, Any]) -> bool:
     return outcome.get("status") == PASS
+
+
+def _is_ungraded(outcome: dict[str, Any]) -> bool:
+    """True when the outcome says no gradable verdict was produced.
+
+    ``detail["ungraded"]`` is the authoritative signal (see
+    ``theoremata_tools.benchmarks.graders``, which sets it on the detail block of
+    every verdict); a top-level ``ungraded`` is honoured too so a runner that
+    only mirrors the flag upward still counts. WHY it is not enough to look at
+    the status: an ungraded item arrives as ``fail`` or ``error`` and would
+    otherwise be indistinguishable from a genuine failure.
+    """
+    detail = outcome.get("detail")
+    if isinstance(detail, dict) and detail.get("ungraded") is True:
+        return True
+    return outcome.get("ungraded") is True
 
 
 # --------------------------------------------------------------------------- #
@@ -248,11 +269,16 @@ def execute_track(
     -------
     A scored report::
 
-        {track, n, n_pass, n_fail, n_error, pass_rate,
-         items: [{id, status, detail, oracle_results?, attempts, repaired}]}
+        {track, n, n_graded, n_ungraded, n_pass, n_fail, n_error,
+         pass_rate, pass_rate_basis,
+         items: [{id, status, ungraded, detail, oracle_results?, attempts,
+                  repaired}]}
+
+    ``pass_rate`` is computed over the GRADED subset (``n_pass / n_graded``) and
+    is ``None`` when ``n_graded`` is 0.
     """
     items: list[dict[str, Any]] = []
-    n_pass = n_fail = n_error = 0
+    n_pass = n_fail = n_error = n_ungraded = 0
 
     for idx, example in enumerate(examples):
         candidate = _candidate_for(candidates, example, idx)
@@ -273,7 +299,16 @@ def execute_track(
                 repaired = True
 
         status = outcome.get("status")
-        if status == PASS:
+        item_ungraded = _is_ungraded(outcome)
+        if item_ungraded:
+            # Counted in its own bucket only. Adding it to n_fail/n_error would
+            # hide an unmeasured item inside the failures; leaving it out of
+            # every count entirely would shrink the denominator invisibly.
+            # An ungraded outcome never counts as a pass even if the runner
+            # reported `pass`: an unverified pass is exactly the inflation the
+            # ungraded flag exists to prevent.
+            n_ungraded += 1
+        elif status == PASS:
             n_pass += 1
         elif status == FAIL:
             n_fail += 1
@@ -283,6 +318,7 @@ def execute_track(
         record: dict[str, Any] = {
             "id": example.get("id"),
             "status": status,
+            "ungraded": item_ungraded,
             "detail": outcome.get("detail"),
             "attempts": attempts,
             "repaired": repaired,
@@ -292,13 +328,30 @@ def execute_track(
         items.append(record)
 
     n = len(items)
+    n_graded = n - n_ungraded
     return {
         "track": track,
         "n": n,
+        "n_graded": n_graded,
+        "n_ungraded": n_ungraded,
         "n_pass": n_pass,
         "n_fail": n_fail,
         "n_error": n_error,
-        "pass_rate": (n_pass / n) if n else None,
+        # None, not 0.0, when nothing was graded: a zero rate asserts that
+        # nothing passed, whereas the truth is that nothing was measured.
+        "pass_rate": (n_pass / n_graded) if n_graded else None,
+        "pass_rate_basis": {
+            "denominator": "graded",
+            "n_graded": n_graded,
+            "n_ungraded": n_ungraded,
+            "n_total": n,
+            "note": (
+                "pass_rate = n_pass / n_graded. Ungraded items yielded no "
+                "verdict: they are excluded from the denominator and reported "
+                "as n_ungraded, never folded into n_fail or n_error. pass_rate "
+                "is None when n_graded is 0."
+            ),
+        },
         "items": items,
     }
 

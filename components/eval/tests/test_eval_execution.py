@@ -370,3 +370,89 @@ def test_empty_examples_pass_rate_none():
     report = execute_track([], {}, lambda a: make_outcome(PASS), track="proof")
     assert report["n"] == 0
     assert report["pass_rate"] is None
+
+
+# --------------------------------------------------------------------------- #
+# ungraded accounting: not measured is neither a pass nor a fail
+# --------------------------------------------------------------------------- #
+
+def _ungraded_outcome(reason="comparator_unavailable"):
+    # Mirrors what a grader-backed runner returns when no verdict is possible.
+    return {
+        "status": FAIL,
+        "detail": {"ungraded": True, "ungraded_reason": reason, "graded": False},
+    }
+
+
+def test_all_graded_report_is_unchanged():
+    examples = [_proof_item("g1"), _proof_item("g2")]
+    passing = {"g1"}
+
+    def runner(artifact):
+        if artifact["id"] in passing:
+            return {"status": "pass", "detail": "compiled"}
+        return {"status": "fail", "detail": "compile error"}
+
+    report = execute_track(examples, {}, runner, track="proof")
+    assert report["n"] == 2
+    assert report["n_graded"] == 2
+    assert report["n_ungraded"] == 0
+    assert report["n_pass"] == 1
+    assert report["n_fail"] == 1
+    assert report["pass_rate"] == 0.5
+    assert all(it["ungraded"] is False for it in report["items"])
+
+
+def test_mixed_pass_rate_is_over_graded_subset_only():
+    examples = [_proof_item("m1"), _proof_item("m2"), _proof_item("m3")]
+
+    def runner(artifact):
+        if artifact["id"] == "m1":
+            return {"status": "pass", "detail": "compiled"}
+        if artifact["id"] == "m2":
+            return {"status": "fail", "detail": "compile error"}
+        return _ungraded_outcome()
+
+    report = execute_track(examples, {}, runner, track="proof")
+    assert report["n"] == 3
+    assert report["n_graded"] == 2
+    assert report["n_ungraded"] == 1
+    # The ungraded item was NOT absorbed into the failures or the errors.
+    assert report["n_fail"] == 1
+    assert report["n_error"] == 0
+    assert report["n_pass"] + report["n_fail"] + report["n_error"] == report["n_graded"]
+    assert report["pass_rate"] == 0.5
+    assert report["pass_rate_basis"]["denominator"] == "graded"
+    assert [it["ungraded"] for it in report["items"]] == [False, False, True]
+
+
+def test_all_ungraded_pass_rate_is_none_not_zero():
+    examples = [_proof_item("u1"), _proof_item("u2")]
+    report = execute_track(examples, {}, lambda a: _ungraded_outcome(), track="proof")
+    assert report["n"] == 2
+    assert report["n_ungraded"] == 2
+    assert report["n_graded"] == 0
+    assert report["n_pass"] == report["n_fail"] == report["n_error"] == 0
+    assert report["pass_rate"] is None
+    assert report["pass_rate"] != 0.0
+
+
+def test_top_level_ungraded_flag_is_honoured():
+    ex = _proof_item("t1")
+    report = execute_track(
+        [ex], {}, lambda a: {"status": ERROR, "detail": "boom", "ungraded": True}, track="proof"
+    )
+    assert report["n_ungraded"] == 1
+    assert report["n_error"] == 0
+    assert report["pass_rate"] is None
+
+
+def test_ungraded_never_counts_as_a_pass():
+    # A runner claiming `pass` while declaring the item ungraded must not
+    # inflate the rate: an unverified pass is exactly what ungraded guards.
+    ex = _proof_item("t2")
+    outcome = {"status": PASS, "detail": {"ungraded": True}}
+    report = execute_track([ex], {}, lambda a: outcome, track="proof")
+    assert report["n_pass"] == 0
+    assert report["n_ungraded"] == 1
+    assert report["pass_rate"] is None
