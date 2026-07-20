@@ -267,6 +267,61 @@ pub struct LeanBackend {
     /// Empty by default, and empty is the only safe default: the allowlist is a
     /// statement about the TASK, and nothing inside this backend knows the task.
     pub designated_inputs: Vec<String>,
+    /// WHERE [`LeanBackend::designated_inputs`] came from. Recorded so a reader of
+    /// the code (and of a log line) can never mistake an operator's assertion for
+    /// something this backend worked out for itself. See
+    /// [`DesignatedInputsSource`], whose missing `Derived` variant is the whole
+    /// point.
+    pub designated_inputs_source: DesignatedInputsSource,
+}
+
+/// Provenance of a [`LeanBackend::designated_inputs`] allowlist.
+///
+/// **There is deliberately NO `Derived` variant.** A designated input is a claim
+/// that a particular unproved assumption is a legitimate ANTECEDENT of the task
+/// rather than smuggled-in mathematics, and this layer has no source it may
+/// derive such a claim from:
+///
+/// * the canonical statement is not a trustworthy source, because in this
+///   pipeline it is itself model-authored (`reason::orchestration::agent`'s
+///   `formalize` writes it via `set_formal_statement`). Allowlisting whatever
+///   binders the statement happens to carry would let the same untrusted producer
+///   that writes `(hRH : RiemannHypothesis)` into the statement designate it;
+/// * and it would be near-vacuous even if it were trustworthy: a hypothesis
+///   binder that is NOT in the canonical statement already fails the (always
+///   enforced) statement-preservation layer, so allowlisting every binder that IS
+///   in it leaves the audit with nothing left to reject;
+/// * `FormalProject::imports` are MODULE imports, i.e. access to *proved*
+///   lemmas, which need no allowlist, and not assumed premises;
+/// * `Config` carries no trusted-premise field at all.
+///
+/// So every entry is asserted by a human/task-definer, and the variants below
+/// record which one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DesignatedInputsSource {
+    /// Nobody declared anything: the allowlist is empty. The audit will therefore
+    /// classify every genuine antecedent as `Unaccounted`.
+    #[default]
+    Unset,
+    /// An operator set [`DESIGNATED_INPUTS_ENV`], the process-global escape
+    /// hatch. It applies to EVERY statement this backend verifies, so it must be
+    /// scoped to a single run whose goals share the same antecedents.
+    OperatorEnv,
+    /// The party that defined the task populated it programmatically via
+    /// [`LeanBackend::with_designated_inputs`], the preferred channel, because it
+    /// is scoped to one backend instance rather than to the process.
+    TaskDeclared,
+}
+
+impl DesignatedInputsSource {
+    /// Stable tag for log lines / JSON detail.
+    pub fn tag(self) -> &'static str {
+        match self {
+            DesignatedInputsSource::Unset => "unset",
+            DesignatedInputsSource::OperatorEnv => "operator_env",
+            DesignatedInputsSource::TaskDeclared => "task_declared",
+        }
+    }
 }
 
 /// Env seam carrying the task's designated hypothesis inputs into
@@ -284,7 +339,14 @@ pub struct LeanBackend {
 /// no existing real source to read, and inventing one inside the backend would be
 /// exactly the hardcoded-mathematical-facts list this must not be. This env var
 /// is the honest minimum: a channel the party that defines the task can populate.
-/// The preferred home remains a `Config` field owned by `app/config.rs`.
+///
+/// **It is process-global, so its entries are designated for EVERY statement any
+/// live backend verifies.** Scope it to a single run whose goals share the same
+/// antecedents, or prefer [`LeanBackend::with_designated_inputs`], which is scoped
+/// to one backend instance. The preferred long-term home remains a task-level
+/// field authored by whoever defined the task. See
+/// [`FormalBackend::designated_inputs`] as implemented below for exactly what
+/// would need to be threaded in.
 pub const DESIGNATED_INPUTS_ENV: &str = "THEOREMATA_LEAN_DESIGNATED_INPUTS";
 
 impl LeanBackend {
@@ -299,11 +361,27 @@ impl LeanBackend {
             kernel_validate: false,
             // A mock has no task context at all; never allowlist anything.
             designated_inputs: Vec::new(),
+            designated_inputs_source: DesignatedInputsSource::Unset,
         }
     }
 
     /// The live backend, reading the configured runner + binary (env-overridable).
     pub fn live(cfg: &Config) -> Self {
+        // The env var is the OPERATOR ESCAPE HATCH and the only populated source
+        // that exists today. An entry that parses to nothing (`""`, `" , ; "`)
+        // leaves the allowlist empty, and an empty allowlist is `Unset` however it
+        // arose: provenance describes what the audit will actually see, so an
+        // operator who set the var to a blank value cannot read `OperatorEnv` and
+        // believe the channel is populated.
+        let designated_inputs = std::env::var(DESIGNATED_INPUTS_ENV)
+            .ok()
+            .map(|raw| parse_designated_inputs(&raw))
+            .unwrap_or_default();
+        let designated_inputs_source = if designated_inputs.is_empty() {
+            DesignatedInputsSource::Unset
+        } else {
+            DesignatedInputsSource::OperatorEnv
+        };
         Self {
             mock: false,
             runner: cfg.formal_runners.for_system(SYSTEM),
@@ -313,11 +391,42 @@ impl LeanBackend {
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
             kernel_validate: cfg.kernel_validate_proof,
-            designated_inputs: std::env::var(DESIGNATED_INPUTS_ENV)
-                .ok()
-                .map(|raw| parse_designated_inputs(&raw))
-                .unwrap_or_default(),
+            designated_inputs,
+            designated_inputs_source,
         }
+    }
+
+    /// Declare the task's DESIGNATED INPUTS on this backend instance: the
+    /// non-global way to populate the layer-2d channel.
+    ///
+    /// Each entry names a hypothesis the caller asserts is a legitimate antecedent
+    /// of the goals this backend will verify, by BINDER name (`hRH`) or by TYPE
+    /// HEAD (`RiemannHypothesis`). Only the party that defined the task may call
+    /// this, because only that party can tell a genuine "assuming RH, …" result
+    /// from a proof dodging its own obligations.
+    ///
+    /// Prefer this over [`DESIGNATED_INPUTS_ENV`]: the env var is process-global
+    /// and so designates its entries for every statement any live backend touches,
+    /// while this is scoped to one instance. Entries are deduplicated and trimmed
+    /// exactly as the env seam does; an all-empty input leaves the channel `Unset`
+    /// rather than claiming a populated one.
+    pub fn with_designated_inputs<I, S>(mut self, entries: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let joined = entries
+            .into_iter()
+            .map(|e| e.as_ref().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        self.designated_inputs = parse_designated_inputs(&joined);
+        self.designated_inputs_source = if self.designated_inputs.is_empty() {
+            DesignatedInputsSource::Unset
+        } else {
+            DesignatedInputsSource::TaskDeclared
+        };
+        self
     }
 
     /// Status of the optional in-kernel `validateProof` soundness gate: whether it
@@ -804,17 +913,55 @@ impl FormalBackend for LeanBackend {
         Ok(fallback_source_scan(code))
     }
 
-    /// Tier-0 layer 2d channel — see [`LeanBackend::designated_inputs`] (the
-    /// field) and [`DESIGNATED_INPUTS_ENV`].
+    /// Tier-0 layer 2d channel. See [`LeanBackend::designated_inputs`] (the
+    /// field), [`DesignatedInputsSource`], [`LeanBackend::with_designated_inputs`]
+    /// and [`DESIGNATED_INPUTS_ENV`].
     ///
-    /// Sourced from the caller-populated field, which `live()` fills from
-    /// [`DESIGNATED_INPUTS_ENV`] and `mock()` leaves empty. **There is no other
-    /// real source in this crate today** — `Config` has no trusted-premise field,
-    /// and `FormalProject::imports` are module imports (access to *proved*
-    /// lemmas), not assumed premises, so they are NOT read here. With nothing
-    /// configured this returns empty, exactly as the trait default does, and every
-    /// genuine antecedent of a conditional theorem will read as `Unaccounted` if
-    /// `THEOREMATA_HYPOTHESIS_GATE` is switched on without populating it.
+    /// Sourced ONLY from the caller-populated field: `live()` fills it from the
+    /// operator env var, `with_designated_inputs` from the task definer, `mock()`
+    /// leaves it empty. **Nothing here is derived, and the following is why**:
+    /// this is the investigated answer, not an unexamined default.
+    ///
+    /// # Why the list cannot be derived at this layer
+    ///
+    /// 1. **The signature forbids it.** `designated_inputs(&self)` receives no
+    ///    statement. One `LeanBackend` verifies every goal of a run
+    ///    (`formal::backend_for` builds it from `Config` alone), so anything
+    ///    returned here is designated for ALL of them. A per-statement answer
+    ///    cannot even be expressed without changing the trait.
+    /// 2. **The obvious source is untrusted.** The tempting derivation is "take
+    ///    the hypothesis binders of the canonical statement". But in this pipeline
+    ///    the canonical statement is model-authored (`reason::orchestration::agent`
+    ///    formalizes it and stores it with `set_formal_statement`), so that rule
+    ///    lets the same producer that writes `(hRH : RiemannHypothesis)` into the
+    ///    statement designate it. That is precisely the OVER-BROAD direction: it
+    ///    admits a proof dodging its own obligations.
+    /// 3. **And it would gut the layer even if the statement were trusted.** A
+    ///    hypothesis binder present in the submission but absent from the canonical
+    ///    statement is already rejected by statement preservation, which is
+    ///    conjoined unconditionally in `verify_with_gates`. Allowlisting every
+    ///    binder the canonical statement carries would therefore leave
+    ///    `hypothesis_audit` with nothing it can still reject: the gate would
+    ///    become a no-op that reads like a check.
+    /// 4. **No other local source qualifies.** `FormalProject` carries `imports`,
+    ///    which are MODULE imports granting access to *proved* lemmas and need no
+    ///    allowlist; `Config` has no trusted-premise field. Hardcoding names
+    ///    (`RiemannHypothesis`, …) would be the list of mathematical facts this
+    ///    must never become.
+    ///
+    /// # What would un-inert the layer
+    ///
+    /// A designated-inputs field on the TASK, authored by whoever defined the
+    /// task rather than by the model that formalized it, threaded to here:
+    /// `ProofTask`/`FormalProject` (`prover/model.rs`) or the graph node that
+    /// produces them, plumbed either into `LeanBackend::with_designated_inputs`
+    /// at construction (`formal::backend_for`) or, for a per-goal answer, by
+    /// giving `FormalBackend::designated_inputs` a `&str` statement parameter the
+    /// way `hypothesis_bundle`/`satisfiability_witness` already have one. Until
+    /// then the honest state is empty, and `THEOREMATA_HYPOTHESIS_GATE` must stay
+    /// off: with an empty allowlist the audit rejects every genuine conditional
+    /// theorem. Empty is NOT a pass. See
+    /// `empty_designated_inputs_fail_the_gate_they_do_not_silence_it`.
     fn designated_inputs(&self) -> Vec<String> {
         self.designated_inputs.clone()
     }
@@ -1220,6 +1367,139 @@ mod tier0_tests {
     #[test]
     fn designated_inputs_default_to_empty() {
         assert!(LeanBackend::mock().designated_inputs().is_empty());
+    }
+
+    /// A theorem conditional on a `Prop` that is STATED and never PROVED: the
+    /// mechanism-(a) shape `hypothesis_audit` exists to catch, and the shape a
+    /// GENUINE "assuming Glaisher3, …" task also has. Only the task definer can
+    /// tell the two apart, which is what the allowlist is for.
+    const COND_STMT: &str = "theorem phi3 (hG : Glaisher3) : True";
+    const COND_CODE: &str = "\
+def Glaisher3 : Prop := True
+
+theorem phi3 (hG : Glaisher3) : True := trivial
+";
+
+    fn cond_report(
+        backend: &LeanBackend,
+        hypothesis_discharge: bool,
+    ) -> crate::prover::model::VerificationReport {
+        backend
+            .verify_with_gates(
+                &Config::default(),
+                COND_CODE,
+                COND_STMT,
+                crate::prover::formal::TierZeroGates {
+                    hypothesis_discharge,
+                    vacuity: false,
+                },
+            )
+            .expect("the mock backend's verify must succeed")
+    }
+
+    /// **The inertness pin.** With nobody having declared a designated input the
+    /// allowlist is empty, and an empty allowlist is not a quiet pass: the audit
+    /// reports UN-clean, and switching the gate on rejects the submission. This is
+    /// pinned so that the layer's current silence can never be misread as "the
+    /// check ran and found nothing".
+    #[test]
+    fn empty_designated_inputs_fail_the_gate_they_do_not_silence_it() {
+        let backend = LeanBackend::mock();
+        assert!(backend.designated_inputs().is_empty());
+
+        // Gate OFF (the shipped default): the verdict is computed and published,
+        // and explicitly marked NOT enforced. This is the inert state.
+        let off = cond_report(&backend, false);
+        let t = &off.detail["tier0"]["hypothesis_audit"];
+        assert_eq!(t["clean"], json!(false), "detail: {t}");
+        assert_eq!(t["enforced"], json!(false));
+        assert_eq!(t["designated_inputs"], json!([]));
+        assert!(
+            off.lexically_verified,
+            "an unenforced Tier-0 verdict must not move the classic gate"
+        );
+
+        // Gate ON with the channel still empty: the genuine antecedent reads as
+        // Unaccounted and the submission FAILS. Un-inerting the layer without
+        // populating the channel costs a rejection, never a false accept.
+        let on = cond_report(&backend, true);
+        assert!(
+            !on.lexically_verified,
+            "an empty allowlist must fail closed, not pass silently: {:#?}",
+            on.detail
+        );
+        assert_eq!(on.detail["tier0"]["hypothesis_audit"]["enforced"], json!(true));
+    }
+
+    /// The channel is not broken, only unpopulated: declaring the antecedent on
+    /// the backend instance clears the very gate the empty list fails.
+    #[test]
+    fn task_declared_designated_inputs_clear_the_gate() {
+        // By TYPE HEAD...
+        let by_head = LeanBackend::mock().with_designated_inputs(["Glaisher3"]);
+        assert!(cond_report(&by_head, true).lexically_verified);
+        // ...and by BINDER name.
+        let by_binder = LeanBackend::mock().with_designated_inputs(["hG"]);
+        assert!(cond_report(&by_binder, true).lexically_verified);
+        // An unrelated entry designates nothing: the allowlist is not a wildcard.
+        let unrelated = LeanBackend::mock().with_designated_inputs(["SomeOtherProp"]);
+        assert!(!cond_report(&unrelated, true).lexically_verified);
+    }
+
+    /// Provenance is recorded, and `Derived` is not one of the options: every
+    /// entry is asserted by a person, none is worked out by this backend.
+    #[test]
+    fn designated_inputs_provenance_is_asserted_never_derived() {
+        assert_eq!(
+            LeanBackend::mock().designated_inputs_source,
+            DesignatedInputsSource::Unset
+        );
+
+        let declared = LeanBackend::mock().with_designated_inputs(["Glaisher3", "hRH"]);
+        assert_eq!(
+            declared.designated_inputs_source,
+            DesignatedInputsSource::TaskDeclared
+        );
+        assert_eq!(declared.designated_inputs, vec!["Glaisher3", "hRH"]);
+        assert_eq!(
+            declared.designated_inputs_source.tag(),
+            "task_declared",
+            "the tag is what reaches a log line"
+        );
+
+        // A declaration that parses to nothing stays Unset: provenance describes
+        // what the audit will actually see, so a blank declaration can never read
+        // as a populated channel.
+        let blank = LeanBackend::mock().with_designated_inputs([" ", ","]);
+        assert!(blank.designated_inputs.is_empty());
+        assert_eq!(
+            blank.designated_inputs_source,
+            DesignatedInputsSource::Unset
+        );
+    }
+
+    /// Nothing about the statement changes the allowlist: the answer is a property
+    /// of the backend instance alone. This pins point (1) of the
+    /// `designated_inputs` docs: a per-statement answer is not expressible here,
+    /// so no future edit may quietly start deriving one from the (model-authored)
+    /// statement.
+    #[test]
+    fn designated_inputs_do_not_depend_on_the_statement() {
+        let backend = LeanBackend::mock();
+        // A statement stuffed with plausible-looking antecedents designates none
+        // of them.
+        assert!(backend.designated_inputs().is_empty());
+        assert_eq!(
+            crate::prover::hypothesis_audit::audit_hypotheses(
+                SYSTEM,
+                COND_STMT,
+                COND_CODE,
+                &backend.designated_inputs(),
+            )
+            .unaccounted_count(),
+            1,
+            "a binder appearing in the canonical statement is NOT self-designating"
+        );
     }
 
     #[test]
