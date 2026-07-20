@@ -32,7 +32,7 @@ from .parsing import (
     parse_blueprint_nodes,
     parse_fqb_main,
 )
-from .resources import find_dir, find_files, rel
+from .resources import find_dir, find_files, rel, resource_root
 from .schema import AXIOMS_WHITELIST, make_item
 from .formalizing_100 import load_formalizing_100
 from .agda_1lab import load_1lab
@@ -49,6 +49,120 @@ def _log_counts(name: str, loaded: int, skipped: int, note: str = "") -> None:
         skipped,
         f" ({note})" if note else "",
     )
+
+
+# ===========================================================================
+# Per-item toolchain provenance
+# ===========================================================================
+#
+# A Lean artifact only means something against the toolchain it was written
+# for. Without that recorded per item, a compile failure caused by a
+# Lean/Mathlib version mismatch is indistinguishable from a genuine failure to
+# prove the theorem, so a run cannot honestly say which of the two it measured.
+#
+# The value is read from what the corpus itself declares (its `lean-toolchain`
+# file, plus the Mathlib pin in its `lake-manifest.json`). It is never guessed
+# and never defaulted to whatever Lean happens to be installed: a wrong-but-
+# plausible toolchain would quietly reclassify mismatch failures as real ones
+# and make a scoreboard look better-founded than it is. A corpus that declares
+# nothing gets `unknown`, which is a fact we can act on.
+
+UNKNOWN_TOOLCHAIN: dict[str, Any] = {
+    "declared": False,
+    "system": "unknown",
+    "lean": "unknown",
+    "mathlib_rev": "unknown",
+    "mathlib_input_rev": "unknown",
+    "source": None,
+}
+
+# keyed by "RESOURCE-ROOT::CORPUS-GLOB" so a test that repoints
+# THEOREMATA_RESOURCES never reads a stale entry.
+_TOOLCHAIN_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def _mathlib_pin(manifest: Path) -> tuple[str, str]:
+    """Return ``(rev, inputRev)`` for the Mathlib package in a lake manifest."""
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8", errors="replace"))
+    except (json.JSONDecodeError, OSError):
+        return "unknown", "unknown"
+    for pkg in data.get("packages") or []:
+        if isinstance(pkg, dict) and str(pkg.get("name", "")).lower() == "mathlib":
+            return (
+                str(pkg.get("rev") or "unknown"),
+                str(pkg.get("inputRev") or "unknown"),
+            )
+    return "unknown", "unknown"
+
+
+def _read_toolchain(corpus_glob: str) -> dict[str, Any]:
+    """Read the toolchain a corpus declares, or ``UNKNOWN_TOOLCHAIN``."""
+    files = find_files(f"{corpus_glob}/**/lean-toolchain")
+    if not files:
+        return dict(UNKNOWN_TOOLCHAIN)
+    # Sub-projects (blueprint/, dataset/, ...) may pin their own toolchain; the
+    # shallowest file is the one governing the corpus as a whole.
+    path = min(files, key=lambda p: (len(p.parts), str(p)))
+    first = path.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+    lean = first[0].strip() if first and first[0].strip() else "unknown"
+    tc = dict(UNKNOWN_TOOLCHAIN)
+    tc.update(
+        {
+            "declared": lean != "unknown",
+            "system": "lean4" if lean != "unknown" else "unknown",
+            "lean": lean,
+            "source": rel(path),
+        }
+    )
+    beside = [
+        p
+        for p in find_files(f"{corpus_glob}/**/lake-manifest.json")
+        if p.parent == path.parent
+    ]
+    if beside:
+        rev, input_rev = _mathlib_pin(beside[0])
+        tc["mathlib_rev"] = rev
+        tc["mathlib_input_rev"] = input_rev
+        tc["manifest"] = rel(beside[0])
+    return tc
+
+
+def _toolchain_for(corpus_glob: str | None) -> dict[str, Any]:
+    if not corpus_glob:
+        # No corpus to interrogate (NL-only corpora, committed fixtures, and
+        # non-Lean systems). Saying `unknown` is the honest answer; inventing
+        # one would be a claim we cannot support.
+        return dict(UNKNOWN_TOOLCHAIN)
+    key = f"{resource_root()}::{corpus_glob}"
+    cached = _TOOLCHAIN_CACHE.get(key)
+    if cached is None:
+        cached = _read_toolchain(corpus_glob)
+        _TOOLCHAIN_CACHE[key] = cached
+    return dict(cached)
+
+
+def _with_toolchain(
+    loader: Callable[[], list[dict[str, Any]]], corpus_glob: str | None = None
+) -> Callable[[], list[dict[str, Any]]]:
+    """Wrap a loader so every item it emits records its corpus toolchain.
+
+    Done at the registry rather than inside each loader so the stamp cannot be
+    forgotten when a loader is added, and so it is uniform across corpora.
+    """
+
+    def wrapped() -> list[dict[str, Any]]:
+        items = loader()
+        tc = _toolchain_for(corpus_glob)
+        for it in items:
+            # a per-item copy: callers annotate provenance and must not be able
+            # to mutate every other item's record by doing so.
+            it["provenance"]["toolchain"] = dict(tc)
+        return items
+
+    wrapped.__name__ = getattr(loader, "__name__", "loader")
+    wrapped.__doc__ = loader.__doc__
+    return wrapped
 
 
 # ===========================================================================
@@ -407,6 +521,67 @@ _MINIF2F_SPLITS: dict[str, list[str]] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# MiniF2F exclusions (mis-formalised items) and count reconciliation
+# ---------------------------------------------------------------------------
+#
+# INTENTIONALLY EMPTY. Several documents in this repo cite "the 8 known
+# mis-formalised miniF2F-test problems" and attribute them to Kimina-Prover, but
+# the identifiers themselves were never copied into this repo and are not
+# derivable from the vendored corpus. Guessing them would be worse than having
+# none: an exclusion silently shrinks the denominator, so a wrong list is a way
+# to manufacture a better score. An empty list plus a working, reporting
+# mechanism is the honest state.
+#
+# TO FILL IN: take the problem names listed in the Kimina-Prover technical
+# report, section 3.1 (the mis-formalised miniF2F-test statements), and add one
+# `"NAME": "reason + source"` entry per problem, keyed by the corpus name.
+# Keys are matched against the corpus `name` field (e.g. "mathd_algebra_182")
+# and also against our own item id ("minif2f:test:42"), so either works.
+MINIF2F_EXCLUSIONS: dict[str, str] = {}
+
+# A DIFFERENT category, deliberately not an exclusion. The upstream corpus
+# README (resources/datasets-main/datasets-main/minif2f/README.md) records three
+# problems as MISSING from the training set. Absent is not mis-formalised:
+# there is nothing to drop, and dropping nothing is correct. What it does mean
+# is that the split will never reconcile with the nominal 488-problem count, so
+# we surface it as a count-reconciliation note on the report instead of letting
+# the discrepancy look like a loader bug.
+MINIF2F_MISSING_FROM_TRAIN: tuple[str, ...] = (
+    "mathd_algebra_31",
+    "mathd_numbertheory_24",
+    "amc12a_2020_p22",
+)
+
+# The nominal MiniF2F size as stated by the upstream README (392+48+48 after the
+# Harmonic re-split); used only for the reconciliation note, never for scoring.
+MINIF2F_NOMINAL_TOTAL = 488
+
+# benchmark name -> the exclusion report from its most recent load. Exclusions
+# must be *reported*, never silently applied, so that a run can state
+# "N candidates, M excluded as mis-formalised, scored over N-M".
+_EXCLUSION_REPORTS: dict[str, dict[str, Any]] = {}
+
+
+def exclusion_report(name: str) -> dict[str, Any] | None:
+    """Exclusion accounting for the last load of benchmark ``name`` (or None)."""
+    report = _EXCLUSION_REPORTS.get(name)
+    return dict(report) if report is not None else None
+
+
+def exclusion_reports() -> dict[str, dict[str, Any]]:
+    """Every exclusion report recorded so far, keyed by benchmark name."""
+    return {k: dict(v) for k, v in _EXCLUSION_REPORTS.items()}
+
+
+def _minif2f_exclusion_key(uid: str, name: str | None) -> str | None:
+    """Return the matching key in :data:`MINIF2F_EXCLUSIONS`, if any."""
+    for candidate in (name, uid):
+        if candidate and candidate in MINIF2F_EXCLUSIONS:
+            return candidate
+    return None
+
+
 def _minif2f_lean_name(rec: dict[str, Any]) -> str:
     name = str(rec.get("name") or "").strip()
     if name:
@@ -419,14 +594,19 @@ def _load_minif2f_split(split: str) -> list[dict[str, Any]]:
     patterns = _MINIF2F_SPLITS.get(split)
     if not patterns:
         raise ValueError(f"unknown MiniF2F split: {split!r}")
+    bench = f"minif2f_{split}"
     files = find_files(*patterns)
     if not files:
-        _log_counts(f"minif2f_{split}", 0, 0, "corpus absent")
+        _log_counts(bench, 0, 0, "corpus absent")
+        _EXCLUSION_REPORTS[bench] = _minif2f_report(split, 0, {}, set())
         return []
 
     items: list[dict[str, Any]] = []
     skipped = 0
     seen: set[str] = set()
+    candidates = 0
+    excluded: dict[str, str] = {}
+    names_present: set[str] = set()
     for path in files:
         try:
             data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
@@ -450,6 +630,17 @@ def _load_minif2f_split(split: str) -> list[dict[str, Any]]:
             if uid in seen:
                 continue
             seen.add(uid)
+            candidates += 1
+            raw_name = rec.get("name")
+            if raw_name:
+                names_present.add(str(raw_name))
+            # Excluded items are counted and named in the report, then left out
+            # of the scored set. Both halves matter: dropping them without
+            # reporting would let the denominator shrink invisibly.
+            hit = _minif2f_exclusion_key(uid, str(raw_name) if raw_name else None)
+            if hit is not None:
+                excluded[uid] = MINIF2F_EXCLUSIONS[hit]
+                continue
             items.append(
                 make_item(
                     id=uid,
@@ -477,8 +668,65 @@ def _load_minif2f_split(split: str) -> list[dict[str, Any]]:
                     },
                 )
             )
-    _log_counts(f"minif2f_{split}", len(items), skipped)
+    report = _minif2f_report(split, candidates, excluded, names_present)
+    _EXCLUSION_REPORTS[bench] = report
+    _log_counts(bench, len(items), skipped, _exclusion_note(report))
     return items
+
+
+def _exclusion_note(report: dict[str, Any]) -> str:
+    """One-line human-readable rendering of an exclusion report."""
+    note = (
+        f"{report['candidates']} candidates, {report['excluded']} excluded as "
+        f"mis-formalised, scored over {report['scored']}"
+    )
+    absent = report.get("known_missing_upstream", {}).get("confirmed_absent")
+    if absent:
+        note += f"; {len(absent)} known missing upstream"
+    return note
+
+
+def _minif2f_report(
+    split: str,
+    candidates: int,
+    excluded: dict[str, str],
+    names_present: set[str],
+) -> dict[str, Any]:
+    """Build the exclusion + count-reconciliation record for one split."""
+    report: dict[str, Any] = {
+        "benchmark": f"minif2f_{split}",
+        "split": split,
+        # candidates = every well-formed record the corpus offered us; scored =
+        # what a run may divide by. The gap is fully itemised in `exclusions`.
+        "candidates": candidates,
+        "excluded": len(excluded),
+        "scored": candidates - len(excluded),
+        "exclusions": dict(excluded),
+        "exclusion_list_source": (
+            "MINIF2F_EXCLUSIONS (empty; see loaders.py for what must be filled "
+            "in and from where)"
+        ),
+    }
+    if split == "train":
+        # Reconciliation, not exclusion: these are absent upstream, so they
+        # never entered `candidates` in the first place.
+        confirmed = [n for n in MINIF2F_MISSING_FROM_TRAIN if n not in names_present]
+        unexpectedly_present = [
+            n for n in MINIF2F_MISSING_FROM_TRAIN if n in names_present
+        ]
+        report["known_missing_upstream"] = {
+            "ids": list(MINIF2F_MISSING_FROM_TRAIN),
+            "confirmed_absent": confirmed,
+            "unexpectedly_present": unexpectedly_present,
+            "nominal_total_all_splits": MINIF2F_NOMINAL_TOTAL,
+            "note": (
+                "Documented as missing from the training set by the corpus "
+                "README; absent rather than mis-formalised, so nothing is "
+                "excluded. Recorded here so the split not reconciling with the "
+                "nominal 488 is a known fact and not an unexplained loader gap."
+            ),
+        }
+    return report
 
 
 def load_minif2f_train() -> list[dict[str, Any]]:
@@ -496,9 +744,34 @@ def load_minif2f_test() -> list[dict[str, Any]]:
 def load_minif2f() -> list[dict[str, Any]]:
     """All MiniF2F splits concatenated (train, then valid, then test)."""
     out: list[dict[str, Any]] = []
+    per_split: dict[str, dict[str, Any]] = {}
     for split in ("train", "valid", "test"):
         out.extend(_load_minif2f_split(split))
-    _log_counts("minif2f", len(out), 0, "all splits")
+        report = _EXCLUSION_REPORTS.get(f"minif2f_{split}")
+        if report is not None:
+            per_split[split] = report
+    combined: dict[str, Any] = {
+        "benchmark": "minif2f",
+        "split": "all",
+        "candidates": sum(r["candidates"] for r in per_split.values()),
+        "excluded": sum(r["excluded"] for r in per_split.values()),
+        "scored": sum(r["scored"] for r in per_split.values()),
+        "exclusions": {
+            uid: reason
+            for r in per_split.values()
+            for uid, reason in r["exclusions"].items()
+        },
+        "per_split": per_split,
+        "exclusion_list_source": (
+            "MINIF2F_EXCLUSIONS (empty; see loaders.py for what must be filled "
+            "in and from where)"
+        ),
+    }
+    train = per_split.get("train")
+    if train and "known_missing_upstream" in train:
+        combined["known_missing_upstream"] = train["known_missing_upstream"]
+    _EXCLUSION_REPORTS["minif2f"] = combined
+    _log_counts("minif2f", len(out), 0, f"all splits; {_exclusion_note(combined)}")
     return out
 
 
@@ -1517,39 +1790,58 @@ def load_lean_tactics_kb() -> list[dict[str, Any]]:
     return items
 
 
-# Registry name -> loader callable.
+# Registry name -> (raw loader, corpus dir glob whose toolchain declaration
+# governs the corpus). ``None`` means the corpus declares no Lean toolchain at
+# all: NL-only corpora, committed fixtures, and non-Lean systems (Agda,
+# Metamath). Those items get `unknown` rather than a fabricated version.
+#
+# `datasets-main` (MiniF2F) is deliberately listed: it ships no lean-toolchain
+# and no lakefile, so its items honestly report `unknown` even though they are
+# Lean 4 artifacts. That is a real gap in the corpus, and one worth seeing.
+_LOADER_CORPUS: dict[str, tuple[Callable[[], list[dict[str, Any]]], str | None]] = {
+    "formalqualbench": (load_formalqualbench, "FormalQualBench-main"),
+    "sphere_packing": (load_sphere_packing, "Sphere-Packing-Lean-main"),
+    "zklinalg": (load_zklinalg, "ZkLinalg-main"),
+    "strongpnt": (load_strongpnt, "strongpnt-main"),
+    "kakeya": (load_kakeya, "KakeyaFiniteFields-main"),
+    "riemann_hypothesis_curves": (
+        load_riemann_hypothesis_curves,
+        "RiemannHypothesisCurves-main",
+    ),
+    "frontiermath_hypergraphs": (
+        load_frontiermath_hypergraphs,
+        "FrontierMathOpen-Hypergraphs-main",
+    ),
+    "erdos1196": (load_erdos1196, "Erdos1196-main"),
+    "ineqmath": (load_ineqmath, None),
+    "aime24": (load_aime24, None),
+    "aime25": (load_aime25, None),
+    "aime26": (load_aime26, None),
+    "brokenmath": (load_brokenmath, None),
+    "goldbach_collatz": (load_goldbach_collatz, None),
+    "minif2f": (load_minif2f, "datasets-main"),
+    "minif2f_train": (load_minif2f_train, "datasets-main"),
+    "minif2f_valid": (load_minif2f_valid, "datasets-main"),
+    "minif2f_test": (load_minif2f_test, "datasets-main"),
+    "bridge178": (load_bridge178, "BRIDGE-main"),
+    "quantumlean": (load_quantumlean, "QuantumLean-Bench-main"),
+    "quantumlean_physics": (load_quantumlean_physics, "QuantumLean-Bench-main"),
+    "millennium": (load_millennium, "LeanMillenniumPrizeProblems-main"),
+    "imo2025": (load_imo2025, "IMO2025-main"),
+    "putnam_artifacts": (load_putnam_artifacts, "aristotle_putnam25-main"),
+    "formulationbench": (load_formulationbench, "flare-main"),
+    "imo_proofbench": (load_imo_proofbench, None),
+    "imo_answerbench": (load_imo_answerbench, None),
+    "imo_gradingbench": (load_imo_gradingbench, None),
+    "zero_to_qed": (load_zero_to_qed, "zero-to-qed-main"),
+    "lean_tactics_kb": (load_lean_tactics_kb, "zero-to-qed-main"),
+    "formalizing_100": (load_formalizing_100, None),
+    "1lab": (load_1lab, None),
+    "metamath_100": (load_metamath_100, None),
+}
+
+# Registry name -> loader callable (toolchain-stamping applied uniformly).
 LOADERS: dict[str, Callable[[], list[dict[str, Any]]]] = {
-    "formalqualbench": load_formalqualbench,
-    "sphere_packing": load_sphere_packing,
-    "zklinalg": load_zklinalg,
-    "strongpnt": load_strongpnt,
-    "kakeya": load_kakeya,
-    "riemann_hypothesis_curves": load_riemann_hypothesis_curves,
-    "frontiermath_hypergraphs": load_frontiermath_hypergraphs,
-    "erdos1196": load_erdos1196,
-    "ineqmath": load_ineqmath,
-    "aime24": load_aime24,
-    "aime25": load_aime25,
-    "aime26": load_aime26,
-    "brokenmath": load_brokenmath,
-    "goldbach_collatz": load_goldbach_collatz,
-    "minif2f": load_minif2f,
-    "minif2f_train": load_minif2f_train,
-    "minif2f_valid": load_minif2f_valid,
-    "minif2f_test": load_minif2f_test,
-    "bridge178": load_bridge178,
-    "quantumlean": load_quantumlean,
-    "quantumlean_physics": load_quantumlean_physics,
-    "millennium": load_millennium,
-    "imo2025": load_imo2025,
-    "putnam_artifacts": load_putnam_artifacts,
-    "formulationbench": load_formulationbench,
-    "imo_proofbench": load_imo_proofbench,
-    "imo_answerbench": load_imo_answerbench,
-    "imo_gradingbench": load_imo_gradingbench,
-    "zero_to_qed": load_zero_to_qed,
-    "lean_tactics_kb": load_lean_tactics_kb,
-    "formalizing_100": load_formalizing_100,
-    "1lab": load_1lab,
-    "metamath_100": load_metamath_100,
+    name: _with_toolchain(loader, corpus)
+    for name, (loader, corpus) in _LOADER_CORPUS.items()
 }

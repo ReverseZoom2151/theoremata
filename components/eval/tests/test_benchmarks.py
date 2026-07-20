@@ -34,6 +34,7 @@ from theoremata_tools.benchmarks.parsing import (  # noqa: E402
     parse_fqb_main,
 )
 from theoremata_tools.benchmarks.resources import find_dir  # noqa: E402
+from theoremata_tools.benchmarks import loaders as _loaders  # noqa: E402
 
 ALL_NAMES = [b["name"] for b in list_benchmarks()]
 
@@ -843,6 +844,177 @@ def test_lean_tactics_kb_parses_structured_entries(monkeypatch, tmp_path):
     # retrieval-style grader matches when the tactic is named
     assert grade(omega, "use the omega tactic here")["is_correct"] is True
     assert grade(omega, "use ring instead")["is_correct"] is False
+
+
+# --------------------------------------------------------------------------- #
+# MiniF2F exclusions: applied AND reported, never silently dropped
+# --------------------------------------------------------------------------- #
+
+_MINIF2F_ROWS = [
+    {"id": 1, "name": "mathd_algebra_182", "natural": "a", "formal": "theorem a : True := by sorry"},
+    {"id": 2, "name": "amc12a_2020_p10", "natural": "b", "formal": "theorem b : True := by sorry"},
+    {"id": 3, "name": "imo_1983_p6", "natural": "c", "formal": "theorem c : True := by sorry"},
+]
+
+
+def test_minif2f_empty_exclusion_list_changes_nothing(monkeypatch, tmp_path):
+    # The shipped list is empty on purpose (the mis-formalised ids were never
+    # copied into this repo), so today's numbers must be untouched.
+    assert _loaders.MINIF2F_EXCLUSIONS == {}
+    _write_minif2f_split(tmp_path, "test", _MINIF2F_ROWS)
+    monkeypatch.setenv("THEOREMATA_RESOURCES", str(tmp_path))
+    items = load_benchmark("minif2f_test")
+    assert len(items) == 3
+    rep = _loaders.exclusion_report("minif2f_test")
+    assert rep["candidates"] == 3
+    assert rep["excluded"] == 0
+    assert rep["scored"] == 3
+    assert rep["exclusions"] == {}
+
+
+def test_minif2f_exclusion_is_applied_and_reported(monkeypatch, tmp_path):
+    monkeypatch.setitem(
+        _loaders.MINIF2F_EXCLUSIONS, "mathd_algebra_182", "mis-formalised: test fixture"
+    )
+    _write_minif2f_split(tmp_path, "test", _MINIF2F_ROWS)
+    monkeypatch.setenv("THEOREMATA_RESOURCES", str(tmp_path))
+    items = load_benchmark("minif2f_test")
+
+    # excluded item is absent from the scored set ...
+    ids = {it["id"] for it in items}
+    names = {it["provenance"]["name"] for it in items}
+    assert "minif2f:test:1" not in ids
+    assert "mathd_algebra_182" not in names
+    assert len(items) == 2
+
+    # ... and the drop is fully accounted for: a run can say "3 items, 1
+    # excluded as mis-formalised, scored over 2".
+    rep = _loaders.exclusion_report("minif2f_test")
+    assert rep["candidates"] == 3
+    assert rep["excluded"] == 1
+    assert rep["scored"] == 2 == len(items)
+    assert rep["exclusions"] == {"minif2f:test:1": "mis-formalised: test fixture"}
+
+
+def test_minif2f_exclusion_also_matches_item_id(monkeypatch, tmp_path):
+    monkeypatch.setitem(
+        _loaders.MINIF2F_EXCLUSIONS, "minif2f:test:3", "mis-formalised: by uid"
+    )
+    _write_minif2f_split(tmp_path, "test", _MINIF2F_ROWS)
+    monkeypatch.setenv("THEOREMATA_RESOURCES", str(tmp_path))
+    items = load_benchmark("minif2f_test")
+    assert {it["id"] for it in items} == {"minif2f:test:1", "minif2f:test:2"}
+    assert _loaders.exclusion_report("minif2f_test")["excluded"] == 1
+
+
+def test_minif2f_combined_report_aggregates_splits(monkeypatch, tmp_path):
+    monkeypatch.setitem(
+        _loaders.MINIF2F_EXCLUSIONS, "mathd_algebra_182", "mis-formalised: fixture"
+    )
+    for split in ("train", "valid", "test"):
+        _write_minif2f_split(tmp_path, split, _MINIF2F_ROWS)
+    monkeypatch.setenv("THEOREMATA_RESOURCES", str(tmp_path))
+    items = load_benchmark("minif2f")
+    rep = _loaders.exclusion_report("minif2f")
+    assert rep["candidates"] == 9
+    assert rep["excluded"] == 3  # one per split
+    assert rep["scored"] == 6 == len(items)
+    assert set(rep["per_split"]) == {"train", "valid", "test"}
+
+
+def test_minif2f_missing_train_items_are_reconciled_not_excluded(monkeypatch, tmp_path):
+    # The three README-documented missing training problems are ABSENT, not
+    # mis-formalised: they must not be treated as exclusions.
+    _write_minif2f_split(tmp_path, "train", _MINIF2F_ROWS)
+    monkeypatch.setenv("THEOREMATA_RESOURCES", str(tmp_path))
+    items = load_benchmark("minif2f_train")
+    rep = _loaders.exclusion_report("minif2f_train")
+    assert rep["excluded"] == 0
+    assert rep["scored"] == len(items) == 3
+    missing = rep["known_missing_upstream"]
+    assert missing["ids"] == [
+        "mathd_algebra_31",
+        "mathd_numbertheory_24",
+        "amc12a_2020_p22",
+    ]
+    assert missing["confirmed_absent"] == missing["ids"]
+    assert missing["unexpectedly_present"] == []
+    assert missing["nominal_total_all_splits"] == 488
+    # only the train split carries the reconciliation note
+    assert "known_missing_upstream" not in (
+        _loaders.exclusion_report("minif2f_test") or {"known_missing_upstream": None}
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Per-item toolchain metadata: declared when the corpus declares it, else
+# explicitly `unknown` (never fabricated)
+# --------------------------------------------------------------------------- #
+
+_TOOLCHAIN_KEYS = {"declared", "system", "lean", "mathlib_rev", "mathlib_input_rev"}
+
+
+@pytest.mark.parametrize("name", sorted(_loaders.LOADERS))
+def test_every_item_carries_toolchain_metadata(name):
+    for it in load_benchmark(name):
+        tc = it["provenance"].get("toolchain")
+        assert isinstance(tc, dict), f"{name}: item {it['id']} has no toolchain"
+        assert _TOOLCHAIN_KEYS <= set(tc)
+        if not tc["declared"]:
+            # nothing declared → explicit unknown, not a guess
+            assert tc["lean"] == "unknown"
+            assert tc["system"] == "unknown"
+
+
+def test_toolchain_is_read_from_what_the_corpus_declares(monkeypatch, tmp_path):
+    root = tmp_path / "zero-to-qed-main" / "zero-to-qed-main"
+    (root / "src" / "ZeroToQED" / "Proofs").mkdir(parents=True)
+    (root / "lean-toolchain").write_text("leanprover/lean4:v4.30.0\n", encoding="utf-8")
+    (root / "lake-manifest.json").write_text(
+        json.dumps(
+            {
+                "version": "1.1.0",
+                "packages": [
+                    {"name": "batteries", "rev": "aaa", "inputRev": "main"},
+                    {"name": "mathlib", "rev": "f897ebc", "inputRev": "v4.30.0"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (root / "src" / "ZeroToQED" / "Proofs" / "Sqrt2Irrational.lean").write_text(
+        "theorem Sqrt2Irrational : True := by trivial\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("THEOREMATA_RESOURCES", str(tmp_path))
+    items = load_benchmark("zero_to_qed")
+    assert len(items) == 1
+    tc = items[0]["provenance"]["toolchain"]
+    assert tc["declared"] is True
+    assert tc["system"] == "lean4"
+    assert tc["lean"] == "leanprover/lean4:v4.30.0"
+    assert tc["mathlib_rev"] == "f897ebc"
+    assert tc["mathlib_input_rev"] == "v4.30.0"
+    assert tc["source"].endswith("lean-toolchain")
+
+
+def test_toolchain_unknown_when_corpus_declares_nothing(monkeypatch, tmp_path):
+    # MiniF2F ships JSON only: no lean-toolchain, no lakefile. Its items are
+    # Lean 4 artifacts, but we must not invent a version for them.
+    _write_minif2f_split(tmp_path, "test", _MINIF2F_ROWS)
+    monkeypatch.setenv("THEOREMATA_RESOURCES", str(tmp_path))
+    tc = load_benchmark("minif2f_test")[0]["provenance"]["toolchain"]
+    assert tc == dict(_loaders.UNKNOWN_TOOLCHAIN)
+    assert tc["declared"] is False
+    assert tc["lean"] == "unknown"
+    assert tc["mathlib_rev"] == "unknown"
+
+
+def test_toolchain_records_are_not_shared_between_items(monkeypatch, tmp_path):
+    _write_minif2f_split(tmp_path, "test", _MINIF2F_ROWS)
+    monkeypatch.setenv("THEOREMATA_RESOURCES", str(tmp_path))
+    items = load_benchmark("minif2f_test")
+    items[0]["provenance"]["toolchain"]["lean"] = "mutated"
+    assert items[1]["provenance"]["toolchain"]["lean"] == "unknown"
 
 
 def test_lean_tactics_kb_end_to_end_if_present():
