@@ -16,7 +16,10 @@
 //! `Admitted` candidate is still rejected).
 
 use crate::{
-    checker_cache::{CheckerCache, EnvironmentFingerprint, VerificationCacheKey},
+    checker_cache::{
+        CheckerCache, EnvironmentFingerprint, VerificationCacheKey,
+        ELABORATED_STATEMENT_DETAIL_KEY,
+    },
     config::Config,
     db::Store,
     model::ModelRequest,
@@ -30,6 +33,10 @@ use crate::{
     sampling,
 };
 use anyhow::{Context, Result};
+// The staleness classifier is pure logic with no callers yet. We do not call it
+// here (this module verifies, it does not sweep); we import its vocabulary so the
+// provenance we record is already in the shape it consumes.
+use crate::reason::proving::staleness;
 use serde_json::{json, Value};
 use std::cell::RefCell;
 
@@ -278,6 +285,13 @@ fn generate_and_verify_inner(
             verify_candidate(cache, &key, || backend.verify(config, &code, statement))?;
         attach_error_feedback(system, &code, &mut report);
         attach_declaration_hints(system, config, &mut report);
+        // Record WHAT this verdict was earned against, on the verdict itself.
+        // Until now the environment was computed for the cache key and dropped,
+        // so no stored result could ever be assessed for staleness. Placed after
+        // the cache call for the same reason the annotations above are: the cache
+        // stores the gate's own report, and provenance must not enter its
+        // accept/reject decision or its key.
+        attach_verification_provenance(system, statement, &code, &environment, &mut report);
         if !report.lexically_verified {
             failures.borrow_mut().push(FailedCandidate {
                 code: code.clone(),
@@ -367,6 +381,18 @@ fn generate_and_verify_inner(
         // visible rather than looking like bad luck.
         "checker_cache_environment": environment.describe(),
         "checker_cache_usable": environment.is_resolved(),
+        // The provenance of the SELECTED candidate, so a later staleness sweep
+        // can read `verified_against` per result straight off the event stream.
+        // Unconditional: a report whose `detail` is not an object cannot carry
+        // the same key, and a silently missing environment is the one omission
+        // that produces a false `Fresh` later.
+        PROVENANCE_KEY: provenance_value(
+            system,
+            statement,
+            &sampled.value.code,
+            &environment,
+            &sampled.value.report,
+        ),
     });
     // Additive only when the opt-in is on, so the default event payload is
     // byte-identical to the pre-correction one.
@@ -498,6 +524,185 @@ where
         cache.insert_verified(key, report.clone());
     }
     Ok((report, false))
+}
+
+// ===========================================================================
+// Verification provenance (what a verdict was earned against)
+// ===========================================================================
+
+/// The `detail` key, and the event field, under which verification provenance is
+/// published.
+///
+/// One name for both surfaces on purpose: a staleness sweep that reads stored
+/// reports and one that replays the event stream must not have to know two
+/// spellings of the same fact.
+const PROVENANCE_KEY: &str = "verification_provenance";
+
+/// Schema tag for the published provenance object.
+const PROVENANCE_SCHEMA: &str = "theoremata.verification-provenance.v1";
+
+/// Stable tag for an artifact class.
+///
+/// Spelled out here rather than derived from the `Debug` form so a rename in
+/// `staleness` cannot silently change a value that has already been written to
+/// the event log.
+fn artifact_tag(class: staleness::ArtifactClass) -> &'static str {
+    match class {
+        staleness::ArtifactClass::SelfContainedCertificate => "self_contained_certificate",
+        staleness::ArtifactClass::TacticScript => "tactic_script",
+        staleness::ArtifactClass::ProofTerm => "proof_term",
+    }
+}
+
+/// Classify the artifact this generator produced, for staleness routing.
+///
+/// Only two of the three classes are reachable from here, and that is the honest
+/// answer rather than a limitation: this module asks a model (or a hammer) for
+/// system-native proof SOURCE, which is a program against the library in every
+/// system it targets. Nothing on this path produces a self-contained certificate
+/// (an SOS witness, an LRAT refutation, an exact-rational bound), so nothing on
+/// this path may claim the cheap `StatementOnly` recheck route that class earns.
+/// Misreading a script as a certificate would skip the proof replay it needs, so
+/// the certificate variant is deliberately unreachable here.
+///
+/// The remaining split, script versus proof term, is safe to decide
+/// heuristically: both route to `StatementAndProof`, so getting it wrong costs a
+/// census label and never a recheck.
+fn classify_artifact(system: FormalSystem, code: &str) -> staleness::ArtifactClass {
+    match system {
+        // A Lean proof is a term unless it opens a tactic block.
+        FormalSystem::Lean => {
+            if has_word(code, "by") {
+                staleness::ArtifactClass::TacticScript
+            } else {
+                staleness::ArtifactClass::ProofTerm
+            }
+        }
+        // Agda proofs are terms by construction: there is no tactic language to
+        // rot, only definitions that reference other definitions.
+        FormalSystem::Agda => staleness::ArtifactClass::ProofTerm,
+        // Isar methods, Rocq tactic scripts, HOL Light tactic combinators and
+        // Metamath label sequences are all programs against a library surface.
+        FormalSystem::Rocq
+        | FormalSystem::Isabelle
+        | FormalSystem::Candle
+        | FormalSystem::Metamath => staleness::ArtifactClass::TacticScript,
+    }
+}
+
+/// Whether `word` appears in `text` as a standalone identifier rather than as a
+/// substring of a longer one (so `by` matches `:= by` but not `bytes`).
+fn has_word(text: &str, word: &str) -> bool {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '\'' || c == '.';
+    text.match_indices(word).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + word.len()..].chars().next();
+        !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
+    })
+}
+
+/// The provenance record for one verified candidate.
+///
+/// Shaped so a later sweep can build a `staleness::VerifiedResult` field for
+/// field, with no reinterpretation:
+///
+/// * `id`                    -> `VerifiedResult::id`
+/// * `artifact`              -> `VerifiedResult::artifact` (tags from [`artifact_tag`])
+/// * `verified_against`      -> `staleness::EnvironmentFingerprint::new(..)`
+/// * `pinned_statement_type` -> `VerifiedResult::pinned_statement_type` (null = absent)
+///
+/// `verified_against` is [`EnvironmentFingerprint::key_field`], which is the same
+/// exact string the cache key mixes in, and which spells both states. An
+/// UNRESOLVED environment is therefore recorded as `unresolved:` plus the
+/// verbatim reason, and is
+/// never omitted: omitting it would read downstream as "this verdict depended on
+/// nothing", which is a different and much more dangerous fact than "we could not
+/// tell what it depended on". `environment_resolved` carries the same bit as a
+/// boolean so a consumer never has to parse the prefix.
+///
+/// A sweep must pass `None` as `assess`'s `current_environment` whenever TODAY's
+/// environment is unresolved. That is the documented contract of `staleness`
+/// (unresolvable current environment yields `Unknown`), and it is what keeps two
+/// unresolved-for-the-same-reason strings from comparing equal and reading as
+/// `Fresh`.
+///
+/// `pinned_statement_type` is the checker's own elaborated form when a backend
+/// published one under [`ELABORATED_STATEMENT_DETAIL_KEY`], and `null` otherwise.
+/// No backend publishes it today, so this is honestly null and the sweep will say
+/// `Unknown(NoPinnedStatementType)` rather than guessing. Deriving a stand-in
+/// from the source text would hand the discriminator something confident and
+/// wrong, which is the exact failure the pin exists to prevent.
+fn provenance_value(
+    system: FormalSystem,
+    statement: &str,
+    code: &str,
+    environment: &EnvironmentFingerprint,
+    report: &VerificationReport,
+) -> Value {
+    let elaborated = report
+        .detail
+        .get(ELABORATED_STATEMENT_DETAIL_KEY)
+        .filter(|node| node.get("form").and_then(Value::as_str).is_some());
+    let unresolved_reason = match environment {
+        EnvironmentFingerprint::Unresolved { reason } => Some(reason.as_str()),
+        EnvironmentFingerprint::Resolved { .. } => None,
+    };
+    json!({
+        "schema": PROVENANCE_SCHEMA,
+        "system": system.as_str(),
+        "id": statement,
+        "artifact": artifact_tag(classify_artifact(system, code)),
+        "verified_against": environment.key_field(),
+        "environment_resolved": environment.is_resolved(),
+        // Verbatim, and only when there is one: "we did not look" and "the
+        // project declares nothing" must stay distinguishable in the record.
+        "environment_unresolved_reason": unresolved_reason,
+        "environment_describe": environment.describe(),
+        "pinned_statement_type": elaborated
+            .and_then(|node| node.get("form"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        "pinned_statement_provenance": elaborated
+            .and_then(|node| node.get("provenance"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        // Present exactly when the pin is absent, so a sweep can report WHY a
+        // result is unassessable instead of only that it is.
+        "pinned_statement_absent_reason": match elaborated {
+            Some(_) => Value::Null,
+            None => json!(
+                "no backend published an elaborated statement form for this verification"
+            ),
+        },
+        // The verdict this provenance describes, copied so a sweep reading the
+        // event stream alone can tell a green from a red. Read-only: nothing here
+        // writes back into the report's verdict fields.
+        "verdict_verified": report.lexically_verified,
+        "verdict_live": report.live,
+    })
+}
+
+/// Publish the provenance record onto a verification report's `detail`.
+///
+/// Strictly additive and verdict-neutral, exactly like [`attach_error_feedback`]:
+/// it writes one new key and reads nothing it could act on. It runs for passes
+/// AND failures, because a sweep that only ever saw greens could not tell an
+/// unrecorded result from an absent one.
+///
+/// A `detail` that is not a JSON object cannot carry the key; the event payload
+/// is written unconditionally and is the surface that is guaranteed to carry the
+/// record.
+fn attach_verification_provenance(
+    system: FormalSystem,
+    statement: &str,
+    code: &str,
+    environment: &EnvironmentFingerprint,
+    report: &mut VerificationReport,
+) {
+    let value = provenance_value(system, statement, code, environment, report);
+    if let Some(detail) = report.detail.as_object_mut() {
+        detail.insert(PROVENANCE_KEY.to_string(), value);
+    }
 }
 
 /// The `detail` key under which rendered checker feedback is published.
@@ -1877,6 +2082,337 @@ mod tests {
         let config = Config::default();
         attach_declaration_hints(FormalSystem::Lean, &config, &mut report);
         assert!(report.detail.get(DECL_HINTS_KEY).is_none());
+    }
+
+    // =======================================================================
+    // Verification provenance
+    // =======================================================================
+
+    /// A resolved Lake-shaped environment distinct from [`test_env`].
+    fn resolved_env(manifest: &str) -> EnvironmentFingerprint {
+        EnvironmentFingerprint::from_parts(
+            "lake",
+            "lake-manifest.json (1 package pin(s)), toolchain leanprover/lean4:v4.19.0",
+            &[("env.manifest", manifest.to_string())],
+        )
+    }
+
+    fn provenance_of(report: &VerificationReport) -> &Value {
+        report
+            .detail
+            .get(PROVENANCE_KEY)
+            .expect("every verified candidate must carry its provenance")
+    }
+
+    #[test]
+    fn a_resolved_environment_is_recorded_with_its_digest() {
+        let env = resolved_env("{\"packages\":[]}");
+        let mut report = live_verified_report("clean");
+        attach_verification_provenance(
+            FormalSystem::Lean,
+            "True",
+            "theorem t : True := by trivial",
+            &env,
+            &mut report,
+        );
+
+        let p = provenance_of(&report);
+        assert_eq!(p["schema"], PROVENANCE_SCHEMA);
+        assert_eq!(p["environment_resolved"], true);
+        assert_eq!(p["environment_unresolved_reason"], Value::Null);
+
+        // The recorded pin is the digest-bearing key field, not a lossy summary:
+        // a sweep compares these for exact equality.
+        let recorded = p["verified_against"].as_str().unwrap();
+        assert_eq!(recorded, env.key_field());
+        assert!(recorded.starts_with("resolved:lake:"), "{recorded}");
+        let EnvironmentFingerprint::Resolved { digest, .. } = &env else {
+            panic!("from_parts yields a resolved fingerprint");
+        };
+        assert!(recorded.ends_with(digest.as_str()), "{recorded}");
+
+        // A different environment must record a different pin, or the comparison
+        // downstream is worthless.
+        let mut other_report = live_verified_report("clean");
+        attach_verification_provenance(
+            FormalSystem::Lean,
+            "True",
+            "theorem t : True := by trivial",
+            &resolved_env("{\"packages\":[{\"name\":\"mathlib\"}]}"),
+            &mut other_report,
+        );
+        assert_ne!(
+            provenance_of(&other_report)["verified_against"],
+            p["verified_against"]
+        );
+    }
+
+    #[test]
+    fn an_unresolved_environment_is_recorded_with_its_reason_not_dropped() {
+        const REASON: &str =
+            "lean: no lake project configured, so no dependency revision can be pinned";
+        let mut report = live_verified_report("clean");
+        attach_verification_provenance(
+            FormalSystem::Lean,
+            "True",
+            "theorem t : True := by trivial",
+            &EnvironmentFingerprint::unresolved(REASON),
+            &mut report,
+        );
+
+        let p = provenance_of(&report);
+        // Omission is the bug: an absent environment reads as "depended on
+        // nothing", which is the fact that produces a false Fresh later.
+        assert!(
+            p.get("verified_against").is_some_and(|v| !v.is_null()),
+            "an unresolved environment must still be recorded"
+        );
+        assert_eq!(p["environment_resolved"], false);
+        assert_eq!(p["environment_unresolved_reason"], REASON);
+        let recorded = p["verified_against"].as_str().unwrap();
+        assert!(recorded.starts_with("unresolved:"), "{recorded}");
+        assert!(recorded.contains(REASON), "{recorded}");
+        assert!(p["environment_describe"].as_str().unwrap().contains(REASON));
+    }
+
+    #[test]
+    fn provenance_leaves_every_verdict_field_byte_identical() {
+        for before in [live_verified_report("clean"), failed_report()] {
+            let mut after = before.clone();
+            attach_verification_provenance(
+                FormalSystem::Lean,
+                "True",
+                "theorem t : True := by trivial",
+                &resolved_env("{}"),
+                &mut after,
+            );
+
+            assert_eq!(after.lexically_verified, before.lexically_verified);
+            assert_eq!(after.axioms_clean, before.axioms_clean);
+            assert_eq!(after.statement_preserved, before.statement_preserved);
+            assert_eq!(after.lexical_clean, before.lexical_clean);
+            assert_eq!(after.hardening_clean, before.hardening_clean);
+            assert_eq!(after.live, before.live);
+
+            // `detail` differs by exactly the one added key and nothing else.
+            let mut stripped = after.detail.clone();
+            stripped.as_object_mut().unwrap().remove(PROVENANCE_KEY);
+            assert_eq!(stripped, before.detail);
+        }
+
+        // A non-object detail is left exactly as it was; the event payload is the
+        // surface that always carries the record.
+        let mut scalar = VerificationReport {
+            detail: json!("opaque"),
+            ..failed_report()
+        };
+        attach_verification_provenance(
+            FormalSystem::Lean,
+            "True",
+            "x",
+            &resolved_env("{}"),
+            &mut scalar,
+        );
+        assert_eq!(scalar.detail, json!("opaque"));
+    }
+
+    #[test]
+    fn the_real_generate_path_publishes_provenance_without_changing_the_verdict() {
+        let store = store();
+        let config = mock_config();
+        let provider = CannedProvider {
+            code: "theorem t : True := trivial".into(),
+        };
+        let (_, report) =
+            generate_and_verify(&store, &config, &provider, FormalSystem::Lean, "True").unwrap();
+
+        // Same verdict `returns_code_and_report_for_each_system` asserts.
+        assert!(report.lexically_verified);
+        assert!(!report.live);
+
+        let p = provenance_of(&report);
+        assert_eq!(p["id"], "True");
+        // A mock backend consults no library, which is a RESOLVED environment
+        // rather than an unknown one.
+        assert_eq!(p["environment_resolved"], true);
+        assert!(p["verified_against"]
+            .as_str()
+            .unwrap()
+            .starts_with("resolved:mock:"));
+        // No backend publishes an elaborated form yet, so the pin is honestly
+        // absent and says why.
+        assert_eq!(p["pinned_statement_type"], Value::Null);
+        assert!(p["pinned_statement_absent_reason"].is_string());
+    }
+
+    #[test]
+    fn artifact_classification_never_claims_a_self_contained_certificate() {
+        use staleness::ArtifactClass;
+
+        // Nothing this module generates is a certificate, and claiming one would
+        // buy the cheap statement-only recheck route it has not earned.
+        for system in [
+            FormalSystem::Lean,
+            FormalSystem::Rocq,
+            FormalSystem::Isabelle,
+            FormalSystem::Candle,
+            FormalSystem::Agda,
+            FormalSystem::Metamath,
+        ] {
+            assert_ne!(
+                classify_artifact(system, stub_for(system).as_str()),
+                ArtifactClass::SelfContainedCertificate,
+                "{system}"
+            );
+        }
+
+        assert_eq!(
+            classify_artifact(FormalSystem::Lean, "theorem t : True := by simp"),
+            ArtifactClass::TacticScript
+        );
+        assert_eq!(
+            classify_artifact(FormalSystem::Lean, "theorem t : True := trivial"),
+            ArtifactClass::ProofTerm
+        );
+        // `by` as a substring of an identifier is not a tactic block.
+        assert_eq!(
+            classify_artifact(FormalSystem::Lean, "theorem t : P := byte_lemma"),
+            ArtifactClass::ProofTerm
+        );
+        assert!(has_word("theorem t : True :=\n  by\n  simp", "by"));
+        assert!(!has_word("Nat.byte", "by"));
+    }
+
+    #[test]
+    fn the_emitted_shape_is_what_staleness_consumes() {
+        use staleness::{
+            assess, ArtifactClass, EnvironmentFingerprint as PinnedEnv, StalenessVerdict,
+            UnknownReason, VerifiedResult,
+        };
+
+        let env = resolved_env("{\"packages\":[]}");
+        let mut report = live_verified_report("clean");
+        attach_verification_provenance(
+            FormalSystem::Lean,
+            "theorem p : P",
+            "theorem p : P := by simp",
+            &env,
+            &mut report,
+        );
+        let p = provenance_of(&report).clone();
+
+        // Rebuild the staleness input straight off the record, field for field.
+        let recovered = VerifiedResult::new(
+            p["id"].as_str().unwrap(),
+            match p["artifact"].as_str().unwrap() {
+                "tactic_script" => ArtifactClass::TacticScript,
+                "proof_term" => ArtifactClass::ProofTerm,
+                "self_contained_certificate" => ArtifactClass::SelfContainedCertificate,
+                other => panic!("unknown artifact tag {other}"),
+            },
+            PinnedEnv::new(p["verified_against"].as_str().unwrap()),
+            p["pinned_statement_type"].as_str().map(str::to_string),
+        );
+        assert_eq!(recovered.artifact, ArtifactClass::TacticScript);
+        assert_eq!(recovered.id, "theorem p : P");
+
+        // Same environment today: Fresh, with no reinterpretation anywhere.
+        let today = PinnedEnv::new(env.key_field());
+        assert_eq!(assess(&recovered, Some(&today), None), StalenessVerdict::Fresh);
+
+        // A moved environment with no elaborated pin is the honest Unknown. This
+        // is the state of the world until a backend publishes an elaborated form.
+        let moved = PinnedEnv::new(resolved_env("{\"packages\":[1]}").key_field());
+        assert!(matches!(
+            assess(&recovered, Some(&moved), None),
+            StalenessVerdict::Unknown(UnknownReason::NoPinnedStatementType)
+        ));
+    }
+
+    #[test]
+    fn a_published_elaborated_form_becomes_the_pinned_statement_type() {
+        use staleness::{
+            assess, EnvironmentFingerprint as PinnedEnv, ReelaborationOutcome, VerifiedResult,
+        };
+
+        // The shape a backend that CAN pretty-print an elaborated type publishes.
+        let mut report = VerificationReport {
+            detail: json!({
+                ELABORATED_STATEMENT_DETAIL_KEY: {
+                    "form": "forall (x : Real), Real.nnrpow x (1/3) = 2",
+                    "provenance": "lean.repl.elaborated_type",
+                }
+            }),
+            ..live_verified_report("clean")
+        };
+        let env = resolved_env("{\"packages\":[]}");
+        attach_verification_provenance(
+            FormalSystem::Lean,
+            "algebra_5778",
+            "theorem algebra_5778 : P := by norm_num",
+            &env,
+            &mut report,
+        );
+
+        let p = provenance_of(&report);
+        assert_eq!(
+            p["pinned_statement_type"],
+            "forall (x : Real), Real.nnrpow x (1/3) = 2"
+        );
+        assert_eq!(p["pinned_statement_provenance"], "lean.repl.elaborated_type");
+        assert_eq!(p["pinned_statement_absent_reason"], Value::Null);
+
+        let recovered = VerifiedResult::new(
+            p["id"].as_str().unwrap(),
+            classify_artifact(FormalSystem::Lean, "theorem algebra_5778 : P := by norm_num"),
+            PinnedEnv::new(p["verified_against"].as_str().unwrap()),
+            p["pinned_statement_type"].as_str().map(str::to_string),
+        );
+        // With the pin present the discriminator actually runs: same type under a
+        // moved environment is a repair candidate, not a silent green.
+        let verdict = assess(
+            &recovered,
+            Some(&PinnedEnv::new(resolved_env("{\"packages\":[1]}").key_field())),
+            Some(&ReelaborationOutcome::Elaborated {
+                statement_type: "forall (x : Real), Real.nnrpow x (1/3) = 2".to_string(),
+            }),
+        );
+        assert!(verdict.is_repairable());
+    }
+
+    #[test]
+    fn an_unresolved_pin_is_never_swept_up_as_fresh() {
+        use staleness::{
+            assess, ArtifactClass, EnvironmentFingerprint as PinnedEnv, StalenessVerdict,
+            UnknownReason, VerifiedResult,
+        };
+
+        let mut report = live_verified_report("clean");
+        attach_verification_provenance(
+            FormalSystem::Lean,
+            "True",
+            "theorem t : True := by trivial",
+            &EnvironmentFingerprint::unresolved("lean: no lake project configured"),
+            &mut report,
+        );
+        let p = provenance_of(&report);
+        let recovered = VerifiedResult::new(
+            p["id"].as_str().unwrap(),
+            ArtifactClass::TacticScript,
+            PinnedEnv::new(p["verified_against"].as_str().unwrap()),
+            None,
+        );
+
+        // The sweep contract: an unresolvable environment TODAY is passed as
+        // `None`, which is what keeps two unresolved records from comparing equal
+        // and reading as Fresh.
+        assert!(matches!(
+            assess(&recovered, None, None),
+            StalenessVerdict::Unknown(UnknownReason::EnvironmentUnresolved { .. })
+        ));
+        // And it can never collide with a resolved environment either.
+        let resolved_today = PinnedEnv::new(resolved_env("{}").key_field());
+        assert!(!assess(&recovered, Some(&resolved_today), None).is_fresh());
     }
 
     #[test]
