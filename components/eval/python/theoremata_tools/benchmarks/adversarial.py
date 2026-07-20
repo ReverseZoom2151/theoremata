@@ -219,9 +219,12 @@ def load_borwein_vacuity() -> list[dict[str, Any]]:
     bad = find_files(
         "gdm-formal-conjectures-main/**/input/BorweinSineSeries/problem.lean",
     )
+    # The control is the PROOF of the corrected statement, not its spec stub.
+    # problem.lean here is sorry-bearing by corpus convention, so an accept
+    # verdict on it asserted the gate must accept a stub.
     good = find_files(
-        "gdm-formal-conjectures-main/*/BorweinSineSeries/problem.lean",
-        "gdm-formal-conjectures-main/**/BorweinSineSeries/problem.lean",
+        "gdm-formal-conjectures-main/*/BorweinSineSeries/solution.lean",
+        "gdm-formal-conjectures-main/**/BorweinSineSeries/solution.lean",
     )
     # The corrected file and the false one both match a loose "**/BorweinSineSeries"
     # glob, so drop anything living under input/.
@@ -231,6 +234,17 @@ def load_borwein_vacuity() -> list[dict[str, Any]]:
 
     items: list[dict[str, Any]] = []
     if bad:
+        # KNOWN LIMITATION, recorded so a green test is not misread. The false
+        # file exists only as a sorry-bearing spec: there is no
+        # input/BorweinSineSeries/solution.lean. Our gate refuses a sorry long
+        # before any vacuity reasoning runs, so this item currently passes on the
+        # SORRY and not on the false premise. It therefore does not yet
+        # demonstrate vacuity detection, which is the thing it was added for.
+        #
+        # Making it demonstrate that needs a proof of the false-premise statement
+        # (so the sorry is gone and vacuity is the only remaining objection).
+        # Until then the reject verdict is correct but under-determined, and
+        # `reject_is_underdetermined` says so in the item itself.
         items.append(
             make_adversarial_item(
                 id="borwein_vacuity:false_premise",
@@ -245,14 +259,22 @@ def load_borwein_vacuity() -> list[dict[str, Any]]:
                     "hypothesis is false and the theorem is vacuously true."
                 ),
                 notes=(
-                    "Differs from the accepted control only in the numeral. The "
-                    "artifact is sorry-free and statement-preserved, so a sorry "
-                    "scan and an axiom audit both pass; only a vacuity check fires."
+                    "Differs from the corrected statement only in the numeral. "
+                    "NOTE: this file is the sorry-bearing SPEC, not a proof, so "
+                    "the gate rejects it on the sorry before any vacuity check "
+                    "runs. The reject verdict is therefore correct but "
+                    "under-determined: it does not yet demonstrate that we detect "
+                    "the false premise. A proof of the false-premise statement "
+                    "would be needed for that."
                 ),
                 extra_provenance={
                     "pair": "borwein_irrationality_measure",
                     "role": "probe",
                     "constant": "7.6063",
+                    # Machine-readable form of the note above, so a run can filter
+                    # out items that pass for a reason other than the one claimed.
+                    "reject_is_underdetermined": True,
+                    "rejected_on": "sorry_not_vacuity",
                 },
             )
         )
@@ -330,7 +352,13 @@ def load_partition_elliptic() -> list[dict[str, Any]]:
 #: a single reading of one file.
 _HIGHER_DYSON_BATCHES = {
     "Batch4": EXPECT_REJECT,
-    "Batch2": EXPECT_ACCEPT,
+    # Batch2 is DELIBERATELY NOT REGISTERED. Its solution.lean still carries one
+    # sorry, so it is not a clean positive, and it is not a designed probe either:
+    # it is simply an unfinished proof. Registering it as a reject would need a
+    # reason outside the adversarial vocabulary (incomplete_proof is not
+    # vacuous_hypothesis, unencoded_side_condition, or missing_witness), and
+    # registering it as a control would assert the gate must accept a sorry.
+    # Batch3 is the sorry-free control that carries the contrast.
     "Batch3": EXPECT_ACCEPT,
 }
 
@@ -352,7 +380,12 @@ def load_higher_dyson() -> list[dict[str, Any]]:
     """
     items: list[dict[str, Any]] = []
     for batch, verdict in sorted(_HIGHER_DYSON_BATCHES.items()):
-        files = find_files(f"HigherDyson-main/**/{batch}/Output/problem.lean")
+        # solution.lean, NOT problem.lean: problem.lean is the sorry-bearing spec
+        # in this corpus (15 sorries in Batches 2 and 3), so the controls asserted
+        # the gate must accept a stub. Batch4's solution is sorry-free, which is
+        # what lets its rejection be attributed to the missing Summable witness
+        # rather than to a sorry.
+        files = find_files(f"HigherDyson-main/**/{batch}/Output/solution.lean")
         if not files:
             continue
         is_probe = verdict == EXPECT_REJECT
@@ -473,8 +506,13 @@ def load_ramanujan_tau() -> list[dict[str, Any]]:
     the uninhabited-structure flag, which is what
     :data:`RAMANUJAN_TAU_HYPOTHESES` pins down.
     """
+    # solution.lean, NOT problem.lean. This corpus follows the Axiom Math
+    # contract: problem.lean is the sorry-bearing spec stub and solution.lean is
+    # the proof. This fixture asserts the gate ACCEPTS a genuinely good proof, so
+    # pointing it at the 4-sorry stub asserted that the gate must accept a stub,
+    # which it rightly refuses. Caught by the live harness.
     files = find_files(
-        "ramanujan-tau-misses-primes-main/**/RamanujanTauMissesPrimes/problem.lean",
+        "ramanujan-tau-misses-primes-main/**/RamanujanTauMissesPrimes/solution.lean",
     )
     if not files:
         return _skip("ramanujan_tau")

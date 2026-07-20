@@ -194,10 +194,10 @@ def test_higher_dyson_batches_are_paired():
     # Batch4 is the probe; batches 2 and 3 are the control with no Summable
     # hypotheses at all. Without both halves the contrast is not assertable.
     assert [i["provenance"]["batch"] for i in by_role["probe"]] == ["Batch4"]
-    assert sorted(i["provenance"]["batch"] for i in by_role["control"]) == [
-        "Batch2",
-        "Batch3",
-    ]
+    # Batch3 only. Batch2 is deliberately unregistered: its solution.lean carries
+    # a sorry, so it is an unfinished proof rather than a clean control, and
+    # asserting the gate must accept it would assert the gate is broken.
+    assert sorted(i["provenance"]["batch"] for i in by_role["control"]) == ["Batch3"]
     assert all(i["expected"]["verdict"] == EXPECT_REJECT for i in by_role["probe"])
     assert all(
         i["expected"]["reason"] == "missing_witness" for i in by_role["probe"]
