@@ -1129,7 +1129,19 @@ impl AgentLoop<'_> {
         abstained: &mut usize,
     ) -> Result<bool> {
         let k = self.config.k_consecutive_clean;
-        let gate = k_consecutive_clean(k, k.max(1), |_round| {
+        // Budget MUST exceed k, or the hedge hedges nothing. The gate needs k
+        // CONSECUTIVE clean passes and resets the streak on any failure, so with
+        // max_rounds == k a single flaky pass makes success arithmetically
+        // impossible: there are no rounds left to rebuild the streak. That is the
+        // exact false-negative this function exists to absorb, and it was being
+        // reintroduced at the call site.
+        //
+        // Headroom is k additional rounds, so up to k transient failures can be
+        // survived. It does not weaken the gate: acceptance still requires k in a
+        // row, which is what guards against a noisy verifier reporting a false
+        // CLEAN. More rounds only buys recovery from a false FAILURE.
+        let max_rounds = k.saturating_mul(2).max(1);
+        let gate = k_consecutive_clean(k, max_rounds, |_round| {
             let (compiles, axioms_clean, _goals) = self.verify_source(lean, theorem, session)?;
             Ok(compiles && axioms_clean)
         })?;
@@ -2037,6 +2049,38 @@ mod tests {
             .reasons()
             .iter()
             .any(|reason| reason.contains("role_override")));
+    }
+
+    #[test]
+    fn a_budget_equal_to_k_makes_the_hedge_impossible() {
+        // The regression this pins. certify_k_consecutive called this with
+        // max_rounds == k, which is arithmetically unable to absorb a single
+        // flake: the streak resets on failure and there are no rounds left to
+        // rebuild it. The hedge existed and hedged nothing.
+        let cell = std::cell::Cell::new(0u32);
+        let starved = k_consecutive_clean(3, 3, |_| {
+            let i = cell.get();
+            cell.set(i + 1);
+            Ok(i != 0) // one transient failure on the very first round
+        })
+        .unwrap();
+        assert!(
+            !starved.certified,
+            "a budget equal to k cannot survive even one flake"
+        );
+
+        // The same flake with the budget the call site now uses (2k).
+        let cell = std::cell::Cell::new(0u32);
+        let survives = k_consecutive_clean(3, 6, |_| {
+            let i = cell.get();
+            cell.set(i + 1);
+            Ok(i != 0)
+        })
+        .unwrap();
+        assert!(
+            survives.certified,
+            "headroom must let a transient failure be recovered from"
+        );
     }
 
     #[test]
