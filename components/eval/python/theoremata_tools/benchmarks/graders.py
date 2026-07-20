@@ -25,6 +25,16 @@ misreport.
   mock-capable provider) only when symbolic parsing is inconclusive.
 * :func:`grade_falsification` — flaw / counterexample detection, or must-reject
   for the negative fixture.
+
+STRUCTURAL-ONLY TRACKS
+======================
+:func:`grade_verified_programming`, :func:`grade_statement_target` and
+:func:`grade_external_artifact` compile nothing and execute nothing. Their
+headline key is ``structural_pass``, and their verdicts additionally carry
+``verified: False`` / ``verification_status: "not_verified"`` /
+``grading_mode: "structural_only"``. ``is_correct`` remains on those verdicts as
+a documented compatibility alias for the uniform :func:`grade` contract; any
+report that renders a number should read ``structural_pass``.
 """
 from __future__ import annotations
 
@@ -719,6 +729,71 @@ def grade_falsification(item: dict[str, Any], response: Any) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# Structural-only verdicts
+# --------------------------------------------------------------------------- #
+
+NOT_VERIFIED = "not_verified"
+STRUCTURAL_ONLY = "structural_only"
+
+
+def _structural_verdict_row(
+    *,
+    is_solved: bool,
+    structural_pass: bool,
+    signals: list[str],
+    detail: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the verdict for a track that produces STRUCTURAL evidence only.
+
+    Three tracks here score a submission without compiling, typechecking or
+    executing anything: verified programming, statement target and external
+    artifact. Their evidence is "the expected text appears in code and no
+    ``sorry``/stray axiom does", which a model can satisfy while proving or
+    computing nothing. Naming that ``is_correct`` is how a per-item row gets read
+    out of context as a verification verdict, so the primary key is
+    ``structural_pass`` and the row carries ``verified: False`` /
+    ``verification_status`` next to it.
+
+    WHY ``is_correct`` survives as an alias: :func:`grade` is a uniform dispatch
+    contract and every generic aggregator over it (the proof-completion runner,
+    the registry ops, the eval harness) keys off ``is_correct`` for all tracks at
+    once. Dropping the key here would not make those aggregators honest, it would
+    make these tracks silently score zero, which is a worse misreport than the
+    name. The alias therefore stays, but it can no longer be read in isolation:
+    ``verified``/``verification_status``/``structural_signals`` travel with it in
+    the same dict and in ``detail``. Callers that report a number should read
+    ``structural_pass``; ``is_correct`` is for generic plumbing only.
+    """
+    detail = dict(detail)
+    detail.update(
+        {
+            "structural_pass": bool(structural_pass),
+            "graded": True,
+            "ungraded": False,
+            "verified": False,
+            "verification_status": NOT_VERIFIED,
+            "grading_mode": STRUCTURAL_ONLY,
+            "structural_signals": list(signals),
+            "is_correct_alias_note": (
+                "`is_correct` mirrors `structural_pass` for the uniform grade() "
+                "contract only. Nothing was compiled, typechecked or executed, "
+                "so it is an upper bound on a verified pass, not a verdict."
+            ),
+        }
+    )
+    return {
+        "is_solved": bool(is_solved),
+        "structural_pass": bool(structural_pass),
+        # Compatibility alias; see the docstring above.
+        "is_correct": bool(structural_pass),
+        "verified": False,
+        "verification_status": NOT_VERIFIED,
+        "grading_mode": STRUCTURAL_ONLY,
+        "detail": detail,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Verified programming (BRIDGE)
 # --------------------------------------------------------------------------- #
 
@@ -737,7 +812,17 @@ def _extract_lean_text(response: Any) -> str:
 
 
 def grade_verified_programming(item: dict[str, Any], response: Any) -> dict[str, Any]:
-    """Structural BRIDGE grading: signatures present, no sorry; oracle deferred."""
+    """Structural BRIDGE grading: signatures present, no sorry; oracle deferred.
+
+    The headline key is ``structural_pass``, NOT ``is_correct``. WHY: nothing is
+    compiled and the BRIDGE oracle input/output pairs are never executed here, so
+    the only evidence available is that the required signature text appears in
+    code and that no ``sorry``/``admit``/non-whitelisted axiom does. A submission
+    of ``def f (w : String) : Int := 0`` satisfies both while being wrong on
+    essentially every oracle case, so the signal is an upper bound on a verified
+    pass, never a verdict about the program. ``is_correct`` is retained only as a
+    compatibility alias (see :func:`_structural_verdict_row`).
+    """
     expected = item.get("expected") or {}
     lean = _extract_lean_text(response)
     signatures = expected.get("lean_signatures") or []
@@ -753,13 +838,14 @@ def grade_verified_programming(item: dict[str, Any], response: Any) -> dict[str,
     oracle = expected.get("oracle_tests") or {}
     has_oracle = bool(oracle.get("inputs")) and bool(oracle.get("expected_outputs"))
     is_solved = bool(lean.strip())
-    is_correct = is_solved and signatures_ok and axioms_ok
-    return {
-        "is_solved": is_solved,
-        "is_correct": is_correct,
-        "detail": {
+    structural_pass = is_solved and signatures_ok and axioms_ok
+    return _structural_verdict_row(
+        is_solved=is_solved,
+        structural_pass=structural_pass,
+        signals=["lean_signature_present", "no_sorry_or_admit_axioms"],
+        detail={
             "track": "verified_programming",
-            "method": "signature_and_oracle",
+            "method": "structural_signature_gate_only",
             "signatures_ok": signatures_ok,
             "signatures_matched": sig_hits,
             "axioms_ok": axioms_ok,
@@ -768,7 +854,7 @@ def grade_verified_programming(item: dict[str, Any], response: Any) -> dict[str,
             "oracle_executed": False,
             "oracle_note": "oracle execution requires live Lean; structural gate only",
         },
-    }
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -819,6 +905,15 @@ def grade_scientific_formalization(item: dict[str, Any], response: Any) -> dict[
 # --------------------------------------------------------------------------- #
 
 def grade_statement_target(item: dict[str, Any], response: Any) -> dict[str, Any]:
+    """Structural statement-target grading: the target statement (or its Lean
+    name) appears in code and the sorry/axiom gate passes.
+
+    Same defect class as :func:`grade_verified_programming`, so the same fix: the
+    headline key is ``structural_pass``. Nothing here compiles the submission, so
+    a pass means "the statement text is present and nothing obviously cheated",
+    which is a necessary condition for a Millennium-scale result and nowhere near
+    a sufficient one.
+    """
     expected = item.get("expected") or {}
     lean = _extract_lean_text(response)
     formal = item.get("formal") or expected.get("lean_name") or ""
@@ -831,19 +926,21 @@ def grade_statement_target(item: dict[str, Any], response: Any) -> dict[str, Any
     )
     axioms_ok, axiom_detail = _axioms_ok(lean, list(expected.get("axioms_whitelist") or AXIOMS_WHITELIST))
     is_solved = bool(lean.strip())
-    is_correct = is_solved and preserved and axioms_ok
-    return {
-        "is_solved": is_solved,
-        "is_correct": is_correct,
-        "detail": {
+    structural_pass = is_solved and preserved and axioms_ok
+    return _structural_verdict_row(
+        is_solved=is_solved,
+        structural_pass=structural_pass,
+        signals=["statement_text_present_in_code", "no_sorry_or_admit_axioms"],
+        detail={
             "track": "statement_target",
-            "method": "statement_preservation",
+            "method": "structural_statement_presence_only",
             "statement_preserved": preserved,
             "axioms_ok": axioms_ok,
             "axiom_detail": axiom_detail,
+            "compile_checked": False,
             "reference_pdf": expected.get("reference_pdf"),
         },
-    }
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -851,6 +948,13 @@ def grade_statement_target(item: dict[str, Any], response: Any) -> dict[str, Any
 # --------------------------------------------------------------------------- #
 
 def grade_external_artifact(item: dict[str, Any], response: Any) -> dict[str, Any]:
+    """Structural grading of a vendored external artifact (Putnam / Aristotle).
+
+    Same defect class as :func:`grade_verified_programming`: the evidence is a
+    header name appearing in code plus the sorry/axiom gate, with
+    ``compile_checked`` already declared ``False``. So the headline key is
+    ``structural_pass``, not ``is_correct``.
+    """
     expected = item.get("expected") or {}
     lean = _extract_lean_text(response) or str(item.get("formal") or "")
     headers = expected.get("headers") or []
@@ -860,11 +964,12 @@ def grade_external_artifact(item: dict[str, Any], response: Any) -> dict[str, An
     header_ok = not headers or any(h.get("name") in lean_code for h in headers)
     axioms_ok, axiom_detail = _axioms_ok(lean, list(expected.get("axioms_whitelist") or AXIOMS_WHITELIST))
     is_solved = bool(lean.strip())
-    is_correct = is_solved and header_ok and axioms_ok
-    return {
-        "is_solved": is_solved,
-        "is_correct": is_correct,
-        "detail": {
+    structural_pass = is_solved and header_ok and axioms_ok
+    return _structural_verdict_row(
+        is_solved=is_solved,
+        structural_pass=structural_pass,
+        signals=["declared_header_present_in_code", "no_sorry_or_admit_axioms"],
+        detail={
             "track": "external_artifact",
             "method": "structural_and_axiom_gate",
             "headers_ok": header_ok,
@@ -874,7 +979,7 @@ def grade_external_artifact(item: dict[str, Any], response: Any) -> dict[str, An
             "compile_checked": False,
             "note": "full compile/hardening requires live Lean suite",
         },
-    }
+    )
 
 
 # --------------------------------------------------------------------------- #

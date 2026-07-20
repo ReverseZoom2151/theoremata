@@ -736,13 +736,94 @@ def test_bridge178_loads_function_signature(monkeypatch, tmp_path):
     oracle = it["expected"]["oracle_tests"]
     assert oracle["bind"] == "kwargs"
     assert oracle["inputs"][0] == {"word": "abcde"}
-    # and grading is now actually correctable (non-empty signatures)
-    good = (
-        "```lean\ndef minimumPushes (word : String) : Int := 0\n```"
-    )
-    res = grade(it, good)
+    # and the signature gate can now actually fire (non-empty signatures)
+    res = grade(it, "```lean\ndef minimumPushes (word : String) : Int := 0\n```")
     assert res["detail"]["signatures_ok"] is True
-    assert res["is_correct"] is True
+
+
+def test_bridge178_constant_stub_is_a_structural_pass_not_a_correct_program(
+    monkeypatch, tmp_path
+):
+    # The assertion below is a true statement about the grader: a constant-zero
+    # body with the right signature clears every structural signal. What was
+    # wrong was calling that `is_correct`: the stub returns 0 for `"abcde"`
+    # where the shipped oracle expects 5, so it satisfies nothing. The key is
+    # now `structural_pass` and the verdict says so about itself.
+    _write_bridge(tmp_path, [_BRIDGE_RECORD])
+    monkeypatch.setenv("THEOREMATA_RESOURCES", str(tmp_path))
+    it = load_benchmark("bridge178")[0]
+    stub = "```lean\ndef minimumPushes (word : String) : Int := 0\n```"
+    res = grade(it, stub)
+
+    assert res["structural_pass"] is True
+    assert res["detail"]["structural_pass"] is True
+    # ... and nothing in the verdict claims the program was verified
+    assert res["verified"] is False
+    assert res["verification_status"] == "not_verified"
+    assert res["grading_mode"] == "structural_only"
+    assert res["detail"]["oracle_present"] is True
+    assert res["detail"]["oracle_executed"] is False
+    # the stub is wrong on the very first shipped oracle case
+    assert it["expected"]["oracle_tests"]["expected_outputs"][0] == 5
+
+
+def test_verified_programming_is_correct_is_only_a_documented_alias(
+    monkeypatch, tmp_path
+):
+    # `is_correct` is kept so the uniform grade() contract still works for the
+    # generic aggregators, but it must never disagree with `structural_pass` and
+    # must never be readable without the not-verified markers beside it.
+    _write_bridge(tmp_path, [_BRIDGE_RECORD])
+    monkeypatch.setenv("THEOREMATA_RESOURCES", str(tmp_path))
+    it = load_benchmark("bridge178")[0]
+    for response, expected_pass in (
+        ("```lean\ndef minimumPushes (word : String) : Int := 0\n```", True),
+        ("```lean\ndef somethingElse (w : String) : Int := 0\n```", False),
+        ("```lean\ndef minimumPushes (word : String) : Int := by sorry\n```", False),
+    ):
+        res = grade(it, response)
+        assert res["structural_pass"] is expected_pass
+        assert res["is_correct"] is res["structural_pass"]
+        assert res["verified"] is False
+        assert "mirrors `structural_pass`" in res["detail"]["is_correct_alias_note"]
+
+
+def _statement_target_item():
+    stmt = "theorem Riemann : True"
+    return make_item(
+        id="s", kind="statement_target", informal="", formal=stmt,
+        expected={"lean_name": "Riemann", "axioms_whitelist": ["propext"]},
+        grading={"track": "statement_target", "method": "statement_preservation"},
+    )
+
+
+def _external_artifact_item():
+    return make_item(
+        id="x", kind="external_artifact", informal="", formal="",
+        expected={"headers": [{"name": "putnam_2025_a1"}],
+                  "axioms_whitelist": ["propext"]},
+        grading={"track": "external_artifact", "method": "structural_and_axiom_gate"},
+    )
+
+
+def test_other_structural_tracks_report_structural_pass_too():
+    # Same defect, same fix: statement_target and external_artifact also score
+    # from text presence plus the sorry gate, with nothing compiled.
+    stmt_res = grade(_statement_target_item(), "theorem Riemann : True := by trivial")
+    assert stmt_res["structural_pass"] is True
+    assert stmt_res["is_correct"] is stmt_res["structural_pass"]
+    assert stmt_res["verified"] is False
+    assert stmt_res["detail"]["compile_checked"] is False
+
+    art_res = grade(_external_artifact_item(), "theorem putnam_2025_a1 : True := by trivial")
+    assert art_res["structural_pass"] is True
+    assert art_res["is_correct"] is art_res["structural_pass"]
+    assert art_res["verified"] is False
+    assert art_res["detail"]["compile_checked"] is False
+
+    # a commented-out mention still cannot buy a structural pass
+    planted = grade(_statement_target_item(), "-- theorem Riemann : True\nexample : True := trivial")
+    assert planted["structural_pass"] is False
 
 
 def test_bridge178_grade_correctable_on_real_corpus_if_present():
