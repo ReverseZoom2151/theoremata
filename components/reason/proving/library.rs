@@ -14,7 +14,10 @@
 //! * a [`DedupFn`] — **defaults to exact string equality** and is deliberately
 //!   shaped `Fn(candidate, existing) -> is_duplicate` so an external
 //!   subsumption-based deduper can be dropped in at integration without touching
-//!   this module;
+//!   this module. Because subsumption is asymmetric, the deduper is consulted in
+//!   both directions by the retention rule in [`retained_and_dropped`]: the more
+//!   general of two verified lemmas is kept and the more specific one is dropped
+//!   with a [`LemmaDrop`] record naming its subsumer;
 //! * an [`Evolver`] — proposes generalisations of a lemma along the four
 //!   [`EvolveDirection`] axes (and, optionally, solves a request).
 //!
@@ -42,6 +45,14 @@ pub type VerifierFn = Box<dyn Fn(&str, &str) -> bool>;
 /// The injected deduper: `(candidate_statement, existing_statement) ->
 /// is_duplicate`. Defaults to exact string equality (see
 /// [`LemmaLibrary::new`]); shaped to accept an external subsumption impl.
+///
+/// Read it as the *relation* "the second argument subsumes the first", because
+/// the retention rule ([`retained_and_dropped`]) calls it in **both** directions
+/// to tell a strictly-more-general lemma from a strictly-more-specific one. It
+/// must therefore be transitive, and it must not be symmetrised: an
+/// implementation that returns the same answer whichever way round it is called
+/// (as exact equality does) simply never reports supersession, which is the
+/// correct, conservative behaviour rather than a wrong one.
 pub type DedupFn = Box<dyn Fn(&str, &str) -> bool>;
 
 /// The four axes along which the evolver generalises a skill (LEGO-Prover).
@@ -103,6 +114,25 @@ enum AdmitOutcome {
     Rejected,
 }
 
+/// A lemma the retention rule dropped, together with the lemma that displaced it.
+///
+/// Every drop is materialised as one of these so the library can explain its own
+/// contents: a lemma that is in the store but not in [`LemmaLibrary::lemmas`]
+/// always has a matching record here naming its subsumer. A library that
+/// silently discards cannot be debugged, so nothing is dropped without a record.
+// No `Eq`: `Lemma` (db::LibraryLemma) is only `PartialEq`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LemmaDrop {
+    /// The lemma that lost. Still present in the underlying store (the store has
+    /// no delete), just not part of the retained library view.
+    pub dropped: Lemma,
+    /// Id of the lemma that subsumed it.
+    pub subsumed_by_id: String,
+    /// Statement of the lemma that subsumed it, denormalised so a drop record is
+    /// readable on its own without a second store round-trip.
+    pub subsumed_by_statement: String,
+}
+
 /// The tally an [`LemmaLibrary::evolve_round`] returns.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EvolveSummary {
@@ -145,6 +175,10 @@ impl<'a> LemmaLibrary<'a> {
     /// lemma subsumes it (α-equivalent, hypothesis-reordered, or strictly more
     /// general). This is the production deduper — it dominates exact-equality by
     /// also collapsing renamed/reordered/weaker restatements of the same skill.
+    ///
+    /// It is also asymmetric, so with this deduper the retention rule is live in
+    /// both directions: a candidate that is strictly more general than a stored
+    /// lemma is admitted and *displaces* it (see [`retained_and_dropped`]).
     pub fn with_subsumption_dedup(store: &'a Store, verifier: VerifierFn) -> Self {
         Self::new(
             store,
@@ -177,10 +211,18 @@ impl<'a> LemmaLibrary<'a> {
         Ok(outcome == AdmitOutcome::Admitted)
     }
 
-    /// The shared admission gate: verify, then dedup against every existing
-    /// lemma (including ones admitted earlier this round), then insert. Uses the
-    /// explicitly-passed verifier/deduper so both `record_lemma` (stored
+    /// The shared admission gate: verify, then dedup against every *retained*
+    /// existing lemma (including ones admitted earlier this round), then insert.
+    /// Uses the explicitly-passed verifier/deduper so both `record_lemma` (stored
     /// injections) and `evolve_round` (per-call injections) share one policy.
+    ///
+    /// Only the *forward* direction is decided here (an existing lemma subsumes
+    /// the candidate, so the candidate adds nothing). The backward direction (the
+    /// candidate subsumes an existing lemma) is deliberately *not* decided here:
+    /// it is settled by the retention rule in [`retained_and_dropped`], which
+    /// recomputes the retained view from the stored set on every read. Keeping
+    /// one rule in one place means admission order can never leave the library in
+    /// a state the rule would not have produced.
     fn try_admit(
         &self,
         project_id: &str,
@@ -193,7 +235,11 @@ impl<'a> LemmaLibrary<'a> {
         if !verifier(statement, proof) {
             return Ok(AdmitOutcome::Rejected);
         }
-        for existing in self.store.library_lemmas(project_id)? {
+        // Compare against the retained view, not the raw store: an already-dropped
+        // lemma must not be able to block a new candidate. That is safe because
+        // the dedup relations we support are transitive, so whatever subsumed the
+        // dropped lemma also subsumes anything the dropped lemma would subsume.
+        for existing in self.retained_lemmas(project_id, dedup)? {
             if dedup(statement, &existing.statement) {
                 return Ok(AdmitOutcome::Duplicate);
             }
@@ -208,9 +254,52 @@ impl<'a> LemmaLibrary<'a> {
         Ok(AdmitOutcome::Admitted)
     }
 
-    /// All admitted lemmas for a project.
+    /// The library's contents: every admitted lemma the retention rule keeps.
+    ///
+    /// Lemmas a more general lemma has displaced are excluded here and surface in
+    /// [`drops`](Self::drops) instead; [`all_lemmas`](Self::all_lemmas) is the
+    /// unfiltered store view.
     pub fn lemmas(&self, project_id: &str) -> Result<Vec<Lemma>> {
+        self.retained_lemmas(project_id, self.dedup.as_ref())
+    }
+
+    /// Every lemma ever admitted, retained or dropped, in store order. Use this
+    /// to audit; use [`lemmas`](Self::lemmas) as the library.
+    pub fn all_lemmas(&self, project_id: &str) -> Result<Vec<Lemma>> {
         self.store.library_lemmas(project_id)
+    }
+
+    /// The drop ledger: every lemma the retention rule dropped, each naming the
+    /// lemma that subsumed it. `lemmas() + drops()` partitions `all_lemmas()`.
+    pub fn drops(&self, project_id: &str) -> Result<Vec<LemmaDrop>> {
+        Ok(self.partition(project_id, self.dedup.as_ref())?.1)
+    }
+
+    /// The retained view under an explicitly-passed deduper (so `evolve_round`,
+    /// which takes a per-call deduper, applies the same rule it was handed).
+    fn retained_lemmas(
+        &self,
+        project_id: &str,
+        dedup: &dyn Fn(&str, &str) -> bool,
+    ) -> Result<Vec<Lemma>> {
+        Ok(self.partition(project_id, dedup)?.0)
+    }
+
+    /// Recompute `(retained, dropped)` from the store under `dedup`.
+    ///
+    /// Recomputing rather than persisting a "retired" flag is what makes the
+    /// library reproducible: the retained set is a pure function of the stored
+    /// lemmas and the injected relation, so it cannot drift from the rule and
+    /// does not depend on the order calls happened to arrive in.
+    fn partition(
+        &self,
+        project_id: &str,
+        dedup: &dyn Fn(&str, &str) -> bool,
+    ) -> Result<(Vec<Lemma>, Vec<LemmaDrop>)> {
+        Ok(retained_and_dropped(
+            self.store.library_lemmas(project_id)?,
+            dedup,
+        ))
     }
 
     /// k-NN retrieval over the lemma store: rank every lemma by cosine
@@ -219,9 +308,11 @@ impl<'a> LemmaLibrary<'a> {
     /// spliceable. Deterministic (stable id tie-break).
     pub fn retrieve(&self, project_id: &str, query: &str, k: usize) -> Result<Vec<Lemma>> {
         let qv = embed(query);
+        // Retrieval serves the retained view only: answering a query with a
+        // lemma that a more general one has displaced is exactly the redundancy
+        // the retention rule exists to remove.
         let mut scored: Vec<(f64, Lemma)> = self
-            .store
-            .library_lemmas(project_id)?
+            .lemmas(project_id)?
             .into_iter()
             .map(|l| (cosine(&embed(&l.statement), &qv), l))
             .collect();
@@ -233,9 +324,19 @@ impl<'a> LemmaLibrary<'a> {
         Ok(scored.into_iter().take(k).map(|(_, l)| l).collect())
     }
 
-    /// The evolver scheduler pick: the least-`update_count` lemma.
+    /// The evolver scheduler pick: the least-`update_count` retained lemma, ties
+    /// broken oldest-created then id. Dropped lemmas are skipped because
+    /// evolving a displaced statement spends the budget re-deriving what its
+    /// subsumer already covers.
     pub fn next_to_evolve(&self, project_id: &str) -> Result<Option<Lemma>> {
-        self.store.next_library_lemma_to_evolve(project_id)
+        let mut lemmas = self.lemmas(project_id)?;
+        lemmas.sort_by(|a, b| {
+            a.update_count
+                .cmp(&b.update_count)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(lemmas.into_iter().next())
     }
 
     // --- request store ----------------------------------------------------
@@ -361,6 +462,108 @@ impl<'a> LemmaLibrary<'a> {
         }
         Ok(())
     }
+}
+
+// --- the retention rule ----------------------------------------------------
+
+/// Split `lemmas` (in store order, oldest first) into the retained library and
+/// the drop ledger under the dedup relation `dedup(a, b) == "b subsumes a"`.
+///
+/// # The retention rule
+///
+/// For two already-verified lemmas `A` and `B`, with
+/// `a_sub_b = dedup(b, a)` ("A subsumes B") and `b_sub_a = dedup(a, b)`:
+///
+/// * `a_sub_b && !b_sub_a`: A is strictly more general. **Keep A, drop B.**
+/// * `b_sub_a && !a_sub_b`: B is strictly more general. **Keep B, drop A.**
+/// * both: mutual subsumption (α-equivalent / hypothesis-reordered restatements
+///   of the same skill). **Keep the incumbent**, i.e. the one that reached the
+///   store first (oldest `created_at`, id as tie-break); drop the newcomer.
+/// * neither: unrelated. **Keep both.**
+///
+/// ## Why keeping the more general one is the sound direction
+///
+/// Subsumption is asymmetric: a proof of a more general statement discharges a
+/// more specific one, never the reverse. If A subsumes B, then every query B
+/// legitimately answers is also answered by A, so dropping B loses no reachable
+/// conclusion. Dropping A instead would leave the library answering a query that
+/// matches A with B, whose extra hypotheses (or narrower conclusion) were never
+/// established for that query. That is unsound, not untidy, which is why the
+/// direction is spelled out here rather than left implicit in a comparison.
+///
+/// Graduation is untouched: both lemmas in every pair above already passed the
+/// verifier. This rule only chooses which of two verified lemmas the library
+/// keeps.
+///
+/// ## Why oldest-wins for mutual subsumption
+///
+/// Mutual subsumption means the two are interchangeable, so soundness does not
+/// pick for us and something else must, deterministically. The incumbent wins:
+/// it is the one downstream retrieval may already have cited, it carries the
+/// accumulated `update_count` the evolver scheduler reads, and "oldest wins" is
+/// stable under replay of the same admission sequence. A rule like "prefer the
+/// shorter statement" would instead let an unrelated edit reshuffle the library.
+///
+/// The dropped lemma is never lost silently: each drop yields a [`LemmaDrop`]
+/// naming its subsumer. Chains are reported honestly, so if C displaced B and B
+/// had already displaced A, the ledger holds both `A <- B` and `B <- C`.
+///
+/// Cost is O(n^2) `dedup` calls; the lemma store is small by construction (it
+/// holds distinct skills, not attempts), and recomputation buys reproducibility.
+pub fn retained_and_dropped(
+    lemmas: Vec<Lemma>,
+    dedup: &dyn Fn(&str, &str) -> bool,
+) -> (Vec<Lemma>, Vec<LemmaDrop>) {
+    let mut retained: Vec<Lemma> = Vec::new();
+    let mut drops: Vec<LemmaDrop> = Vec::new();
+
+    for lemma in lemmas {
+        // Index of a retained lemma that subsumes this one, and the retained
+        // lemmas this one strictly supersedes.
+        let mut subsumer: Option<usize> = None;
+        let mut superseded: Vec<usize> = Vec::new();
+        for (i, r) in retained.iter().enumerate() {
+            if dedup(&lemma.statement, &r.statement) {
+                // r subsumes lemma. Checked first, so the mutual case resolves
+                // in favour of r, the incumbent.
+                subsumer = Some(i);
+                break;
+            }
+            if dedup(&r.statement, &lemma.statement) {
+                superseded.push(i);
+            }
+        }
+
+        match subsumer {
+            Some(i) => drops.push(LemmaDrop {
+                subsumed_by_id: retained[i].id.clone(),
+                subsumed_by_statement: retained[i].statement.clone(),
+                dropped: lemma,
+            }),
+            None => {
+                // Remove back-to-front so the earlier indices stay valid.
+                for i in superseded.into_iter().rev() {
+                    let loser = retained.remove(i);
+                    drops.push(LemmaDrop {
+                        subsumed_by_id: lemma.id.clone(),
+                        subsumed_by_statement: lemma.statement.clone(),
+                        dropped: loser,
+                    });
+                }
+                retained.push(lemma);
+            }
+        }
+    }
+
+    // Ledger order is the dropped lemmas' own store order, not the order the
+    // scan happened to remove them in, so the ledger reads the same every time.
+    drops.sort_by(|a, b| {
+        a.dropped
+            .created_at
+            .cmp(&b.dropped.created_at)
+            .then_with(|| a.dropped.id.cmp(&b.dropped.id))
+    });
+    (retained, drops)
 }
 
 // --- deterministic hashing-trick embedding --------------------------------
@@ -502,6 +705,193 @@ mod tests {
             .unwrap());
         // Exactly the two genuinely-distinct lemmas survived.
         assert_eq!(lib.lemmas(&pid).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn general_lemma_displaces_the_specific_one_it_subsumes() {
+        // Backward direction: the specific lemma lands first, then a strictly
+        // more general one arrives. The general one is admitted AND the specific
+        // one leaves the library, because every query the specific one answered
+        // is answered by the general one.
+        let (store, pid) = store_with_project();
+        let lib = LemmaLibrary::with_subsumption_dedup(&store, pattern_verifier());
+
+        assert!(lib
+            .record_lemma(&pid, "P x, Q y ⊢ R z", "by tac", "specific")
+            .unwrap());
+        assert!(lib
+            .record_lemma(&pid, "P x ⊢ R z", "by tac", "general")
+            .unwrap());
+
+        let kept = lib.lemmas(&pid).unwrap();
+        assert_eq!(kept.len(), 1, "only the general lemma is retained");
+        assert_eq!(kept[0].statement, "P x ⊢ R z");
+        // The store still holds both; it is the library *view* that narrowed.
+        assert_eq!(lib.all_lemmas(&pid).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn specific_lemma_never_displaces_the_general_one() {
+        // The asymmetry, and the soundness test. Same pair as above in the other
+        // order: the specific lemma must not be admitted, and must certainly not
+        // evict the general lemma. Answering a query that matches "P x ⊢ R z"
+        // with "P x, Q y ⊢ R z" would assume Q y, which was never established.
+        let (store, pid) = store_with_project();
+        let lib = LemmaLibrary::with_subsumption_dedup(&store, pattern_verifier());
+
+        assert!(lib
+            .record_lemma(&pid, "P x ⊢ R z", "by tac", "general")
+            .unwrap());
+        assert!(
+            !lib.record_lemma(&pid, "P x, Q y ⊢ R z", "by tac", "specific")
+                .unwrap(),
+            "a more specific lemma adds nothing and must not be admitted"
+        );
+
+        let kept = lib.lemmas(&pid).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            kept[0].statement, "P x ⊢ R z",
+            "the general lemma must survive"
+        );
+        assert_eq!(
+            kept[0].provenance, "general",
+            "the surviving lemma is the original general one, not a replacement"
+        );
+    }
+
+    #[test]
+    fn mutual_subsumption_resolves_to_the_incumbent() {
+        // α-equivalent restatements subsume each other, so soundness does not
+        // pick a winner and the documented tie-break must: oldest wins.
+        let (store, pid) = store_with_project();
+        let lib = LemmaLibrary::with_subsumption_dedup(&store, pattern_verifier());
+
+        assert!(lib
+            .record_lemma(&pid, "⊢ ∀ x, P x", "by intro", "first")
+            .unwrap());
+        assert!(!lib
+            .record_lemma(&pid, "⊢ ∀ y, P y", "by intro", "second")
+            .unwrap());
+
+        let kept = lib.lemmas(&pid).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].provenance, "first", "the incumbent wins ties");
+
+        // And the same input in the opposite order keeps the other statement:
+        // the rule is order-stable, not statement-preferential.
+        let (store2, pid2) = store_with_project();
+        let lib2 = LemmaLibrary::with_subsumption_dedup(&store2, pattern_verifier());
+        lib2.record_lemma(&pid2, "⊢ ∀ y, P y", "by intro", "first")
+            .unwrap();
+        lib2.record_lemma(&pid2, "⊢ ∀ x, P x", "by intro", "second")
+            .unwrap();
+        let kept2 = lib2.lemmas(&pid2).unwrap();
+        assert_eq!(kept2.len(), 1);
+        assert_eq!(kept2[0].statement, "⊢ ∀ y, P y");
+    }
+
+    #[test]
+    fn dropped_lemmas_are_recorded_with_their_subsumer() {
+        // Nothing is lost silently: both a rejected-at-admission drop and a
+        // displaced-after-the-fact drop appear in the ledger with a subsumer.
+        let (store, pid) = store_with_project();
+        let lib = LemmaLibrary::with_subsumption_dedup(&store, pattern_verifier());
+
+        lib.record_lemma(&pid, "P x, Q y ⊢ R z", "by tac", "specific")
+            .unwrap();
+        lib.record_lemma(&pid, "P x ⊢ R z", "by tac", "general")
+            .unwrap();
+
+        let drops = lib.drops(&pid).unwrap();
+        assert_eq!(drops.len(), 1);
+        assert_eq!(drops[0].dropped.statement, "P x, Q y ⊢ R z");
+        assert_eq!(drops[0].subsumed_by_statement, "P x ⊢ R z");
+        let general = lib.lemmas(&pid).unwrap()[0].clone();
+        assert_eq!(drops[0].subsumed_by_id, general.id);
+
+        // retained + dropped partitions the store: nothing falls off the edge.
+        assert_eq!(
+            lib.lemmas(&pid).unwrap().len() + drops.len(),
+            lib.all_lemmas(&pid).unwrap().len()
+        );
+    }
+
+    #[test]
+    fn a_chain_of_generalisations_leaves_one_survivor_and_an_explained_ledger() {
+        // Increasingly general lemmas arrive in turn. Each is admitted (nothing
+        // stored subsumes it yet) and displaces its predecessor, so the library
+        // converges on the most general one while the ledger records the chain.
+        let (store, pid) = store_with_project();
+        let lib = LemmaLibrary::with_subsumption_dedup(&store, pattern_verifier());
+
+        assert!(lib
+            .record_lemma(&pid, "A, B, C ⊢ R", "by tac", "s0")
+            .unwrap());
+        assert!(lib.record_lemma(&pid, "A, B ⊢ R", "by tac", "s1").unwrap());
+        assert!(lib.record_lemma(&pid, "A ⊢ R", "by tac", "s2").unwrap());
+
+        let kept = lib.lemmas(&pid).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].statement, "A ⊢ R");
+
+        // Each loser names the lemma that displaced it, so following
+        // `subsumed_by` from any dropped lemma terminates at a retained one.
+        let drops = lib.drops(&pid).unwrap();
+        assert_eq!(drops.len(), 2);
+        assert_eq!(drops[0].dropped.statement, "A, B, C ⊢ R");
+        assert_eq!(drops[0].subsumed_by_statement, "A, B ⊢ R");
+        assert_eq!(drops[1].dropped.statement, "A, B ⊢ R");
+        assert_eq!(drops[1].subsumed_by_statement, "A ⊢ R");
+    }
+
+    #[test]
+    fn unrelated_lemmas_both_survive() {
+        // Different conclusions: neither subsumes the other, so the rule must
+        // keep both. A retention rule that over-drops is as useless as one that
+        // never drops.
+        let (store, pid) = store_with_project();
+        let lib = LemmaLibrary::with_subsumption_dedup(&store, pattern_verifier());
+
+        assert!(lib.record_lemma(&pid, "P x ⊢ Q x", "by tac", "s1").unwrap());
+        assert!(lib.record_lemma(&pid, "P x ⊢ R x", "by tac", "s2").unwrap());
+        assert_eq!(lib.lemmas(&pid).unwrap().len(), 2);
+        assert!(lib.drops(&pid).unwrap().is_empty());
+    }
+
+    #[test]
+    fn displaced_lemma_is_not_retrieved_or_evolved() {
+        // The retained view is what the rest of the system sees: a displaced
+        // lemma must not come back through retrieval or the evolver scheduler.
+        let (store, pid) = store_with_project();
+        let lib = LemmaLibrary::with_subsumption_dedup(&store, pattern_verifier());
+
+        lib.record_lemma(&pid, "P x, Q y ⊢ R z", "by tac", "specific")
+            .unwrap();
+        lib.record_lemma(&pid, "P x ⊢ R z", "by tac", "general")
+            .unwrap();
+
+        let hits = lib.retrieve(&pid, "P x, Q y ⊢ R z", 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].statement, "P x ⊢ R z");
+
+        let pick = lib.next_to_evolve(&pid).unwrap().unwrap();
+        assert_eq!(pick.statement, "P x ⊢ R z");
+    }
+
+    #[test]
+    fn exact_dedup_never_displaces() {
+        // Exact equality is symmetric, so it can only ever report the mutual
+        // case, and duplicates are refused at admission. An exact-dedup library
+        // therefore retains everything it stored: the retention rule is inert.
+        let (store, pid) = store_with_project();
+        let lib = LemmaLibrary::with_exact_dedup(&store, pattern_verifier());
+
+        lib.record_lemma(&pid, "P x ⊢ R z", "by tac", "s1").unwrap();
+        lib.record_lemma(&pid, "P x, Q y ⊢ R z", "by tac", "s2")
+            .unwrap();
+        assert_eq!(lib.lemmas(&pid).unwrap().len(), 2);
+        assert!(lib.drops(&pid).unwrap().is_empty());
     }
 
     #[test]
