@@ -24,6 +24,8 @@ from theoremata_tools.cert_log import (  # noqa: E402
     FORMAT,
     check_cert_log,
     export_asymptotic_cert,
+    export_fp_error_bound_cert,
+    export_fp_rounding_cert,
     export_geometry_cert,
     export_lp_cert,
     export_subsumption_cert,
@@ -331,6 +333,172 @@ def test_subsumption_valid_and_tampered():
         if step["op"] == "subsumption_relation":
             step["subsumed"] = ["P(a)", "R(a)"]  # Q(a) gone
     assert check_cert_log(bad)["valid"] is False
+
+
+# --------------------------------------------------------------------------- #
+# Floating-point kinds: fp_rounding + fp_error_bound.
+#
+# These are re-checked with EXACT rational arithmetic.  fp_error_bound is checked
+# in full; fp_rounding is checked exactly in an unbounded-exponent model and
+# WITHHELDS (never passes) for a mode it does not model or an irrational exact
+# expression.  A wrong certificate (a bound the numbers break, a mis-rounding) is
+# rejected.
+# --------------------------------------------------------------------------- #
+
+def _double(x):
+    """Exact value of ``x`` rounded to a binary64 double, as a string rational.
+
+    ``float(Fraction)`` is round-nearest-even to binary64, so this yields a value
+    the checker's own rounding must reproduce (independent recomputation, not a
+    shared code path).
+    """
+    from fractions import Fraction
+    return str(Fraction(float(x)))
+
+
+def test_fp_rounding_valid_and_json_roundtrip():
+    # 1/3 correctly rounded to a 53-bit double under round-nearest-even.
+    from fractions import Fraction
+    exact = {"op": "div", "args": ["1", "3"]}
+    log = export_fp_rounding_cert(precision=53, mode="nearest_even",
+                                  exact=exact, computed=_double(Fraction(1, 3)))
+    assert log["kind"] == "fp_rounding"
+    res = check_cert_log(log)
+    assert res["valid"] is True, res
+    assert res["status"] == "verified"
+    assert check_cert_log(_roundtrip(log))["valid"] is True
+
+
+def test_fp_rounding_directed_mode_validates():
+    # toward_zero truncation of 1/3 at 4 bits is 5/16 (see module sanity check).
+    log = export_fp_rounding_cert(precision=4, mode="toward_zero",
+                                  exact={"op": "div", "args": ["1", "3"]},
+                                  computed="5/16")
+    assert check_cert_log(log)["valid"] is True
+
+
+def test_fp_rounding_wrong_value_is_rejected():
+    # Claim the double nearest 1/3 equals the double nearest 2/3: a real
+    # counterexample, the correctly-rounded value differs.
+    from fractions import Fraction
+    log = export_fp_rounding_cert(precision=53, mode="nearest_even",
+                                  exact={"op": "div", "args": ["1", "3"]},
+                                  computed=_double(Fraction(2, 3)))
+    res = check_cert_log(log)
+    assert res["valid"] is False
+    assert res["status"] == "rejected"
+    assert "correctly-rounded" in res["reason"]
+
+
+def test_fp_rounding_non_representable_computed_rejected():
+    # 1/3 is not a dyadic p-bit float, so it cannot be any rounding result.
+    log = export_fp_rounding_cert(precision=53, mode="nearest_even",
+                                  exact={"op": "div", "args": ["1", "3"]},
+                                  computed="1/3")
+    res = check_cert_log(log)
+    assert res["valid"] is False
+    assert res["status"] == "rejected"
+    assert "p-bit float" in res["reason"] or "53-bit float" in res["reason"]
+
+
+def test_fp_rounding_unmodeled_mode_withholds():
+    # A mode the checker does not implement: WITHHELD, never a pass.
+    from fractions import Fraction
+    log = export_fp_rounding_cert(precision=53, mode="stochastic",
+                                  exact={"op": "div", "args": ["1", "3"]},
+                                  computed=_double(Fraction(1, 3)))
+    res = check_cert_log(log)
+    assert res["valid"] is False
+    assert res["status"] == "withheld"
+    assert "WITHHELD" in res["verified_statement"]
+
+
+def test_fp_rounding_irrational_exact_withholds():
+    # correct rounding of sqrt(2) is a legitimate claim we cannot evaluate
+    # exactly: the checker must WITHHOLD, not pass, and not falsely reject.
+    import math
+    from fractions import Fraction
+    # A genuine 53-bit double as the (representable) computed value, so the
+    # withhold comes from the irrational exact side, not from representability.
+    computed = str(Fraction(math.sqrt(2)))
+    log = export_fp_rounding_cert(precision=53, mode="nearest_even",
+                                  exact={"op": "sqrt", "args": ["2"]},
+                                  computed=computed)
+    res = check_cert_log(log)
+    assert res["valid"] is False
+    assert res["status"] == "withheld", res
+
+
+def test_fp_rounding_float_literal_is_refused():
+    # The checker must not silently decimal-round a raw float literal.
+    log = export_fp_rounding_cert(precision=53, mode="nearest_even",
+                                  exact={"op": "div", "args": ["1", "3"]},
+                                  computed="1/3")
+    # Inject a raw float where an exact literal is required.
+    for step in log["steps"]:
+        if step["op"] == "fp_value":
+            step["computed"] = 0.3333333333333333
+    res = check_cert_log(log)
+    assert res["valid"] is False
+    assert "float literal" in res["reason"]
+
+
+def test_fp_error_bound_valid_and_json_roundtrip():
+    # |0.5 - 1/3| = 1/6 <= 1/4.
+    log = export_fp_error_bound_cert(computed="1/2",
+                                     exact={"op": "div", "args": ["1", "3"]},
+                                     bound="1/4")
+    assert log["kind"] == "fp_error_bound"
+    assert check_cert_log(log)["valid"] is True
+    assert check_cert_log(_roundtrip(log))["valid"] is True
+
+
+def test_fp_error_bound_violation_is_rejected():
+    # |0.5 - 1/3| = 1/6 > 1/10: a genuine counterexample the numbers break.
+    log = export_fp_error_bound_cert(computed="1/2",
+                                     exact={"op": "div", "args": ["1", "3"]},
+                                     bound="1/10")
+    res = check_cert_log(log)
+    assert res["valid"] is False
+    assert res["status"] == "rejected"
+    assert "exceeds bound" in res["reason"]
+
+
+def test_fp_error_bound_negative_bound_is_rejected():
+    log = export_fp_error_bound_cert(computed="1/2", exact="1/2", bound="-1")
+    res = check_cert_log(log)
+    assert res["valid"] is False
+    assert "negative" in res["reason"]
+
+
+def test_fp_error_bound_exact_expression_arithmetic():
+    # exact = (1 + 1/2) * 2 - 1 = 2 ; |computed 2 - 2| = 0 <= 0.
+    exact = {"op": "sub", "args": [
+        {"op": "mul", "args": [{"op": "add", "args": ["1", "1/2"]}, "2"]}, "1"]}
+    log = export_fp_error_bound_cert(computed="2", exact=exact, bound="0")
+    assert check_cert_log(log)["valid"] is True
+
+
+def test_fp_run_export_then_check_roundtrip():
+    from fractions import Fraction
+    exported = run({"op": "export", "kind": "fp_rounding", "precision": 53,
+                    "mode": "nearest_even", "exact": {"op": "div", "args": ["1", "3"]},
+                    "computed": _double(Fraction(1, 3))})
+    assert "log" in exported
+    assert run({"op": "check", "log": exported["log"]})["valid"] is True
+
+    exported2 = run({"op": "export", "kind": "fp_error_bound", "computed": "1/2",
+                     "exact": {"op": "div", "args": ["1", "3"]}, "bound": "1/4"})
+    assert run({"op": "check", "log": exported2["log"]})["valid"] is True
+
+
+def test_fp_kinds_are_registered_and_recognized():
+    # The reconciled KINDS must recognize the two new fp kinds as OWN kinds
+    # (checked here), never as foreign or unknown.
+    for k in ("fp_rounding", "fp_error_bound"):
+        assert k in cl.KINDS
+        assert k in cl._KIND_OPS
+        assert k not in cl.FOREIGN_KIND_OWNERS
 
 
 # --------------------------------------------------------------------------- #

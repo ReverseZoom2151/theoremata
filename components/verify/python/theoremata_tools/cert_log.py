@@ -60,7 +60,14 @@ CAKEML_TARGET = (
 # shared by a family of sibling checker modules (``cert_sturm``, ``cert_sos``,
 # ...), each of which owns its own kinds and its own independent checker.  Keep
 # this tuple in lockstep with ``_KIND_OPS`` below; a test enforces that.
-KINDS = ("lp_primal_dual", "lp_farkas", "asymptotic", "wu_geometry", "subsumption")
+#
+# ``fp_rounding`` and ``fp_error_bound`` are floating-point certificate kinds
+# owned and re-checked HERE (not by a sibling module), added because the ATP
+# mining corpus flagged them as the two highest-confidence new numeric kinds.
+# Both are validated with exact rational arithmetic; see their handlers for the
+# precise soundness boundary (what is checked exactly vs what is withheld).
+KINDS = ("lp_primal_dual", "lp_farkas", "asymptotic", "wu_geometry",
+         "subsumption", "fp_rounding", "fp_error_bound")
 
 # Kinds in the SAME proof-log format that are owned (and validated) by a sibling
 # module.  Purpose: report such a document as *not checked here, checked over
@@ -93,6 +100,13 @@ FOREIGN_KIND_OWNERS = {
 STATUS_VERIFIED = "verified"             # steps re-verified here
 STATUS_REJECTED = "rejected"             # malformed/tampered/unsatisfied: refuted
 STATUS_UNSUPPORTED = "unsupported_kind"  # a sibling module's kind: UNKNOWN here
+# WITHHELD is the honest "I cannot decide this" verdict for a kind we DO own but
+# whose specific instance falls outside what this checker can verify exactly (an
+# unmodeled rounding mode, or an exact expression using an irrational operation).
+# It is fail-closed: withheld carries valid=False, so it is never a pass, but it
+# is deliberately distinct from a refutation. A checker that can only partially
+# verify must land here rather than fabricate a pass.
+STATUS_WITHHELD = "withheld"             # well-formed but undecidable exactly here
 
 
 # --------------------------------------------------------------------------- #
@@ -492,6 +506,255 @@ def export_subsumption_cert(subsumer: list, subsumed: list,
 
 
 # --------------------------------------------------------------------------- #
+# Floating-point certificate helpers (fp_rounding, fp_error_bound).
+#
+# Soundness boundary for these two kinds:
+#  * All arithmetic is exact rational (fractions.Fraction). We never touch a
+#    hardware/Python float during checking, so nothing here inherits float drift.
+#  * ``fp_error_bound`` is checked in FULL: it recomputes |computed - exact| as
+#    an exact rational and compares it to the stated bound. No part is asserted.
+#  * ``fp_rounding`` is checked EXACTLY in an unbounded-exponent model: it
+#    recomputes the correctly-rounded value of the exact expression at the stated
+#    significand precision and rounding mode and compares. What is deliberately
+#    NOT modeled: IEEE-754 subnormal (gradual underflow), overflow to infinity,
+#    and NaN. Those are exponent-range concerns; the rounding of a finite value
+#    to a p-bit significand is exact and complete in this model. An instance that
+#    needs a mode we do not implement, or an exact expression that uses an
+#    irrational operation (sqrt, exp, ...), is WITHHELD, never passed.
+# --------------------------------------------------------------------------- #
+
+# Rounding modes implemented exactly here. Any other declared mode is WITHHELD
+# (undecided), because passing a rounding rule we do not model would be a
+# fabricated verdict.
+_FP_MODES = frozenset(
+    ("nearest_even", "toward_zero", "toward_pos", "toward_neg", "away_zero")
+)
+
+# Exact expression node ops we can evaluate over the rationals.
+_FP_EXACT_BINOPS = frozenset(("add", "sub", "mul", "div"))
+
+# Real operations that yield a legitimate rounding claim whose exact value is
+# generally irrational. We cannot form them as an exact rational, so a
+# certificate whose exact expression uses one is WITHHELD: a fuller checker
+# could decide it; this reference checker soundly declines instead of guessing.
+_FP_INEXACT_OPS = frozenset(
+    ("sqrt", "cbrt", "root", "exp", "log", "ln", "log2", "log10",
+     "sin", "cos", "tan", "atan", "asin", "acos", "pi", "e", "pow")
+)
+
+
+def _exact_rat(x: Any) -> Fraction:
+    """Parse an fp numeric literal, refusing raw floats.
+
+    A Python ``float`` literal would be silently decimal-rounded by
+    ``_frac(str(float))`` and so lose its exact binary identity; fp certificates
+    must carry EXACT numbers (integers or string rationals like ``"p/q"``), so a
+    float here is rejected rather than approximated.
+    """
+    if isinstance(x, float):
+        raise _Reject("fp certificate carries a float literal; pass an exact "
+                      "integer or a string rational instead")
+    return _frac(x)
+
+
+def _eval_fp_exact(node: Any, depth: int = 0) -> Fraction:
+    """Evaluate an fp exact expression to an exact rational.
+
+    A node is either a numeric literal or ``{"op": ..., "args": [...]}``. Only
+    the four rational field operations are evaluated; a recognized-but-irrational
+    operation withholds (see ``_FP_INEXACT_OPS``), and anything else is malformed.
+    """
+    if depth > 64:
+        raise _Reject("fp exact expression nested too deeply")
+    if isinstance(node, dict):
+        op = node.get("op")
+        if op in _FP_INEXACT_OPS:
+            # WHY withhold: the value is real but generally irrational; forming it
+            # as an exact rational is impossible here, so we decline (not pass).
+            raise _Withhold(f"fp exact op {op!r} is not exactly evaluable here")
+        args = node.get("args")
+        if not isinstance(args, list) or not args:
+            raise _Reject("fp exact expression: op needs a non-empty args list")
+        if op == "neg":
+            return -_eval_fp_exact(args[0], depth + 1)
+        if op in _FP_EXACT_BINOPS:
+            if len(args) < 2:
+                raise _Reject(f"fp exact op {op!r} needs at least two args")
+            acc = _eval_fp_exact(args[0], depth + 1)
+            for a in args[1:]:
+                b = _eval_fp_exact(a, depth + 1)
+                if op == "add":
+                    acc = acc + b
+                elif op == "sub":
+                    acc = acc - b
+                elif op == "mul":
+                    acc = acc * b
+                else:  # div
+                    if b == 0:
+                        raise _Reject("fp exact division by zero")
+                    acc = acc / b
+            return acc
+        raise _Reject(f"fp exact expression: unknown op {op!r}")
+    return _exact_rat(node)
+
+
+def _trailing_zeros(n: int) -> int:
+    n = abs(int(n))
+    if n == 0:
+        return 0
+    tz = 0
+    while (n & 1) == 0:
+        n >>= 1
+        tz += 1
+    return tz
+
+
+def _is_p_bit_float(c: Fraction, p: int) -> bool:
+    """True iff ``c`` is representable with a ``p``-bit significand.
+
+    Unbounded-exponent model: ``c`` must be a dyadic rational (power-of-two
+    denominator) whose significant-bit width is at most ``p``. A correctly-rounded
+    result is always such a value, so a ``computed`` field that fails this is
+    provably not a rounding result.
+    """
+    if c == 0:
+        return True
+    a = -c if c < 0 else c
+    n, d = a.numerator, a.denominator
+    if d & (d - 1) != 0:            # denominator not a power of two -> not dyadic
+        return False
+    width = n.bit_length() - _trailing_zeros(n)
+    return width <= p
+
+
+def _floor_log2(a: Fraction) -> int:
+    """floor(log2(a)) for exact ``a > 0``; bit-length estimate, then corrected."""
+    approx = a.numerator.bit_length() - a.denominator.bit_length()
+    while (Fraction(2) ** approx) > a:
+        approx -= 1
+    while (Fraction(2) ** (approx + 1)) <= a:
+        approx += 1
+    return approx
+
+
+def _round_bump(frac: Fraction, m0: int, sign: int, mode: str) -> bool:
+    """Whether the p-bit mantissa ``m0`` rounds UP by one, given fractional part.
+
+    ``frac`` is in ``[0, 1)``; ``sign`` is the sign of the value; ``mode`` is one
+    of ``_FP_MODES`` (validated by the caller).
+    """
+    if frac == 0:
+        return False
+    if mode == "toward_zero":
+        return False
+    if mode == "away_zero":
+        return True
+    if mode == "toward_pos":
+        return sign > 0
+    if mode == "toward_neg":
+        return sign < 0
+    # nearest_even (round half to even).
+    if frac < Fraction(1, 2):
+        return False
+    if frac > Fraction(1, 2):
+        return True
+    return (m0 % 2) == 1
+
+
+def _round_to_precision(e: Fraction, p: int, mode: str) -> Fraction:
+    """Correctly round exact ``e`` to a ``p``-bit significand under ``mode``.
+
+    Returns the exact rational value of the rounded float. Unbounded exponent:
+    no overflow/underflow, so every finite ``e`` has a well-defined result.
+    """
+    if e == 0:
+        return Fraction(0)
+    sign = 1 if e > 0 else -1
+    a = e if e > 0 else -e
+    # Scale so floor(a / 2^s) has exactly p bits: 2^(p-1) <= a / 2^s < 2^p.
+    s = _floor_log2(a) - (p - 1)
+    scaled = a / (Fraction(2) ** s)
+    # Correct any off-by-one left by the log2 estimate.
+    while scaled >= (1 << p):
+        s += 1
+        scaled = a / (Fraction(2) ** s)
+    while scaled < (1 << (p - 1)):
+        s -= 1
+        scaled = a / (Fraction(2) ** s)
+    m0 = scaled.numerator // scaled.denominator
+    frac = scaled - m0
+    m = m0 + 1 if _round_bump(frac, m0, sign, mode) else m0
+    if m == (1 << p):   # rounding carried into a new bit: renormalize.
+        m //= 2
+        s += 1
+    return sign * m * (Fraction(2) ** s)
+
+
+def _fp_lit(x: Any) -> Any:
+    """Serialize an fp literal to an exact string, preserving a float's value.
+
+    Producer-side convenience: a caller may hand us a real ``float`` (e.g. the
+    machine result it computed); we snapshot its EXACT binary value via
+    ``Fraction(float)`` so the emitted log carries no decimal drift. The checker
+    itself never accepts a float (see ``_exact_rat``).
+    """
+    if isinstance(x, Fraction):
+        return _fs(x)
+    if isinstance(x, float):
+        return _fs(Fraction(x))
+    return x
+
+
+def export_fp_rounding_cert(*, precision: int, mode: str, exact: Any,
+                            computed: Any, claim: Optional[str] = None) -> dict:
+    """Serialize an fp_rounding certificate.
+
+    Attests: ``computed`` equals the correctly-rounded value of the exact
+    expression ``exact`` at ``precision`` significand bits under rounding ``mode``.
+    ``exact`` is a numeric literal or an ``{"op", "args"}`` expression tree;
+    ``computed`` is the resulting float (its exact value is preserved).
+    """
+    return {
+        "format": FORMAT,
+        "kind": "fp_rounding",
+        "claim": claim or (f"computed is the correctly-rounded ({mode}, "
+                           f"{int(precision)}-bit significand) value of exact"),
+        "steps": [
+            {"op": "fp_value", "precision": int(precision), "mode": str(mode),
+             "exact": _fp_lit(exact) if not isinstance(exact, dict) else exact,
+             "computed": _fp_lit(computed)},
+            {"op": "assert_correct_rounding"},
+        ],
+        "meta": {"producer": "fp_rounding", "cakeml_target": CAKEML_TARGET,
+                 "checked": ("exact correct rounding in an unbounded-exponent "
+                             "model; IEEE subnormal/overflow/NaN not modeled")},
+    }
+
+
+def export_fp_error_bound_cert(*, computed: Any, exact: Any, bound: Any,
+                               claim: Optional[str] = None) -> dict:
+    """Serialize an fp_error_bound certificate.
+
+    Attests: ``|computed - exact| <= bound``, with all three exact rationals
+    (``exact`` may be an ``{"op", "args"}`` expression tree). Fully re-checkable.
+    """
+    return {
+        "format": FORMAT,
+        "kind": "fp_error_bound",
+        "claim": claim or "absolute error |computed - exact| is within bound",
+        "steps": [
+            {"op": "fp_error_bound",
+             "computed": _fp_lit(computed),
+             "exact": _fp_lit(exact) if not isinstance(exact, dict) else exact,
+             "bound": _fp_lit(bound)},
+            {"op": "assert_error_within_bound"},
+        ],
+        "meta": {"producer": "fp_error_bound", "cakeml_target": CAKEML_TARGET,
+                 "checked": "exact rational recomputation of |computed - exact|"},
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Self-contained polynomial arithmetic for the WU checker (no producer import).
 # --------------------------------------------------------------------------- #
 
@@ -645,6 +908,16 @@ class _Unsupported(_Reject):
             "This is NOT a verdict on the certificate: route it to that module."
         )
         self.owner = owner
+
+
+class _Withhold(_Reject):
+    """Raised for a kind we OWN whose instance we cannot decide exactly.
+
+    A subclass of :class:`_Reject` on purpose: a withheld document must still come
+    back ``valid=False`` (fail-closed, never a fabricated pass). The separate type
+    only lets the caller tell "I decline to decide this" from "I refuted this":
+    unlike a rejection, a withhold makes no claim that the certificate is wrong.
+    """
 
 
 def _need(cond: bool, reason: str) -> None:
@@ -866,6 +1139,58 @@ def _h_assert_theta_subsumes(step, ctx):
     ctx["concluded"] = True
 
 
+# -- floating-point handlers ------------------------------------------------- #
+
+def _h_fp_value(step, ctx):
+    p = step["precision"]
+    # bool is an int subclass; a boolean precision is nonsense, so reject it.
+    if not isinstance(p, int) or isinstance(p, bool) or p < 1:
+        raise _Reject("fp_rounding: precision must be a positive integer")
+    mode = str(step["mode"])
+    if mode not in _FP_MODES:
+        # Unmodeled rounding rule: decline rather than fabricate a verdict.
+        raise _Withhold(f"fp_rounding: rounding mode {mode!r} is not modeled here")
+    ctx["fp_precision"] = p
+    ctx["fp_mode"] = mode
+    ctx["fp_exact"] = step["exact"]        # evaluated at assert time (may withhold)
+    ctx["fp_computed"] = step["computed"]
+
+
+def _h_assert_correct_rounding(step, ctx):
+    p = ctx["fp_precision"]
+    c = _exact_rat(ctx["fp_computed"])
+    # A correctly-rounded result is always representable; if `computed` is not a
+    # p-bit float it cannot be that result, so this is a genuine refutation.
+    _need(_is_p_bit_float(c, p),
+          f"fp_rounding: computed value {c} is not a {p}-bit float")
+    e = _eval_fp_exact(ctx["fp_exact"])    # may raise _Withhold for irrational ops
+    r = _round_to_precision(e, p, ctx["fp_mode"])
+    _need(c == r,
+          f"fp_rounding: computed {c} != correctly-rounded value {r} "
+          f"of exact {e} at {p} bits ({ctx['fp_mode']})")
+    ctx["concluded"] = True
+
+
+def _h_fp_error_bound(step, ctx):
+    ctx["fpe_computed"] = step["computed"]
+    ctx["fpe_exact"] = step["exact"]
+    ctx["fpe_bound"] = step["bound"]
+
+
+def _h_assert_error_within_bound(step, ctx):
+    b = _exact_rat(ctx["fpe_bound"])
+    # A negative bound is meaningless for an absolute error and cannot be met.
+    _need(b >= 0, f"fp_error_bound: bound {b} is negative")
+    c = _exact_rat(ctx["fpe_computed"])
+    e = _eval_fp_exact(ctx["fpe_exact"])   # may raise _Withhold for irrational ops
+    err = c - e
+    if err < 0:
+        err = -err
+    _need(err <= b,
+          f"fp_error_bound: |computed - exact| = {err} exceeds bound {b}")
+    ctx["concluded"] = True
+
+
 _HANDLERS = {
     "lp_problem": _h_lp_problem,
     "dual_vector": _h_dual_vector,
@@ -890,6 +1215,10 @@ _HANDLERS = {
     "assert_pseudo_remainders_zero": _h_assert_pseudo_remainders_zero,
     "subsumption_relation": _h_subsumption_relation,
     "assert_theta_subsumes": _h_assert_theta_subsumes,
+    "fp_value": _h_fp_value,
+    "assert_correct_rounding": _h_assert_correct_rounding,
+    "fp_error_bound": _h_fp_error_bound,
+    "assert_error_within_bound": _h_assert_error_within_bound,
 }
 
 # Which ops are legal in which kind (a step from the wrong kind is rejected).
@@ -905,6 +1234,8 @@ _KIND_OPS = {
     "wu_geometry": {"declare_ring", "characteristic_set", "goal_polynomials",
                     "non_degeneracy", "assert_pseudo_remainders_zero"},
     "subsumption": {"subsumption_relation", "assert_theta_subsumes"},
+    "fp_rounding": {"fp_value", "assert_correct_rounding"},
+    "fp_error_bound": {"fp_error_bound", "assert_error_within_bound"},
 }
 
 
@@ -923,9 +1254,12 @@ def check_cert_log(log: Any) -> dict:
     ``False``; ``verified_statement`` is the machine-derived description of what
     was actually re-verified.  Do not present ``claim`` as a proven statement.
 
-    ``status`` is ``verified`` / ``rejected`` / ``unsupported_kind``.  The last
-    means the document names a kind owned by a sibling checker module: this
-    module did NOT check it and says nothing about whether it holds.  Only
+    ``status`` is ``verified`` / ``rejected`` / ``unsupported_kind`` /
+    ``withheld``.  ``unsupported_kind`` means the document names a kind owned by a
+    sibling checker module (not checked here).  ``withheld`` means a kind we DO
+    own whose specific instance falls outside what this checker can decide exactly
+    (an unmodeled rounding mode, or an exact expression using an irrational
+    operation): it is fail-closed, neither a pass nor a refutation.  Only
     ``verified`` carries ``valid=True``; treat every other status as unchecked.
     """
     checked = 0
@@ -982,9 +1316,17 @@ def check_cert_log(log: Any) -> dict:
                     "free-text `claim` field"
                 )}
     except _Reject as exc:
+        # _Withhold is checked first: it is a subclass of _Reject (and disjoint
+        # from _Unsupported), and must map to its own fail-closed status.
+        withheld = isinstance(exc, _Withhold)
         unsupported = isinstance(exc, _Unsupported)
-        out = {"valid": False,
-               "status": STATUS_UNSUPPORTED if unsupported else STATUS_REJECTED,
+        if withheld:
+            status = STATUS_WITHHELD
+        elif unsupported:
+            status = STATUS_UNSUPPORTED
+        else:
+            status = STATUS_REJECTED
+        out = {"valid": False, "status": status,
                "reason": str(exc), "checked_steps": checked,
                "kind": log.get("kind") if isinstance(log, dict) else None,
                "claim": log.get("claim") if isinstance(log, dict) else None,
@@ -995,6 +1337,14 @@ def check_cert_log(log: Any) -> dict:
             out["checker"] = exc.owner
             out["verified_statement"] = (
                 "NOTHING was verified here: this kind is checked by another module"
+            )
+        elif withheld:
+            # Well-formed but outside what we can decide exactly: NOT a pass and
+            # NOT a refutation. A fuller checker may still validate or refute it.
+            out["verified_statement"] = (
+                "WITHHELD: this certificate is well-formed but falls outside what "
+                "this reference checker can verify exactly; it is neither a pass "
+                "nor a refutation"
             )
         return out
 
@@ -1035,6 +1385,17 @@ def run(request: dict) -> dict:
             log = export_subsumption_cert(request["subsumer"], request["subsumed"],
                                           request["substitution"],
                                           claim=request.get("claim"))
+        elif kind == "fp_rounding":
+            log = export_fp_rounding_cert(precision=request["precision"],
+                                          mode=request["mode"],
+                                          exact=request["exact"],
+                                          computed=request["computed"],
+                                          claim=request.get("claim"))
+        elif kind == "fp_error_bound":
+            log = export_fp_error_bound_cert(computed=request["computed"],
+                                             exact=request["exact"],
+                                             bound=request["bound"],
+                                             claim=request.get("claim"))
         else:
             raise ValueError(f"unknown export kind: {kind!r}")
         return {"log": log}
