@@ -18,17 +18,50 @@ use crate::{
             AxiomReport, CompileReport, FormalBackend, FormalSystem, GoalState, ProofSession,
             RecheckReport, ScanReport, StateResult, UnitResult, Workspace,
         },
-        model::{FormalProject, ProofJob, ProofResult, ProofTask, ProverJobStatus},
+        model::{
+            FormalProject, ProofJob, ProofResult, ProofTask, ProverJobStatus, VerificationReport,
+        },
     },
 };
 use anyhow::{anyhow, Result};
 use chrono::Utc;
-use serde_json::json;
-use std::{path::PathBuf, time::Instant};
+use serde_json::{json, Value};
+use std::{
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 const BACKEND: &str = "lean";
 const SYSTEM: FormalSystem = FormalSystem::Lean;
 const MODULE: &str = "Generated";
+
+/// `CompileReport::detail` key carrying WHICH LIBRARY THE COMPILE ACTUALLY READ,
+/// as opposed to the one the configuration names. See
+/// [`LeanBackend::library_resolution`] for why the two can differ.
+const LIBRARY_RESOLUTION_KEY: &str = "library_resolution";
+
+/// `CompileReport::detail` key carrying the temp workspace the compile ran in.
+/// Published so a later phase of the same verification (the elaborated-statement
+/// probe in [`LeanBackend::verify`]) can reach the very files that were compiled
+/// instead of scaffolding a second, possibly different, workspace.
+const WORKSPACE_ROOT_KEY: &str = "workspace_root";
+
+/// Kill switch for the advisory elaborated-statement probe (see
+/// [`LeanBackend::elaborated_statement`]). Set to `0`/`false` to skip the probe.
+///
+/// It exists because the probe costs one extra `lean` run per SUCCESSFUL
+/// verification, and against a real Mathlib that is not free. Skipping it
+/// publishes nothing, which `checker_cache` reads as UNAVAILABLE, the correct
+/// reading, and the reason no placeholder is ever emitted in its place.
+pub const ELABORATION_PROBE_ENV: &str = "THEOREMATA_LEAN_PUBLISH_ELABORATION";
+
+/// Upper bound on a published elaborated form. `pp.all` output is fully explicit
+/// and can be enormous (a 200-term arithmetic goal pretty-printed to 600 KB on
+/// the machine this was measured on). Past the cap we publish NOTHING rather
+/// than a truncation: a truncated form digests to a value that is neither the
+/// old statement's nor the new one's, which is exactly the confidently-wrong
+/// input a staleness discriminator must never be handed.
+const MAX_ELABORATED_FORM_BYTES: usize = 64 * 1024;
 
 /// The LeanDojo in-kernel `validateProof` soundness-gate template
 /// (`components/verify/lean/validate_proof_template.lean`). Referenced from the
@@ -450,6 +483,180 @@ impl LeanBackend {
             },
         })
     }
+
+    /// WHAT THE COMPILE ACTUALLY RESOLVED ITS IMPORTS AGAINST, measured rather
+    /// than assumed.
+    ///
+    /// # Why this is not the same as the configured project
+    ///
+    /// [`FormalBackend::compile`] runs bare `lean Generated.lean` in a fresh
+    /// per-verification temp workspace
+    /// (`formal::live_workspace_dir`), NOT `lake env lean` inside
+    /// `Config::lean_project`. A bare `lean` builds its search path from exactly
+    /// two sources: the toolchain's own `--print-libdir`, and the ambient
+    /// `LEAN_PATH`. The configured Lake project contributes NOTHING unless
+    /// something outside this process already put it on `LEAN_PATH`.
+    ///
+    /// That was verified directly against the installed toolchain (lean 4.32.0):
+    /// with two directories each holding a different `Foo.olean`, the identical
+    /// source `import Foo` elaborated against whichever one `LEAN_PATH` named, and
+    /// with `LEAN_PATH` unset the import failed with the search path listed as the
+    /// libdir alone. So the environment fingerprint, which pins the CONFIGURED
+    /// Lake project, can be pinning a library the compile never read.
+    ///
+    /// # What is captured
+    ///
+    /// `lean --deps FILE` prints the ABSOLUTE resolved `.olean` path of every
+    /// header import without elaborating anything, so it is both cheap and
+    /// authoritative: it is the resolver's own answer, obtained through the same
+    /// [`Runner`] as the compile, so it also holds under a container runner where
+    /// this process's own `LEAN_PATH` would be irrelevant. From those paths the
+    /// library ROOTS are recovered by stripping each module's own path tail.
+    ///
+    /// This is a DETAIL FIELD only. It changes no verdict, and a failed probe
+    /// records `provenance: "unavailable"` with the reason rather than a guess.
+    fn library_resolution(&self, ws: &Workspace, code: &str) -> Value {
+        let file = format!("{MODULE}.lean");
+        let deps = exec::run(&self.runner, &[&self.lean, "--deps", &file], &ws.root);
+        if !deps.success() {
+            return json!({
+                "provenance": "unavailable",
+                "runner": self.runner.tag(),
+                "reason": if deps.launched {
+                    "lean --deps exited non-zero (unresolvable import, or a malformed header)"
+                } else {
+                    "lean --deps could not be launched"
+                },
+                "stderr": deps.stderr,
+            });
+        }
+        let resolved = parse_dep_paths(&deps.stdout);
+        let modules = parse_import_modules(code);
+        let roots = library_roots(&resolved, &modules);
+        // The toolchain's built-in library directory, asked of the same binary
+        // through the same runner. It is always one of the roots; naming it
+        // separately lets a consumer subtract it and see what came from
+        // elsewhere, which is the part `LEAN_PATH` controls.
+        let libdir = exec::run(&self.runner, &[&self.lean, "--print-libdir"], &ws.root);
+        json!({
+            "provenance": "lean.deps",
+            "runner": self.runner.tag(),
+            "imports": modules,
+            "resolved_imports": resolved,
+            "library_roots": roots,
+            "toolchain_libdir": libdir.success().then(|| libdir.stdout.trim().to_string()),
+            "note": "roots the bare `lean` compile actually read; the configured lake \
+                     project contributes only via an ambient LEAN_PATH",
+        })
+    }
+
+    /// THE CHECKER'S OWN ELABORATED FORM of the accepted statement, published for
+    /// [`checker_cache`](crate::checker_cache)'s
+    /// `ELABORATED_STATEMENT_DETAIL_KEY`. Advisory provenance; never a verdict.
+    ///
+    /// # What is actually obtainable, and what this is
+    ///
+    /// Determined against the installed toolchain (lean 4.32.0) rather than
+    /// assumed. `lean --json FILE` reports every message as one JSON object per
+    /// line, so a `#check @thm` appended to the already-compiled source yields the
+    /// elaborated type of the declaration the kernel accepted, cleanly delimited
+    /// and attributable by source position. Under
+    ///
+    /// ```text
+    /// set_option pp.deepTerms true in
+    /// set_option pp.maxSteps 10000000 in
+    /// set_option pp.all true in
+    /// ```
+    ///
+    /// what comes back is FULLY EXPLICIT: universe levels, implicit arguments and
+    /// instance arguments are all printed (`@HAdd.hAdd.{0,0,0} Nat Nat Nat
+    /// (@instHAdd.{0} Nat instAddNat) n m`). That matters for the motivating case:
+    /// when a library re-routes `x ^ (1/3)` through `Real.rpow`, the SURFACE
+    /// notation is unchanged and default pretty-printing would digest identically,
+    /// while the explicit form's head constant and instance change. `pp.deepTerms`
+    /// and a large `pp.maxSteps` are set so the printer cannot elide a subterm to
+    /// `⋯`, which would make two different types print the same.
+    ///
+    /// **It is a PRETTY-PRINTED type, not a kernel term hash**, and the provenance
+    /// string says exactly that (`lean.check.pp_all`). It is sensitive to the
+    /// pretty-printer, so a toolchain upgrade can move it without the mathematics
+    /// moving; it is a hint about WHY a cached green went stale, never evidence
+    /// that one did. A kernel-level identity would need a REPL or a plugin that
+    /// hands back the `Expr`/term hash; no such build is wired here, and inventing
+    /// a stronger-sounding label for a weaker artifact is the one thing that would
+    /// make this field harmful.
+    ///
+    /// Returns `None`, i.e. publish NOTHING, on every doubt: no declaration name, a
+    /// probe that fails to elaborate, output past [`MAX_ELABORATED_FORM_BYTES`], or
+    /// the [`ELABORATION_PROBE_ENV`] kill switch. `checker_cache` reads an absent
+    /// field as UNAVAILABLE, which is the honest reading of all four.
+    fn elaborated_statement(&self, root: &Path, decl: &str) -> Option<Value> {
+        if decl.trim().is_empty() {
+            return None;
+        }
+        let base = std::fs::read_to_string(root.join(format!("{MODULE}.lean"))).ok()?;
+        let mut content = base;
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        // 1-based line of the first line we append, so a `#check` that was already
+        // in the submitted source cannot be mistaken for ours.
+        let first_appended_line = content.lines().count() + 1;
+        content.push_str(&elaboration_probe_block(decl));
+        let probe_file = format!("{MODULE}_elab.lean");
+        std::fs::write(root.join(&probe_file), content).ok()?;
+        let out = exec::run(
+            &self.runner,
+            &[&self.lean, "--json", &probe_file],
+            root,
+        );
+        if !out.success() {
+            return None;
+        }
+        let form = elaborated_form_from_json(&out.stdout, first_appended_line)?;
+        if form.len() > MAX_ELABORATED_FORM_BYTES {
+            return None;
+        }
+        Some(json!({
+            "provenance": ELABORATED_PROVENANCE,
+            "form": form,
+            "declaration": decl,
+            "options": ["pp.all", "pp.deepTerms", "pp.maxSteps"],
+        }))
+    }
+}
+
+/// Provenance label for the published elaborated form. It names the MECHANISM
+/// (`#check` under `pp.all`), so no consumer can read it as a kernel-level term
+/// identity, which it is not. See [`LeanBackend::elaborated_statement`].
+const ELABORATED_PROVENANCE: &str = "lean.check.pp_all";
+
+/// The lines appended to a compiled source to print its elaborated type.
+///
+/// `pp.deepTerms`/`pp.maxSteps` suppress the `⋯` elision the printer applies to
+/// deep or long terms: an elided form is a form two DIFFERENT types can share, so
+/// leaving elision on would make the discriminator quietly blind. Both options
+/// were confirmed to exist and be accepted by lean 4.32.0.
+fn elaboration_probe_block(decl: &str) -> String {
+    format!(
+        "set_option pp.deepTerms true in\n\
+         set_option pp.maxSteps 10000000 in\n\
+         set_option pp.all true in\n\
+         #check @{decl}\n"
+    )
+}
+
+/// Whether the advisory elaborated-statement probe should run. Default ON; the
+/// [`ELABORATION_PROBE_ENV`] kill switch turns it off for runs that will not pay
+/// one extra `lean` invocation per success.
+fn elaboration_probe_enabled() -> bool {
+    match std::env::var(ELABORATION_PROBE_ENV) {
+        Ok(v) => {
+            let v = v.trim();
+            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+        }
+        Err(_) => true,
+    }
 }
 
 /// Parse the transitive axiom set from a `#print axioms` message. Returns
@@ -703,6 +910,176 @@ fn norm_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+// ===========================================================================
+// Elaborated-statement publication + resolved-library capture
+// ===========================================================================
+
+/// The module names a Lean file's header imports, in source order, plus `Init`,
+/// which every file imports implicitly and which therefore always shows up in
+/// `lean --deps` output.
+///
+/// Header-only by construction: scanning stops at the first line that is neither
+/// blank, a comment, nor an `import`, because Lean's own header ends there. A
+/// later `import` inside a string literal or a doc comment is thus never picked
+/// up as a module.
+fn parse_import_modules(code: &str) -> Vec<String> {
+    let mut out: Vec<String> = vec!["Init".to_string()];
+    for raw in code.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with("--") {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("import ") else {
+            // `prelude` and `set_option` may legally precede imports; anything
+            // else ends the header.
+            if line == "prelude" || line.starts_with("set_option ") {
+                continue;
+            }
+            break;
+        };
+        // `import all Foo` / `import Foo`: take the last whitespace-separated
+        // token, which is the module name in either spelling.
+        if let Some(module) = rest.split_whitespace().last() {
+            if !module.is_empty() && !out.iter().any(|m| m == module) {
+                out.push(module.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Normalize a path for suffix comparison: `\` to `/`, and lowercased.
+///
+/// Lean emits MIXED separators on Windows (a search-path entry keeps the
+/// separator style it was given, and only the final component is appended with
+/// the native one), so a naive `ends_with` on the raw text misses. Lowercasing is
+/// for the same platform: the search-path entry's drive letter and directory case
+/// come from the environment, not from the module name.
+fn normalize_path_for_match(p: &str) -> String {
+    p.replace('\\', "/").to_ascii_lowercase()
+}
+
+/// Given a resolved `.olean` path and the module name it resolves, recover the
+/// SEARCH-PATH ROOT it was found under, i.e. the library root: strip the
+/// `A/B/C.olean` tail that the module name `A.B.C` dictates.
+///
+/// `None` when the path does not end in that tail, which means this path did not
+/// come from this module. Recovering the root rather than guessing it is the
+/// point: the root is the thing a fingerprint can compare against the project it
+/// believes it pinned.
+fn olean_root_for(path: &str, module: &str) -> Option<String> {
+    let tail = format!("/{}.olean", module.replace('.', "/"));
+    let hay = normalize_path_for_match(path);
+    let needle = normalize_path_for_match(&tail);
+    let cut = hay.len().checked_sub(needle.len())?;
+    if !hay.ends_with(&needle) {
+        return None;
+    }
+    // Cut the ORIGINAL string at the same byte offset: the normalized form is
+    // byte-for-byte length-preserving (separator swap and ASCII lowercasing both
+    // are), so the offset transfers, and the caller sees the real on-disk casing.
+    Some(path[..cut].to_string())
+}
+
+/// The distinct library roots behind a set of resolved `.olean` paths.
+///
+/// Sorted and deduplicated so the value is stable run to run (an unstable detail
+/// field would show up as spurious environment churn). A path that matches no
+/// known module contributes no root; it is still reported verbatim under
+/// `resolved_imports`, so nothing is silently dropped.
+fn library_roots(deps: &[String], modules: &[String]) -> Vec<String> {
+    let mut roots: Vec<String> = Vec::new();
+    for dep in deps {
+        for module in modules {
+            if let Some(root) = olean_root_for(dep, module) {
+                if !roots.iter().any(|r| r == &root) {
+                    roots.push(root);
+                }
+                break;
+            }
+        }
+    }
+    roots.sort();
+    roots
+}
+
+/// Split `lean --deps` stdout into resolved paths, one per line.
+fn parse_dep_paths(stdout: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in stdout.lines() {
+        let p = line.trim();
+        // `--deps` repeats a path when two imports resolve to the same file;
+        // dedup here so the detail lists each resolved artifact once.
+        if !p.is_empty() && !out.iter().any(|e| e == p) {
+            out.push(p.to_string());
+        }
+    }
+    out
+}
+
+/// The text Lean's `#check` prints for a declaration is `name : type`. Return the
+/// TYPE half.
+///
+/// The name is dropped ON PURPOSE. A published elaborated form exists to tell
+/// "the script needs a rename" apart from "the mathematics moved"; if the
+/// declaration's own name were part of the digested form, every rename would move
+/// the digest and the two cases would be indistinguishable again. The separator
+/// is the first `" : "`, which is unambiguous because the printed name (possibly
+/// with universe parameters, `foo.{u_1}`) contains no whitespace.
+fn strip_check_prefix(printed: &str) -> Option<String> {
+    let (name, ty) = printed.split_once(" : ")?;
+    if name.trim().is_empty() || name.contains(char::is_whitespace) {
+        return None;
+    }
+    let ty = ty.trim();
+    if ty.is_empty() {
+        None
+    } else {
+        Some(ty.to_string())
+    }
+}
+
+/// Pull the elaborated type out of `lean --json` output for a probe whose
+/// appended block starts at 1-based line `first_appended_line`.
+///
+/// Fails closed to `None` on ANY error message in the run: an error means the
+/// probe file did not elaborate, so whatever else it printed says nothing about
+/// the accepted statement.
+fn elaborated_form_from_json(stdout: &str, first_appended_line: usize) -> Option<String> {
+    let mut found: Option<String> = None;
+    for line in stdout.lines() {
+        let Ok(msg) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        let severity = msg.get("severity").and_then(Value::as_str).unwrap_or("");
+        if severity == "error" {
+            return None;
+        }
+        if severity != "information" {
+            continue;
+        }
+        let pos = msg
+            .get("pos")
+            .and_then(|p| p.get("line"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        // Only messages from the block WE appended may be read. A `#check`
+        // already present in the submitted source prints an information message
+        // too, and attributing that to the statement would be a lie.
+        if pos < first_appended_line {
+            continue;
+        }
+        if let Some(ty) = msg
+            .get("data")
+            .and_then(Value::as_str)
+            .and_then(strip_check_prefix)
+        {
+            found = Some(ty);
+        }
+    }
+    found
+}
+
 /// Offline lexical fallback for [`LeanBackend::source_scan`]: the Lean escape
 /// hatches NOT caught cleanly by the kernel / `#print axioms`.
 ///
@@ -818,8 +1195,61 @@ impl FormalBackend for LeanBackend {
                 "code": out.code,
                 "stdout": out.stdout,
                 "stderr": out.stderr,
+                // WHERE the compile ran and WHAT LIBRARY it reached. The second is
+                // not implied by the first, nor by `Config::lean_project`: see
+                // `LeanBackend::library_resolution`.
+                WORKSPACE_ROOT_KEY: ws.root.display().to_string(),
+                LIBRARY_RESOLUTION_KEY: self.library_resolution(ws, &code),
             }),
         })
+    }
+
+    /// [`FormalBackend::verify`]'s default behaviour, plus the ADVISORY
+    /// elaborated-statement publication.
+    ///
+    /// The gate itself is untouched: `verify_with_gates` produces the report and
+    /// every verdict field is passed through byte-for-byte. All this override does
+    /// is add one PROVENANCE key to `detail`, and only when the gate already said
+    /// yes. Restricting the probe to an accepted, live report is deliberate on
+    /// three counts: a failed compile has no accepted statement to elaborate, a
+    /// mock never touched a library, and the probe costs one extra `lean` run that
+    /// should not be spent on a proof that was rejected anyway.
+    ///
+    /// If anything about the probe is doubtful the key is simply absent, which
+    /// `checker_cache` reads as UNAVAILABLE. Nothing here can turn a green red or
+    /// a red green.
+    fn verify(&self, cfg: &Config, code: &str, stmt: &str) -> Result<VerificationReport> {
+        let mut report =
+            self.verify_with_gates(cfg, code, stmt, crate::prover::formal::TierZeroGates::from_config(cfg))?;
+        if self.mock || !report.live || !report.lexically_verified || !elaboration_probe_enabled() {
+            return Ok(report);
+        }
+        // The workspace `verify_with_gates` scaffolded is not returned to us, so
+        // it is read back out of the compile detail this backend just wrote. That
+        // keeps the probe on the EXACT files the kernel accepted; re-scaffolding
+        // would elaborate a second copy, and a second copy is a second chance to
+        // differ from what was verified.
+        let Some(root) = report
+            .detail
+            .get("compile")
+            .and_then(|c| c.get("detail"))
+            .and_then(|d| d.get(WORKSPACE_ROOT_KEY))
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+        else {
+            return Ok(report);
+        };
+        let decl = crate::prover::formal::entry_name(SYSTEM, code)
+            .unwrap_or_else(|| crate::prover::formal::theorem_name_hint(stmt));
+        if let Some(elaborated) = self.elaborated_statement(&root, &decl) {
+            if let Some(detail) = report.detail.as_object_mut() {
+                detail.insert(
+                    crate::checker_cache::ELABORATED_STATEMENT_DETAIL_KEY.to_string(),
+                    elaborated,
+                );
+            }
+        }
+        Ok(report)
     }
 
     fn audit_axioms(&self, ws: &Workspace, thm: &str, whitelist: &[String]) -> Result<AxiomReport> {
@@ -1520,6 +1950,173 @@ theorem phi3 (hG : Glaisher3) : True := trivial
     fn bundle_parsing_is_deterministic() {
         let stmt = "theorem t (n : Nat) (hn : 0 < n) (hp : Nat.Prime n) : n ≠ 0";
         assert_eq!(bundle(stmt), bundle(stmt));
+    }
+}
+
+#[cfg(test)]
+mod elaboration_tests {
+    use super::*;
+
+    /// One real `lean --json` line, captured verbatim from lean 4.32.0 on the
+    /// machine this was developed on, for
+    /// `theorem algebra_5778 (x : Nat) (h : x > 0) : x >= 1 := h` with the probe
+    /// block appended at lines 4..7. It is the evidence that the fully explicit
+    /// form is obtainable at all, so it is pinned here rather than paraphrased.
+    const REAL_CHECK_JSON: &str = concat!(
+        r#"{"caption":"","data":"algebra_5778 : ∀ (x : Nat)\n  (h : @GT.gt.{0} Nat instLTNat x "#,
+        r#"(@OfNat.ofNat.{0} Nat (nat_lit 0) (instOfNatNat (nat_lit 0)))),\n  @GE.ge.{0} Nat "#,
+        r#"instLENat x (@OfNat.ofNat.{0} Nat (nat_lit 1) (instOfNatNat (nat_lit 1)))","#,
+        r#""endPos":{"column":6,"line":7},"fileName":"Generated_elab.lean","isSilent":false,"#,
+        r#""keepFullRange":false,"kind":"[anonymous]","pos":{"column":0,"line":7},"#,
+        r#""severity":"information"}"#,
+    );
+
+    /// The captured run parses, and what is published is the TYPE, fully
+    /// explicit: instances (`instLTNat`) and universe levels (`.{0}`) are present,
+    /// which is exactly what a notation-preserving library change (nth roots
+    /// re-routed through `rpow`) moves while the source text does not.
+    #[test]
+    fn a_real_lean_json_check_yields_the_explicit_type() {
+        let form = elaborated_form_from_json(REAL_CHECK_JSON, 4)
+            .expect("the captured lean 4.32.0 output must parse");
+        assert!(form.starts_with("∀ (x : Nat)"), "{form}");
+        assert!(form.contains("@GT.gt.{0} Nat instLTNat"), "{form}");
+        assert!(!form.contains("algebra_5778"), "the name must not be in the form: {form}");
+    }
+
+    /// A RENAME must not move the form, or the discriminator cannot tell "your
+    /// script needs a rename" from "the mathematics moved", the entire purpose.
+    #[test]
+    fn the_declaration_name_is_not_part_of_the_form() {
+        let a = strip_check_prefix("algebra_5778 : @Eq.{1} Nat x y").unwrap();
+        let b = strip_check_prefix("algebra_5778' : @Eq.{1} Nat x y").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a, "@Eq.{1} Nat x y");
+        // Universe-parameterized names still split at the first ` : `.
+        assert_eq!(strip_check_prefix("foo.{u_1} : Type u_1").unwrap(), "Type u_1");
+        assert!(strip_check_prefix("no separator here").is_none());
+    }
+
+    /// Only the block WE appended may be read, and any error voids the probe.
+    /// Both are fail-to-absent, which `checker_cache` reads as UNAVAILABLE.
+    #[test]
+    fn a_foreign_check_or_any_error_publishes_nothing() {
+        let foreign = concat!(
+            r#"{"data":"userCheck : Nat","severity":"information","pos":{"line":2,"column":0}}"#,
+            "\n",
+        );
+        assert_eq!(elaborated_form_from_json(foreign, 4), None);
+
+        let errored = concat!(
+            r#"{"data":"t : True","severity":"information","pos":{"line":9,"column":0}}"#,
+            "\n",
+            r#"{"data":"unknown identifier","severity":"error","pos":{"line":9,"column":7}}"#,
+            "\n",
+        );
+        assert_eq!(elaborated_form_from_json(errored, 4), None);
+        assert_eq!(elaborated_form_from_json("not json at all\n", 1), None);
+    }
+
+    /// The probe block's line count is what makes position attribution correct,
+    /// and the anti-elision options are what keep two different types from
+    /// printing the same.
+    #[test]
+    fn probe_block_is_four_lines_and_pins_the_pp_options() {
+        let block = elaboration_probe_block("algebra_5778");
+        assert_eq!(block.lines().count(), 4);
+        assert!(block.contains("set_option pp.all true in"));
+        assert!(block.contains("set_option pp.deepTerms true in"));
+        assert!(block.contains("set_option pp.maxSteps"));
+        assert!(block.trim_end().ends_with("#check @algebra_5778"));
+    }
+
+    #[test]
+    fn the_probe_defaults_on_and_the_kill_switch_turns_it_off() {
+        std::env::remove_var(ELABORATION_PROBE_ENV);
+        assert!(elaboration_probe_enabled());
+        for off in ["0", "false", "OFF"] {
+            std::env::set_var(ELABORATION_PROBE_ENV, off);
+            assert!(!elaboration_probe_enabled(), "{off} must disable the probe");
+        }
+        std::env::set_var(ELABORATION_PROBE_ENV, "1");
+        assert!(elaboration_probe_enabled());
+        std::env::remove_var(ELABORATION_PROBE_ENV);
+    }
+
+    /// The provenance label names the mechanism and never claims a kernel type.
+    #[test]
+    fn provenance_is_honest_about_being_a_pretty_printed_type() {
+        assert_eq!(ELABORATED_PROVENANCE, "lean.check.pp_all");
+        assert!(!ELABORATED_PROVENANCE.contains("kernel"));
+    }
+
+    /// Header-only import parsing: a later `import` line (or one inside a
+    /// string) is not a header import and must not become a module.
+    #[test]
+    fn imports_are_header_only_plus_the_implicit_init() {
+        let code = "import Mathlib\nimport Mathlib.Tactic\ntheorem t : True := by\n  trivial\nimport Evil\n";
+        assert_eq!(
+            parse_import_modules(code),
+            vec![
+                "Init".to_string(),
+                "Mathlib".to_string(),
+                "Mathlib.Tactic".to_string()
+            ]
+        );
+        // Every file imports `Init`, which is why it is always in the list.
+        assert_eq!(
+            parse_import_modules("theorem t : True := trivial\n"),
+            vec!["Init".to_string()]
+        );
+    }
+
+    /// Root recovery on the exact path shapes lean 4.32.0 printed here,
+    /// including the mixed separators Windows produces.
+    #[test]
+    fn library_roots_are_recovered_from_resolved_olean_paths() {
+        let mixed = "C:/Users/x/scratch/libA\\Foo.olean";
+        assert_eq!(
+            olean_root_for(mixed, "Foo").unwrap(),
+            "C:/Users/x/scratch/libA",
+            "the on-disk casing and separators are preserved"
+        );
+        assert_eq!(
+            olean_root_for("/x/Mathlib/Analysis/Foo.olean", "Mathlib.Analysis.Foo").unwrap(),
+            "/x"
+        );
+        // A path that is not this module's yields nothing rather than a guess.
+        assert!(olean_root_for("/x/Mathlib/Analysis/Foo.olean", "Init").is_none());
+    }
+
+    /// THE POINT OF TASK 2, in miniature: a second library reached through an
+    /// ambient `LEAN_PATH` shows up as a second root, one the configured Lake
+    /// project never named. Verified live: with two directories each holding a
+    /// different `Foo.olean`, the identical `import Foo` elaborated against
+    /// whichever `LEAN_PATH` named, and `lean --deps` reported that one.
+    #[test]
+    fn an_ambient_library_shows_up_as_its_own_root() {
+        let deps = vec![
+            "c:\\lean\\lib\\lean\\Init.olean".to_string(),
+            "c:\\lean\\lib\\lean\\Init.olean".to_string(),
+            "D:/somewhere-else/.lake/build/lib/Mathlib.olean".to_string(),
+        ];
+        let modules = parse_import_modules("import Mathlib\n");
+        assert_eq!(
+            library_roots(&deps, &modules),
+            vec![
+                "D:/somewhere-else/.lake/build/lib".to_string(),
+                "c:\\lean\\lib\\lean".to_string()
+            ],
+            "sorted and deduplicated so the detail field is stable run to run"
+        );
+    }
+
+    #[test]
+    fn dep_paths_are_deduplicated_in_order() {
+        assert_eq!(
+            parse_dep_paths("a.olean\na.olean\n\n b.olean \n"),
+            vec!["a.olean".to_string(), "b.olean".to_string()]
+        );
     }
 }
 
