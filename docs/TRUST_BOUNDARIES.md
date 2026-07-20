@@ -25,18 +25,29 @@ synthesis in `docs/resource-mining/README.md`.
 
 Evidence rows (`graph.db::add_evidence`) record verdicts; they are not proofs.
 
-| `evidence_type` | Producer | Meaning |
-|---|---|---|
-| `lean_compile` | LeanCheck / LeanSession | File typechecked |
-| `axiom_audit` | Python `check_axioms` | Transitive axiom set within whitelist |
-| `k_consecutive_clean` | Agent verifier | N consecutive clean passes before certify |
-| `hardening` | LeanParanoia | Adversarial battery on certified nodes |
-| `falsification` | Python falsifier | Numeric/symbolic counterexample screen |
-| `retrieval` | Mathlib / accessible retrieve | Candidate lemmas (untrusted hints) |
-| `external_prover_artifact` | Aristotle / Harmonic outputs | Externally generated Lean + request provenance |
-| `external_producer_checked` | Any external producer | Output locally re-verified (trust-but-verify) |
-| `reformulation_check` | FLARE / formulation bench | MILP reformulation equivalence attempt |
-| `repair_loop` | BRIDGE-style verifier | Structured verifier stderr/stdout from repair |
+This table was audited on 2026-07-20 and five of its ten rows claimed a producer
+that does not exist. The Status column now records what is actually written. A row
+marked RESERVED is declared in `components/graph/evidence.rs` and emitted by nothing,
+so an audit trail built from the database will not contain it. A drift guard in that
+file fails if a reserved type gains a producer, or if a declared type has neither a
+producer nor a reservation, so this table can no longer silently drift from the code.
+
+| `evidence_type` | Producer | Status | Meaning |
+|---|---|---|---|
+| `lean_compile` | `agent.rs`, `observe.rs` | EMITTED | File typechecked |
+| `axiom_audit` | none | RESERVED | The audit DOES run; its result is folded into the `lean_compile` verdict and the `formal_verify` payload, so no standalone row exists |
+| `k_consecutive_clean` | `agent.rs` | EMITTED | N consecutive clean passes before certify |
+| `hardening` | `agent.rs` | EMITTED | Adversarial battery on certified nodes |
+| `falsification` | `agent.rs` | EMITTED | Numeric/symbolic counterexample screen |
+| `retrieval` | `agent.rs` | EMITTED | Candidate lemmas (untrusted hints) |
+| `external_prover_artifact` | intended: the three external-prover backends | RESERVED | Externally generated Lean + request provenance |
+| `external_producer_checked` | intended: `session/verify.rs` | RESERVED | Output locally re-verified (trust-but-verify) |
+| `reformulation_check` | none possible | RESERVED | No FLARE or MILP code exists in the tree. Either build the track or delete the constant |
+| `repair_loop` | intended: `proving/repair.rs` | RESERVED | Structured verifier output from repair |
+
+Note also that `components/verify/hardening.rs` writes kind `lean_paranoia` with source
+`hardening`, which is the two fields in the opposite order from `agent.rs`. It is easy
+to misread as a `hardening` producer and is not one.
 
 ## External producers
 
@@ -60,8 +71,11 @@ Evidence rows (`graph.db::add_evidence`) record verdicts; they are not proofs.
 - **Boundary**: Async job state is operational truth; mathematical truth is local only.
 - **Required checks**: `verify.rs` lexical gate, axiom gate, statement preservation,
   artifact directory under `.theoremata/artifacts/`, provenance JSON on `ProofResult`.
-- **Evidence**: Record as `external_prover_artifact` with request UUID, toolchain pin,
-  input hash, output hash, wall-clock duration.
+- **Evidence**: PLANNED, not written. The intent is a row of kind
+  `external_prover_artifact` carrying request UUID, toolchain pin, input hash, output
+  hash, and wall-clock duration. `components/graph/evidence.rs::external_prover_payload`
+  is the intended builder and currently has zero callers, so no such row exists in any
+  database today.
 
 ## Statement-change guard
 
@@ -108,6 +122,11 @@ Artifacts are operational audit records, not trusted certificates.
 When adding a new tool, backend, or axiom:
 
 1. Classify it in the boundary map above.
-2. Add an evidence type or extend an existing one.
-3. Wire the acceptance gate in Rust before `FormallyVerified` status.
-4. Update this file in the same PR.
+2. Add an evidence type or extend an existing one, and register it in
+   `components/graph/evidence.rs::ALL`. This is now enforced: a declared type with
+   neither a producer nor a `RESERVED_UNEMITTED` entry fails the drift guard.
+3. If you declare a type you do not yet emit, add it to `RESERVED_UNEMITTED` and mark
+   it RESERVED in the table above, so the documentation cannot claim an audit trail
+   the database does not contain. That is the exact failure this section had.
+4. Wire the acceptance gate in Rust before `FormallyVerified` status.
+5. Update this file in the same PR.
