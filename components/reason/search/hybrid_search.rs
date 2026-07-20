@@ -29,7 +29,7 @@
 //!   between the best-first side and the critic-guided-driver side from cheap goal
 //!   features. A [`super::ttc::TtcController`] is the intended caller (see the
 //!   wiring note on [`route`]).
-//! * [`run_alpha_sweep_search`] — the production entry point. It is the only item
+//! * [`run_alpha_sweep_search`]: the production entry point. It is the only item
 //!   here that talks to the outside world: it builds a model-backed scorer, runs
 //!   the sweep, optionally runs the minimizer behind a real
 //!   [`GateReplay`](crate::prover::session::replay::GateReplay), records a store
