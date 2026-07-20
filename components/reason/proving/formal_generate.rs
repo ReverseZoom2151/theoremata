@@ -16,7 +16,7 @@
 //! `Admitted` candidate is still rejected).
 
 use crate::{
-    checker_cache::{CheckerCache, VerificationCacheKey},
+    checker_cache::{CheckerCache, EnvironmentFingerprint, VerificationCacheKey},
     config::Config,
     db::Store,
     model::ModelRequest,
@@ -222,6 +222,19 @@ fn generate_and_verify_inner(
     // list that smuggles in an axiom must never share a cache slot with one
     // verified under a clean list.
     let import_manifest = system.default_imports();
+    // The import NAMES above say `Mathlib`; they do not say WHICH Mathlib. This
+    // resolves the environment those names actually bind to (for Lean: the
+    // lake-manifest revisions and the toolchain pin beside them) so that updating
+    // a library in place, at the same path under the same Lean, is a mandatory
+    // cache miss rather than a silent reuse of a verdict earned against the old
+    // one. When it cannot be resolved the key becomes unusable and the cache goes
+    // quiet for this run, which is the safe direction: an extra verification, not
+    // a stale green.
+    let environment = EnvironmentFingerprint::resolve(
+        system,
+        backend.is_mock(),
+        config.lean_project.as_deref().filter(|p| p.exists()),
+    );
 
     // An ADDITIONAL best-of-N candidate: a hammer-assisted proof. We ask the
     // `hammer` worker (Sledgehammer / CoqHammer / aesop) to FIND a tactic for the
@@ -259,6 +272,7 @@ fn generate_and_verify_inner(
             checker_identity: &checker_identity,
             policy_fingerprint: &policy_fingerprint,
             import_manifest: &import_manifest,
+            environment: &environment,
         };
         let (mut report, cache_hit) =
             verify_candidate(cache, &key, || backend.verify(config, &code, statement))?;
@@ -348,6 +362,11 @@ fn generate_and_verify_inner(
         "hammer_candidate": hammer_candidate.is_some(),
         "checker_cache_enabled": cache.is_some(),
         "checker_cache_hit": sampled.value.cache_hit,
+        // Surfaced so an operator can see WHY a run never hits the cache: an
+        // unresolved environment disables it by design, and that should be
+        // visible rather than looking like bad luck.
+        "checker_cache_environment": environment.describe(),
+        "checker_cache_usable": environment.is_resolved(),
     });
     // Additive only when the opt-in is on, so the default event payload is
     // byte-identical to the pre-correction one.
@@ -747,6 +766,14 @@ fn raw_checker_output(compile: Option<&Value>) -> String {
 /// Stable identity for the checker installation and corpus selected by config.
 /// The optional epoch is an explicit cache-buster for an in-place tool/corpus
 /// replacement whose path and configured toolchain string did not change.
+///
+/// Everything here is REQUESTED configuration: paths, a runner tag, the toolchain
+/// string a backend expects, a manually-set epoch. None of it moves when a library
+/// at one of those paths is updated underneath us, which is why the cache key also
+/// carries a resolved
+/// [`EnvironmentFingerprint`](crate::checker_cache::EnvironmentFingerprint). The
+/// manual epoch is retained unchanged: it remains a useful override, and it was
+/// never a detector.
 fn checker_identity(config: &Config, backend: &dyn FormalBackend) -> String {
     let system = backend.system();
     let env_or = crate::prover::exec::env_or;
@@ -1092,6 +1119,19 @@ mod tests {
         }
     }
 
+    /// A fixed RESOLVED environment for cache tests that are about other fields.
+    /// Borrowed for the process lifetime because a key borrows its environment.
+    fn test_env() -> &'static EnvironmentFingerprint {
+        static CELL: std::sync::OnceLock<EnvironmentFingerprint> = std::sync::OnceLock::new();
+        CELL.get_or_init(|| {
+            EnvironmentFingerprint::from_parts(
+                "test",
+                "unit-test environment",
+                &[("env.fixture", "formal-generate".to_string())],
+            )
+        })
+    }
+
     fn mock_verified_report() -> VerificationReport {
         VerificationReport {
             live: false,
@@ -1111,6 +1151,7 @@ mod tests {
             checker_identity: "lean:live:v4.19",
             policy_fingerprint: "gate-v1",
             import_manifest: &[],
+            environment: test_env(),
         };
         let calls = Cell::new(0);
 
@@ -1142,6 +1183,7 @@ mod tests {
             checker_identity: "lean:live",
             policy_fingerprint: "gate-v1",
             import_manifest: &[],
+            environment: test_env(),
         };
         let calls = Cell::new(0);
         for marker in ["first", "second"] {
@@ -1168,6 +1210,7 @@ mod tests {
             checker_identity: "lean:live",
             policy_fingerprint: "gate-v1",
             import_manifest: &[],
+            environment: test_env(),
         };
         let mock_key = VerificationCacheKey {
             checker_identity: "lean:mock",
@@ -1192,6 +1235,37 @@ mod tests {
             assert!(!hit);
         }
         assert_eq!(calls.get(), 4);
+        assert!(cache.is_empty());
+    }
+
+    /// A live verdict whose environment we could not resolve is re-verified every
+    /// time. Preferring the redundant call is the whole point: we cannot say what
+    /// the earlier green was earned against.
+    #[test]
+    fn an_unresolved_environment_disables_the_cache() {
+        let cache = CheckerCache::new();
+        let context = Vec::new();
+        let unresolved = EnvironmentFingerprint::unresolved("test: environment not inspected");
+        let key = VerificationCacheKey {
+            system: FormalSystem::Lean,
+            canonical_statement: "P",
+            ordered_context: &context,
+            proof_source: "theorem p : P := h",
+            checker_identity: "lean:live:v4.19",
+            policy_fingerprint: "gate-v1",
+            import_manifest: &[],
+            environment: &unresolved,
+        };
+        let calls = Cell::new(0);
+        for _ in 0..2 {
+            let (_, hit) = verify_candidate(Some(&cache), &key, || {
+                calls.set(calls.get() + 1);
+                Ok(live_verified_report("fresh"))
+            })
+            .unwrap();
+            assert!(!hit, "an unresolved environment can never hit");
+        }
+        assert_eq!(calls.get(), 2);
         assert!(cache.is_empty());
     }
 
