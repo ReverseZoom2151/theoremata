@@ -249,7 +249,43 @@ pub struct ProofSearchDriver<E: TacticExpander> {
     /// Optional trained state-value critic, blended into PUCT selection via
     /// `cfg.critic_weight` (the [`super::critic_scorer`] seam). `None` ⇒ nodes
     /// fall back to their `progress` estimate.
+    ///
+    /// The critic is a **heuristic only**: it may reorder exploration and nothing
+    /// else. It is never consulted when deciding whether a node is closed, whether
+    /// the search is solved/refuted, or what the driver reports — those come solely
+    /// from [`GoalState::is_closed`].
     critic: Option<Arc<dyn CriticScorer>>,
+}
+
+/// Read a node's state-value estimate, falling back to `progress`.
+///
+/// Two guards, both about not letting a bad critic damage the search:
+/// * With no critic injected the estimate *is* `progress`, so the blended term is
+///   whatever the progress term already contributed and nothing changes.
+/// * A critic that returns a non-finite value (`NaN` / `±inf` — the only way an
+///   erroring or untrained implementation can signal failure through an `f64`
+///   return) is discarded in favour of `progress`. This matters because `NaN`
+///   poisons every `score > best_score` comparison in the PUCT loop (all
+///   comparisons with `NaN` are false), which would silently collapse selection to
+///   "no child chosen" and truncate the descent. Degrading to today's signal is the
+///   only safe failure mode. Finite values are clamped to the documented `[0, 1]`
+///   contract so an out-of-range critic cannot dominate `q` and `u` outright.
+fn critic_estimate<S: GoalState>(
+    critic: Option<&Arc<dyn CriticScorer>>,
+    state: &S,
+    progress: f64,
+) -> f64 {
+    match critic {
+        None => progress,
+        Some(c) => {
+            let v = c.score(state);
+            if v.is_finite() {
+                v.clamp(0.0, 1.0)
+            } else {
+                progress
+            }
+        }
+    }
 }
 
 impl<E: TacticExpander> ProofSearchDriver<E> {
@@ -274,6 +310,26 @@ impl<E: TacticExpander> ProofSearchDriver<E> {
 
     /// Inject a trained state-value critic. Combine with a non-zero
     /// `SearchConfig::critic_weight` to fold `V(s)` into PUCT selection.
+    ///
+    /// The critic only ever reorders *exploration*. It cannot close a node, cannot
+    /// make a search `solved` or `refuted`, and never reaches any verdict path —
+    /// those are decided exclusively by [`GoalState::is_closed`]. A wrong critic
+    /// therefore costs search efficiency, never soundness. Default is no critic, in
+    /// which case the driver behaves exactly as it did before this seam existed.
+    ///
+    /// The critic value reaches the search through exactly **two** places, both of
+    /// them exploration-only:
+    /// 1. the PUCT priority term, gated on `SearchConfig::critic_weight`; and
+    /// 2. the eta-MCTS per-node expansion breadth, gated on
+    ///    `SearchConfig::eta_mcts` (which reads `V(s)` as node importance and is
+    ///    `None` by default).
+    ///
+    /// Both are off unless configured, so with no critic injected the driver is
+    /// byte-identical for *every* config. Note the corollary for (2): with
+    /// `eta_mcts` switched on, injecting a critic changes breadth even at
+    /// `critic_weight == 0.0`, because eta-MCTS reads the critic directly rather
+    /// than through the weight. That is deliberate and is pinned by
+    /// `critic_reaches_expansion_breadth_only_under_eta_mcts`.
     pub fn with_critic(mut self, critic: Arc<dyn CriticScorer>) -> Self {
         self.critic = Some(critic);
         self
@@ -346,11 +402,17 @@ impl<E: TacticExpander> ProofSearchDriver<E> {
         let root_key = root.dedup_key();
         let root_closed = root.is_closed();
         let root_progress = root.progress();
-        let root_critic = self
-            .critic
-            .as_ref()
-            .map(|c| c.score(&root))
-            .unwrap_or(root_progress);
+        let root_critic = critic_estimate(self.critic.as_ref(), &root, root_progress);
+        // The critic term is gated on a critic actually being injected, not merely
+        // on the configured weight. Without one, `critic == progress`, so a
+        // non-zero `critic_weight` would silently double-count the progress prior;
+        // forcing the weight to zero keeps the no-critic path byte-identical to the
+        // pre-seam driver for *every* config.
+        let critic_weight = if self.critic.is_some() {
+            self.cfg.critic_weight
+        } else {
+            0.0
+        };
         nodes.push(DagNode {
             state: root,
             closed: root_closed,
@@ -411,13 +473,19 @@ impl<E: TacticExpander> ProofSearchDriver<E> {
                             };
                             let u =
                                 self.cfg.exploration * e.prior * n_parent / (1.0 + c.visits as f64);
-                            // LeanProgress-style value prior, identical to mcts.rs.
+                            // LeanProgress-style value prior, identical to mcts.rs,
+                            // plus the critic as an ADDITIVE term (never a
+                            // replacement). Ordering is therefore a pure function of
+                            // the scores already stored on the nodes: no wall-clock,
+                            // no rng, and no critic call inside the hot loop, so the
+                            // determinism contract holds even for a critic that is
+                            // expensive or (against its contract) unstable.
                             let score = super::critic_scorer::blend_priority(
                                 q,
                                 c.progress,
                                 self.cfg.progress_weight,
                                 c.critic,
-                                self.cfg.critic_weight,
+                                critic_weight,
                                 u,
                             );
                             if score > best_score {
@@ -470,6 +538,13 @@ impl<E: TacticExpander> ProofSearchDriver<E> {
                     let mut edges = Vec::new();
                     // eta-MCTS: optionally size this node's expansion breadth by its
                     // critic (uncertainty) signal; `None` keeps the fixed `expand_k`.
+                    // This is the critic's SECOND entry point, and it is deliberately
+                    // not gated on `critic_weight`: that weight scales a PUCT term,
+                    // whereas eta-MCTS consumes `V(s)` as a raw importance in [0, 1].
+                    // With no critic injected `nodes[..].critic == progress`, which is
+                    // the exact signal this branch used before the seam existed, so
+                    // the no-critic path is unchanged. Breadth is still only *where
+                    // to look*, never a verdict.
                     let expand_budget = match &self.cfg.eta_mcts {
                         Some(eta) => super::distance_critic::expansion_budget(
                             nodes[current].critic,
@@ -495,11 +570,8 @@ impl<E: TacticExpander> ProofSearchDriver<E> {
                             }
                             let closed = step.next.is_closed();
                             let progress = step.next.progress();
-                            let critic = self
-                                .critic
-                                .as_ref()
-                                .map(|c| c.score(&step.next))
-                                .unwrap_or(progress);
+                            let critic =
+                                critic_estimate(self.critic.as_ref(), &step.next, progress);
                             let idx = nodes.len();
                             nodes.push(DagNode {
                                 state: step.next,
@@ -541,11 +613,8 @@ impl<E: TacticExpander> ProofSearchDriver<E> {
                             } else {
                                 let closed = neg_state.is_closed();
                                 let progress = neg_state.progress();
-                                let critic = self
-                                    .critic
-                                    .as_ref()
-                                    .map(|c| c.score(&neg_state))
-                                    .unwrap_or(progress);
+                                let critic =
+                                    critic_estimate(self.critic.as_ref(), &neg_state, progress);
                                 let idx = nodes.len();
                                 nodes.push(DagNode {
                                     state: neg_state,
@@ -731,6 +800,13 @@ mod tests {
         key: String,
         closed: bool,
         difficulty: f64,
+        /// The LeanProgress-style prior. Defaults to `0.0`, matching the
+        /// [`GoalState::progress`] default, so tests that do not set it are
+        /// unaffected. Tests that need the progress term to actually participate in
+        /// the priority arithmetic (the golden) set it explicitly: with progress
+        /// pinned at `0` for every state, `progress_weight` multiplies zero and the
+        /// selection formula is untestable.
+        progress: f64,
     }
 
     impl MockGoal {
@@ -739,6 +815,7 @@ mod tests {
                 key: key.into(),
                 closed: false,
                 difficulty: 0.5,
+                progress: 0.0,
             }
         }
         fn closed(key: &str) -> Self {
@@ -746,10 +823,15 @@ mod tests {
                 key: key.into(),
                 closed: true,
                 difficulty: 0.5,
+                progress: 0.0,
             }
         }
         fn with_difficulty(mut self, d: f64) -> Self {
             self.difficulty = d;
+            self
+        }
+        fn with_progress(mut self, p: f64) -> Self {
+            self.progress = p;
             self
         }
     }
@@ -763,6 +845,9 @@ mod tests {
         }
         fn difficulty(&self) -> f64 {
             self.difficulty
+        }
+        fn progress(&self) -> f64 {
+            self.progress
         }
     }
 
@@ -1160,5 +1245,531 @@ mod tests {
         let r2 = d2.run(MockGoal::open("e2"));
         assert!(r1.solved);
         assert_eq!(r1.visit_counts, r2.visit_counts);
+    }
+
+    // ---- Feature 4: trained state-value critic folded into PUCT selection ----
+
+    use super::super::critic_scorer::{ConstantCritic, CriticScorer, GoalStateLike};
+
+    /// A critic that rates one named state as maximally close to done and every
+    /// other state as maximally far. Deterministic (a pure function of the state
+    /// text), as the [`CriticScorer`] contract requires.
+    struct KeyCritic(&'static str);
+    impl CriticScorer for KeyCritic {
+        fn score(&self, state: &dyn GoalStateLike) -> f64 {
+            if state.state_text() == self.0 {
+                1.0
+            } else {
+                0.0
+            }
+        }
+    }
+
+    /// A critic that rates every state identically, whatever its value. Stands in
+    /// for an untrained head that has collapsed onto a single output.
+    struct FlatCritic(f64);
+    impl CriticScorer for FlatCritic {
+        fn score(&self, _state: &dyn GoalStateLike) -> f64 {
+            self.0
+        }
+    }
+
+    /// A broken critic: `NaN` is the only way a failing implementation can signal
+    /// "no estimate" through this trait's `f64` return, and it is also the value
+    /// that would poison PUCT's comparisons if it were used raw.
+    struct BrokenCritic;
+    impl CriticScorer for BrokenCritic {
+        fn score(&self, _state: &dyn GoalStateLike) -> f64 {
+            f64::NAN
+        }
+    }
+
+    /// A critic that violates the `[0, 1]` contract with a huge magnitude — enough
+    /// to swamp `q` and `u` entirely if it were not clamped.
+    struct OutOfRangeCritic;
+    impl CriticScorer for OutOfRangeCritic {
+        fn score(&self, _state: &dyn GoalStateLike) -> f64 {
+            1e18
+        }
+    }
+
+    /// `DriverResult` has no `PartialEq`, so compare every observable field: this
+    /// is the "byte-identical behaviour" check the critic seam must satisfy.
+    fn assert_identical(a: &DriverResult, b: &DriverResult, what: &str) {
+        assert_eq!(a.solved, b.solved, "{what}: solved");
+        assert_eq!(a.refuted, b.refuted, "{what}: refuted");
+        assert_eq!(a.best_tactic, b.best_tactic, "{what}: best_tactic");
+        assert_eq!(a.root_visits, b.root_visits, "{what}: root_visits");
+        assert_eq!(a.iterations, b.iterations, "{what}: iterations");
+        assert_eq!(a.nodes_created, b.nodes_created, "{what}: nodes_created");
+        assert_eq!(a.edges_created, b.edges_created, "{what}: edges_created");
+        assert_eq!(a.dedup_hits, b.dedup_hits, "{what}: dedup_hits");
+        assert_eq!(a.visit_counts, b.visit_counts, "{what}: visit_counts");
+    }
+
+    /// A root with two equally-prior tactics leading to two distinct dead ends.
+    /// Nothing closes, so the search spends its whole budget deciding *where to
+    /// look* — which makes the visit split a direct readout of exploration order.
+    fn fork_expander() -> TableExpander {
+        TableExpander::new()
+            .edge("R", "tx", 0.5, MockGoal::open("x"))
+            .edge("R", "ty", 0.5, MockGoal::open("y"))
+    }
+
+    fn fork_cfg(critic_weight: f64) -> SearchConfig {
+        SearchConfig {
+            max_nodes: 50,
+            critic_weight,
+            ..SearchConfig::default()
+        }
+    }
+
+    /// Run the fork scenario, optionally with a critic injected.
+    fn run_fork(critic: Option<Arc<dyn CriticScorer>>, critic_weight: f64) -> DriverResult {
+        let mut driver = ProofSearchDriver::new(fork_expander())
+            .with_seed(11)
+            .with_config(fork_cfg(critic_weight));
+        if let Some(c) = critic {
+            driver = driver.with_critic(c);
+        }
+        driver.run(MockGoal::open("R"))
+    }
+
+    fn visits_of(result: &DriverResult, tactic: &str) -> usize {
+        result
+            .visit_counts
+            .iter()
+            .find(|(t, _)| t == tactic)
+            .map(|(_, v)| *v)
+            .expect("root tactic present in visit counts")
+    }
+
+    /// A branching lattice with two transpositions and no closed state anywhere, so
+    /// the search spends its entire budget on *exploration order*. Every observable
+    /// field of the result (visit split, node/edge counts, dedup hits) is therefore
+    /// a fingerprint of the selection arithmetic: any drift in the priority formula
+    /// moves at least one of them.
+    /// Distinct per-state progress values so `progress_weight · progress` is a live
+    /// term, and a deliberate tie between the two children of `C` so the stable
+    /// first-edge tie-break is exercised too.
+    fn lattice_goal(key: &str) -> MockGoal {
+        let p = match key {
+            "B" => 0.30,
+            "C" => 0.55,
+            "D" => 0.40,
+            "E" => 0.65,
+            // F ties D exactly, and C's two edges tie on prior, so C's children are
+            // fully indistinguishable and the stable first-edge tie-break decides
+            // which is descended into. (The tie-break rule itself is pinned by
+            // `injected_critic_reorders_exploration`, which reads it off the root.)
+            "F" => 0.40,
+            "G" => 0.80,
+            "H" => 0.20,
+            _ => 0.10,
+        };
+        MockGoal::open(key).with_progress(p)
+    }
+
+    fn lattice_expander() -> TableExpander {
+        TableExpander::new()
+            .edge("A", "l", 0.6, lattice_goal("B"))
+            .edge("A", "r", 0.4, lattice_goal("C"))
+            .edge("B", "d1", 0.7, lattice_goal("D"))
+            .edge("B", "d2", 0.3, lattice_goal("E"))
+            .edge("C", "d3", 0.5, lattice_goal("D"))
+            .edge("C", "d4", 0.5, lattice_goal("F"))
+            .edge("D", "x", 1.0, lattice_goal("G"))
+            .edge("E", "y", 1.0, lattice_goal("G"))
+            .edge("F", "z", 1.0, lattice_goal("H"))
+    }
+
+    fn lattice_cfg() -> SearchConfig {
+        SearchConfig {
+            max_nodes: 32,
+            expand_k: 3,
+            max_depth: 6,
+            ..SearchConfig::default()
+        }
+    }
+
+    #[test]
+    fn no_critic_path_matches_the_pinned_golden() {
+        // THE load-bearing regression test for this seam. `driver.rs` is the main
+        // search path, so "the no-critic path still works" is not enough: a silent
+        // reordering would pass that and change every downstream proof search.
+        // These literals were recorded from the driver and are pinned by hand, so a
+        // change to the priority formula that leaks into the no-critic path fails
+        // here loudly instead of being invisible.
+        let mut driver = ProofSearchDriver::new(lattice_expander())
+            .with_seed(11)
+            .with_config(lattice_cfg());
+        let r = driver.run(MockGoal::open("A"));
+
+        assert!(!r.solved, "golden scenario has no closed state");
+        assert!(!r.refuted);
+        assert_eq!(r.best_tactic.as_deref(), Some("r"));
+        assert_eq!(r.root_visits, 32);
+        assert_eq!(r.iterations, 32);
+        assert_eq!(r.nodes_created, 8, "distinct states A,B,C,D,E,F,G,H");
+        assert_eq!(r.edges_created, 9);
+        assert_eq!(r.dedup_hits, 2, "C->D and E->G both transpose");
+        assert_eq!(
+            r.visit_counts,
+            vec![("l".to_string(), 15), ("r".to_string(), 16)],
+            "the exact exploration split is the fingerprint of the priority formula"
+        );
+    }
+
+    #[test]
+    fn no_critic_leaves_the_driver_byte_identical() {
+        // The seam is default-OFF: with no critic injected the driver must produce
+        // exactly the pre-seam result. The strongest available statement of that is
+        // that the result does not depend on `critic_weight` AT ALL when no critic
+        // exists — the term cannot be reached, so no config can perturb the main
+        // search path by accident.
+        let baseline = run_fork(None, 0.0);
+        for weight in [0.0, 1.0, 25.0, -3.0] {
+            let other = run_fork(None, weight);
+            assert_identical(
+                &baseline,
+                &other,
+                &format!("no critic injected, critic_weight={weight}"),
+            );
+        }
+
+        // The same must hold on the richer golden scenario, and there it must also
+        // hold with eta-MCTS switched on: that branch reads the per-node critic
+        // value directly, so it is the one place where a no-critic run could have
+        // drifted without the weight being involved at all.
+        let base = |cfg: SearchConfig| {
+            ProofSearchDriver::new(lattice_expander())
+                .with_seed(11)
+                .with_config(cfg)
+                .run(MockGoal::open("A"))
+        };
+        let lattice_baseline = base(lattice_cfg());
+        for weight in [0.0, 3.0, 100.0] {
+            for eta in [None, Some(super::super::distance_critic::EtaMctsConfig::default())] {
+                assert_identical(
+                    &lattice_baseline,
+                    &base(SearchConfig {
+                        critic_weight: weight,
+                        eta_mcts: eta,
+                        ..lattice_cfg()
+                    }),
+                    &format!("no critic injected, weight={weight} eta={}", eta.is_some()),
+                );
+            }
+        }
+
+        // Injecting a critic while leaving the weight at its `0.0` default is
+        // likewise inert *for the PUCT term*, which is the only path `eta_mcts`
+        // (`None` by default) leaves open here. See
+        // `critic_reaches_expansion_breadth_only_under_eta_mcts` for the one case
+        // where injection alone is observable.
+        let inert = run_fork(Some(Arc::new(KeyCritic("y"))), 0.0);
+        assert_identical(&baseline, &inert, "critic injected at weight 0");
+
+        // And the no-critic path is still reproducible run to run.
+        assert_identical(&baseline, &run_fork(None, 0.0), "repeat of the baseline");
+    }
+
+    #[test]
+    fn critic_reaches_expansion_breadth_only_under_eta_mcts() {
+        // Honest pinning of the critic's second entry point. eta-MCTS sizes a node's
+        // expansion breadth from its `V(s)`, so with `eta_mcts` enabled an injected
+        // critic is observable even at `critic_weight == 0.0`. This is exploration
+        // breadth only, but it is a real behaviour change, so it is asserted rather
+        // than glossed as "inert".
+        let wide = || {
+            TableExpander::new()
+                .edge("W", "t1", 0.5, MockGoal::open("s1"))
+                .edge("W", "t2", 0.5, MockGoal::open("s2"))
+                .edge("W", "t3", 0.5, MockGoal::open("s3"))
+                .edge("W", "t4", 0.5, MockGoal::open("s4"))
+                .edge("W", "t5", 0.5, MockGoal::open("s5"))
+        };
+        // `expand_k = 2` so the fixed budget genuinely truncates the five candidates.
+        let eta_cfg = SearchConfig {
+            max_nodes: 32,
+            expand_k: 2,
+            max_depth: 6,
+            eta_mcts: Some(super::super::distance_critic::EtaMctsConfig::default()),
+            ..SearchConfig::default()
+        };
+        let run = |critic: Option<Arc<dyn CriticScorer>>, cfg: SearchConfig| {
+            let mut d = ProofSearchDriver::new(wide()).with_seed(11).with_config(cfg);
+            if let Some(c) = critic {
+                d = d.with_critic(c);
+            }
+            d.run(MockGoal::open("W"))
+        };
+
+        // No critic: breadth stays at the fixed `expand_k`, i.e. exactly today's
+        // behaviour. This is the property that must never break.
+        let no_critic = run(None, eta_cfg);
+        assert_eq!(no_critic.edges_created, 2, "no critic, so fixed expand_k");
+
+        // A maximally-confident critic widens the node, at weight 0.
+        let widened = run(Some(Arc::new(FlatCritic(1.0))), eta_cfg);
+        assert!(
+            widened.edges_created > no_critic.edges_created,
+            "eta-MCTS must widen a high-V node ({} vs {})",
+            widened.edges_created,
+            no_critic.edges_created
+        );
+
+        // With `eta_mcts` off (the default) the same injection is fully inert.
+        let plain = SearchConfig {
+            eta_mcts: None,
+            ..eta_cfg
+        };
+        assert_identical(
+            &run(None, plain),
+            &run(Some(Arc::new(FlatCritic(1.0))), plain),
+            "without eta_mcts, a weight-0 critic changes nothing",
+        );
+    }
+
+    #[test]
+    fn critic_is_consulted_only_when_a_node_is_created() {
+        // The determinism contract says ordering is a pure function of scores the
+        // driver ALREADY holds. That is only true if the critic is never called from
+        // inside the selection loop, where the number of calls would depend on the
+        // traversal. Pin it: exactly one call per node minted, budget-independent.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingCritic(AtomicUsize);
+        impl CriticScorer for CountingCritic {
+            fn score(&self, _state: &dyn GoalStateLike) -> f64 {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                // A constant, so the search shape matches the no-critic run and the
+                // call count is attributable to node creation alone.
+                0.5
+            }
+        }
+
+        for budget in [8usize, 32, 64] {
+            let critic = Arc::new(CountingCritic(AtomicUsize::new(0)));
+            let mut driver = ProofSearchDriver::new(lattice_expander())
+                .with_seed(11)
+                .with_config(SearchConfig {
+                    max_nodes: budget,
+                    critic_weight: 2.0,
+                    ..lattice_cfg()
+                })
+                .with_critic(critic.clone());
+            let r = driver.run(MockGoal::open("A"));
+            assert_eq!(
+                critic.0.load(Ordering::SeqCst),
+                r.nodes_created,
+                "one critic call per node created (budget {budget}), never per selection step"
+            );
+        }
+    }
+
+    #[test]
+    fn injected_critic_reorders_exploration() {
+        // Baseline: the two tactics are indistinguishable, so deterministic
+        // tie-breaking keeps the first-seen edge ahead.
+        let baseline = run_fork(None, 0.0);
+        assert!(
+            visits_of(&baseline, "tx") >= visits_of(&baseline, "ty"),
+            "without a critic, ties must resolve to the first edge ({:?})",
+            baseline.visit_counts
+        );
+
+        // With a critic that rates "y" as nearly proved, exploration must swing to
+        // the "ty" branch. This is the entire point of the seam.
+        let guided = run_fork(Some(Arc::new(KeyCritic("y"))), 1.0);
+        assert!(
+            visits_of(&guided, "ty") > visits_of(&guided, "tx"),
+            "the critic-preferred branch must be explored more ({:?})",
+            guided.visit_counts
+        );
+        assert_ne!(
+            baseline.visit_counts, guided.visit_counts,
+            "the critic must actually change the exploration order"
+        );
+
+        // Pointing the critic at the other branch swings it back, so the effect
+        // tracks the critic and is not an artifact of enabling the weight.
+        let flipped = run_fork(Some(Arc::new(KeyCritic("x"))), 1.0);
+        assert!(
+            visits_of(&flipped, "tx") > visits_of(&flipped, "ty"),
+            "the effect must follow the critic's preference ({:?})",
+            flipped.visit_counts
+        );
+
+        // Same critic, same seed, same result: the ordering logic stays a pure
+        // function of the scores it is handed.
+        assert_identical(
+            &guided,
+            &run_fork(Some(Arc::new(KeyCritic("y"))), 1.0),
+            "guided search is reproducible",
+        );
+    }
+
+    #[test]
+    fn constant_critic_does_not_degenerate_the_frontier() {
+        // A critic stuck on one output (an untrained head) is the dangerous case: if
+        // the critic REPLACED the priority it would flatten every child to the same
+        // score and destroy the frontier. Because it is folded in as an additive
+        // term, a constant shifts all siblings equally and the ordering is exactly
+        // the no-critic ordering — a useless critic costs nothing.
+        let baseline = run_fork(None, 0.0);
+        for value in [0.0, 0.5, 0.7, 1.0] {
+            for weight in [1.0, 10.0] {
+                let flat = run_fork(Some(Arc::new(FlatCritic(value))), weight);
+                assert_identical(
+                    &baseline,
+                    &flat,
+                    &format!("constant critic value={value} weight={weight}"),
+                );
+            }
+        }
+
+        // `ConstantCritic` (the shipped test double) behaves the same way.
+        assert_identical(
+            &baseline,
+            &run_fork(Some(Arc::new(ConstantCritic(0.42))), 5.0),
+            "ConstantCritic must not reshape the frontier",
+        );
+
+        // An out-of-contract magnitude is clamped into [0, 1] before it is blended,
+        // so it degenerates to the constant case instead of swamping q and u.
+        assert_identical(
+            &baseline,
+            &run_fork(Some(Arc::new(OutOfRangeCritic)), 1.0),
+            "an out-of-range critic is clamped, not allowed to dominate",
+        );
+
+        // The fork is a deliberate tie, so repeat the check on the lattice, where
+        // the no-critic ordering is genuinely non-trivial (distinct priors and
+        // distinct progress values). Flattening THAT frontier would be visible.
+        let run_lattice = |critic: Option<Arc<dyn CriticScorer>>, weight: f64| {
+            let mut d = ProofSearchDriver::new(lattice_expander())
+                .with_seed(11)
+                .with_config(SearchConfig {
+                    critic_weight: weight,
+                    ..lattice_cfg()
+                });
+            if let Some(c) = critic {
+                d = d.with_critic(c);
+            }
+            d.run(MockGoal::open("A"))
+        };
+        let lattice_baseline = run_lattice(None, 0.0);
+        for value in [0.0, 0.5, 1.0] {
+            for weight in [1.0, 10.0] {
+                assert_identical(
+                    &lattice_baseline,
+                    &run_lattice(Some(Arc::new(FlatCritic(value))), weight),
+                    &format!("constant critic must preserve a non-trivial frontier (value={value} weight={weight})"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn erroring_critic_degrades_to_the_no_critic_behaviour() {
+        // A critic that cannot produce an estimate returns NaN. Used raw it would
+        // make every `score > best_score` comparison false and silently truncate
+        // selection; discarded in favour of `progress` it costs nothing at all.
+        let baseline = run_fork(None, 0.0);
+        assert_identical(
+            &baseline,
+            &run_fork(Some(Arc::new(BrokenCritic)), 1.0),
+            "a NaN critic must fall back to today's signal",
+        );
+
+        // Non-finite infinities are handled by the same guard.
+        struct InfCritic(f64);
+        impl CriticScorer for InfCritic {
+            fn score(&self, _state: &dyn GoalStateLike) -> f64 {
+                self.0
+            }
+        }
+        for v in [f64::INFINITY, f64::NEG_INFINITY] {
+            assert_identical(
+                &baseline,
+                &run_fork(Some(Arc::new(InfCritic(v))), 1.0),
+                "an infinite critic must fall back to today's signal",
+            );
+        }
+
+        // A broken critic must not cost the search a proof it would otherwise find.
+        let expander = TableExpander::new()
+            .edge("b2", "close", 1.0, MockGoal::open("b1"))
+            .edge("b1", "close", 1.0, MockGoal::closed("b0"));
+        let mut driver = ProofSearchDriver::new(expander)
+            .with_seed(6)
+            .with_config(SearchConfig {
+                critic_weight: 4.0,
+                ..SearchConfig::default()
+            })
+            .with_critic(Arc::new(BrokenCritic));
+        let result = driver.run(MockGoal::open("b2"));
+        assert!(result.solved, "a broken critic must not break proving");
+    }
+
+    #[test]
+    fn critic_never_influences_closed_or_accepted_determinations() {
+        // A critic is a heuristic, never a verdict. Closure comes from
+        // `GoalState::is_closed` alone, so the most confident possible critic cannot
+        // manufacture a proof and the most pessimistic cannot deny one.
+
+        // 1. Maximum confidence on an unprovable goal: still not solved.
+        let stuck = TableExpander::new().edge("q", "stuck", 1.0, MockGoal::open("q"));
+        let mut optimist = ProofSearchDriver::new(stuck)
+            .with_seed(1)
+            .with_config(SearchConfig {
+                max_nodes: 20,
+                critic_weight: 100.0,
+                ..SearchConfig::default()
+            })
+            .with_critic(Arc::new(ConstantCritic(1.0)));
+        let result = optimist.run(MockGoal::open("q"));
+        assert!(
+            !result.solved,
+            "a critic claiming V=1 everywhere must not close an unprovable goal"
+        );
+        assert!(!result.refuted, "nor may it manufacture a refutation");
+
+        // 2. Minimum confidence on a provable goal: still solved. The critic can
+        //    only make the search look elsewhere first; it cannot reject a proof.
+        let chain = TableExpander::new()
+            .edge("c2", "close", 1.0, MockGoal::open("c1"))
+            .edge("c1", "close", 1.0, MockGoal::closed("c0"));
+        let mut pessimist = ProofSearchDriver::new(chain)
+            .with_seed(1)
+            .with_config(SearchConfig {
+                critic_weight: 100.0,
+                ..SearchConfig::default()
+            })
+            .with_critic(Arc::new(ConstantCritic(0.0)));
+        let result = pessimist.run(MockGoal::open("c2"));
+        assert!(
+            result.solved,
+            "a critic claiming V=0 everywhere must not block a real proof"
+        );
+
+        // 3. The disproof verdict is equally out of reach: a critic that loves the
+        //    negation side cannot turn a provable goal into a refuted one, because
+        //    `refuted` is gated on a negation node genuinely closing.
+        let expander = TableExpander::new()
+            .edge("n2", "close", 1.0, MockGoal::open("n1"))
+            .edge("n1", "close", 1.0, MockGoal::closed("n0"));
+        let mut driver = ProofSearchDriver::new(expander)
+            .with_seed(9)
+            .with_config(SearchConfig {
+                critic_weight: 100.0,
+                ..SearchConfig::default()
+            })
+            .with_critic(Arc::new(KeyCritic("not:n2")))
+            .with_negator(|g: &MockGoal| Some(MockGoal::open(&format!("not:{}", g.key))));
+        let result = driver.run(MockGoal::open("n2"));
+        assert!(!result.refuted, "an unclosable negation stays unrefuted");
+        assert!(result.solved, "and the real proof is still found");
     }
 }
