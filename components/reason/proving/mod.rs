@@ -21,3 +21,4 @@ pub mod repair;
 pub mod retry;
 pub mod router;
 pub mod sketch;
+pub mod staleness;
