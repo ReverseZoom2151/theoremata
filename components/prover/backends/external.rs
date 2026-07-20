@@ -20,7 +20,9 @@ use crate::{
 use anyhow::Result;
 use chrono::Utc;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeSet,
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -46,6 +48,14 @@ const AGDA_GOAL_CONTEXT_HOLE_CAP: usize = 16;
 /// diagnostics that exist today. Deliberately far below the batch checker's own
 /// limit: the enrichment is optional, so it yields rather than extends the gate.
 const AGDA_GOAL_CONTEXT_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Most files the Metamath include walk will open while building the dependency
+/// closure. `$[ file $]` includes nest, and a database is free to include a
+/// database that includes another. The cap bounds the walk so a pathological or
+/// hostile include chain cannot turn the axiom audit into an unbounded file
+/// crawl. Hitting the cap means the closure is INCOMPLETE, which the spec calls
+/// a failure rather than a successful skip, so it fails the audit closed.
+const METAMATH_INCLUDE_CLOSURE_CAP: usize = 64;
 
 pub struct ExternalBackend {
     pub system: FormalSystem,
@@ -1052,6 +1062,106 @@ impl ExternalBackend {
             "stderr": outcome.stderr,
         })
     }
+
+    /// Probe the checker for its exact version string.
+    ///
+    /// Returns the reason for failure rather than a guess: an unknown tool
+    /// version is a failure state in the spec, not a blank field, so callers
+    /// must be able to say WHY it is missing.
+    fn checker_version(&self) -> std::result::Result<String, String> {
+        if self.mock {
+            return Err("mock backend does not invoke a checker".into());
+        }
+        let probe = match self.system {
+            FormalSystem::Agda => vec![self.binary.as_str(), "--version"],
+            // The `metamath` reference binary has no version flag; its help
+            // banner is the only place the version appears.
+            FormalSystem::Metamath => vec![self.binary.as_str(), "-h"],
+            _ => return Err("unsupported system".into()),
+        };
+        let out = exec::run(&self.runner, &probe, Path::new("."));
+        if !out.launched {
+            return Err(format!("version probe could not launch: {}", out.stderr));
+        }
+        let combined = format!("{}\n{}", out.stdout, out.stderr);
+        combined
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && line.to_ascii_lowercase().contains("version"))
+            .map(str::to_string)
+            .ok_or_else(|| {
+                format!(
+                    "{} exposed no recognisable version line",
+                    backend_name(self.system)
+                )
+            })
+    }
+
+    /// The common cross-backend contract from docs/formal-systems: system,
+    /// checker identity, source hash, dependency hash, and the resource limits
+    /// the run was held to.
+    ///
+    /// Every field that cannot be computed is emitted as an explicit
+    /// null-with-reason (see [`unavailable_field`]) so a reader can never
+    /// confuse "we did not record this" with "this was empty".
+    fn provenance(&self, ws: Option<&Workspace>) -> serde_json::Value {
+        let limits = exec::ResourceLimits::from_env();
+        let filename = ws
+            .and_then(|ws| ws.source_path.file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or("Generated");
+        let version = match self.checker_version() {
+            Ok(version) => json!(version),
+            Err(reason) => unavailable_field(&reason),
+        };
+        let source = ws.map(|ws| std::fs::read(&ws.source_path));
+        let source_sha256 = match &source {
+            Some(Ok(bytes)) => json!(sha256_hex(bytes)),
+            Some(Err(error)) => {
+                unavailable_field(&format!("source could not be read: {error}"))
+            }
+            None => unavailable_field("no workspace was scaffolded for this phase"),
+        };
+        // Metamath's dependencies are the resolved `$[ file $]` closure. Agda's
+        // are a library/module graph this backend does not resolve, so the field
+        // is explicitly absent with the reason rather than silently empty.
+        let dependency_sha256 = match (self.system, ws, &source) {
+            (FormalSystem::Metamath, Some(ws), Some(Ok(bytes))) => {
+                let text = String::from_utf8_lossy(bytes).into_owned();
+                let stripped = crate::prover::formal::strip_comments(&text);
+                let closure = metamath_include_closure(&ws.root, stripped.as_str());
+                match closure.dependency_sha256 {
+                    Some(sha) => json!(sha),
+                    None => unavailable_field(&format!(
+                        "include closure is incomplete: {}",
+                        closure.unresolved.join("; ")
+                    )),
+                }
+            }
+            (FormalSystem::Metamath, _, _) => {
+                unavailable_field("the database source could not be read")
+            }
+            _ => unavailable_field(
+                "the Agda module-graph closure is not resolved by this backend",
+            ),
+        };
+        json!({
+            "system": self.system.as_str(),
+            "mock": self.mock,
+            "runner": self.runner.tag(),
+            "checker": {
+                "binary": self.binary.clone(),
+                "version": version,
+                "command": self.command(filename),
+            },
+            "source_sha256": source_sha256,
+            "dependency_sha256": dependency_sha256,
+            "limits": {
+                "timeout_seconds": limits.timeout.as_secs(),
+                "max_output_bytes": limits.max_output_bytes,
+            },
+        })
+    }
 }
 
 impl FormalBackend for ExternalBackend {
@@ -1140,7 +1250,7 @@ impl FormalBackend for ExternalBackend {
                 compiled: true,
                 errors: vec![],
                 per_unit: vec![],
-                detail: json!({"mock": true}),
+                detail: json!({"mock": true, "provenance": self.provenance(Some(ws))}),
             });
         }
         if !self.available() {
@@ -1148,7 +1258,7 @@ impl FormalBackend for ExternalBackend {
                 compiled: false,
                 errors: vec![format!("{} toolchain unavailable", self.system)],
                 per_unit: vec![],
-                detail: json!({"unavailable": true}),
+                detail: json!({"unavailable": true, "provenance": self.provenance(Some(ws))}),
             });
         }
         let out = self.run_file(ws);
@@ -1204,36 +1314,149 @@ impl FormalBackend for ExternalBackend {
                 &errors,
             ),
             errors,
-            detail: json!({"runner": self.runner.tag(), "binary": self.binary.clone(), "command": command, "code": out.code, "verified": verified, "stdout": out.stdout, "stderr": out.stderr, "interaction_diagnostics": interaction_diagnostics}),
+            detail: json!({"runner": self.runner.tag(), "binary": self.binary.clone(), "command": command, "code": out.code, "verified": verified, "stdout": out.stdout, "stderr": out.stderr, "interaction_diagnostics": interaction_diagnostics, "provenance": self.provenance(Some(ws))}),
         })
     }
 
-    fn audit_axioms(
-        &self,
-        _ws: &Workspace,
-        _thm: &str,
-        whitelist: &[String],
-    ) -> Result<AxiomReport> {
-        // Agda's trusted boundary is the type checker plus the source policy;
-        // Metamath's `$a` declarations belong to the loaded database context.
-        Ok(AxiomReport {
-            axioms: vec![],
-            within_whitelist: true,
-            detail: json!({"system": self.system.as_str(), "whitelist": whitelist}),
-        })
+    /// Layer 2 of the gate: what does this proof ASSUME?
+    ///
+    /// This used to return `within_whitelist: true` unconditionally, which made
+    /// layer 2 inert for two of six systems while still presenting as a gate.
+    /// An audit that cannot run must say so and fail CLOSED; asserting
+    /// cleanliness it never established is the one answer it may not give.
+    fn audit_axioms(&self, ws: &Workspace, thm: &str, whitelist: &[String]) -> Result<AxiomReport> {
+        if self.mock {
+            // The mock's canned clean audit is offline scaffolding, and it is
+            // safe ONLY because `is_mock()` forces `VerificationReport.live` to
+            // false in `formal.rs::verify`, so no caller can promote it. The
+            // markers are repeated in the detail so a persisted report stays
+            // self-describing when read out of context.
+            return Ok(AxiomReport {
+                axioms: Vec::new(),
+                within_whitelist: true,
+                detail: json!({
+                    "system": self.system.as_str(),
+                    "mock": true,
+                    "live": false,
+                    "audit_ran": false,
+                    "whitelist": whitelist,
+                    "provenance": self.provenance(Some(ws)),
+                }),
+            });
+        }
+        let provenance = self.provenance(Some(ws));
+        if !self.available() {
+            return Ok(blocked_audit(
+                self.system,
+                whitelist,
+                "toolchain unavailable; the assumed axiom set could not be determined",
+                provenance,
+                json!({"unavailable": true}),
+            ));
+        }
+        // The audit reads the SUBMITTED source, never a rewritten copy: editing
+        // it would invalidate the source scan and the statement-preservation
+        // check, which both read the same text.
+        let code = match std::fs::read_to_string(&ws.source_path) {
+            Ok(code) => code,
+            Err(error) => {
+                return Ok(blocked_audit(
+                    self.system,
+                    whitelist,
+                    "the candidate source could not be read",
+                    provenance,
+                    json!({"source_path": ws.source_path.to_string_lossy(), "error": error.to_string()}),
+                ));
+            }
+        };
+        let stripped = crate::prover::formal::strip_comments(&code);
+        match self.system {
+            FormalSystem::Agda => {
+                // Agda has no `#print axioms`, so the assumed set is what the
+                // module postulates plus whatever its imports postulate. Local
+                // postulates are read off the source; imports are only trusted
+                // when they lie inside the DECLARED closure (the builtins that
+                // ship with the checker and are covered by `--safe`). Any other
+                // import is a module this backend has not read, so the closure
+                // is unknown and the audit fails closed rather than reporting a
+                // local-only answer as if it were complete. See the
+                // `agda_transitive_postulates` note in this file's tests for the
+                // module-graph walk that would lift this restriction.
+                let axioms = agda_postulate_names(stripped.as_str());
+                let imports = agda_imports(stripped.as_str());
+                let unresolved: Vec<String> = imports
+                    .iter()
+                    .filter(|module| !agda_import_inside_declared_closure(module.as_str()))
+                    .cloned()
+                    .collect();
+                let local_clean = axioms.iter().all(|axiom| whitelist.contains(axiom));
+                let within = local_clean && unresolved.is_empty();
+                Ok(AxiomReport {
+                    axioms: axioms.clone(),
+                    within_whitelist: within,
+                    detail: json!({
+                        "system": "agda",
+                        "live": true,
+                        "audit_ran": true,
+                        "target": thm,
+                        "whitelist": whitelist,
+                        "local_postulates": axioms,
+                        "local_postulates_within_whitelist": local_clean,
+                        "imports": imports,
+                        "declared_closure": FormalSystem::Agda.default_imports(),
+                        "imports_outside_declared_closure": unresolved,
+                        "transitive_imported_postulates": unavailable_field(
+                            "resolving imported postulates needs an Agda module-graph walk this backend does not perform; imports outside the declared closure therefore fail the audit closed",
+                        ),
+                        "provenance": provenance,
+                    }),
+                })
+            }
+            FormalSystem::Metamath => {
+                // A `$a` in the CANDIDATE source is a new axiom and widens the
+                // trusted base. A `$a` inside an included database is a reviewed
+                // database axiom: the spec says to RECORD those, not to reject
+                // them, so they are counted per file instead of being folded
+                // into the whitelist check. An include that cannot be resolved
+                // makes the closure incomplete, which is a failure and not a
+                // successful skip.
+                let axioms = metamath_axiom_labels(stripped.as_str());
+                let closure = metamath_include_closure(&ws.root, stripped.as_str());
+                let local_clean = axioms.iter().all(|axiom| whitelist.contains(axiom));
+                let within = local_clean && closure.unresolved.is_empty();
+                Ok(AxiomReport {
+                    axioms: axioms.clone(),
+                    within_whitelist: within,
+                    detail: json!({
+                        "system": "metamath",
+                        "live": true,
+                        "audit_ran": true,
+                        "target": thm,
+                        "whitelist": whitelist,
+                        "generated_axioms": axioms,
+                        "generated_axioms_within_whitelist": local_clean,
+                        "database_closure": closure.files,
+                        "database_closure_unresolved": closure.unresolved,
+                        "database_closure_complete": closure.unresolved.is_empty(),
+                        "provenance": provenance,
+                    }),
+                })
+            }
+            _ => unreachable!("ExternalBackend only supports Agda and Metamath"),
+        }
     }
 
     fn kernel_recheck(&self, ws: &Workspace) -> Result<RecheckReport> {
         if self.mock {
             return Ok(RecheckReport {
                 rechecked: true,
-                detail: json!({"mock": true}),
+                detail: json!({"mock": true, "live": false, "provenance": self.provenance(Some(ws))}),
             });
         }
         if !self.available() {
             return Ok(RecheckReport {
                 rechecked: false,
-                detail: json!({"unavailable": true}),
+                detail: json!({"unavailable": true, "provenance": self.provenance(Some(ws))}),
             });
         }
         let out = self.run_file(ws);
@@ -1243,31 +1466,61 @@ impl FormalBackend for ExternalBackend {
             .and_then(|s| s.to_str())
             .unwrap_or("Generated");
         let command = self.command(filename);
+        // SOUNDNESS: this used to read `out.success()`, i.e. the exit code. The
+        // Metamath reference binary returns 0 even when `verify proof *` FAILS
+        // (see `compile_success_signal`), so the exit code alone would certify a
+        // failed re-check. The recheck therefore uses the SAME declared success
+        // signal as `compile`: sentinel for Metamath, honest exit for Agda.
+        let primary_passed = self.compile_success_signal().is_pass(
+            out.launched,
+            out.success(),
+            &out.stdout,
+            &out.stderr,
+        );
         let mut secondary = json!(null);
-        let mut rechecked = out.success();
-        if rechecked {
-            if let (FormalSystem::Metamath, Some(binary)) = (self.system, &self.secondary_binary) {
-                let filename = ws
-                    .source_path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("Generated");
-                let args = [binary.as_str(), filename];
-                let second = exec::run(&self.runner, &args, &ws.root);
-                rechecked = second.success();
-                secondary = json!({
-                    "binary": binary,
-                    "command": args,
-                    "code": second.code,
-                    "stdout": second.stdout,
-                    "stderr": second.stderr,
-                    "passed": second.success(),
-                });
-            }
+        let mut secondary_passed = None;
+        if let (FormalSystem::Metamath, Some(binary)) = (self.system, &self.secondary_binary) {
+            let args = [binary.as_str(), filename];
+            let second = exec::run(&self.runner, &args, &ws.root);
+            // The secondary checker may CORROBORATE or FLAG DISAGREEMENT; it may
+            // never substitute for the primary verdict (docs/formal-systems).
+            // Its exit code is the only signal an arbitrary third-party checker
+            // offers, so a non-zero exit or a failed launch reads as "did not
+            // pass" (fail-closed).
+            let passed = second.success();
+            secondary_passed = Some(passed);
+            let agreement = if passed == primary_passed {
+                "agree"
+            } else {
+                "disagree"
+            };
+            secondary = json!({
+                "binary": binary,
+                "command": args,
+                "code": second.code,
+                "stdout": second.stdout,
+                "stderr": second.stderr,
+                "passed": passed,
+                "role": "cross_check_only",
+                "agreement": agreement,
+            });
         }
+        let (rechecked, disagreement) = cross_checked_verdict(primary_passed, secondary_passed);
         Ok(RecheckReport {
             rechecked,
-            detail: json!({"binary": self.binary.clone(), "command": command, "code": out.code, "stdout": out.stdout, "stderr": out.stderr, "checker": self.system.as_str(), "secondary": secondary}),
+            detail: json!({
+                "binary": self.binary.clone(),
+                "command": command,
+                "code": out.code,
+                "stdout": out.stdout,
+                "stderr": out.stderr,
+                "checker": self.system.as_str(),
+                "primary_passed": primary_passed,
+                "exit_status_trusted": false,
+                "secondary": secondary,
+                "secondary_disagreement": disagreement,
+                "provenance": self.provenance(Some(ws)),
+            }),
         })
     }
 
@@ -1396,6 +1649,261 @@ fn metamath_includes(code: &str) -> Vec<PathBuf> {
         rest = &rest[end + 2..];
     }
     includes
+}
+
+// --- provenance and axiom audit -------------------------------------------
+
+/// Lowercase hex of a digest. sha2 0.11's output no longer implements
+/// `LowerHex`, so the bytes are formatted explicitly (same helper shape as
+/// `graph::db`).
+fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
+    use std::fmt::Write as _;
+    let bytes = bytes.as_ref();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex_lower(Sha256::digest(bytes))
+}
+
+/// A field of the common cross-backend contract that could NOT be computed.
+///
+/// The spec names `source_sha256`, `dependency_sha256` and `limits` as fields
+/// every result carries. Omitting one when it cannot be computed would make
+/// "not recorded" indistinguishable from "recorded as empty", so an explicit
+/// null carrying its reason is emitted instead.
+fn unavailable_field(reason: &str) -> serde_json::Value {
+    json!({"value": serde_json::Value::Null, "unavailable": true, "reason": reason})
+}
+
+/// Names introduced by `postulate` blocks in COMMENT-STRIPPED Agda source.
+///
+/// Agda's layout rule makes the block everything indented deeper than the
+/// `postulate` keyword itself, so the block is delimited by indentation rather
+/// than by a terminator token. A line that cannot be split at `:` is recorded
+/// verbatim rather than dropped: over-reporting only makes the audit stricter,
+/// while dropping an entry would understate the trusted base.
+fn agda_postulate_names(stripped: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut block: Option<usize> = None;
+    for raw in stripped.lines() {
+        let indent = raw.len() - raw.trim_start().len();
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(open_indent) = block {
+            if indent > open_indent {
+                push_agda_postulate_entry(line, &mut names);
+                continue;
+            }
+            block = None;
+        }
+        // Word-boundary match: `postulates` is an ordinary identifier.
+        let is_keyword = line == "postulate"
+            || line
+                .strip_prefix("postulate")
+                .is_some_and(|rest| rest.starts_with(char::is_whitespace));
+        if is_keyword {
+            block = Some(indent);
+            let inline = line["postulate".len()..].trim();
+            if !inline.is_empty() {
+                push_agda_postulate_entry(inline, &mut names);
+            }
+        }
+    }
+    names
+}
+
+fn push_agda_postulate_entry(entry: &str, names: &mut Vec<String>) {
+    match entry.split_once(':') {
+        Some((lhs, _)) if !lhs.trim().is_empty() => {
+            names.extend(lhs.split_whitespace().map(str::to_string));
+        }
+        // No `:` on this line means a continuation or a shape we do not model.
+        // Keep it verbatim so the reader sees exactly what was assumed.
+        _ => names.push(entry.to_string()),
+    }
+}
+
+/// Module names imported by COMMENT-STRIPPED Agda source (`import M`,
+/// `open import M ...`).
+fn agda_imports(stripped: &str) -> Vec<String> {
+    let mut modules = Vec::new();
+    for raw in stripped.lines() {
+        let mut tokens = raw.split_whitespace().peekable();
+        let Some(first) = tokens.next() else { continue };
+        let rest = match first {
+            "import" => tokens.next(),
+            "open" => match tokens.next() {
+                Some("import") => tokens.next(),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(module) = rest {
+            let module = module.trim_end_matches(';').to_string();
+            if !module.is_empty() && !modules.contains(&module) {
+                modules.push(module);
+            }
+        }
+    }
+    modules
+}
+
+/// Whether an Agda import lies inside the DECLARED project closure.
+///
+/// The declared closure is `FormalSystem::Agda.default_imports()`, i.e. the
+/// builtin modules that ship with the checker we invoke. Under `--safe` those
+/// builtins are part of the checker's own trusted base, so they need no separate
+/// postulate audit. Anything else is a module this backend has not read, and
+/// per the spec an import outside the declared closure fails closed.
+fn agda_import_inside_declared_closure(module: &str) -> bool {
+    FormalSystem::Agda.default_imports().iter().any(|prefix| {
+        module == prefix.as_str() || module.starts_with(&format!("{prefix}."))
+    })
+}
+
+/// Labels of `$a` axiomatic assertions declared in COMMENT-STRIPPED Metamath
+/// source. In Metamath a statement is `label $a ... $.`, so the label is the
+/// token immediately before the `$a` keyword.
+fn metamath_axiom_labels(stripped: &str) -> Vec<String> {
+    let tokens: Vec<&str> = stripped.split_whitespace().collect();
+    let mut labels = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if *token != "$a" {
+            continue;
+        }
+        let label = match index.checked_sub(1).and_then(|i| tokens.get(i)) {
+            Some(label) if !label.starts_with('$') => (*label).to_string(),
+            // An unlabelled `$a` is malformed Metamath, but it still announces
+            // an axiom, so it is recorded rather than skipped.
+            _ => format!("unlabelled $a at token {index}"),
+        };
+        labels.push(label);
+    }
+    labels
+}
+
+/// The transitively-resolved `$[ file $]` closure of a Metamath database.
+struct MetamathClosure {
+    /// One entry per resolved file: name, content hash, and how many `$a`
+    /// database axioms it contributes to the trusted base.
+    files: Vec<serde_json::Value>,
+    /// Includes that could not be read, escaped the workspace, or were cut off
+    /// by the cap. Any entry here means the closure is incomplete.
+    unresolved: Vec<String>,
+    /// Hash over the resolved closure, or `None` when it is incomplete: a hash
+    /// of a partial closure would look like a real dependency identity.
+    dependency_sha256: Option<String>,
+}
+
+/// Walk the include closure of `code` under `root`, transitively and bounded.
+///
+/// Nested includes are followed because the spec requires the dependency
+/// closure to include included files, and a database is free to include another
+/// database. Cycles terminate on the visited set; the cap bounds the walk.
+fn metamath_include_closure(root: &Path, code: &str) -> MetamathClosure {
+    use std::path::Component;
+    let mut files = Vec::new();
+    let mut unresolved = Vec::new();
+    let mut visited: BTreeSet<String> = BTreeSet::new();
+    let mut queue: Vec<PathBuf> = metamath_includes(code);
+    let mut digest_material: Vec<String> = Vec::new();
+
+    while let Some(include) = queue.pop() {
+        let name = include.to_string_lossy().to_string();
+        if !visited.insert(name.clone()) {
+            continue;
+        }
+        if visited.len() > METAMATH_INCLUDE_CLOSURE_CAP {
+            unresolved.push(format!(
+                "{name}: include closure exceeded the {METAMATH_INCLUDE_CLOSURE_CAP}-file cap"
+            ));
+            continue;
+        }
+        let escapes = include.is_absolute()
+            || include.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            });
+        if escapes {
+            unresolved.push(format!("{name}: include escapes the workspace"));
+            continue;
+        }
+        let bytes = match std::fs::read(root.join(&include)) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                unresolved.push(format!("{name}: {error}"));
+                continue;
+            }
+        };
+        let sha = sha256_hex(&bytes);
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let stripped = crate::prover::formal::strip_comments(&text);
+        let database_axioms = metamath_axiom_labels(stripped.as_str()).len();
+        digest_material.push(format!("{name}\u{0}{sha}"));
+        files.push(json!({
+            "include": name,
+            "sha256": sha,
+            "database_axioms": database_axioms,
+        }));
+        queue.extend(metamath_includes(stripped.as_str()));
+    }
+
+    digest_material.sort();
+    let dependency_sha256 = unresolved
+        .is_empty()
+        .then(|| sha256_hex(digest_material.join("\n").as_bytes()));
+    MetamathClosure {
+        files,
+        unresolved,
+        dependency_sha256,
+    }
+}
+
+/// Combine a primary re-check verdict with an OPTIONAL secondary checker.
+///
+/// Returns `(rechecked, disagreement)`. The secondary may corroborate or flag
+/// disagreement; it may never substitute for the primary verdict, so it can
+/// only ever withhold the re-check, never grant one the primary refused. A
+/// disagreement is surfaced rather than silently resolved in favour of whichever
+/// checker ran last, because two checkers contradicting each other is exactly
+/// the state in which we do not know the proof is good.
+fn cross_checked_verdict(primary_passed: bool, secondary_passed: Option<bool>) -> (bool, bool) {
+    let disagreement = secondary_passed.is_some_and(|passed| passed != primary_passed);
+    (primary_passed && !disagreement, disagreement)
+}
+
+/// A fail-closed [`AxiomReport`]: the axiom set is UNKNOWN, so the audit is not
+/// clean. `axioms` stays empty because nothing was learned, and `audit_ran` is
+/// false so a reader can tell this apart from a genuinely empty axiom set.
+fn blocked_audit(
+    system: FormalSystem,
+    whitelist: &[String],
+    reason: &str,
+    provenance: serde_json::Value,
+    extra: serde_json::Value,
+) -> AxiomReport {
+    AxiomReport {
+        axioms: Vec::new(),
+        within_whitelist: false,
+        detail: json!({
+            "system": system.as_str(),
+            "live": true,
+            "audit_ran": false,
+            "blocked": reason,
+            "whitelist": whitelist,
+            "provenance": provenance,
+            "detail": extra,
+        }),
+    }
 }
 
 impl ProofSession for ExternalBackend {
@@ -1913,6 +2421,249 @@ mod tests {
             report.detail
         );
         assert!(report.detail.get("goal_context_enrichment").is_none());
+    }
+
+    // --- Layer 2: the axiom audit ----------------------------------------
+    //
+    // This layer used to return `within_whitelist: true` unconditionally for
+    // both Agda and Metamath, so it presented as a gate while gating nothing.
+
+    /// A backend pointed at a binary that does not exist cannot audit anything,
+    /// so it must fail CLOSED and say why, never assert cleanliness.
+    #[test]
+    fn audit_fails_closed_when_it_cannot_run() {
+        for system in [FormalSystem::Agda, FormalSystem::Metamath] {
+            let backend = ExternalBackend {
+                system,
+                mock: false,
+                runner: Runner::Native,
+                binary: "theoremata-no-such-checker".into(),
+                secondary_binary: None,
+            };
+            let ws = Workspace {
+                system,
+                root: PathBuf::from("."),
+                source_path: PathBuf::from(format!("Generated{}", system.source_extension())),
+                entry: "Generated".into(),
+            };
+            let report = backend
+                .audit_axioms(&ws, "Generated", &system.axiom_whitelist())
+                .expect("a blocked audit is a report, not an error");
+            assert!(
+                !report.within_whitelist,
+                "an audit that could not run must not claim cleanliness: {report:?}"
+            );
+            assert_eq!(report.detail["audit_ran"], false);
+            assert!(report.detail["blocked"].is_string());
+            assert!(report.axioms.is_empty(), "nothing was learned");
+        }
+    }
+
+    /// The mock audit stays clean (offline scaffolding) but must be marked as
+    /// not-live and not-run, so it is distinguishable from a real clean audit.
+    #[test]
+    fn mock_audit_is_marked_as_not_live_and_not_run() {
+        let cfg = Config::default();
+        for system in [FormalSystem::Agda, FormalSystem::Metamath] {
+            let backend = ExternalBackend::new(&cfg, system, true);
+            let ws = backend.scaffold(&cfg, "", "Generated").unwrap();
+            let report = backend
+                .audit_axioms(&ws, "Generated", &system.axiom_whitelist())
+                .unwrap();
+            assert!(report.within_whitelist);
+            assert_eq!(report.detail["live"], false);
+            assert_eq!(report.detail["audit_ran"], false);
+            assert_eq!(report.detail["mock"], true);
+        }
+    }
+
+    #[test]
+    fn agda_postulates_and_imports_are_read_off_the_source() {
+        let code = "module Generated where\n\
+                    open import Agda.Builtin.Unit\n\
+                    open import Untrusted.Module\n\
+                    postulate\n  \
+                      bad : Set\n  \
+                      worse also : Set\n\
+                    thm : Set\nthm = Set\n";
+        let stripped = crate::prover::formal::strip_comments(code);
+        let names = agda_postulate_names(stripped.as_str());
+        assert_eq!(names, vec!["bad", "worse", "also"]);
+        // The block ends at the dedent: `thm` is a declaration, not an axiom.
+        assert!(!names.iter().any(|name| name.starts_with("thm")));
+        let imports = agda_imports(stripped.as_str());
+        assert_eq!(imports, vec!["Agda.Builtin.Unit", "Untrusted.Module"]);
+        assert!(agda_import_inside_declared_closure("Agda.Builtin.Unit"));
+        assert!(!agda_import_inside_declared_closure("Untrusted.Module"));
+        // A commented-out postulate is never seen by the checker.
+        let commented =
+            crate::prover::formal::strip_comments("-- postulate ghost : Set\nthm : Set\n");
+        assert!(agda_postulate_names(commented.as_str()).is_empty());
+        // `postulates` is an ordinary identifier, not the keyword.
+        let identifier =
+            crate::prover::formal::strip_comments("postulates : Set\npostulates = Set\n");
+        assert!(agda_postulate_names(identifier.as_str()).is_empty());
+    }
+
+    #[test]
+    fn metamath_axiom_labels_are_read_off_the_source() {
+        let stripped = crate::prover::formal::strip_comments(
+            "$( a comment with badax $a $)\n$c wff $.\nid $a |- ph $.\nth $p |- ph $= wph id $.\n",
+        );
+        assert_eq!(metamath_axiom_labels(stripped.as_str()), vec!["id"]);
+    }
+
+    /// An unresolvable include leaves the dependency closure INCOMPLETE, which
+    /// the spec calls a failure, so no dependency hash is produced for it.
+    #[test]
+    fn metamath_include_closure_fails_closed_on_a_missing_include() {
+        let tmp = tempfile::tempdir().unwrap();
+        let closure = metamath_include_closure(tmp.path(), "$[ absent.mm $]\n");
+        assert!(closure.dependency_sha256.is_none());
+        assert_eq!(closure.unresolved.len(), 1);
+        assert!(closure.files.is_empty());
+
+        // A resolvable closure hashes, and nested includes are followed.
+        std::fs::write(tmp.path().join("base.mm"), "ax1 $a |- ph $.\n").unwrap();
+        std::fs::write(tmp.path().join("mid.mm"), "$[ base.mm $]\nax2 $a |- ps $.\n").unwrap();
+        let closure = metamath_include_closure(tmp.path(), "$[ mid.mm $]\n");
+        assert!(closure.unresolved.is_empty());
+        assert_eq!(closure.files.len(), 2, "nested include must be walked");
+        assert!(closure.dependency_sha256.is_some());
+        // Database axioms are RECORDED, not rejected.
+        assert!(closure
+            .files
+            .iter()
+            .all(|file| file["database_axioms"] == 1));
+        // An escaping include is unresolved rather than followed.
+        let escaping = metamath_include_closure(tmp.path(), "$[ ../evil.mm $]\n");
+        assert!(escaping.dependency_sha256.is_none());
+        assert!(escaping.unresolved[0].contains("escapes"));
+    }
+
+    // --- Layer 2b: the kernel re-check ------------------------------------
+
+    /// The exit code is not the signal for Metamath: the binary exits 0 on a
+    /// FAILED `verify proof *`. The re-check must use the same declared success
+    /// signal as `compile`, which is what this asserts.
+    #[test]
+    fn metamath_recheck_rejects_exit_zero_with_a_failure_sentinel() {
+        let signal = ExternalBackend::new(&Config::default(), FormalSystem::Metamath, true)
+            .compile_success_signal();
+        // Exit 0 (`exit_success == true`) plus a failure sentinel: NOT a pass.
+        assert!(!signal.is_pass(true, true, "?Error on line 5: proof does not verify.", ""));
+        // Exit 0 with no sentinel at all is likewise not a pass.
+        assert!(!signal.is_pass(true, true, "", ""));
+        // Only the explicit success sentinel passes.
+        assert!(signal.is_pass(true, true, "All proofs in the database were verified in 0.01 s.", ""));
+        // And that verdict, not the exit code, is what the re-check reports.
+        assert_eq!(cross_checked_verdict(false, None), (false, false));
+    }
+
+    /// A secondary checker may corroborate or flag disagreement; it may never
+    /// substitute for the primary verdict.
+    #[test]
+    fn secondary_checker_never_overwrites_the_primary_verdict() {
+        // Corroboration.
+        assert_eq!(cross_checked_verdict(true, Some(true)), (true, false));
+        assert_eq!(cross_checked_verdict(false, Some(false)), (false, false));
+        // The secondary cannot grant a pass the primary refused.
+        assert_eq!(
+            cross_checked_verdict(false, Some(true)),
+            (false, true),
+            "a secondary pass must not overwrite a primary failure"
+        );
+        // Nor can it be silently resolved away when it contradicts a pass.
+        assert_eq!(
+            cross_checked_verdict(true, Some(false)),
+            (false, true),
+            "a disagreement must surface and withhold the re-check"
+        );
+        // With no secondary configured there is nothing to disagree with.
+        assert_eq!(cross_checked_verdict(true, None), (true, false));
+    }
+
+    // --- The common cross-backend provenance contract ----------------------
+
+    #[test]
+    fn provenance_carries_the_common_contract_fields() {
+        let cfg = Config::default();
+        for system in [FormalSystem::Agda, FormalSystem::Metamath] {
+            let backend = ExternalBackend::new(&cfg, system, true);
+            let ws = backend.scaffold(&cfg, "", "Generated").unwrap();
+            let provenance = backend.provenance(Some(&ws));
+            assert_eq!(provenance["system"], system.as_str());
+            assert!(provenance["checker"]["command"].is_array());
+            assert_eq!(
+                provenance["limits"]["timeout_seconds"],
+                json!(exec::ResourceLimits::from_env().timeout.as_secs())
+            );
+            // Fields that cannot be computed are explicit nulls WITH a reason,
+            // so "not recorded" never reads as "recorded as empty".
+            for field in ["source_sha256", "dependency_sha256"] {
+                let value = &provenance[field];
+                assert!(
+                    value.is_string() || value["unavailable"] == true,
+                    "{field} must be a hash or an explicit null-with-reason: {value:?}"
+                );
+                if value["unavailable"] == true {
+                    assert!(
+                        value["reason"].as_str().is_some_and(|r| !r.is_empty()),
+                        "{field} must say WHY it is unavailable"
+                    );
+                    assert!(value["value"].is_null());
+                }
+            }
+            assert_eq!(provenance["checker"]["version"]["unavailable"], true);
+        }
+    }
+
+    /// A real source hash is computed when the source exists, and it is the
+    /// hash of the exact bytes the checker was given.
+    #[test]
+    fn provenance_hashes_the_submitted_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("Generated.mm");
+        let code = "$c wff $.\n";
+        std::fs::write(&source, code).unwrap();
+        let backend = ExternalBackend {
+            system: FormalSystem::Metamath,
+            mock: false,
+            runner: Runner::Native,
+            binary: "theoremata-no-such-checker".into(),
+            secondary_binary: None,
+        };
+        let ws = Workspace {
+            system: FormalSystem::Metamath,
+            root: tmp.path().to_path_buf(),
+            source_path: source,
+            entry: "Generated".into(),
+        };
+        let provenance = backend.provenance(Some(&ws));
+        assert_eq!(provenance["source_sha256"], json!(sha256_hex(code.as_bytes())));
+        // No includes: the closure is complete and empty, so it still hashes.
+        assert!(provenance["dependency_sha256"].is_string());
+    }
+
+    /// TRANSITIVE IMPORTED POSTULATES (spec, Agda section). A postulate in an
+    /// imported module is as much an axiom as a local one, but resolving it
+    /// needs an Agda module-graph walk (library roots, `.agda-lib` resolution,
+    /// interface files) that this whole-file backend does not have. Rather than
+    /// half-build it, the audit fails CLOSED on any import outside the declared
+    /// closure and records the reason in the report.
+    #[test]
+    fn agda_transitive_postulates_fail_closed_pending_a_module_graph_walk() {
+        let stripped = crate::prover::formal::strip_comments(
+            "module Generated where\nopen import Some.Untrusted.Lib\nthm : Set\nthm = Set\n",
+        );
+        let imports = agda_imports(stripped.as_str());
+        assert!(agda_postulate_names(stripped.as_str()).is_empty());
+        assert!(
+            imports
+                .iter()
+                .any(|module| !agda_import_inside_declared_closure(module)),
+            "an unresolvable import must be visible to the audit"
+        );
     }
 
     #[test]
