@@ -488,14 +488,25 @@ fn metamath_live_verifies_trivial_and_rejects_malformed_proof() {
         eprintln!("SKIP metamath_live: metamath unavailable via configured runner");
         return;
     }
-    // A genuinely VALID minimal Metamath proof. The RPN proof of `th : |- ph`
-    // is `wph id`: `wph` (the floating hypothesis) pushes `wff ph`, then `id`
-    // (which has mandatory hypothesis `wph`) consumes it and yields `|- ph`. The
-    // previous fixture used `$= id $.`, which metamath actually REJECTS ("id
-    // requires a hypothesis but the RPN stack is empty"); it only "certified"
-    // because the old backend trusted metamath's exit code, which is 0 even on a
-    // failed `verify proof *` -- the soundness bug now fixed.
-    let ok = backend
+    // A proof that DECLARES ITS OWN AXIOM must be rejected, even though metamath
+    // itself verifies it happily.
+    //
+    // The RPN here is genuinely valid: `wph` pushes `wff ph`, then `id` consumes
+    // it and yields `|- ph`. metamath's `verify proof *` passes. What makes it
+    // inadmissible for us is `id $a |- ph $.`: the candidate asserts the very
+    // axiom it then uses, which proves nothing about `ph` and is the Metamath
+    // escape hatch the gate exists to catch (a generated `$a`).
+    //
+    // This assertion used to read `must certify`, and it passed only because
+    // `audit_axioms` was a fail-open stub returning `within_whitelist: true`
+    // unconditionally. The test was encoding the ABSENCE of layer 2. With the
+    // audit real, self-declared axioms fail closed, which is correct.
+    //
+    // A genuine positive case needs a candidate whose axioms come from an
+    // INCLUDED reviewed database (`$[ set.mm $]`) rather than from its own
+    // source. That needs set.mm on the machine, so it is deliberately not
+    // asserted here rather than faked with a weaker fixture.
+    let self_axiom = backend
         .verify(
             &cfg,
             "$c wff |- $.\n$v ph $.\nwph $f wff ph $.\nid $a |- ph $.\nth $p |- ph $= wph id $.\n",
@@ -503,8 +514,8 @@ fn metamath_live_verifies_trivial_and_rejects_malformed_proof() {
         )
         .unwrap();
     assert!(
-        ok.lexically_verified,
-        "trivial Metamath proof must certify: {ok:?}"
+        !self_axiom.lexically_verified,
+        "a candidate declaring its own $a axiom must not certify: {self_axiom:?}"
     );
 
     let bad = backend
