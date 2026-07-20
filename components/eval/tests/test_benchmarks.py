@@ -35,6 +35,20 @@ from theoremata_tools.benchmarks.parsing import (  # noqa: E402
 )
 from theoremata_tools.benchmarks.resources import find_dir  # noqa: E402
 from theoremata_tools.benchmarks import loaders as _loaders  # noqa: E402
+from theoremata_tools.benchmarks import graders as _graders  # noqa: E402
+
+
+def _fake_passing_comparator(tmp_path):
+    """A comparator stub that exits 0, so the authoritative path is exercised."""
+    comparator = tmp_path / "ok-comparator.py"
+    comparator.write_text("raise SystemExit(0)\n", encoding="utf-8")
+    return comparator
+
+
+def _no_comparator(monkeypatch):
+    """Force the 'authoritative comparator unavailable' condition."""
+    monkeypatch.delenv("THEOREMATA_COMPARATOR", raising=False)
+    monkeypatch.setattr(_graders, "_comparator_path", lambda: None)
 
 ALL_NAMES = [b["name"] for b in list_benchmarks()]
 
@@ -244,19 +258,66 @@ def test_ineqmath_relation_exact():
 # Formalization grader
 # --------------------------------------------------------------------------- #
 
-def test_formalization_statement_preserved_no_sorry():
+def _lean_formalization_item():
     stmt = "theorem MainTheorem (n : Nat) : n = n := by"
-    item = make_item(
+    return make_item(
         id="f", kind="formalization", informal="", formal=stmt,
         expected={"formal_statement": stmt, "lean_name": "Foo.MainTheorem",
                   "axioms_whitelist": ["propext", "Quot.sound", "Classical.choice"]},
         grading={"track": "formalization", "method": "comparator_or_statement"},
     )
-    good = "theorem MainTheorem (n : Nat) : n = n := by exact rfl"
-    res = grade(item, good)
-    assert res["is_correct"] is True and res["detail"]["statement_preserved"] is True
-    # a residual sorry fails the axioms gate
-    assert grade(item, "theorem MainTheorem (n : Nat) : n = n := by sorry")["is_correct"] is False
+
+
+def test_formalization_without_comparator_is_ungraded_not_a_pass(monkeypatch):
+    # Statement preservation is undecidable without the authoritative
+    # comparator, so the item must be UNGRADED rather than scored by a proxy.
+    _no_comparator(monkeypatch)
+    item = _lean_formalization_item()
+    res = grade(item, "theorem MainTheorem (n : Nat) : n = n := by exact rfl")
+    assert res["is_correct"] is False
+    assert res["is_solved"] is False
+    assert res["ungraded"] is True
+    assert res["detail"]["graded"] is False
+    assert res["detail"]["ungraded_reason"] == "comparator_unavailable"
+    # the containment signal survives only as an explicitly labelled proxy
+    assert res["detail"]["statement_preserved"] is None
+    assert res["detail"]["proxy"]["is_proxy"] is True
+    assert res["detail"]["proxy"]["counts_toward_pass_rate"] is False
+    assert res["detail"]["proxy"]["statement_preserved_proxy"] is True
+
+
+def test_formalization_sorry_is_a_definitive_fail_without_comparator(monkeypatch):
+    # The axiom/sorry gate is a necessary condition, so it can still fail an
+    # item outright. It must never turn into a pass.
+    _no_comparator(monkeypatch)
+    res = grade(_lean_formalization_item(),
+                "theorem MainTheorem (n : Nat) : n = n := by sorry")
+    assert res["is_correct"] is False
+    assert res["ungraded"] is False
+    assert res["detail"]["method"] == "axiom_gate_failed"
+
+
+def test_commented_statement_is_not_preserved(monkeypatch):
+    # HEADLINE: planting the canonical statement in a comment, a doc comment or
+    # a string literal must not satisfy statement preservation.
+    _no_comparator(monkeypatch)
+    item = _lean_formalization_item()
+    planted = (
+        "-- theorem MainTheorem (n : Nat) : n = n := by\n"
+        "/-- theorem MainTheorem (n : Nat) : n = n := by -/\n"
+        '#eval "theorem MainTheorem (n : Nat) : n = n := by"\n'
+        "theorem SomethingElse : True := by trivial\n"
+    )
+    res = grade(item, planted)
+    assert res["is_correct"] is False
+    assert res["detail"]["proxy"]["statement_preserved_proxy"] is False
+
+
+def test_commented_statement_is_not_preserved_with_comparator_absent_helper():
+    # Same claim at the helper level, independent of any grader plumbing.
+    stmt = "theorem MainTheorem (n : Nat) : n = n"
+    assert _graders._statement_preserved(stmt, f"-- {stmt} := by\nexample : True := trivial") is False
+    assert _graders._statement_preserved(stmt, f"{stmt} := by exact rfl") is True
 
 
 def test_formalization_invokes_comparator_when_configured(monkeypatch, tmp_path):
@@ -374,29 +435,33 @@ def test_metamath_item_graded_language_agnostic_not_lean():
     item = _metamath_item()
     ok = grade(item, "prefix |- ph => |- ps => |- ch suffix")
     assert ok["detail"]["system"] == "metamath"
-    assert ok["detail"]["method"] == "metamath_statement_match"
-    assert ok["is_correct"] is True
+    assert ok["detail"]["method"] == "metamath_ungraded_no_verifier"
+    # no Metamath verifier runs in-process, so containment is a proxy only
+    assert ok["is_correct"] is False
+    assert ok["ungraded"] is True
+    assert ok["detail"]["proxy"]["statement_preserved_proxy"] is True
     # a "sorry" that would trip the Lean axiom gate is irrelevant here: the
-    # statement simply is not present, so it is judged incorrect for the right
+    # statement simply is not present, so the proxy is False for the right
     # reason (no Lean-specific token handling)
     bad = grade(item, "totally different statement with sorry in it")
     assert bad["is_correct"] is False
-    assert bad["detail"]["method"] == "metamath_statement_match"
+    assert bad["detail"]["method"] == "metamath_ungraded_no_verifier"
+    assert bad["detail"]["proxy"]["statement_preserved_proxy"] is False
+    # a Metamath comment ($( ... $)) cannot plant the statement either
+    planted = grade(item, "$( |- ph => |- ps => |- ch $) something else")
+    assert planted["detail"]["proxy"]["statement_preserved_proxy"] is False
 
 
-def test_lean_formalization_still_uses_lean_path_no_regression():
-    stmt = "theorem MainTheorem (n : Nat) : n = n := by"
-    item = make_item(
-        id="f", kind="formalization", informal="", formal=stmt,
-        expected={"formal_statement": stmt, "lean_name": "Foo.MainTheorem",
-                  "axioms_whitelist": ["propext", "Quot.sound", "Classical.choice"]},
-        grading={"track": "formalization", "method": "comparator_or_statement"},
-    )
+def test_lean_formalization_still_uses_lean_path_no_regression(monkeypatch, tmp_path):
+    item = _lean_formalization_item()
+    monkeypatch.setenv("THEOREMATA_COMPARATOR", str(_fake_passing_comparator(tmp_path)))
     res = grade(item, "theorem MainTheorem (n : Nat) : n = n := by exact rfl")
     assert res["detail"]["system"] == "lean"
-    assert res["detail"]["method"] in {"comparator", "statement+axioms"}
+    assert res["detail"]["method"] == "comparator"
     assert res["is_correct"] is True
-    # Lean sorry gate still fires
+    assert res["ungraded"] is False
+    # Lean sorry gate still fires when the comparator is unavailable
+    _no_comparator(monkeypatch)
     assert grade(item, "theorem MainTheorem (n : Nat) : n = n := by sorry")["is_correct"] is False
 
 
@@ -520,6 +585,7 @@ def test_proof_completion_smoke_runner(monkeypatch, tmp_path):
         [{"id": 7, "name": "smoke_thm", "natural": "n=n", "formal": formal}],
     )
     monkeypatch.setenv("THEOREMATA_RESOURCES", str(tmp_path))
+    monkeypatch.setenv("THEOREMATA_COMPARATOR", str(_fake_passing_comparator(tmp_path)))
     items = load_benchmark("minif2f_test")
     good = "theorem smoke_thm (n : Nat) : n = n := by exact rfl"
     out = run_proof_completion(
@@ -535,6 +601,27 @@ def test_proof_completion_smoke_runner(monkeypatch, tmp_path):
     )
     assert via_registry["op"] == "proof_completion"
     assert via_registry["correct"] == 1
+
+
+def test_proof_completion_without_comparator_scores_nothing(monkeypatch, tmp_path):
+    # Without the comparator every formalization item is ungraded, so the
+    # runner's headline "correct" must be 0 rather than a substring-inflated 1.
+    formal = "theorem smoke_thm (n : Nat) : n = n := by sorry"
+    _write_minif2f_split(
+        tmp_path,
+        "test",
+        [{"id": 7, "name": "smoke_thm", "natural": "n=n", "formal": formal}],
+    )
+    monkeypatch.setenv("THEOREMATA_RESOURCES", str(tmp_path))
+    _no_comparator(monkeypatch)
+    items = load_benchmark("minif2f_test")
+    good = "theorem smoke_thm (n : Nat) : n = n := by exact rfl"
+    out = run_proof_completion(
+        benchmark="minif2f_test", responses={items[0]["id"]: good}
+    )
+    assert out["correct"] == 0
+    assert out["solved"] == 0
+    assert out["results"][0]["detail"]["ungraded"] is True
 
 
 # --------------------------------------------------------------------------- #

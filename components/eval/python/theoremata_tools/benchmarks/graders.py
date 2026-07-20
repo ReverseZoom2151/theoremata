@@ -11,8 +11,15 @@ Tracks:
 
 * :func:`grade_formalization` — Lean compile + axiom-whitelist + statement
   preservation. Shells out to ``leanprover/comparator`` when it is available
-  (``$THEOREMATA_COMPARATOR``); otherwise degrades to a deterministic
-  statement-string comparison + a ``sorry``/axiom-whitelist check.
+  (``$THEOREMATA_COMPARATOR``). When it is NOT available, statement
+  preservation is undetermined and the item is reported UNGRADED
+  (``verdict["ungraded"] is True``) rather than scored by a weaker proxy; the
+  ``sorry``/axiom-whitelist gate can still produce a definitive fail.
+
+Verdicts additionally carry ``ungraded`` (default ``False``). An ungraded item
+has ``is_solved`` and ``is_correct`` both ``False`` and MUST be excluded from a
+pass-rate denominator or reported separately; counting it either way is a
+misreport.
 * :func:`grade_nl_answer` — deterministic symbolic/integer/relation grading via
   the existing :mod:`theoremata_tools.grader`, with an LLM-judge fallback (the
   mock-capable provider) only when symbolic parsing is inconclusive.
@@ -50,17 +57,92 @@ def _normalize_lean(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
 
 
-def _statement_preserved(expected_formal: str, response: str) -> bool:
-    """The expected statement (or its bound Lean name) must appear intact in the
-    response — the anti-cheat "didn't weaken the theorem" check."""
-    exp = _normalize_lean(expected_formal)
-    resp = _normalize_lean(response)
+_METAMATH_COMMENT = re.compile(r"\$\(.*?\$\)", re.DOTALL)
+
+
+def _strip_noncode(text: str, system: str = "lean") -> str:
+    """Remove comments, doc comments and string literals from a source text.
+
+    WHY: every containment check in this module is plantable. A model can make
+    the canonical statement "appear" in its submission just by pasting the goal
+    into a comment, a docstring or a string literal while proving something
+    else entirely. The Rust side already settled this question the same way
+    (``ESCAPE_HATCH_COMMENT_POLICY`` is ``CodeOnly``): a commented mention must
+    never count as the thing being mentioned. We apply this to BOTH sides of a
+    comparison, so stripping can only ever remove a spurious match, never a
+    genuine one.
+    """
+    text = text or ""
+    if system == "metamath":
+        # Metamath comments are ``$( ... $)``; there are no string literals.
+        return _METAMATH_COMMENT.sub(" ", text)
+
+    # Lean and Agda share the shape: nestable block comments plus a line
+    # comment to end-of-line. Lean uses ``/- -/`` and ``--``, Agda ``{- -}``
+    # and ``--``. Lean doc comments (``/-- ... -/``) are just block comments.
+    block_open, block_close = ("{-", "-}") if system == "agda" else ("/-", "-/")
+    out: list[str] = []
+    i, n, depth = 0, len(text), 0
+    while i < n:
+        two = text[i : i + 2]
+        if depth:
+            if two == block_open:
+                depth += 1
+                i += 2
+                continue
+            if two == block_close:
+                depth -= 1
+                i += 2
+                continue
+            i += 1
+            continue
+        if two == block_open:
+            depth += 1
+            i += 2
+            out.append(" ")
+            continue
+        if two == "--":
+            nl = text.find("\n", i)
+            i = n if nl < 0 else nl
+            out.append(" ")
+            continue
+        if text[i] == '"':
+            # String literals are data, not the proved statement; a planted
+            # goal inside one must not satisfy a containment check either.
+            j = i + 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == '"':
+                    break
+                j += 1
+            i = min(j + 1, n)
+            out.append(" ")
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+def _statement_preserved(
+    expected_formal: str, response: str, system: str = "lean"
+) -> bool:
+    """Code-only containment of the expected statement in the response.
+
+    This is a *proxy* for the anti-cheat "didn't weaken the theorem" check; the
+    authoritative answer comes from the comparator. It is deliberately code-only
+    (see :func:`_strip_noncode`) so that a mention inside a comment, a doc
+    comment or a string literal cannot satisfy it.
+    """
+    exp = _normalize_lean(_strip_noncode(expected_formal, system))
+    resp = _normalize_lean(_strip_noncode(response, system))
     if not exp:
         return False
     if exp in resp:
         return True
     # Fall back to the signature up to the proof separator (ignore the `:= by`).
-    exp_sig = _normalize_lean(re.split(r":=", expected_formal, maxsplit=1)[0])
+    exp_sig = _normalize_lean(re.split(r":=", exp, maxsplit=1)[0])
     return bool(exp_sig) and exp_sig in resp
 
 
@@ -248,9 +330,11 @@ def _grade_nonlean_formalization(
     ``sorry``/``#print axioms`` gate. When the item has no gold formal statement
     (to-be-formalized corpora such as 1Lab), it is marked *not auto-gradable*
     instead of being spuriously scored. When a gold formal statement exists
-    (e.g. a Metamath ``$p`` assertion), correctness is a language-agnostic
-    whitespace-normalized comparison; a live typecheck/verifier is still needed
-    for a real pass.
+    (e.g. a Metamath ``$p`` assertion) there is still no verifier in this
+    process, so the language-agnostic code-only comparison is reported as a
+    labelled PROXY and the item stays UNGRADED. WHY: scoring an unverified
+    string match into the same column as a verified pass inflates the pass rate
+    exactly as a silent benchmark exclusion deflates the denominator.
     """
     expected = item.get("expected") or {}
     grading = item.get("grading") or {}
@@ -264,10 +348,14 @@ def _grade_nonlean_formalization(
         return {
             "is_solved": is_solved,
             "is_correct": False,
+            "ungraded": True,
             "detail": {
                 "track": "formalization",
                 "system": system,
                 "method": f"{system}_not_auto_gradable",
+                "graded": False,
+                "ungraded": True,
+                "ungraded_reason": "no_gold_statement",
                 "auto_gradable": False,
                 "gold_present": gold_present,
                 "statement_preserved": None,
@@ -276,31 +364,42 @@ def _grade_nonlean_formalization(
                 "note": (
                     f"{system} formalization item has no gold formal statement to "
                     f"compare against; a real pass requires a live {system} "
-                    "typecheck/verifier. Not auto-gradable — the Lean grader is "
-                    "deliberately NOT applied."
+                    "typecheck/verifier. Not auto-gradable, and the Lean grader "
+                    "is deliberately NOT applied."
                 ),
             },
         }
 
-    exp_n = _normalize_lean(expected_formal)
-    resp_n = _normalize_lean(response)
-    preserved = bool(exp_n) and exp_n in resp_n
+    # A gold statement exists but no verifier does. Report the code-only match
+    # as a labelled proxy and leave the item ungraded.
+    preserved_proxy = _statement_preserved(expected_formal, response, system)
     return {
         "is_solved": is_solved,
-        "is_correct": preserved,
+        "is_correct": False,
+        "ungraded": True,
         "detail": {
             "track": "formalization",
             "system": system,
-            "method": f"{system}_statement_match",
-            "statement_preserved": preserved,
+            "method": f"{system}_ungraded_no_verifier",
+            "graded": False,
+            "ungraded": True,
+            "ungraded_reason": "verifier_unavailable",
+            "statement_preserved": None,
             "auto_gradable": True,
             "gold_present": True,
             "comparator": None,
             "invoked": False,
+            "proxy": {
+                "is_proxy": True,
+                "counts_toward_pass_rate": False,
+                "method": f"{system}_code_only_statement_match",
+                "statement_preserved_proxy": preserved_proxy,
+            },
             "note": (
-                f"{system} statement graded by a language-agnostic normalized "
-                f"comparison (no Lean syntax assumed); a verified pass requires "
-                f"the {system} backend."
+                f"{system} statement containment is a PROXY only (code-only "
+                "normalized comparison, comments and string literals stripped). "
+                f"A verified pass requires the {system} backend, so this item is "
+                "reported UNGRADED and must be excluded from any pass rate."
             ),
         },
     }
@@ -329,10 +428,13 @@ def grade_formalization(item: dict[str, Any], response: str) -> dict[str, Any]:
         return {
             "is_solved": bool(response.strip()),
             "is_correct": bool(cmp.get("ok")),
+            "ungraded": False,
             "detail": {
                 "track": "formalization",
                 "system": "lean",
                 "method": "comparator",
+                "graded": True,
+                "ungraded": False,
                 "statement_preserved": bool(cmp.get("ok")),
                 "axioms_ok": bool(cmp.get("ok")),
                 "axiom_reason": "comparator_exit_0" if cmp.get("ok") else "comparator_failed",
@@ -342,22 +444,81 @@ def grade_formalization(item: dict[str, Any], response: str) -> dict[str, Any]:
             },
         }
 
-    preserved = _statement_preserved(expected_formal, response)
+    # No comparator: statement preservation CANNOT be decided here.
+    #
+    # WHY not fall back to a string comparison: statement preservation is one of
+    # the four gate layers, and it is precisely the check that the proof proves
+    # the theorem that was asked. A containment test accepts a proof of a
+    # different theorem whenever the canonical statement happens to appear in
+    # the submission, which a model can arrange for free. Scoring such an item
+    # as a pass inflates the pass rate; the honest report is UNGRADED. Any
+    # containment signal we still compute is labelled a proxy, is code-only
+    # (comments, doc comments and string literals stripped, matching the Rust
+    # side's CodeOnly escape-hatch policy) and never sets ``is_correct``.
     axioms_ok, axiom_reason = _axioms_ok(response, whitelist)
-    is_correct = preserved and axioms_ok
+    preserved_proxy = _statement_preserved(expected_formal, response)
+
+    if not axioms_ok:
+        # A residual sorry/admit or a non-whitelisted axiom is a definitive
+        # failure that does not need the comparator, so this stays GRADED. It
+        # can only ever produce a fail, never a pass.
+        return {
+            "is_solved": bool(response.strip()),
+            "is_correct": False,
+            "ungraded": False,
+            "detail": {
+                "track": "formalization",
+                "system": "lean",
+                "method": "axiom_gate_failed",
+                "graded": True,
+                "ungraded": False,
+                "statement_preserved": None,
+                "axioms_ok": False,
+                "axiom_reason": axiom_reason,
+                "expected_lean_name": expected.get("lean_name"),
+                "comparator": None,
+                "invoked": False,
+                "note": (
+                    "The axiom/sorry gate is a necessary condition and it failed, "
+                    "so the item is a definitive fail regardless of the "
+                    "comparator being unavailable."
+                ),
+            },
+        }
+
     return {
-        "is_solved": preserved,
-        "is_correct": is_correct,
+        # Ungraded items are not "solved" either: no gradable verdict was
+        # produced, so neither counter may absorb them.
+        "is_solved": False,
+        "is_correct": False,
+        "ungraded": True,
         "detail": {
             "track": "formalization",
             "system": "lean",
-            "method": "comparator" if comparator else "statement+axioms",
-            "statement_preserved": preserved,
+            "method": "ungraded_comparator_unavailable",
+            "graded": False,
+            "ungraded": True,
+            "ungraded_reason": "comparator_unavailable",
+            "statement_preserved": None,
             "axioms_ok": axioms_ok,
             "axiom_reason": axiom_reason,
             "expected_lean_name": expected.get("lean_name"),
             "comparator": None,
             "invoked": False,
+            "response_present": bool(response.strip()),
+            "proxy": {
+                "is_proxy": True,
+                "counts_toward_pass_rate": False,
+                "method": "code_only_statement_containment",
+                "statement_preserved_proxy": preserved_proxy,
+            },
+            "note": (
+                "No statement comparator was available "
+                "($THEOREMATA_COMPARATOR / `comparator` on PATH), so statement "
+                "preservation is UNDETERMINED. This item is UNGRADED and must be "
+                "excluded from any verification pass-rate denominator or reported "
+                "separately. The proxy block is diagnostic only."
+            ),
         },
     }
 
@@ -580,9 +741,12 @@ def grade_verified_programming(item: dict[str, Any], response: Any) -> dict[str,
     expected = item.get("expected") or {}
     lean = _extract_lean_text(response)
     signatures = expected.get("lean_signatures") or []
+    # Code-only: a signature pasted into a comment or a string literal is not a
+    # signature the submission actually defines.
+    lean_code = _normalize_lean(_strip_noncode(lean))
     sig_hits = [
         s for s in signatures
-        if s and _normalize_lean(str(s)) in _normalize_lean(lean)
+        if s and _normalize_lean(_strip_noncode(str(s))) in lean_code
     ]
     signatures_ok = bool(signatures) and len(sig_hits) == len(signatures)
     axioms_ok, axiom_detail = _axioms_ok(lean, list(AXIOMS_WHITELIST))
@@ -659,8 +823,11 @@ def grade_statement_target(item: dict[str, Any], response: Any) -> dict[str, Any
     lean = _extract_lean_text(response)
     formal = item.get("formal") or expected.get("lean_name") or ""
     lean_name = str(expected.get("lean_name") or "")
-    preserved = _statement_preserved(str(formal), lean) or (
-        lean_name and lean_name in lean
+    # Code-only on both alternatives: a commented-out mention of the target
+    # statement or of its Lean name must not count as having stated it.
+    preserved = bool(
+        _statement_preserved(str(formal), lean)
+        or (lean_name and lean_name in _strip_noncode(lean))
     )
     axioms_ok, axiom_detail = _axioms_ok(lean, list(expected.get("axioms_whitelist") or AXIOMS_WHITELIST))
     is_solved = bool(lean.strip())
@@ -688,7 +855,9 @@ def grade_external_artifact(item: dict[str, Any], response: Any) -> dict[str, An
     lean = _extract_lean_text(response) or str(item.get("formal") or "")
     headers = expected.get("headers") or []
     lean_name = str(expected.get("lean_name") or "")
-    header_ok = not headers or any(h.get("name") in lean for h in headers)
+    # Code-only: a header name mentioned in a comment is not a declared header.
+    lean_code = _strip_noncode(lean)
+    header_ok = not headers or any(h.get("name") in lean_code for h in headers)
     axioms_ok, axiom_detail = _axioms_ok(lean, list(expected.get("axioms_whitelist") or AXIOMS_WHITELIST))
     is_solved = bool(lean.strip())
     is_correct = is_solved and header_ok and axioms_ok
