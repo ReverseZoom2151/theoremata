@@ -264,6 +264,104 @@ pub struct Workspace {
     pub entry: String,
 }
 
+// --- Agda module-to-path seam ---------------------------------------------
+
+/// File name, inside a [`Workspace::root`], through which a workspace CARRIES a
+/// resolved Agda module-to-path map.
+///
+/// The map is a sidecar rather than a `Workspace` field on purpose. `Workspace`
+/// is built by struct literal in every backend and in the replay/session paths,
+/// so a new field (even one with a serde default) would be a breaking change
+/// across files that have nothing to do with the Agda audit. A sidecar keeps the
+/// seam OPTIONAL in the strongest sense available: a workspace that does not
+/// write the file behaves exactly as it does today, and no other code has to
+/// learn about the map to keep compiling.
+pub const AGDA_MODULE_MAP_FILE: &str = ".theoremata-agda-modules.json";
+
+/// A RESOLVED Agda module-name to source-path map for one workspace.
+///
+/// Resolution (reading `.agda-lib` files, expanding include-path roots, mapping
+/// a dotted module name onto a file under those roots) is a project/library
+/// concern, not something a whole-file checker backend can do correctly. So the
+/// backend does not attempt it: it consumes an already-resolved map and walks
+/// it. Whoever owns the include path is the one who can produce this honestly.
+///
+/// A module that is NOT listed here cannot be resolved by the audit, which makes
+/// the axiom closure incomplete. That is the intended failure mode: an omission
+/// degrades to "we do not know", never to "we checked and it was fine".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgdaModuleMap {
+    /// Dotted module name (`Data.Nat.Base`) to its source file. Relative paths
+    /// are resolved against [`Workspace::root`].
+    pub modules: std::collections::BTreeMap<String, PathBuf>,
+}
+
+/// What a workspace supplies for the Agda module walk. The three cases are kept
+/// apart because they mean three different things to the audit: nothing was
+/// supplied (today's behaviour), a usable map was supplied, or a map was
+/// supplied but is broken (which must fail closed, not silently degrade to the
+/// no-map path, because someone intended a closure walk to happen).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgdaModuleMapSource {
+    /// No map accompanies this workspace.
+    Absent,
+    /// A usable map.
+    Resolved(AgdaModuleMap),
+    /// A map is present but could not be read or parsed.
+    Unreadable(String),
+}
+
+impl AgdaModuleMap {
+    pub fn new(modules: std::collections::BTreeMap<String, PathBuf>) -> Self {
+        Self { modules }
+    }
+
+    /// The file a module's postulates would be read from, resolved against the
+    /// workspace root when the recorded path is relative.
+    pub fn resolve(&self, root: &Path, module: &str) -> Option<PathBuf> {
+        self.modules.get(module).map(|path| {
+            if path.is_absolute() {
+                path.clone()
+            } else {
+                root.join(path)
+            }
+        })
+    }
+
+    /// Attach this map to a workspace so the audit can find it.
+    pub fn attach(&self, root: &Path) -> Result<()> {
+        let json = serde_json::to_string_pretty(self)?;
+        std::fs::write(root.join(AGDA_MODULE_MAP_FILE), json)?;
+        Ok(())
+    }
+
+    /// Read whatever map a workspace carries. A missing file is `Absent` (the
+    /// only case that preserves today's behaviour); anything present but
+    /// unusable is `Unreadable` so the caller can fail closed on it.
+    pub fn for_workspace(root: &Path) -> AgdaModuleMapSource {
+        let path = root.join(AGDA_MODULE_MAP_FILE);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return AgdaModuleMapSource::Absent
+            }
+            Err(error) => {
+                return AgdaModuleMapSource::Unreadable(format!(
+                    "{} could not be read: {error}",
+                    path.display()
+                ))
+            }
+        };
+        match serde_json::from_str::<AgdaModuleMap>(&text) {
+            Ok(map) => AgdaModuleMapSource::Resolved(map),
+            Err(error) => AgdaModuleMapSource::Unreadable(format!(
+                "{} is not a valid module map: {error}",
+                path.display()
+            )),
+        }
+    }
+}
+
 /// Per-declaration compile status (open-atp `_parse_per_file`): a failure in one
 /// declaration does not mask the rest, so a partially-good artifact is visible
 /// instead of collapsing to one whole-project boolean.

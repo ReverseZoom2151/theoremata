@@ -11,8 +11,9 @@ use crate::{
     prover::{
         exec::{self, Runner},
         formal::{
-            AxiomReport, CompileReport, FormalBackend, FormalSystem, GoalState, ProofSession,
-            RecheckReport, ScanReport, SessionError, StateResult, UnitResult, Workspace,
+            AgdaModuleMap, AgdaModuleMapSource, AxiomReport, CompileReport, FormalBackend,
+            FormalSystem, GoalState, ProofSession, RecheckReport, ScanReport, SessionError,
+            StateResult, UnitResult, Workspace,
         },
         model::{FormalProject, ProofJob, ProofResult, ProofTask, ProverJobStatus},
     },
@@ -56,6 +57,13 @@ const AGDA_GOAL_CONTEXT_DEADLINE: Duration = Duration::from_secs(30);
 /// crawl. Hitting the cap means the closure is INCOMPLETE, which the spec calls
 /// a failure rather than a successful skip, so it fails the audit closed.
 const METAMATH_INCLUDE_CLOSURE_CAP: usize = 64;
+
+/// Most modules the Agda import walk will open while building the transitive
+/// postulate closure. Same reasoning as the Metamath include cap: imports nest
+/// arbitrarily, so an unbounded walk over a hostile or merely large library
+/// would turn the axiom audit into a file crawl. Hitting the cap leaves the
+/// closure INCOMPLETE, which is a failure and not a successful skip.
+const AGDA_MODULE_CLOSURE_CAP: usize = 64;
 
 pub struct ExternalBackend {
     pub system: FormalSystem,
@@ -1374,25 +1382,51 @@ impl FormalBackend for ExternalBackend {
             FormalSystem::Agda => {
                 // Agda has no `#print axioms`, so the assumed set is what the
                 // module postulates plus whatever its imports postulate. Local
-                // postulates are read off the source; imports are only trusted
-                // when they lie inside the DECLARED closure (the builtins that
-                // ship with the checker and are covered by `--safe`). Any other
-                // import is a module this backend has not read, so the closure
-                // is unknown and the audit fails closed rather than reporting a
-                // local-only answer as if it were complete. See the
-                // `agda_transitive_postulates` note in this file's tests for the
-                // module-graph walk that would lift this restriction.
+                // postulates are read off the source. Imports inside the
+                // DECLARED closure are the builtins that ship with the checker
+                // and are covered by `--safe`, so they need no separate audit.
+                // Every other import is walked through the resolved module map
+                // the workspace carries; without that map nothing outside the
+                // declared closure can be read, and the audit fails closed
+                // rather than reporting a local-only answer as if it were the
+                // whole trusted base.
                 let axioms = agda_postulate_names(stripped.as_str());
                 let imports = agda_imports(stripped.as_str());
-                let unresolved: Vec<String> = imports
+                let outside: Vec<String> = imports
                     .iter()
                     .filter(|module| !agda_import_inside_declared_closure(module.as_str()))
                     .cloned()
                     .collect();
+                let map_source = AgdaModuleMap::for_workspace(&ws.root);
+                let closure = agda_import_closure(&ws.root, &map_source, &outside);
                 let local_clean = axioms.iter().all(|axiom| whitelist.contains(axiom));
-                let within = local_clean && unresolved.is_empty();
+                // An imported postulate is checked against the whitelist under
+                // either spelling: a whitelist may name the bare postulate or
+                // the module-qualified one, and neither reading may let an
+                // unlisted assumption through.
+                let imported_clean = closure.qualified_postulates.iter().all(|qualified| {
+                    let bare = qualified.rsplit_once('.').map_or(qualified.as_str(), |(_, n)| n);
+                    whitelist.contains(qualified) || whitelist.iter().any(|w| w == bare)
+                });
+                let complete = closure.unresolved.is_empty();
+                let (closure_state, within) =
+                    agda_axiom_verdict(complete, local_clean, imported_clean);
+                // The reported axiom set merges the imported postulates in,
+                // qualified by their source module so attribution survives.
+                let mut reported = axioms.clone();
+                reported.extend(closure.qualified_postulates.iter().cloned());
+                // With no map supplied this field keeps the exact shape it had
+                // before the walk existed: nothing was resolved, and saying so
+                // is the honest answer.
+                let transitive = match map_source {
+                    AgdaModuleMapSource::Absent => unavailable_field(
+                        "resolving imported postulates needs an Agda module-graph walk this backend does not perform; imports outside the declared closure therefore fail the audit closed",
+                    ),
+                    AgdaModuleMapSource::Unreadable(ref reason) => unavailable_field(reason),
+                    AgdaModuleMapSource::Resolved(_) => json!(closure.qualified_postulates),
+                };
                 Ok(AxiomReport {
-                    axioms: axioms.clone(),
+                    axioms: reported,
                     within_whitelist: within,
                     detail: json!({
                         "system": "agda",
@@ -1404,10 +1438,14 @@ impl FormalBackend for ExternalBackend {
                         "local_postulates_within_whitelist": local_clean,
                         "imports": imports,
                         "declared_closure": FormalSystem::Agda.default_imports(),
-                        "imports_outside_declared_closure": unresolved,
-                        "transitive_imported_postulates": unavailable_field(
-                            "resolving imported postulates needs an Agda module-graph walk this backend does not perform; imports outside the declared closure therefore fail the audit closed",
-                        ),
+                        "imports_outside_declared_closure": outside,
+                        "transitive_imported_postulates": transitive,
+                        "imported_postulates_within_whitelist": imported_clean,
+                        "imported_modules": closure.modules,
+                        "module_map": closure.map_state,
+                        "closure_unresolved": closure.unresolved,
+                        "closure_complete": complete,
+                        "closure_state": closure_state,
                         "provenance": provenance,
                     }),
                 })
@@ -1766,6 +1804,156 @@ fn agda_import_inside_declared_closure(module: &str) -> bool {
     FormalSystem::Agda.default_imports().iter().any(|prefix| {
         module == prefix.as_str() || module.starts_with(&format!("{prefix}."))
     })
+}
+
+/// The three states the Agda axiom audit distinguishes, and the verdict each
+/// carries.
+///
+/// * `complete_clean`: the whole closure was read and holds nothing outside
+///   the whitelist. The ONLY pass.
+/// * `complete_non_whitelisted`: the whole closure was read and something in
+///   it is not whitelisted. A definite, informative failure.
+/// * `incomplete`: part of the closure could not be read. NOT a pass: a
+///   partial axiom set reported as complete looks like an audit while being
+///   none, which is worse than admitting we do not know.
+fn agda_axiom_verdict(
+    complete: bool,
+    local_clean: bool,
+    imported_clean: bool,
+) -> (&'static str, bool) {
+    if !complete {
+        ("incomplete", false)
+    } else if local_clean && imported_clean {
+        ("complete_clean", true)
+    } else {
+        ("complete_non_whitelisted", false)
+    }
+}
+
+/// The transitively-resolved imported-postulate closure of an Agda module.
+struct AgdaClosure {
+    /// One entry per module actually read: name, path, content hash, and the
+    /// postulates it contributes. Attribution is per module, so an imported
+    /// axiom is never blended into the local ones.
+    modules: Vec<serde_json::Value>,
+    /// Every imported postulate, qualified as `Module.name` so the reported
+    /// axiom set says WHERE each assumption came from.
+    qualified_postulates: Vec<String>,
+    /// Imports that could not be resolved, could not be read, or were cut off by
+    /// the cap. Any entry here means the closure is INCOMPLETE.
+    unresolved: Vec<String>,
+    /// Which of the three module-map states this workspace was in: `absent`,
+    /// `resolved`, or `unreadable`. Reporting only; the verdict is driven by
+    /// `unresolved`.
+    map_state: &'static str,
+}
+
+/// Walk the transitive imported-postulate closure of `imports` under `root`.
+///
+/// A `postulate` in an imported module is every bit as much an axiom as a local
+/// one, so the audit has to read the imports rather than only the candidate
+/// file. Resolution is not attempted here: the walk consumes the ALREADY
+/// resolved module-to-path map the workspace carries, because mapping a dotted
+/// module name onto a file needs `.agda-lib` and include-path knowledge that
+/// lives with whoever assembled the project.
+///
+/// Termination mirrors the Metamath include walk in this same file: a visited
+/// set makes cycles (`A` imports `B` imports `A`) terminate, and the cap bounds
+/// the total number of files opened. Both the cap and every resolution failure
+/// are recorded in `unresolved`, which is what makes the audit fail closed.
+fn agda_import_closure(
+    root: &Path,
+    source: &AgdaModuleMapSource,
+    imports: &[String],
+) -> AgdaClosure {
+    let mut closure = AgdaClosure {
+        modules: Vec::new(),
+        qualified_postulates: Vec::new(),
+        unresolved: Vec::new(),
+        map_state: "absent",
+    };
+    let map = match source {
+        // No map supplied: exactly today's situation. Nothing can be resolved,
+        // so every import outside the declared closure is unresolved, which is
+        // the same verdict this audit reached before the walk existed.
+        AgdaModuleMapSource::Absent => {
+            for module in imports {
+                closure.unresolved.push(format!(
+                    "{module}: no resolved Agda module map accompanies this workspace, so its postulates could not be read"
+                ));
+            }
+            return closure;
+        }
+        // A map was supplied and is broken. This fails closed even when there is
+        // nothing to resolve: someone intended a closure walk to happen here,
+        // and a broken map means we cannot tell whether it would have found
+        // anything. Degrading silently to the no-map path would hide that.
+        AgdaModuleMapSource::Unreadable(reason) => {
+            closure.map_state = "unreadable";
+            closure
+                .unresolved
+                .push(format!("the supplied Agda module map is unusable: {reason}"));
+            return closure;
+        }
+        AgdaModuleMapSource::Resolved(map) => {
+            closure.map_state = "resolved";
+            map
+        }
+    };
+
+    let mut visited: BTreeSet<String> = BTreeSet::new();
+    let mut queue: Vec<String> = imports.to_vec();
+    while let Some(module) = queue.pop() {
+        if !visited.insert(module.clone()) {
+            continue;
+        }
+        if visited.len() > AGDA_MODULE_CLOSURE_CAP {
+            closure.unresolved.push(format!(
+                "{module}: import closure exceeded the {AGDA_MODULE_CLOSURE_CAP}-module cap"
+            ));
+            continue;
+        }
+        let Some(path) = map.resolve(root, &module) else {
+            closure.unresolved.push(format!(
+                "{module}: not listed in the resolved module map, so its postulates are unknown"
+            ));
+            continue;
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                closure
+                    .unresolved
+                    .push(format!("{module}: {} could not be read: {error}", path.display()));
+                continue;
+            }
+        };
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let stripped = crate::prover::formal::strip_comments(&text);
+        let postulates = agda_postulate_names(stripped.as_str());
+        closure.qualified_postulates.extend(
+            postulates
+                .iter()
+                .map(|name| format!("{module}.{name}")),
+        );
+        closure.modules.push(json!({
+            "module": module,
+            "path": path.to_string_lossy(),
+            "sha256": sha256_hex(&bytes),
+            "postulates": postulates,
+        }));
+        // Recurse to a fixpoint: an import of an import is in the trusted base
+        // too. Declared-closure modules are the checker's own builtins under
+        // `--safe`, so they are not walked, exactly as at the top level.
+        for next in agda_imports(stripped.as_str()) {
+            if !agda_import_inside_declared_closure(next.as_str()) {
+                queue.push(next);
+            }
+        }
+    }
+    closure.qualified_postulates.sort();
+    closure.unresolved.sort();
+    closure
 }
 
 /// Labels of `$a` axiomatic assertions declared in COMMENT-STRIPPED Metamath
@@ -2645,25 +2833,304 @@ mod tests {
         assert!(provenance["dependency_sha256"].is_string());
     }
 
-    /// TRANSITIVE IMPORTED POSTULATES (spec, Agda section). A postulate in an
-    /// imported module is as much an axiom as a local one, but resolving it
-    /// needs an Agda module-graph walk (library roots, `.agda-lib` resolution,
-    /// interface files) that this whole-file backend does not have. Rather than
-    /// half-build it, the audit fails CLOSED on any import outside the declared
-    /// closure and records the reason in the report.
+    // --- TRANSITIVE IMPORTED POSTULATES (spec, Agda section) ---------------
+    //
+    // A `postulate` in an imported module is every bit as much an axiom as a
+    // local one. Resolving one needs library roots / `.agda-lib` knowledge that
+    // a whole-file backend cannot have, so the workspace SUPPLIES a resolved
+    // module-to-path map and the audit walks it. Without a map nothing changes.
+
+    fn agda_map(entries: &[(&str, &str)]) -> AgdaModuleMapSource {
+        let modules = entries
+            .iter()
+            .map(|(module, path)| ((*module).to_string(), PathBuf::from(*path)))
+            .collect();
+        AgdaModuleMapSource::Resolved(AgdaModuleMap::new(modules))
+    }
+
+    /// The pre-existing local-postulate reading is untouched, and an import
+    /// outside the declared closure is still visible to the audit.
     #[test]
-    fn agda_transitive_postulates_fail_closed_pending_a_module_graph_walk() {
+    fn agda_local_postulates_are_still_found() {
         let stripped = crate::prover::formal::strip_comments(
-            "module Generated where\nopen import Some.Untrusted.Lib\nthm : Set\nthm = Set\n",
+            "module Generated where\nopen import Some.Untrusted.Lib\npostulate\n  magic : Set\nthm : Set\nthm = Set\n",
         );
-        let imports = agda_imports(stripped.as_str());
-        assert!(agda_postulate_names(stripped.as_str()).is_empty());
+        assert_eq!(agda_postulate_names(stripped.as_str()), vec!["magic"]);
         assert!(
-            imports
+            agda_imports(stripped.as_str())
                 .iter()
                 .any(|module| !agda_import_inside_declared_closure(module)),
-            "an unresolvable import must be visible to the audit"
+            "an import outside the declared closure must be visible to the audit"
         );
+    }
+
+    /// The gap this closes: a postulate in an IMPORTED module is now reported,
+    /// attributed to the module it came from, and so is one reached only
+    /// transitively (an import of an import).
+    #[test]
+    fn agda_imported_postulates_are_found_and_attributed() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Deep.agda"),
+            "module Deep where\npostulate\n  deepAxiom : Set\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("Lib.agda"),
+            "module Lib where\nopen import Agda.Builtin.Unit\nopen import Deep\npostulate\n  libAxiom : Set\n",
+        )
+        .unwrap();
+        let source = agda_map(&[("Lib", "Lib.agda"), ("Deep", "Deep.agda")]);
+        let closure =
+            agda_import_closure(tmp.path(), &source, &["Lib".to_string()]);
+        assert!(closure.unresolved.is_empty(), "{:?}", closure.unresolved);
+        assert_eq!(
+            closure.qualified_postulates,
+            vec!["Deep.deepAxiom", "Lib.libAxiom"],
+            "imported postulates must be attributed to their own module"
+        );
+        assert_eq!(closure.modules.len(), 2, "the walk must reach a fixpoint");
+        // Attribution is per module, never blended into the local set.
+        let lib = closure
+            .modules
+            .iter()
+            .find(|entry| entry["module"] == "Lib")
+            .unwrap();
+        assert_eq!(lib["postulates"], json!(["libAxiom"]));
+        assert!(lib["sha256"].as_str().is_some_and(|s| s.len() == 64));
+        // A builtin import inside the declared closure is covered by `--safe`
+        // and is not walked, so it never appears as unresolved.
+        assert!(!closure
+            .modules
+            .iter()
+            .any(|entry| entry["module"] == "Agda.Builtin.Unit"));
+        // And such a closure is a definite failure, not an unknown: Agda's
+        // whitelist is empty, so a discovered postulate is non-whitelisted.
+        assert_eq!(
+            agda_axiom_verdict(closure.unresolved.is_empty(), true, false),
+            ("complete_non_whitelisted", false)
+        );
+    }
+
+    /// A cycle (`A` imports `B` imports `A`) must terminate on the visited set.
+    #[test]
+    fn agda_import_cycle_terminates() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("A.agda"),
+            "module A where\nopen import B\npostulate\n  fromA : Set\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("B.agda"),
+            "module B where\nopen import A\n",
+        )
+        .unwrap();
+        let source = agda_map(&[("A", "A.agda"), ("B", "B.agda")]);
+        let closure = agda_import_closure(tmp.path(), &source, &["A".to_string()]);
+        assert!(closure.unresolved.is_empty(), "{:?}", closure.unresolved);
+        assert_eq!(closure.modules.len(), 2);
+        assert_eq!(closure.qualified_postulates, vec!["A.fromA"]);
+    }
+
+    /// Every way the closure can come up short must land in `unresolved`, which
+    /// is what makes the audit fail CLOSED. A module missing from the map, a
+    /// file that cannot be read, a broken map, and the cap all qualify.
+    #[test]
+    fn agda_incomplete_closure_always_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // 1. The module is not listed in the map.
+        let closure = agda_import_closure(
+            tmp.path(),
+            &agda_map(&[]),
+            &["Missing.Module".to_string()],
+        );
+        assert_eq!(closure.unresolved.len(), 1);
+        assert!(closure.unresolved[0].contains("not listed"));
+        assert_eq!(agda_axiom_verdict(false, true, true), ("incomplete", false));
+
+        // 2. Listed, but the file is not there.
+        let closure = agda_import_closure(
+            tmp.path(),
+            &agda_map(&[("Ghost", "Ghost.agda")]),
+            &["Ghost".to_string()],
+        );
+        assert_eq!(closure.unresolved.len(), 1);
+        assert!(closure.unresolved[0].contains("could not be read"));
+
+        // 3. A map was supplied but is unusable. This fails closed even with
+        // nothing to resolve: a walk was intended and could not happen.
+        let broken = AgdaModuleMapSource::Unreadable("bad json".into());
+        let closure = agda_import_closure(tmp.path(), &broken, &[]);
+        assert_eq!(closure.map_state, "unreadable");
+        assert_eq!(closure.unresolved.len(), 1);
+
+        // 4. The cap is REPORTED when hit, rather than silently truncating.
+        for index in 0..=(AGDA_MODULE_CLOSURE_CAP + 1) {
+            let next = index + 1;
+            std::fs::write(
+                tmp.path().join(format!("M{index}.agda")),
+                format!("module M{index} where\nopen import M{next}\n"),
+            )
+            .unwrap();
+        }
+        let entries: Vec<(String, String)> = (0..=(AGDA_MODULE_CLOSURE_CAP + 2))
+            .map(|index| (format!("M{index}"), format!("M{index}.agda")))
+            .collect();
+        let map: std::collections::BTreeMap<String, PathBuf> = entries
+            .iter()
+            .map(|(module, path)| (module.clone(), PathBuf::from(path)))
+            .collect();
+        let source = AgdaModuleMapSource::Resolved(AgdaModuleMap::new(map));
+        let closure = agda_import_closure(tmp.path(), &source, &["M0".to_string()]);
+        assert!(
+            closure.unresolved.iter().any(|entry| entry.contains("cap")),
+            "hitting the cap must be reported: {:?}",
+            closure.unresolved
+        );
+        assert!(closure.modules.len() <= AGDA_MODULE_CLOSURE_CAP);
+    }
+
+    /// PRESERVATION: with no module map, the walk contributes nothing and the
+    /// audit reaches exactly the verdict it reached before this feature.
+    #[test]
+    fn agda_absent_module_map_preserves_todays_behaviour() {
+        let tmp = tempfile::tempdir().unwrap();
+        let absent = AgdaModuleMap::for_workspace(tmp.path());
+        assert_eq!(absent, AgdaModuleMapSource::Absent);
+
+        // Only declared-closure imports: nothing to walk, so the closure is
+        // complete and the verdict is the local one, exactly as before.
+        let closure = agda_import_closure(tmp.path(), &absent, &[]);
+        assert_eq!(closure.map_state, "absent");
+        assert!(closure.unresolved.is_empty());
+        assert!(closure.qualified_postulates.is_empty());
+        assert_eq!(
+            agda_axiom_verdict(true, true, true),
+            ("complete_clean", true)
+        );
+        assert_eq!(
+            agda_axiom_verdict(true, false, true),
+            ("complete_non_whitelisted", false)
+        );
+
+        // An import outside the declared closure is unresolvable without a map,
+        // which is the pre-existing fail-closed behaviour.
+        let closure =
+            agda_import_closure(tmp.path(), &absent, &["Some.Untrusted.Lib".to_string()]);
+        assert_eq!(closure.unresolved.len(), 1);
+        assert!(closure.unresolved[0].contains("no resolved Agda module map"));
+        assert!(!agda_axiom_verdict(false, true, true).1);
+    }
+
+    /// The seam round-trips: a workspace that attaches a map is seen to carry
+    /// it, and a corrupt one reads as `Unreadable` rather than as absent.
+    #[test]
+    fn agda_module_map_seam_round_trips_through_the_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut modules = std::collections::BTreeMap::new();
+        modules.insert("Lib".to_string(), PathBuf::from("Lib.agda"));
+        let map = AgdaModuleMap::new(modules);
+        map.attach(tmp.path()).unwrap();
+        match AgdaModuleMap::for_workspace(tmp.path()) {
+            AgdaModuleMapSource::Resolved(read) => {
+                assert_eq!(read, map);
+                assert_eq!(
+                    read.resolve(tmp.path(), "Lib"),
+                    Some(tmp.path().join("Lib.agda"))
+                );
+                assert!(read.resolve(tmp.path(), "Absent").is_none());
+            }
+            other => panic!("an attached map must read back as resolved: {other:?}"),
+        }
+        std::fs::write(
+            tmp.path().join(crate::prover::formal::AGDA_MODULE_MAP_FILE),
+            "{ not json",
+        )
+        .unwrap();
+        assert!(matches!(
+            AgdaModuleMap::for_workspace(tmp.path()),
+            AgdaModuleMapSource::Unreadable(_)
+        ));
+    }
+
+    /// End to end through `audit_axioms`: the detail keys that existed before
+    /// this feature keep their shape when no map is supplied, and the three
+    /// closure states are reported explicitly.
+    #[test]
+    fn agda_audit_reports_the_three_closure_states() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("Generated.agda");
+        std::fs::write(
+            &source_path,
+            "module Generated where\nopen import Lib\nthm : Set\nthm = Set\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("Lib.agda"),
+            "module Lib where\npostulate\n  libAxiom : Set\n",
+        )
+        .unwrap();
+        // `available()` probes `<binary> --version`. `rustc` is present wherever
+        // this test suite builds, so it stands in for a present toolchain: the
+        // Agda audit is a pure source read and never invokes the checker.
+        let backend = ExternalBackend {
+            system: FormalSystem::Agda,
+            mock: false,
+            runner: Runner::Native,
+            binary: "rustc".into(),
+            secondary_binary: None,
+        };
+        if !backend.available() {
+            return;
+        }
+        let ws = Workspace {
+            system: FormalSystem::Agda,
+            root: tmp.path().to_path_buf(),
+            source_path,
+            entry: "thm".into(),
+        };
+        let whitelist = FormalSystem::Agda.axiom_whitelist();
+
+        // No map: today's behaviour. The import cannot be resolved, so the
+        // closure is INCOMPLETE and the audit does not claim the whitelist.
+        let report = backend.audit_axioms(&ws, "thm", &whitelist).unwrap();
+        assert!(!report.within_whitelist);
+        assert_eq!(report.detail["closure_state"], "incomplete");
+        assert_eq!(report.detail["module_map"], "absent");
+        assert_eq!(report.axioms, Vec::<String>::new());
+        assert_eq!(report.detail["local_postulates"], json!([]));
+        assert_eq!(report.detail["imports"], json!(["Lib"]));
+        assert_eq!(report.detail["imports_outside_declared_closure"], json!(["Lib"]));
+        // The pre-existing null-with-reason shape is unchanged with no map.
+        assert_eq!(
+            report.detail["transitive_imported_postulates"]["unavailable"],
+            true
+        );
+
+        // With a map, the imported postulate is found, merged into the reported
+        // axiom set under its module, and the closure is complete but dirty.
+        let mut modules = std::collections::BTreeMap::new();
+        modules.insert("Lib".to_string(), PathBuf::from("Lib.agda"));
+        AgdaModuleMap::new(modules).attach(tmp.path()).unwrap();
+        let report = backend.audit_axioms(&ws, "thm", &whitelist).unwrap();
+        assert_eq!(report.detail["closure_state"], "complete_non_whitelisted");
+        assert!(!report.within_whitelist);
+        assert_eq!(report.axioms, vec!["Lib.libAxiom".to_string()]);
+        assert_eq!(report.detail["local_postulates"], json!([]));
+        assert_eq!(
+            report.detail["transitive_imported_postulates"],
+            json!(["Lib.libAxiom"])
+        );
+        assert_eq!(report.detail["closure_complete"], true);
+
+        // A clean, fully resolved closure is the only pass.
+        std::fs::write(tmp.path().join("Lib.agda"), "module Lib where\nid : Set\n").unwrap();
+        let report = backend.audit_axioms(&ws, "thm", &whitelist).unwrap();
+        assert_eq!(report.detail["closure_state"], "complete_clean");
+        assert!(report.within_whitelist);
+        assert!(report.axioms.is_empty());
     }
 
     #[test]
