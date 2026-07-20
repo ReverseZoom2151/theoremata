@@ -55,7 +55,44 @@ CAKEML_TARGET = (
     "stand-in until that verified binary/toolchain is available."
 )
 
+# The kinds THIS module exports and re-checks.  It is NOT the list of kinds that
+# exist in the ``theoremata.cert-log.v1`` namespace: the format is deliberately
+# shared by a family of sibling checker modules (``cert_sturm``, ``cert_sos``,
+# ...), each of which owns its own kinds and its own independent checker.  Keep
+# this tuple in lockstep with ``_KIND_OPS`` below; a test enforces that.
 KINDS = ("lp_primal_dual", "lp_farkas", "asymptotic", "wu_geometry", "subsumption")
+
+# Kinds in the SAME proof-log format that are owned (and validated) by a sibling
+# module.  Purpose: report such a document as *not checked here, checked over
+# there* instead of lumping it in with tampered garbage.  This grants NO
+# validation power: this module still refuses to check these documents, and a
+# caller must route them to the owning module's checker to learn anything about
+# their validity.  A drift-guard test fails if a shipped ``cert_*.py`` exports a
+# kind that is absent or misattributed here.
+FOREIGN_KIND_OWNERS = {
+    "bernstein": "theoremata_tools.cert_bernstein",
+    "bezout": "theoremata_tools.cert_bezout",
+    "bnb_inequality": "theoremata_tools.cert_bnb",
+    "continued_fraction": "theoremata_tools.cert_continued_fraction",
+    "flyspeck_lp": "theoremata_tools.cert_flyspeck_lp",
+    "herbrand": "theoremata_tools.cert_herbrand",
+    "nullstellensatz": "theoremata_tools.cert_nullstellensatz",
+    "pocklington_primality": "theoremata_tools.cert_pocklington",
+    "poly_minimax": "theoremata_tools.cert_sturm",
+    "positivstellensatz": "theoremata_tools.cert_positivstellensatz",
+    "pratt_primality": "theoremata_tools.cert_pratt",
+    "sos": "theoremata_tools.cert_sos",
+    "sturm": "theoremata_tools.cert_sturm",
+    "taylor_model": "theoremata_tools.cert_taylor_model",
+    "wz": "theoremata_tools.cert_wz",
+}
+
+# Outcome statuses of :func:`check_cert_log`.  Only ``STATUS_VERIFIED`` ever
+# accompanies ``valid=True``; the other two are distinct flavours of "this
+# module is NOT telling you the document is good".
+STATUS_VERIFIED = "verified"             # steps re-verified here
+STATUS_REJECTED = "rejected"             # malformed/tampered/unsatisfied: refuted
+STATUS_UNSUPPORTED = "unsupported_kind"  # a sibling module's kind: UNKNOWN here
 
 
 # --------------------------------------------------------------------------- #
@@ -593,6 +630,23 @@ class _Reject(Exception):
     """Raised to reject a certificate with a human-readable reason."""
 
 
+class _Unsupported(_Reject):
+    """Raised when the kind belongs to a sibling checker, not to this module.
+
+    A subclass of :class:`_Reject` on purpose: whatever else changes, the
+    document must still come back with ``valid=False``.  "I do not check this"
+    must never leak out as "this is fine".  The separate type exists only so a
+    caller can tell *unknown here* from *refuted here* and re-route.
+    """
+
+    def __init__(self, kind: str, owner: str):
+        super().__init__(
+            f"kind {kind!r} is not checked by cert_log; it is owned by {owner}. "
+            "This is NOT a verdict on the certificate: route it to that module."
+        )
+        self.owner = owner
+
+
 def _need(cond: bool, reason: str) -> None:
     if not cond:
         raise _Reject(reason)
@@ -857,8 +911,8 @@ _KIND_OPS = {
 def check_cert_log(log: Any) -> dict:
     """Independently RE-VERIFY a cert-log document.
 
-    Returns ``{valid, reason, checked_steps, kind, claim, claim_verified,
-    verified_statement}``.  Recomputes every assertion from the raw rationals in
+    Returns ``{valid, status, reason, checked_steps, kind, claim,
+    claim_verified, verified_statement}``.  Recomputes every assertion from the raw rationals in
     the log with exact arithmetic; it never trusts a producer's own verdict.  Any
     malformed, tampered, or unsatisfied step yields ``valid=False`` with a
     ``reason`` — this is the sound boundary.
@@ -868,13 +922,24 @@ def check_cert_log(log: Any) -> dict:
     checked against what the steps prove, so ``claim_verified`` is always
     ``False``; ``verified_statement`` is the machine-derived description of what
     was actually re-verified.  Do not present ``claim`` as a proven statement.
+
+    ``status`` is ``verified`` / ``rejected`` / ``unsupported_kind``.  The last
+    means the document names a kind owned by a sibling checker module: this
+    module did NOT check it and says nothing about whether it holds.  Only
+    ``verified`` carries ``valid=True``; treat every other status as unchecked.
     """
     checked = 0
     try:
         _need(isinstance(log, dict), "log is not a JSON object")
         _need(log.get("format") == FORMAT, f"unknown format: {log.get('format')!r}")
         kind = log.get("kind")
-        _need(kind in KINDS, f"unknown kind: {kind!r}")
+        if kind not in KINDS:
+            # Fail closed either way; only the phrasing/status differs, so that a
+            # sibling module's certificate is not misreported as refuted.
+            owner = FOREIGN_KIND_OWNERS.get(kind) if isinstance(kind, str) else None
+            if owner is not None:
+                raise _Unsupported(kind, owner)
+            raise _Reject(f"unknown kind: {kind!r}")
         steps = log.get("steps")
         _need(isinstance(steps, list) and steps, "steps must be a non-empty list")
         _need(isinstance(log.get("claim", ""), str), "claim must be a string")
@@ -906,7 +971,8 @@ def check_cert_log(log: Any) -> dict:
         # machine-derived statement of what WAS checked, so no caller can mistake
         # the free text for a proven fact. (Binding the claim string to the
         # certificate content is a deeper per-kind follow-up.)
-        return {"valid": True, "reason": "all steps independently re-verified",
+        return {"valid": True, "status": STATUS_VERIFIED,
+                "reason": "all steps independently re-verified",
                 "checked_steps": checked, "kind": kind,
                 "claim": log.get("claim"),
                 "claim_verified": False,
@@ -916,10 +982,21 @@ def check_cert_log(log: Any) -> dict:
                     "free-text `claim` field"
                 )}
     except _Reject as exc:
-        return {"valid": False, "reason": str(exc), "checked_steps": checked,
-                "kind": log.get("kind") if isinstance(log, dict) else None,
-                "claim": log.get("claim") if isinstance(log, dict) else None,
-                "claim_verified": False}
+        unsupported = isinstance(exc, _Unsupported)
+        out = {"valid": False,
+               "status": STATUS_UNSUPPORTED if unsupported else STATUS_REJECTED,
+               "reason": str(exc), "checked_steps": checked,
+               "kind": log.get("kind") if isinstance(log, dict) else None,
+               "claim": log.get("claim") if isinstance(log, dict) else None,
+               "claim_verified": False}
+        if unsupported:
+            # Where to go for an actual verdict.  Naming the owner does not imply
+            # the document is well-formed or true; nothing here has been checked.
+            out["checker"] = exc.owner
+            out["verified_statement"] = (
+                "NOTHING was verified here: this kind is checked by another module"
+            )
+        return out
 
 
 # --------------------------------------------------------------------------- #

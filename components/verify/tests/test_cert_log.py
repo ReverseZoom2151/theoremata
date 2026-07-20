@@ -19,6 +19,7 @@ for rel in ("components/verify/python", "components/tools/python",
             "components/prover/python"):
     sys.path.insert(0, str(_ROOT / rel))
 
+from theoremata_tools import cert_log as cl  # noqa: E402  (registry drift guard)
 from theoremata_tools.cert_log import (  # noqa: E402
     FORMAT,
     check_cert_log,
@@ -390,3 +391,154 @@ def test_run_check_rejects_tampered():
 def test_run_unknown_op_raises():
     with pytest.raises(ValueError):
         run({"op": "nope"})
+
+
+# --------------------------------------------------------------------------- #
+# Registry drift guard: cert_log's notion of "which kinds exist" versus the
+# checker modules that actually ship.  These two drifted apart once (5 kinds
+# registered, 20 shipped); these tests keep them married.
+# --------------------------------------------------------------------------- #
+
+_TOOLS_DIR = _ROOT / "components/verify/python/theoremata_tools"
+
+
+def _shipped_checker_modules():
+    """Every sibling ``cert_*.py`` checker module (cert_log itself excluded)."""
+    import importlib
+    mods = {}
+    for path in sorted(_TOOLS_DIR.glob("cert_*.py")):
+        if path.stem == "cert_log":
+            continue
+        mods[path.stem] = importlib.import_module(f"theoremata_tools.{path.stem}")
+    return mods
+
+
+def _exported_kinds(mod):
+    """Kinds a checker module exports.  Some modules export MORE than one, so
+    the guard counts KINDS, never files."""
+    kinds = getattr(mod, "KINDS", None)
+    if kinds is None:
+        single = getattr(mod, "KIND", None)
+        assert single is not None, (
+            f"{mod.__name__} declares neither KIND nor KINDS; the drift guard "
+            "cannot see which certificate kinds it checks"
+        )
+        kinds = (single,)
+    return tuple(str(k) for k in kinds)
+
+
+def test_every_shipped_checker_kind_is_registered():
+    """Adding a cert_*.py without registering its kind must FAIL here."""
+    mods = _shipped_checker_modules()
+    assert len(mods) >= 14, f"expected the full checker family, saw {sorted(mods)}"
+    known = set(cl.KINDS) | set(cl.FOREIGN_KIND_OWNERS)
+    missing = {}
+    for name, mod in mods.items():
+        for kind in _exported_kinds(mod):
+            if kind not in known:
+                missing.setdefault(name, []).append(kind)
+    assert not missing, (
+        f"unregistered certificate kinds: {missing}; "
+        "add them to cert_log.FOREIGN_KIND_OWNERS"
+    )
+
+
+def test_foreign_owners_point_at_the_module_that_exports_the_kind():
+    """The registry must not merely be non-empty; it must be accurate, and it
+    must carry no phantom entry for a kind nothing ships."""
+    mods = _shipped_checker_modules()
+    for name, mod in mods.items():
+        for kind in _exported_kinds(mod):
+            assert cl.FOREIGN_KIND_OWNERS.get(kind) == mod.__name__, (
+                f"{kind!r} (exported by {name}) is missing or misattributed"
+            )
+    all_shipped = {k for m in mods.values() for k in _exported_kinds(m)}
+    assert set(cl.FOREIGN_KIND_OWNERS) == all_shipped
+
+
+def test_true_kind_count_is_kinds_not_files():
+    """cert_sturm ships two kinds, so kinds outnumber modules."""
+    from theoremata_tools import cert_sturm
+    assert set(_exported_kinds(cert_sturm)) == {"sturm", "poly_minimax"}
+    for kind in ("sturm", "poly_minimax"):
+        assert cl.FOREIGN_KIND_OWNERS[kind] == "theoremata_tools.cert_sturm"
+    mods = _shipped_checker_modules()
+    all_shipped = {k for m in mods.values() for k in _exported_kinds(m)}
+    assert len(all_shipped) > len(mods)
+
+
+def test_foreign_and_own_kinds_are_disjoint():
+    """No kind may be claimed both by cert_log and by a sibling checker."""
+    assert not set(cl.KINDS) & set(cl.FOREIGN_KIND_OWNERS)
+
+
+def test_kinds_matches_the_dispatch_table():
+    """cert_log's own two lists cannot drift from each other either."""
+    assert set(cl.KINDS) == set(cl._KIND_OPS)
+
+
+# --------------------------------------------------------------------------- #
+# Unknown kinds: never treated as checked, and a sibling's kind is not refuted.
+# --------------------------------------------------------------------------- #
+
+def test_sibling_kind_is_unsupported_not_validated():
+    cert, constraints = _farkas_cert()
+    log = export_lp_cert(cert, constraints=constraints)
+    doc = copy.deepcopy(log)
+    doc["kind"] = "sturm"  # a real kind, owned by cert_sturm
+    res = check_cert_log(doc)
+    assert res["valid"] is False  # unknown here means UNCHECKED, never valid
+    assert res["status"] == "unsupported_kind"
+    assert res["checker"] == "theoremata_tools.cert_sturm"
+    assert res["claim_verified"] is False
+    assert "NOTHING was verified" in res["verified_statement"]
+
+
+def test_every_foreign_kind_fails_closed():
+    """Every sibling-owned kind: valid=False, and steps are never executed."""
+    cert, constraints = _farkas_cert()
+    log = export_lp_cert(cert, constraints=constraints)
+    for kind, owner in cl.FOREIGN_KIND_OWNERS.items():
+        doc = copy.deepcopy(log)
+        doc["kind"] = kind
+        res = check_cert_log(doc)
+        assert res["valid"] is False, kind
+        assert res["status"] == "unsupported_kind", kind
+        assert res["checker"] == owner, kind
+        assert res["checked_steps"] == 0, kind
+
+
+def test_nonsense_kind_is_rejected_outright():
+    cert, constraints = _farkas_cert()
+    log = export_lp_cert(cert, constraints=constraints)
+    for kind in ("not_a_real_kind", "", None, 17, ("sturm",)):
+        doc = copy.deepcopy(log)
+        doc["kind"] = kind
+        res = check_cert_log(doc)
+        assert res["valid"] is False
+        assert res["status"] == "rejected"
+        assert "checker" not in res
+
+
+def test_status_verified_only_ever_accompanies_valid_true():
+    cert, constraints = _farkas_cert()
+    log = export_lp_cert(cert, constraints=constraints)
+    good = check_cert_log(log)
+    assert good["valid"] is True and good["status"] == "verified"
+    bad = copy.deepcopy(log)
+    for step in bad["steps"]:
+        if step["op"] == "farkas_multipliers":
+            step["m"] = ["-1" for _ in step["m"]]
+    res = check_cert_log(bad)
+    assert res["valid"] is False and res["status"] == "rejected"
+
+
+def test_worker_run_surfaces_the_unsupported_status():
+    cert, constraints = _farkas_cert()
+    log = export_lp_cert(cert, constraints=constraints)
+    doc = copy.deepcopy(log)
+    doc["kind"] = "pratt_primality"
+    res = run({"op": "check", "log": _roundtrip(doc)})
+    assert res["valid"] is False
+    assert res["status"] == "unsupported_kind"
+    assert res["checker"] == "theoremata_tools.cert_pratt"
