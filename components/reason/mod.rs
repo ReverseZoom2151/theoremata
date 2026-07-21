@@ -17,6 +17,7 @@ pub use orchestration::{
     team, trace,
 };
 pub use proving::{
+    alignment, alignment_propose, alignment_refute,
     blueprint, checker_cache, conjecture_engine, decompose, decomposition_admission,
     definition_synthesis, evolve_sketch, falsification, formal_generate, formalize_modes, formalize_portfolio, graph_rag,
     informal_defect_prior, library, mathlib_export, model_router, optimize, portfolio, refine_ops, repair, retry, router, sketch,

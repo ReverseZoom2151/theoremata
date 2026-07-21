@@ -24,7 +24,8 @@ pub use prover::{
     hypothesis_audit, isabelle, lean, proof_job, proof_log, rocq, statement_preservation, subgoal_extract, vacuity,
 };
 pub use reason::{
-    agent, best_first, blueprint, blueprint_generate, blueprint_run, certification, chat,
+    agent, alignment, alignment_propose, alignment_refute,
+    best_first, blueprint, blueprint_generate, blueprint_run, certification, chat,
     checker_cache, concurrent, conjecture_engine, consolidate, context_assembly, critic,
     critic_scorer, dag_projection, decompose, decomposition_admission, definition_synthesis,
     discovery_game,

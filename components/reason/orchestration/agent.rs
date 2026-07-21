@@ -704,6 +704,67 @@ impl AgentLoop<'_> {
                     worker_detail = serde_json::to_value(&result)?;
                 }
 
+                // Plan Phase 2.4: an alignment may STEER premise retrieval and
+                // may suggest an obligation; it may never license a transfer.
+                // This is the one place the alignment stack is consumed, and it
+                // is consumed in the weakest of the two permitted ways: names
+                // are APPENDED to the tail of the candidate list, so a
+                // suggestion can never displace a premise the graph or the
+                // external retriever already earned, and nothing here reads a
+                // statement, a grade or an obligation off an alignment. The
+                // whole exchange is a list of names.
+                //
+                // Refutation costs falsifier runs, so the block is gated OFF by
+                // default. When the switch is off nothing below executes and the
+                // recorded evidence is byte-identical to what it was before this
+                // consumer existed.
+                let mut alignment_detail = Value::Null;
+                if self.config.alignment_retrieval_steer {
+                    let corpora_path = self.config.resources.join("alignments/corpora.json");
+                    match crate::alignment_refute::load_corpora_pair(&corpora_path) {
+                        Ok(Some((left, right))) => {
+                            // Named binding rather than a temporary: the
+                            // falsifier is borrowed for the whole steer call.
+                            let falsifier = crate::falsification::Falsifier {
+                                provider: self.provider,
+                            };
+                            let surfaced = crate::alignment_refute::steer_retrieval(
+                                &left,
+                                &right,
+                                &crate::alignment_propose::MatcherConfig::default(),
+                                &falsifier,
+                                &lemmas,
+                                4,
+                            );
+                            alignment_detail = json!({
+                                "corpora": corpora_path.to_string_lossy(),
+                                "surfaced": surfaced
+                                    .iter()
+                                    .map(|c| c.to_json())
+                                    .collect::<Vec<Value>>(),
+                            });
+                            for candidate in &surfaced {
+                                lemmas.push(candidate.name().to_string());
+                            }
+                        }
+                        // No corpora on disk is the ordinary case, and the
+                        // fail-safe one: nothing to align means no signal.
+                        Ok(None) => {
+                            alignment_detail = json!({"steer": "no_corpora"});
+                        }
+                        // An unreadable corpora file is an operator mistake. It
+                        // is recorded and then ignored, because an alignment we
+                        // could not even load must read as no signal rather than
+                        // as an alignment that survived probing.
+                        Err(err) => {
+                            alignment_detail = json!({
+                                "steer": "unavailable",
+                                "error": err.to_string(),
+                            });
+                        }
+                    }
+                }
+
                 // Graph candidates come first because they are already-certified
                 // project-local premises. Preserve that order while removing any
                 // duplicate names returned by the external retriever.
@@ -729,10 +790,21 @@ impl AgentLoop<'_> {
                     } else {
                         "candidates"
                     },
-                    json!({
-                        "graph_candidates": graph_candidates,
-                        "worker": worker_detail,
-                    }),
+                    {
+                        // The alignment key is added only when the steer switch
+                        // actually ran, so the recorded evidence on the default
+                        // path is byte-identical to what it was before.
+                        let mut detail = json!({
+                            "graph_candidates": graph_candidates,
+                            "worker": worker_detail,
+                        });
+                        if !alignment_detail.is_null() {
+                            if let Some(obj) = detail.as_object_mut() {
+                                obj.insert("alignment".to_string(), alignment_detail);
+                            }
+                        }
+                        detail
+                    },
                 )?;
                 if lemmas.is_empty() && !py.available() {
                     Ok("noop")
