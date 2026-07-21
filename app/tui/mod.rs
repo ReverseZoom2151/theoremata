@@ -21,6 +21,8 @@ mod cell;
 mod command_popup;
 mod composer;
 mod event;
+mod graph_panel;
+mod mention;
 
 use crate::{
     chat::{ChatAction, ChatEngine},
@@ -59,6 +61,8 @@ use self::cell::Cell;
 use self::command_popup::CommandPopup;
 use self::composer::{Composer, Submit};
 use self::event::{UiEvent, WorkerInputs};
+use self::graph_panel::{GraphPanel, PanelNode};
+use self::mention::MentionPopup;
 
 /// The env var the Python adapter reads on every model call; a `/model` switch
 /// sets it and the next turn picks it up (the `CommandProvider` spawns the
@@ -108,6 +112,19 @@ struct App {
     project_id: String,
     composer: Composer,
     popup: CommandPopup,
+    /// The @-node mention popup, mutually exclusive with `popup` by trigger char
+    /// ('/' vs a trailing '@' token); kept in sync on every composer edit.
+    mention: MentionPopup,
+    /// The graph-first side panel and whether it is currently shown. `show_graph`
+    /// is user intent; whether it actually renders also depends on there being
+    /// enough width (see `graph_width`).
+    graph: GraphPanel,
+    show_graph: bool,
+    /// When true AND the panel is shown, Up/Down drive the panel's selection
+    /// instead of the composer/popup. Esc or typing returns focus to the
+    /// composer. The invariant is that this is never true while `show_graph` is
+    /// false (toggling and unfocus keep them consistent).
+    graph_focused: bool,
     /// Committed transcript cells, oldest first.
     history: Vec<Cell>,
     /// The in-flight streamed reply preview. `Some` only while a chat worker is
@@ -145,6 +162,10 @@ fn run_loop(
         project_id: project_id.into(),
         composer,
         popup: CommandPopup::new(),
+        mention: MentionPopup::new(),
+        graph: GraphPanel::new(),
+        show_graph: false,
+        graph_focused: false,
         history: opening_history(store, project_id),
         active_stream: None,
         scroll: None,
@@ -158,7 +179,7 @@ fn run_loop(
         rx,
     };
     loop {
-        draw(terminal, &mut app)?;
+        draw(terminal, &mut app, store)?;
         drain_events(&mut app);
         // Short poll so the UI stays responsive AND the spinner animates while a
         // worker runs. Keys are handled every tick, never blocked by a worker.
@@ -176,7 +197,7 @@ fn run_loop(
                 },
                 CEvent::Paste(text) => {
                     app.composer.paste(&text);
-                    app.popup.sync(&app.composer.text());
+                    sync_popups(&mut app, store);
                 }
                 // Resize needs no explicit handling: the next draw re-splits the
                 // area and every cell re-renders to the new width (ratatui
@@ -264,7 +285,21 @@ fn handle_key(
     }
     match (k.code, k.modifiers) {
         (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => return true,
+        // Ctrl+G toggles the graph-first side panel. Showing it also focuses it
+        // (so Up/Down browse nodes immediately); hiding it drops focus. Whether
+        // the panel actually fits is decided at draw time by `graph_width`.
+        (KeyCode::Char('g'), m) if m.contains(KeyModifiers::CONTROL) => {
+            app.show_graph = !app.show_graph;
+            app.graph_focused = app.show_graph;
+            return false;
+        }
         (KeyCode::Esc, _) => {
+            // While the panel is focused, Esc first returns focus to the composer
+            // rather than interrupting/clearing, so the graph is easy to leave.
+            if app.graph_focused {
+                app.graph_focused = false;
+                return false;
+            }
             if app.busy {
                 // True mid-turn interrupt: the worker checks this between rounds
                 // and stops forwarding stream deltas immediately.
@@ -272,7 +307,7 @@ fn handle_key(
                 app.status = "interrupting… (returns to input at the next round)".into();
             } else if !app.composer.is_empty() {
                 app.composer.clear();
-                app.popup.sync(app.composer.text().as_str());
+                sync_popups(app, store);
             } else {
                 // Nothing to cancel or clear: jump back to the live bottom.
                 app.scroll = None;
@@ -290,12 +325,26 @@ fn handle_key(
         _ => {}
     }
 
-    // Route navigation keys to the popup while it is completing a command name.
+    // Graph panel focus: while focused, Up/Down drive the panel's selection.
+    // A non-nav key returns focus to the composer and is then processed normally
+    // (the "typing returns focus" rule), so the user can just start typing.
+    if let Some(nav) = graph_nav(app.show_graph, app.graph_focused, k.code) {
+        match nav {
+            GraphNav::Prev => app.graph.select_prev(),
+            GraphNav::Next => app.graph.select_next(),
+        }
+        return false;
+    }
+    if app.graph_focused {
+        app.graph_focused = false;
+    }
+
+    // Route navigation keys to the command popup while it is completing a name.
     if app.popup.is_active() && popup_consumes(k.code) {
         match app.popup.key(k) {
             Some(name) => {
                 complete_composer(&mut app.composer, name);
-                app.popup.sync(app.composer.text().as_str());
+                sync_popups(app, store);
             }
             None => {
                 // Up/Down moved the selection (consumed). Enter with no match
@@ -304,7 +353,30 @@ fn handle_key(
                     if let Some(Submit::Line(s)) = app.composer.input(k) {
                         on_submit(app, store, config, provider, s);
                     }
-                    app.popup.sync(app.composer.text().as_str());
+                    sync_popups(app, store);
+                }
+            }
+        }
+        return false;
+    }
+
+    // Route the same navigation keys to the @-mention popup when IT is active.
+    // The two popups are mutually exclusive (a '/'-prefixed name has no '@'
+    // trailing token, and vice versa), so this branch never fights the one above.
+    if app.mention.is_active() && popup_consumes(k.code) {
+        match app.mention.key(k) {
+            Some(name) => {
+                replace_mention_token(&mut app.composer, &name);
+                sync_popups(app, store);
+            }
+            None => {
+                // Up/Down moved the selection (consumed). Enter with nothing to
+                // accept falls through to a normal submit.
+                if k.code == KeyCode::Enter {
+                    if let Some(Submit::Line(s)) = app.composer.input(k) {
+                        on_submit(app, store, config, provider, s);
+                    }
+                    sync_popups(app, store);
                 }
             }
         }
@@ -315,8 +387,70 @@ fn handle_key(
     if let Some(Submit::Line(s)) = app.composer.input(k) {
         on_submit(app, store, config, provider, s);
     }
-    app.popup.sync(app.composer.text().as_str());
+    sync_popups(app, store);
     false
+}
+
+/// Sync BOTH completion popups to the current composer text. The command popup
+/// keys off a leading '/', the mention popup off a trailing '@token'; feeding
+/// both here keeps them consistent after every edit from a single call site.
+/// The node names are the project's live node titles (a cheap DB read).
+fn sync_popups(app: &mut App, store: &Store) {
+    let text = app.composer.text();
+    app.popup.sync(&text);
+    let names = node_names(store, &app.project_id);
+    app.mention.sync(&text, &names);
+}
+
+/// The project's node titles, for @-mention completion. A read error yields an
+/// empty list (the popup simply offers nothing) rather than disrupting input.
+fn node_names(store: &Store, project_id: &str) -> Vec<String> {
+    store
+        .nodes(project_id)
+        .map(|ns| ns.into_iter().map(|n| n.title).collect())
+        .unwrap_or_default()
+}
+
+/// The graph-panel navigation intent for a key, or `None` when the key must keep
+/// its normal meaning (history recall / popup nav). A pure decision so the
+/// focus-routing rule is unit-testable without a TTY: nav is claimed ONLY while
+/// the panel is both shown and focused, and only for Up/Down.
+#[derive(Debug, PartialEq, Eq)]
+enum GraphNav {
+    Prev,
+    Next,
+}
+
+fn graph_nav(show_graph: bool, focused: bool, code: KeyCode) -> Option<GraphNav> {
+    if show_graph && focused {
+        match code {
+            KeyCode::Up => Some(GraphNav::Prev),
+            KeyCode::Down => Some(GraphNav::Next),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+/// Replace the trailing `@partial` token in the composer with `@<name> ` after a
+/// mention is accepted. The composer only edits (no set-text), so we compute the
+/// new text purely and reload it via clear+paste, mirroring `complete_composer`.
+fn replace_mention_token(composer: &mut Composer, name: &str) {
+    let new = replace_trailing_mention(&composer.text(), name);
+    composer.clear();
+    composer.paste(&new);
+}
+
+/// Pure token surgery: swap the trailing whitespace-delimited token (which the
+/// mention popup guarantees starts with '@') for `@<name> `. Everything before
+/// that token is preserved verbatim. Kept free-standing so it is unit-testable.
+fn replace_trailing_mention(text: &str, name: &str) -> String {
+    // The mention is active only when the LAST token starts with '@', so there is
+    // no trailing whitespace; `trim_end` is a harmless guard.
+    let head = text.trim_end();
+    let start = head.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
+    format!("{}@{name} ", &head[..start])
 }
 
 /// Which keys the popup consumes while active: selection movement and accept.
@@ -448,9 +582,8 @@ fn dispatch_command(
         "/project" => handle_project(app, store, rest),
         "/new" => handle_new(app, store, rest),
         "/help" => app.history.push(help_cell()),
-        "/graph" | "/obligations" | "/attempts" | "/events" | "/status" | "/verify" => {
-            inspect(app, store, cmd)
-        }
+        "/verify" => inspect_verify(app, store),
+        "/graph" | "/obligations" | "/attempts" | "/events" | "/status" => inspect(app, store, cmd),
         "/proposals" => inspect_proposals(app, store),
         "/approve" => handle_approve(app, store, provider, rest),
         "/reject" => handle_reject(app, store, provider, rest),
@@ -611,24 +744,6 @@ fn inspect(app: &mut App, store: &Store, cmd: &str) {
                 out.push(format!("Theorem:  {}", p.theorem));
                 p.name
             }
-            "/verify" => {
-                let nodes = store.nodes(&project_id)?;
-                let verified = nodes
-                    .iter()
-                    .filter(|n| n.status == NodeStatus::FormallyVerified)
-                    .count();
-                for n in &nodes {
-                    let layer = if n.formal_statement.is_some() {
-                        "formal"
-                    } else {
-                        "informal"
-                    };
-                    out.push(format!("{:<20} {:<9} {}", n.status, layer, n.title));
-                }
-                out.push(String::new());
-                out.push("Use /prove or /agent to drive verification.".into());
-                format!("{}/{} nodes formally verified", verified, nodes.len())
-            }
             _ => "".into(),
         };
         Ok((title, out))
@@ -638,6 +753,37 @@ fn inspect(app: &mut App, store: &Store, cmd: &str) {
         Err(e) => app
             .history
             .push(cell::error_cell(&format!("{cmd} error: {e}"))),
+    }
+}
+
+/// `/verify`: the verification census as a rich, glyphed cell. Reads the nodes
+/// once and hands the presentation layer plain `(status, layer, title)` rows plus
+/// the verified/total counts; the cell enforces the honesty rule (only
+/// `formally_verified` renders green).
+fn inspect_verify(app: &mut App, store: &Store) {
+    match store.nodes(&app.project_id) {
+        Ok(nodes) => {
+            let verified = nodes
+                .iter()
+                .filter(|n| n.status == NodeStatus::FormallyVerified)
+                .count();
+            let rows: Vec<(String, String, String)> = nodes
+                .iter()
+                .map(|n| {
+                    let layer = if n.formal_statement.is_some() {
+                        "formal"
+                    } else {
+                        "informal"
+                    };
+                    (n.status.to_string(), layer.to_string(), n.title.clone())
+                })
+                .collect();
+            app.history
+                .push(cell::verify_cell(verified, nodes.len(), rows));
+        }
+        Err(e) => app
+            .history
+            .push(cell::error_cell(&format!("/verify error: {e}"))),
     }
 }
 
@@ -994,14 +1140,62 @@ fn current_model() -> String {
     std::env::var(MODEL_ENV).unwrap_or_else(|_| "(adapter default)".into())
 }
 
+/// The graph panel's width in columns, or 0 when it must NOT be shown. Returns 0
+/// unless the panel is requested AND the terminal is wide enough to keep both a
+/// readable transcript (>= `TRANSCRIPT_MIN`) and a minimum panel (>= `MIN`). A
+/// pure function so the "too narrow, keep it off" rule is unit-testable.
+fn graph_width(total: u16, show: bool) -> u16 {
+    const MIN: u16 = 24;
+    const TRANSCRIPT_MIN: u16 = 30;
+    if !show || total < MIN + TRANSCRIPT_MIN {
+        return 0;
+    }
+    // Aim for ~35% of the width, but never below the minimum, and never so wide
+    // that the transcript drops under its own minimum.
+    let want = (total as u32 * 35 / 100) as u16;
+    want.max(MIN).min(total - TRANSCRIPT_MIN)
+}
+
+/// How many transcript lines sit BELOW the current viewport, for the scroll-up
+/// indicator. Zero while auto-following (`None`) or already at the bottom. Pure,
+/// so the indicator math is unit-testable without a TTY.
+fn lines_below(scroll: Option<usize>, total: usize, vh: usize) -> usize {
+    let max_top = total.saturating_sub(vh);
+    match scroll {
+        None => 0,
+        Some(t) => max_top.saturating_sub(t.min(max_top)),
+    }
+}
+
+/// Map a store `Node`'s presentation fields to a `PanelNode`. Kept as a small
+/// free function taking the enum types (not a whole `Node`) so the mapping, and
+/// in particular that status/kind go through their `Display`, is unit-testable
+/// without constructing a full `Node`. The honesty rule rides along for free:
+/// only `NodeStatus::FormallyVerified` stringifies to "formally_verified", the
+/// single status the panel paints green.
+fn panel_node(id: &str, title: &str, status: NodeStatus, kind: NodeKind) -> PanelNode {
+    PanelNode {
+        id: id.to_string(),
+        title: title.to_string(),
+        status: status.to_string(),
+        kind: kind.to_string(),
+    }
+}
+
 /// Draw one full frame. All layout math and line-building happens up front so we
 /// can record the transcript geometry (`last_total`, `last_vh`) for the scroll
 /// keys; the closure then renders the pre-built widgets.
-fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
+fn draw(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    store: &Store,
+) -> Result<()> {
     let size = terminal.size()?;
     let full = Rect::new(0, 0, size.width, size.height);
 
-    let popup_h = app.popup.height();
+    // Whichever completion popup is active reserves the height; they are mutually
+    // exclusive, so at most one is non-zero.
+    let popup_h = app.popup.height().max(app.mention.height());
     // The composer is a full bordered box: input height plus a top and bottom
     // border. A one-row gap above the input zone keeps the transcript from
     // butting straight into the box, which was the "squeezed" look.
@@ -1011,13 +1205,33 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
         .constraints([
             Constraint::Min(3),             // transcript (scrolls)
             Constraint::Length(1),          // breathing room above the input zone
-            Constraint::Length(popup_h),    // slash-command popup (0 when inactive)
+            Constraint::Length(popup_h),    // completion popup (0 when inactive)
             Constraint::Length(composer_h), // the composer box
             Constraint::Length(1),          // one-line status footer
         ])
         .split(full);
-    let (transcript_area, popup_area, composer_area, footer_area) =
+    let (top_area, popup_area, composer_area, footer_area) =
         (areas[0], areas[2], areas[3], areas[4]);
+
+    // Split the transcript row horizontally when the graph panel is shown AND
+    // fits: transcript on the left, a one-column gap, the panel on the right.
+    let gw = graph_width(size.width, app.show_graph);
+    let (transcript_area, graph_area) = if gw > 0 {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(1),     // transcript
+                Constraint::Length(1),  // gap
+                Constraint::Length(gw), // graph panel
+            ])
+            .split(top_area);
+        (cols[0], Some(cols[2]))
+    } else {
+        (top_area, None)
+    };
+    // The panel was requested but the terminal is too narrow: say so in the
+    // footer rather than silently dropping it.
+    let graph_too_narrow = app.show_graph && gw == 0;
 
     // Build the whole transcript into one line list at the transcript width.
     // Committed cells never change; only the streamed preview re-renders each
@@ -1047,16 +1261,50 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
     };
     app.last_total = total;
     app.last_vh = vh;
+    let below = lines_below(app.scroll, total, vh);
 
-    let popup_lines = app.popup.lines(popup_area.width);
+    // Build the graph panel lines (a cheap store read; no worker needed). Done
+    // outside the draw closure so a read error cannot poison the frame.
+    let graph_lines: Vec<Line<'static>> = match graph_area {
+        Some(area) => {
+            let panel_nodes: Vec<PanelNode> = store
+                .nodes(&app.project_id)
+                .map(|ns| {
+                    ns.iter()
+                        .map(|n| panel_node(&n.id, &n.title, n.status, n.kind))
+                        .collect()
+                })
+                .unwrap_or_default();
+            app.graph.lines(&panel_nodes, area.width, area.height)
+        }
+        None => Vec::new(),
+    };
+
+    // Exactly one popup contributes lines (the other returns empty when inactive).
+    let mut popup_lines = app.popup.lines(popup_area.width);
+    popup_lines.extend(app.mention.lines(popup_area.width));
     let composer_lines = app.composer.lines(composer_area.width);
-    let footer = footer_line(app);
+    let footer = footer_line(app, graph_too_narrow);
 
     terminal.draw(|f| {
         f.render_widget(
             Paragraph::new(lines).scroll((top as u16, 0)),
             transcript_area,
         );
+        // The scroll-up indicator overlays the bottom transcript row so the user
+        // knows there is more below while reading history.
+        if below > 0 && transcript_area.height > 0 {
+            let y = transcript_area.y + transcript_area.height - 1;
+            let rect = Rect::new(transcript_area.x, y, transcript_area.width, 1);
+            let hint = format!("  \u{2193} {below} more below  ");
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(hint, cell::theme::dim()))),
+                rect,
+            );
+        }
+        if let Some(area) = graph_area {
+            f.render_widget(Paragraph::new(graph_lines), area);
+        }
         if popup_h > 0 {
             f.render_widget(Paragraph::new(popup_lines), popup_area);
         }
@@ -1076,10 +1324,11 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
 }
 
 /// The footer/status line: the active model, the busy/idle state (with a
-/// spinner while a worker runs), and the current hint. The working indicator is
-/// truthful because the UI is live during the turn, unlike the old frozen
-/// "(blocking; please wait)".
-fn footer_line(app: &App) -> Paragraph<'static> {
+/// spinner while a worker runs), the current hint, and a compact key-hint strip.
+/// The working indicator is truthful because the UI is live during the turn,
+/// unlike the old frozen "(blocking; please wait)". `graph_too_narrow` swaps the
+/// key hints for a note when the graph panel was toggled on but does not fit.
+fn footer_line(app: &App, graph_too_narrow: bool) -> Paragraph<'static> {
     let state = if app.busy {
         Span::styled(
             format!("{} busy", cell::theme::spinner_frame(app.tick)),
@@ -1087,6 +1336,14 @@ fn footer_line(app: &App) -> Paragraph<'static> {
         )
     } else {
         Span::styled("idle".to_string(), cell::theme::dim())
+    };
+    // The context hints: the discoverability strip for the panel, popups, and
+    // quit, or the "too narrow" note when the graph cannot fit.
+    let hints = if graph_too_narrow {
+        "  \u{b7}  graph hidden: terminal too narrow".to_string()
+    } else {
+        "  \u{b7}  Ctrl+G graph  \u{b7}  / commands  \u{b7}  @ nodes  \u{b7}  Ctrl-C quit"
+            .to_string()
     };
     let line = Line::from(vec![
         Span::styled(
@@ -1096,6 +1353,7 @@ fn footer_line(app: &App) -> Paragraph<'static> {
         Span::styled("· ".to_string(), cell::theme::dim()),
         state,
         Span::styled(format!("  · {}", app.status), cell::theme::dim()),
+        Span::styled(hints, cell::theme::dim()),
     ]);
     Paragraph::new(line)
 }
@@ -1192,5 +1450,95 @@ mod tests {
         assert_eq!(lines.len(), 3); // title + 2 body lines
         let title: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(title.contains("2 nodes"));
+    }
+
+    // ---- The graph-panel focus routing ----
+
+    #[test]
+    fn graph_nav_claims_up_down_only_when_shown_and_focused() {
+        // Shown and focused: Up/Down become panel navigation.
+        assert_eq!(graph_nav(true, true, KeyCode::Up), Some(GraphNav::Prev));
+        assert_eq!(graph_nav(true, true, KeyCode::Down), Some(GraphNav::Next));
+        // Other keys are never claimed, so typing/enter reach the composer.
+        assert_eq!(graph_nav(true, true, KeyCode::Enter), None);
+        assert_eq!(graph_nav(true, true, KeyCode::Char('a')), None);
+        // Not focused (even if shown): Up/Down keep their normal meaning.
+        assert_eq!(graph_nav(true, false, KeyCode::Up), None);
+        assert_eq!(graph_nav(true, false, KeyCode::Down), None);
+        // Not shown: never claimed regardless of the focus flag.
+        assert_eq!(graph_nav(false, true, KeyCode::Up), None);
+    }
+
+    // ---- The @-mention token replacement ----
+
+    #[test]
+    fn replace_trailing_mention_swaps_last_token() {
+        // A mention mid-message: only the trailing @token is replaced.
+        assert_eq!(
+            replace_trailing_mention("prove @lem", "lemma_3"),
+            "prove @lemma_3 "
+        );
+        // A message that is only a mention.
+        assert_eq!(replace_trailing_mention("@lem", "lemma_1"), "@lemma_1 ");
+        // A bare '@' completes to the chosen node.
+        assert_eq!(replace_trailing_mention("@", "root"), "@root ");
+        // Preserves everything before the token verbatim, including other words.
+        assert_eq!(
+            replace_trailing_mention("see also @foo bar @ba", "baz"),
+            "see also @foo bar @baz "
+        );
+    }
+
+    // ---- The graph-width fit rule ----
+
+    #[test]
+    fn graph_width_zero_when_hidden_or_too_narrow() {
+        assert_eq!(graph_width(200, false), 0); // hidden: never shows
+        assert_eq!(graph_width(40, true), 0); // too narrow: min panel + transcript won't fit
+                                              // Wide enough: ~35% of the width, at least the 24-col minimum.
+        assert_eq!(graph_width(100, true), 35);
+        // Just over the threshold gives the minimum panel, transcript keeps 30.
+        assert_eq!(graph_width(54, true), 24);
+        // The transcript is never starved below its minimum of 30.
+        let gw = graph_width(60, true);
+        assert!(gw >= 24 && 60 - gw >= 30);
+    }
+
+    // ---- The scroll-indicator math ----
+
+    #[test]
+    fn lines_below_zero_at_bottom_positive_when_scrolled_up() {
+        // Auto-follow (None) is always at the bottom: nothing below.
+        assert_eq!(lines_below(None, 100, 20), 0);
+        // max_top = 80. Pinned at 60 leaves 20 rows below.
+        assert_eq!(lines_below(Some(60), 100, 20), 20);
+        // Pinned at the very bottom: nothing below.
+        assert_eq!(lines_below(Some(80), 100, 20), 0);
+        // A stale scroll past max clamps, never underflows.
+        assert_eq!(lines_below(Some(999), 100, 20), 0);
+        // Content shorter than the viewport: nothing below.
+        assert_eq!(lines_below(Some(0), 10, 20), 0);
+    }
+
+    // ---- The Node -> PanelNode mapping (status/kind via Display) ----
+
+    #[test]
+    fn panel_node_maps_status_and_kind_via_display() {
+        let n = panel_node(
+            "abc",
+            "My lemma",
+            NodeStatus::FormallyVerified,
+            NodeKind::Lemma,
+        );
+        assert_eq!(n.id, "abc");
+        assert_eq!(n.title, "My lemma");
+        // The one status the panel paints green stringifies exactly as it expects.
+        assert_eq!(n.status, "formally_verified");
+        assert_eq!(n.kind, "lemma");
+        // A non-verified status must NOT stringify to the verified token, so the
+        // panel can never be tricked into greening it.
+        let open = panel_node("x", "t", NodeStatus::Active, NodeKind::Obligation);
+        assert_eq!(open.status, "active");
+        assert_ne!(open.status, "formally_verified");
     }
 }

@@ -844,6 +844,92 @@ pub fn proposal_cell(id: &str, summary: &str) -> Cell {
     })
 }
 
+// The /verify inspector, rendered richly: a bold count header, then one glyphed
+// row per node. The honesty rule is enforced here exactly as in `VerdictCell` and
+// the graph panel: ONLY a `formally_verified` status earns the green check. A
+// rejected node is a red cross; an informally-verified or blocked node is a
+// yellow warning (a pass that is NOT a kernel verification); everything else is a
+// neutral dim bullet. No status but `formally_verified` can ever read as green.
+struct VerifyRow {
+    status: String,
+    layer: String,
+    title: String,
+}
+
+struct VerifyCell {
+    verified: usize,
+    total: usize,
+    rows: Vec<VerifyRow>,
+}
+
+// The per-node glyph and its style. Free function so the honesty mapping is
+// pinned by a test and cannot silently gain a green case.
+fn verify_glyph(status: &str) -> (&'static str, Style) {
+    match status {
+        "formally_verified" => (theme::VERIFIED, theme::verified()),
+        "rejected" => (theme::FAILED, theme::failed()),
+        // Not a kernel verification, but not a crash either: yellow warning.
+        "informally_verified" | "blocked" => (theme::WARN, theme::warn()),
+        // proposed / active / superseded / anything unknown: neutral, never green.
+        _ => (theme::BULLET, theme::dim()),
+    }
+}
+
+impl HistoryCell for VerifyCell {
+    fn lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut out = vec![Line::from(vec![
+            Span::styled(format!("{} ", theme::BULLET), theme::dim()),
+            Span::styled(
+                format!("{}/{} nodes formally verified", self.verified, self.total),
+                theme::bold(),
+            ),
+        ])];
+        for row in &self.rows {
+            let (glyph, style) = verify_glyph(&row.status);
+            // Reserve room for the glyph, status, and layer columns; truncate the
+            // title so a long name never overflows the pane.
+            let avail = (width as usize).saturating_sub(34).max(8);
+            let title: String = row.title.chars().take(avail).collect();
+            out.push(Line::from(vec![
+                Span::raw("  ".to_string()),
+                Span::styled(glyph.to_string(), style),
+                Span::styled(format!(" {:<20}", row.status), theme::dim()),
+                Span::styled(format!("{:<9}", row.layer), theme::dim()),
+                Span::raw(title),
+            ]));
+        }
+        if self.rows.is_empty() {
+            out.push(Line::from(Span::styled(
+                "  no nodes yet".to_string(),
+                theme::dim(),
+            )));
+        }
+        out.push(Line::from(Vec::<Span>::new()));
+        out.push(Line::from(Span::styled(
+            "  Use /prove or /agent to drive verification.".to_string(),
+            theme::dim(),
+        )));
+        out
+    }
+}
+
+/// Build the rich /verify cell from `(status, layer, title)` rows plus the
+/// verified/total counts. See `VerifyCell` for the honesty rule it enforces.
+pub fn verify_cell(verified: usize, total: usize, rows: Vec<(String, String, String)>) -> Cell {
+    Box::new(VerifyCell {
+        verified,
+        total,
+        rows: rows
+            .into_iter()
+            .map(|(status, layer, title)| VerifyRow {
+                status,
+                layer,
+                title,
+            })
+            .collect(),
+    })
+}
+
 struct NoticeCell {
     text: String,
 }
@@ -1160,6 +1246,75 @@ mod tests {
         let l2 = theme::status_line("compiled", false);
         assert!(l2.spans[0].content.contains(theme::FAILED));
         assert_eq!(l2.spans[0].style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn verify_glyph_only_formally_verified_is_green() {
+        // The one green case.
+        assert_eq!(verify_glyph("formally_verified").1.fg, Some(Color::Green));
+        // Every other status must NOT be green (the honesty rule).
+        for s in [
+            "proposed",
+            "active",
+            "blocked",
+            "rejected",
+            "informally_verified",
+            "superseded",
+            "",
+        ] {
+            assert_ne!(
+                verify_glyph(s).1.fg,
+                Some(Color::Green),
+                "status {s:?} must not be green"
+            );
+        }
+        // A rejection reads red; an informal pass reads yellow, never green.
+        assert_eq!(verify_glyph("rejected").1.fg, Some(Color::Red));
+        assert_eq!(
+            verify_glyph("informally_verified").1.fg,
+            Some(Color::Yellow)
+        );
+    }
+
+    #[test]
+    fn verify_cell_greens_only_the_verified_node() {
+        let cell = verify_cell(
+            1,
+            2,
+            vec![
+                (
+                    "formally_verified".to_string(),
+                    "formal".to_string(),
+                    "Proved thm".to_string(),
+                ),
+                (
+                    "active".to_string(),
+                    "informal".to_string(),
+                    "Open goal".to_string(),
+                ),
+            ],
+        );
+        let lines = cell.lines(80);
+        // The header reports the count.
+        let header: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(header.contains("1/2 nodes formally verified"));
+        // The verified glyph appears in green somewhere.
+        let spans = all_spans(&cell, 80);
+        assert!(contains_glyph_with_fg(
+            &spans,
+            theme::VERIFIED,
+            Color::Green
+        ));
+        // The row carrying the "active" status is never green.
+        let active_line = cell
+            .lines(80)
+            .into_iter()
+            .find(|l| l.spans.iter().any(|s| s.content.contains("active")))
+            .expect("active row present");
+        assert!(active_line
+            .spans
+            .iter()
+            .all(|s| s.style.fg != Some(Color::Green)));
     }
 
     #[test]
