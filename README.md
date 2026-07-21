@@ -17,7 +17,7 @@ assistant, and returns a machine-checkable certificate of the result.
 ![Metamath](https://img.shields.io/badge/Metamath-set.mm-444444?style=flat-square)
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)
 
-[The gate](#the-gate) • [Proof it bites](#proof-it-bites) • [Certificates](#certificates) • [Install](#install) • [CLI](#cli) • [Honest limits](#honest-limits)
+[Watch it run](#watch-it-run) • [The gate](#the-gate) • [Proof it bites](#proof-it-bites) • [Certificates](#certificates) • [Install](#install) • [CLI](#cli)
 
 </div>
 
@@ -51,6 +51,30 @@ trust the model. You do not have to trust us either.
 
 The last one is the whole point. Anything can generate convincing mathematics; the useful
 question is whether you can check it without taking anyone's word for it.
+
+## Watch it run
+
+Break it first. A false conjecture never reaches the prover:
+
+```console
+$ theoremata falsify "x,y" "x^2 + y^2 >= 3*x*y"
+{ "verdict": "counterexample", "assignment": { "x": 1, "y": 1 } }
+  1 + 1 = 2, but 3*x*y = 3.  Rejected before a single proof attempt.
+```
+
+Prove what survives, and read the verdict off the gate, layer by layer:
+
+```console
+$ theoremata formal-prove lean "1 + 1 = 2"
+{ "lexically_verified": true, "axioms_clean": true,
+  "statement_preserved": true, "live": true }
+  compile ok -> axioms whitelisted -> leanchecker ok -> statement is the one you asked for
+```
+
+> [!NOTE]
+> `live: true` is the field that matters. A backend without its toolchain still runs, but
+> in mock mode, where `live` is `false` and the result is at most *informal*. A mock check
+> can never mark a result formally verified. Only a live prover run can.
 
 ## The gate
 
@@ -96,7 +120,8 @@ smaller-trusted-checker argument.
 
 ## Proof it bites
 
-The interesting cases are the ones that pass everything else.
+The interesting cases are the ones that pass everything else. Each row below is a real
+artifact found in third-party Lean, and each is pinned by a fixture in the test suite.
 
 | What slipped through | What caught it |
 |---|---|
@@ -104,10 +129,18 @@ The interesting cases are the ones that pass everything else.
 | `theorem xHyperbolicity : ∃ r, r = (bigExpr).lambda1`, trivially true for any expression whatsoever, named for a substantive PDE property. Sorry-free, axiom-free, statement genuinely preserved. | Statement triviality. Replace the definitions with unrelated constants, re-run the unchanged proof; if it still closes, the statement never constrained them. |
 | A theorem named for a published result whose every substantive symbol is a `sorry`-defined constant. The proof is complete. | Opaque-constant attribution. The axiom audit sees `sorryAx` but reports it identically to an honest unfinished proof; this names the guilty constants. |
 
-Each of these was found in real third-party Lean, and each is pinned by a fixture. The
-adversarial registry carries accept and reject fixtures both, because a gate that rejects
-everything is as broken as one that accepts everything, and a reject for the wrong reason
-is a coincidence rather than a passing test.
+The adversarial registry carries accept and reject fixtures both, because a gate that
+rejects everything is as broken as one that accepts everything, and a reject for the wrong
+reason is a coincidence rather than a passing test.
+
+By the numbers:
+
+- **6** proof assistants behind **1** gate
+- **22** independently re-checkable certificate kinds
+- **0 of 7,365** ordinary Mathlib statements trip the triviality detector; it fires only on
+  the shapes it was built for, never on real mathematics
+- accusing detectors **only ever accuse**: surviving a check is recorded as "not shown to
+  be wrong", never as sound
 
 ## Certificates
 
@@ -146,6 +179,10 @@ skipped rather than fatal.
 
 Formal backends are optional and independent. Install only the ones you want; a backend
 without its toolchain runs mock-only and can never reach `FormallyVerified`.
+
+> [!TIP]
+> Bring your own model. The provider is model-agnostic through LiteLLM, so any hosted API
+> or a local model via [Ollama](docs/ollama.md) works by setting one environment variable.
 
 ## CLI
 
