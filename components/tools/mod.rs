@@ -19,8 +19,30 @@ use std::{
     path::PathBuf,
     process::{Command, Stdio},
     sync::{Mutex, OnceLock},
-    time::Instant,
+    time::{Duration, Instant},
 };
+
+/// Wall-clock ceiling for one [`PythonCheck`] worker call, in seconds.
+///
+/// A NUMERIC budget, not an on/off switch: it cannot disable the worker, only
+/// bound how long a wedged one may hold the calling thread. Generous by design,
+/// because the workers behind it drive Lean and a real elaboration against
+/// Mathlib takes minutes; the point is to make "never returns" impossible, not
+/// to police normal slowness.
+const PYTHON_CHECK_TIMEOUT_ENV: &str = "THEOREMATA_PYTHON_CHECK_TIMEOUT_SECS";
+const PYTHON_CHECK_TIMEOUT_DEFAULT_SECS: u64 = 900;
+
+/// The configured worker ceiling. An unparseable or zero value falls back to the
+/// default rather than meaning "no limit", so a typo cannot silently restore the
+/// unbounded wait this exists to remove.
+fn python_check_timeout() -> Duration {
+    let secs = std::env::var(PYTHON_CHECK_TIMEOUT_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(PYTHON_CHECK_TIMEOUT_DEFAULT_SECS);
+    Duration::from_secs(secs)
+}
 
 pub trait Tool {
     fn name(&self) -> &str;
@@ -209,18 +231,74 @@ impl Tool for PythonCheck {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
-        use std::io::Write;
+        use std::io::{Read, Write};
         child
             .stdin
             .take()
-            .unwrap()
+            .ok_or_else(|| anyhow!("python worker stdin was not piped"))?
             .write_all(input.to_string().as_bytes())?;
-        let output = child.wait_with_output()?;
+
+        // Drain both pipes on their own threads BEFORE waiting. A child that
+        // fills a pipe buffer blocks on write and never exits, so polling for
+        // exit without draining would turn a merely chatty worker into a
+        // timeout, and a kill.
+        let mut out_pipe = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("python worker stdout was not piped"))?;
+        let mut err_pipe = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("python worker stderr was not piped"))?;
+        let out_reader = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = out_pipe.read_to_end(&mut buf);
+            buf
+        });
+        let err_reader = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = err_pipe.read_to_end(&mut buf);
+            buf
+        });
+
+        // This wait used to be unbounded (`wait_with_output`), so a wedged
+        // worker held the calling thread forever. Poll to a deadline, and on
+        // expiry KILL rather than merely stop waiting: abandoning the handle
+        // would leave the child, and the Lean subprocess it drives, running.
+        let deadline = Instant::now() + python_check_timeout();
+        let mut timed_out = false;
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                timed_out = true;
+                let _ = child.kill();
+                break child.wait()?;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        // The readers end once the pipes close, which the kill guarantees.
+        let stdout = out_reader.join().unwrap_or_default();
+        let stderr = err_reader.join().unwrap_or_default();
+
+        let output = std::process::Output {
+            status,
+            stdout,
+            stderr,
+        };
+        // A killed worker exits non-zero, so `finish` already records failure.
+        // The flag exists so a reader can tell "the tool said no" from "we never
+        // let the tool finish", which are different facts.
         Ok(finish(
             self.name(),
             started,
             output,
-            json!({"workers": "components/*/python"}),
+            json!({
+                "workers": "components/*/python",
+                "timed_out": timed_out,
+                "timeout_secs": python_check_timeout().as_secs(),
+            }),
         ))
     }
 }
