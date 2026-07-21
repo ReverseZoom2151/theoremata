@@ -340,11 +340,19 @@ impl CommandPopup {
             )];
         }
         let sel = self.selected.min(matches.len() - 1);
-        matches
+        // Scroll window: keep the selected row visible when there are more
+        // matches than MAX_ROWS. Without this, `lines` always showed the first
+        // page, so pressing Down past row 8 moved a selection you could not see.
+        let start = if sel >= MAX_ROWS {
+            sel + 1 - MAX_ROWS
+        } else {
+            0
+        };
+        let end = (start + MAX_ROWS).min(matches.len());
+        matches[start..end]
             .iter()
-            .take(MAX_ROWS)
             .enumerate()
-            .map(|(i, spec)| spec_line(spec, i == sel))
+            .map(|(i, spec)| spec_line(spec, start + i == sel))
             .collect()
     }
 }

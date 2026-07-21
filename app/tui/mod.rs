@@ -35,9 +35,8 @@ use crate::{
 use anyhow::Result;
 use crossterm::{
     event::{
-        poll as poll_event, read as read_event, DisableBracketedPaste, DisableMouseCapture,
-        EnableBracketedPaste, EnableMouseCapture, Event as CEvent, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseEventKind,
+        poll as poll_event, read as read_event, DisableBracketedPaste, EnableBracketedPaste,
+        Event as CEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -71,9 +70,6 @@ const MODEL_ENV: &str = "THEOREMATA_MODEL";
 /// Prefix litellm needs to route a bare ollama tag to the local ollama server.
 const OLLAMA_PREFIX: &str = "ollama_chat/";
 
-/// How many rows a wheel notch scrolls the transcript.
-const WHEEL_STEP: usize = 3;
-
 pub fn run(
     store: &Store,
     config: &Config,
@@ -83,14 +79,11 @@ pub fn run(
     store.project(project_id)?;
     enable_raw_mode()?;
     let mut out = io::stdout();
-    // Mouse capture drives wheel scrolling; bracketed paste lets a pasted
-    // statement arrive as one `Event::Paste` instead of a burst of key events.
-    execute!(
-        out,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableBracketedPaste
-    )?;
+    // We do NOT capture the mouse: mouse capture steals the terminal's own
+    // click-drag selection, so the user could not select and copy transcript
+    // text. Scrolling is by keyboard (PageUp/PageDown). Bracketed paste is still
+    // enabled so a pasted statement arrives as one `Event::Paste`.
+    execute!(out, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
     let result = run_loop(&mut terminal, store, config, provider, project_id);
@@ -98,7 +91,6 @@ pub fn run(
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture,
         DisableBracketedPaste
     )?;
     terminal.show_cursor()?;
@@ -190,11 +182,6 @@ fn run_loop(
                         break;
                     }
                 }
-                CEvent::Mouse(m) => match m.kind {
-                    MouseEventKind::ScrollUp => scroll_up(&mut app, WHEEL_STEP),
-                    MouseEventKind::ScrollDown => scroll_down(&mut app, WHEEL_STEP),
-                    _ => {}
-                },
                 CEvent::Paste(text) => {
                     app.composer.paste(&text);
                     sync_popups(&mut app, store);
@@ -1075,7 +1062,7 @@ fn help_cell() -> Cell {
     lines.push(Line::raw("".to_string()));
     lines.push(Line::from(Span::styled(
         "plain text talks to the agent (it may prove/falsify/hammer/sweep). \
-         Enter sends, Shift+Enter newline, Esc interrupts/clears, PageUp/Down or wheel scroll."
+         Enter sends, Shift+Enter newline, Esc interrupts/clears, PageUp/Down scrolls; select with the mouse to copy."
             .to_string(),
         Style::default().add_modifier(Modifier::DIM),
     )));
