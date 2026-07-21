@@ -84,18 +84,16 @@ You drive it like any CLI agent: type natural language, and it can **act**, not 
 
 Commands inside the chat:
 
-| Command | What it does |
-|---|---|
-| `/model [name]` | list local models / switch the active one, live |
-| `/project [name]` | list projects / switch to one |
-| `/new <name> \| <thm>` | create a project and switch to it |
-| `/prove [sys] <target>` | formalize + prove + gate a node, index, or statement |
-| `/hammer <sys> <goal>` | hammer-assisted native proof + gate |
-| `/falsify <json> <claim>` | numeric counterexample search |
-| `/sweep` | staleness census for this project |
-| `/agent` | run the autonomous loop on this project |
-| `/graph` `/obligations` `/attempts` `/events` `/verify` `/status` `/proposals` | inspect state |
-| `/help` | the full reference |
+- `/model [name]`: list local models, or switch the active one live
+- `/project [name]`: list projects, or switch to one
+- `/new <name> | <thm>`: create a project and switch to it
+- `/prove [sys] <target>`: formalize, prove, and gate a node, index, or statement
+- `/hammer <sys> <goal>`: hammer-assisted native proof plus gate
+- `/falsify <json> <claim>`: numeric counterexample search
+- `/sweep`: staleness census for this project
+- `/agent`: run the autonomous loop on this project
+- `/graph` `/obligations` `/attempts` `/events` `/verify` `/status` `/proposals`: inspect state
+- `/help`: the full reference
 
 `theoremata send <project> "<message>"` is the non-interactive one-shot version, useful for
 scripting or piping.
