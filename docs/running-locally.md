@@ -30,6 +30,35 @@ export THEOREMATA_TEMPERATURE=0.1
 Swap the model any time: `ollama_chat/qwen3.6:27b` (smaller, faster) or
 `ollama_chat/ornith:9b` (fastest). Use `ollama_chat/`, not `ollama/`, for chat models.
 
+## The interactive TUI (chat with the agent)
+
+This is the main interactive interface, not the CLI verbs below.
+
+```bash
+theoremata new fermat "for all a b : Nat, (a+b)^2 = a^2 + 2*a*b + b^2"   # once, to make a project
+theoremata chat fermat
+```
+
+`chat` opens a full-screen TUI with three panes: **CHAT**, **PROOF GRAPH**, **TRAJECTORY**.
+Tab switches panes, Esc clears the input, Ctrl-C exits.
+
+- Type **natural language** and it goes to your local model as a
+  `mathematical_research_orchestrator`, with the project's whole proof-DAG and the
+  conversation history as context. It replies and proposes concrete graph changes
+  (add a lemma, set a formal statement, change a status).
+- Proposed changes are **proposals you review**; the graph never mutates without your
+  approval. `/proposals` lists them, `/approve <id>` and `/reject <id> [reason]` decide.
+- Slash commands inspect state: `/graph`, `/obligations`, `/attempts`, `/events`,
+  `/verify`, `/status`, `/help`.
+
+Every turn carries the project's policy: the graph is the source of truth, small atomic
+mutations only, and it may never claim formal verification without tool evidence. So the
+chat reasons and restructures the problem; actually proving a node still goes through the
+gate via `formal-prove` / `hammer-prove` / `agent` below.
+
+`theoremata send <project> "<message>"` is the non-interactive one-shot version, useful for
+scripting or piping.
+
 ## Prove a single statement
 
 `formal-prove` asks the model to formalize your statement into the target system, prove it,
