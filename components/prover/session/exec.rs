@@ -379,7 +379,17 @@ pub fn run(runner: &Runner, argv: &[&str], workspace: &Path) -> ExecOutcome {
         }
         Runner::Wsl { distro } => {
             let mnt = to_wsl_path(workspace);
-            let script = format!("cd {} && {}", sh_quote(&mnt), argv.join(" "));
+            // argv[0] (the binary path) stays unquoted so a leading `~` still
+            // expands. Each ARGUMENT is single-quoted so a multi-word argument
+            // survives bash word-splitting and any glob metacharacter is passed
+            // literally to the tool. Metamath is the case that forced this: it
+            // takes whole commands as single argv items (`read Generated.mm`,
+            // `verify proof *`), and the old unquoted join split them into
+            // separate tokens and let bash glob the `*`. Single-word args from
+            // the other backends (coqc/agda/isabelle flags and file names) are
+            // unaffected by being quoted.
+            let args: String = argv[1..].iter().map(|a| format!(" {}", sh_quote(a))).collect();
+            let script = format!("cd {} && {}{}", sh_quote(&mnt), argv[0], args);
             let mut cmd = Command::new("wsl.exe");
             cmd.args(["-d", distro.as_str(), "--", "bash", "-lc", script.as_str()]);
             spawn(cmd)
