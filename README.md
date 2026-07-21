@@ -2,10 +2,8 @@
 
 # Theoremata
 
-### an AI mathematician
-
-An autonomous agent that takes a mathematical conjecture, proves it inside a formal proof
-assistant, and returns a machine-checkable certificate of the result.
+An AI mathematician that runs in your terminal, proves theorems inside a real proof
+assistant, and hands you a proof you can check yourself.
 
 ![Rust](https://img.shields.io/badge/Rust-2021-000000?style=flat-square&logo=rust&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white)
