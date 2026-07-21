@@ -30,34 +30,58 @@ export THEOREMATA_TEMPERATURE=0.1
 Swap the model any time: `ollama_chat/qwen3.6:27b` (smaller, faster) or
 `ollama_chat/ornith:9b` (fastest). Use `ollama_chat/`, not `ollama/`, for chat models.
 
-## The interactive TUI (chat with the agent)
+## Just run it (the agent chat)
 
-This is the main interactive interface, not the CLI verbs below.
+This is the main way in. Type the name, nothing else:
 
 ```bash
-theoremata new fermat "for all a b : Nat, (a+b)^2 = a^2 + 2*a*b + b^2"   # once, to make a project
-theoremata chat fermat
+theoremata
 ```
 
-`chat` opens a full-screen TUI with three panes: **CHAT**, **PROOF GRAPH**, **TRAJECTORY**.
+A bare `theoremata` boots straight into the agent chat, opening your most recent project
+or creating a `scratch` workspace on a first run. (The old `theoremata chat <project>`
+still works if you want to open a specific one.)
+
+It is a full-screen TUI with three panes: **CHAT**, **PROOF GRAPH**, **TRAJECTORY**.
 Tab switches panes, Esc clears the input, Ctrl-C exits.
 
-- Type **natural language** and it goes to your local model as a
-  `mathematical_research_orchestrator`, with the project's whole proof-DAG and the
-  conversation history as context. It replies and proposes concrete graph changes
-  (add a lemma, set a formal statement, change a status).
-- Proposed changes are **proposals you review**; the graph never mutates without your
-  approval. `/proposals` lists them, `/approve <id>` and `/reject <id> [reason]` decide.
-- Slash commands inspect state: `/graph`, `/obligations`, `/attempts`, `/events`,
-  `/verify`, `/status`, `/help`.
+You drive it like any CLI agent: type natural language, and it can **act**, not just talk.
 
-Every turn carries the project's policy: the graph is the source of truth, small atomic
-mutations only, and it may never claim formal verification without tool evidence. So the
-chat reasons and restructures the problem; actually proving a node still goes through the
-gate via `formal-prove` / `hammer-prove` / `agent` below.
+```
+> /model qwen3.6:35b                       switch the active model, live
+> /new fermat | for all a b : Nat, (a+b)^2 = a^2 + 2*a*b + b^2   create a goal, switch to it
+> prove the main theorem                   plain English; the agent runs the real gate
+```
+
+- **Plain text talks to the agent.** It reasons over the project's whole proof-DAG and the
+  conversation, and can invoke real actions (prove, falsify, hammer, sweep), see the
+  results, and react, up to a few rounds per turn. Esc or Ctrl-C interrupts between rounds.
+- **It can restructure the problem**, proposing graph changes (add a lemma, set a formal
+  statement). Those are proposals you review: `/proposals`, `/approve <id>`,
+  `/reject <id> [reason]`. The graph never mutates without your approval.
+- **It can never fake a verdict.** A model reply is text, not a status; only the gate marks
+  a node verified. Ask it to prove something and it runs the real pipeline; if the proof
+  does not hold, it says so.
+
+Commands inside the chat:
+
+| | |
+|---|---|
+| `/model [name]` | list local models / switch the active one, live |
+| `/project [name]` | list projects / switch to one |
+| `/new <name> \| <thm>` | create a project and switch to it |
+| `/prove [sys] <target>` | formalize + prove + gate a node, index, or statement |
+| `/hammer <sys> <goal>` | hammer-assisted native proof + gate |
+| `/falsify <json> <claim>` | numeric counterexample search |
+| `/sweep` | staleness census for this project |
+| `/agent` | run the autonomous loop on this project |
+| `/graph` `/obligations` `/attempts` `/events` `/verify` `/status` `/proposals` | inspect state |
+| `/help` | the full reference |
 
 `theoremata send <project> "<message>"` is the non-interactive one-shot version, useful for
 scripting or piping.
+
+The CLI verbs below are the same machinery the chat drives; reach for them when scripting.
 
 ## Prove a single statement
 
