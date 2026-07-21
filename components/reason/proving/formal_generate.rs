@@ -190,6 +190,13 @@ pub fn generate_and_verify_with_cache(
     )
 }
 
+/// An injectable hammer seam: given `(config, system, goal)` it returns a
+/// complete, system-native candidate proof, or `None` when it declines (worker
+/// unavailable, found nothing, or gated off). Production wires this to
+/// [`hammer_prove`] guarded by the live backend; tests inject a deterministic
+/// stand-in so the fallback's control flow can be exercised without a toolchain.
+type HammerSeam<'a> = dyn Fn(&Config, FormalSystem, &str) -> Option<String> + 'a;
+
 /// Implementation of [`generate_and_verify_with_cache`] with an explicit
 /// correction budget, so tests can exercise the loop without touching global
 /// process environment state.
@@ -218,8 +225,52 @@ fn generate_and_verify_inner(
     } else {
         backend_for(config, system, true)
     };
-    let checker_identity = checker_identity(config, backend.as_ref());
-    let policy_fingerprint = policy_fingerprint(config, backend.as_ref());
+    // The production hammer seam. Gated on the LIVE backend: only a real
+    // 3+1-layer gate keeps a hammer-found proof honest. Under the mock backend
+    // the "verification" is canned, so a mock hammer would fabricate a clean
+    // pass; return `None` there so the fallback never runs and can never fake.
+    let hammer = move |cfg: &Config, sys: FormalSystem, goal: &str| -> Option<String> {
+        if used_live {
+            hammer_prove(cfg, sys, goal)
+        } else {
+            None
+        }
+    };
+    generate_and_verify_core(
+        store,
+        config,
+        provider,
+        system,
+        statement,
+        ordered_context,
+        cache,
+        correction,
+        backend.as_ref(),
+        used_live,
+        &hammer,
+    )
+}
+
+/// The generate/verify body, factored out so the hammer fallback (below) can run
+/// against an injectable `hammer` seam. The seam is attempted ONLY after every
+/// model attempt failed the gate, so a model success never triggers or pays for
+/// it; see the fallback block for the full soundness argument.
+#[allow(clippy::too_many_arguments)]
+fn generate_and_verify_core(
+    store: &Store,
+    config: &Config,
+    provider: &dyn ModelProvider,
+    system: FormalSystem,
+    statement: &str,
+    ordered_context: &[String],
+    cache: Option<&CheckerCache>,
+    correction: CorrectionConfig,
+    backend: &dyn FormalBackend,
+    used_live: bool,
+    hammer: &HammerSeam,
+) -> Result<(String, VerificationReport)> {
+    let checker_identity = checker_identity(config, backend);
+    let policy_fingerprint = policy_fingerprint(config, backend);
     // The import closure this verification runs under. A cached PASS is only
     // meaningful relative to an environment: a proof verified under an import
     // list that smuggles in an axiom must never share a cache slot with one
@@ -238,25 +289,6 @@ fn generate_and_verify_inner(
         backend.is_mock(),
         config.lean_project.as_deref().filter(|p| p.exists()),
     );
-
-    // An ADDITIONAL best-of-N candidate: a hammer-assisted proof. We ask the
-    // `hammer` worker (Sledgehammer / CoqHammer / aesop) to FIND a tactic for the
-    // goal and assemble a complete system-native proof around it. The external
-    // ATP is only a hint oracle — the acceptance predicate below is unchanged (the
-    // real `FormalBackend::verify` 3+1-layer gate), so a hammer proof is trusted
-    // only if it genuinely verifies. When the model is offline/mock but the hammer
-    // is live (Isabelle on this box), the hammer can still produce a VERIFIED
-    // proof; when unavailable it yields `None` and the candidate is simply skipped.
-    //
-    // Gated on the LIVE backend: only a real 3+1-layer gate keeps a hammer-found
-    // proof honest. Under the mock backend the "verification" is canned, so a mock
-    // hammer would fabricate a clean pass — we therefore skip it entirely there.
-    let hammer_candidate = if used_live {
-        hammer_prove(config, system, statement)
-    } else {
-        None
-    };
-    let total = N + hammer_candidate.is_some() as usize;
 
     // Every rejected candidate, recorded with its rendered checker feedback so a
     // later correction round can generate against the checker's own words. This
@@ -301,15 +333,13 @@ fn generate_and_verify_inner(
         })
     };
 
+    // Round 0 is model-only best-of-N. The hammer is no longer a positive
+    // candidate here; it runs strictly as a fallback below and only if all of
+    // these fail, so a model success never triggers or pays for it.
     let selection = sampling::best_of_n(
-        total,
-        |i| -> Result<Candidate> {
-            // Slot 0 is the hammer-assisted candidate when one was produced; every
-            // other slot is a fresh model (or offline-stub) generation.
-            let code = match (i, &hammer_candidate) {
-                (0, Some(h)) => h.clone(),
-                _ => generate_once(provider, system, statement)?,
-            };
+        N,
+        |_i| -> Result<Candidate> {
+            let code = generate_once(provider, system, statement)?;
             verify_one(code)
         },
         |c: &Candidate| c.report.lexically_verified,
@@ -362,6 +392,50 @@ fn generate_and_verify_inner(
         }
     }
 
+    // HAMMER FALLBACK. Reached only when every model attempt (round 0 plus any
+    // correction rounds) failed the gate. We give the SAME goal one more real
+    // attempt through the SAME gate: the hammer worker (Sledgehammer / CoqHammer
+    // / aesop) proposes a candidate and `verify_one` runs the identical
+    // key/policy/`backend.verify` path every model candidate ran.
+    //
+    // Soundness. This can only turn a failure into a gate-accepted success:
+    //   * it runs solely when `!sampled.accepted`, so a model success is untouched
+    //     and pays nothing;
+    //   * the incumbent is replaced ONLY when the hammer candidate itself reports
+    //     `lexically_verified` (the same gate accepted it), never merely because a
+    //     hammer proof was produced;
+    //   * any error from the seam or the gate is swallowed, leaving the original
+    //     model failure exactly as it was (fail closed);
+    //   * the production seam yields `None` unless the LIVE backend is in use, so a
+    //     canned mock verdict can never bless a hammer proof.
+    // Nothing here can downgrade an accepted verdict or synthesize one.
+    let mut hammer_attempted = false;
+    let mut hammer_accepted = false;
+    if !sampled.accepted {
+        if let Some(hammer_code) = hammer(config, system, statement) {
+            hammer_attempted = true;
+            attempts += 1;
+            // Swallow any gate error: the model failure must stand unchanged.
+            if let Ok(candidate) = verify_one(hammer_code) {
+                if candidate.report.lexically_verified {
+                    hammer_accepted = true;
+                    // The hammer candidate is not one of the N model slots; record
+                    // it in the slot just past them so `index` stays honest.
+                    sampled.index = N;
+                    sampled.accepted = true;
+                    sampled.value = candidate;
+                }
+            }
+        }
+    }
+
+    // Which path produced the artifact being returned. On a model success or a
+    // both-failed outcome the returned proof is the model's, hence "model"; only a
+    // gate-accepted hammer candidate earns "hammer". Recorded on the report detail
+    // so a caller/UI can attribute the proof honestly.
+    let proof_path = if hammer_accepted { "hammer" } else { "model" };
+    attach_proof_path(&mut sampled.value.report, proof_path, hammer_attempted);
+
     let mut event = json!({
         "system": system.as_str(),
         "accepted": sampled.accepted,
@@ -369,7 +443,12 @@ fn generate_and_verify_inner(
         "index": sampled.index,
         "verified": sampled.value.report.lexically_verified,
         "backend": if used_live { "live" } else { "mock" },
-        "hammer_candidate": hammer_candidate.is_some(),
+        // A hammer fallback was tried (the model round(s) failed). Retains the old
+        // key name; its meaning is now "the fallback ran" rather than "a hammer
+        // candidate was included in best-of-N".
+        "hammer_candidate": hammer_attempted,
+        "hammer_accepted": hammer_accepted,
+        "proof_path": proof_path,
         "checker_cache_enabled": cache.is_some(),
         "checker_cache_hit": sampled.value.cache_hit,
         // Surfaced so an operator can see WHY a run never hits the cache: an
@@ -747,6 +826,38 @@ fn attach_verification_provenance(
     let value = provenance_value(system, statement, code, environment, report);
     if let Some(detail) = report.detail.as_object_mut() {
         detail.insert(PROVENANCE_KEY.to_string(), value);
+    }
+}
+
+/// The `detail` key under which the accepted proof's PATH provenance is
+/// published: which generator actually produced the proof being returned, the
+/// model or the hammer fallback. Named distinctly from [`PROVENANCE_KEY`] (which
+/// records what a verdict was earned AGAINST) because this records who produced
+/// it, and a caller/UI must be able to read either without the other.
+const PROOF_PATH_KEY: &str = "proof_path";
+
+/// Schema tag for the published proof-path record.
+const PROOF_PATH_SCHEMA: &str = "theoremata.proof-path.v1";
+
+/// Publish, onto a report's `detail`, which path produced the returned proof.
+///
+/// Strictly additive and verdict-neutral, like the other `attach_*` passes: it
+/// writes one key and reads nothing it could act on. `path` is `"model"` or
+/// `"hammer"`; `hammer_attempted` records whether the fallback ran at all, so a
+/// consumer can tell "hammer was never needed" (model passed first) apart from
+/// "hammer was tried and failed" (both `path == "model"`). A `detail` that is not
+/// a JSON object cannot carry the key and is left untouched; the event payload is
+/// the surface guaranteed to carry the record.
+fn attach_proof_path(report: &mut VerificationReport, path: &str, hammer_attempted: bool) {
+    if let Some(detail) = report.detail.as_object_mut() {
+        detail.insert(
+            PROOF_PATH_KEY.to_string(),
+            json!({
+                "schema": PROOF_PATH_SCHEMA,
+                "path": path,
+                "hammer_attempted": hammer_attempted,
+            }),
+        );
     }
 }
 
@@ -2483,5 +2594,218 @@ mod tests {
         let config = Config::default();
         attach_declaration_hints(FormalSystem::Rocq, &config, &mut report);
         assert!(report.detail.get(DECL_HINTS_KEY).is_none());
+    }
+
+    // =======================================================================
+    // Hammer fallback (model fails the gate -> a second real attempt via hammer)
+    // =======================================================================
+
+    /// Read the proof-path record the fallback publishes on the returned report.
+    fn proof_path_of(report: &VerificationReport) -> &Value {
+        report
+            .detail
+            .get(PROOF_PATH_KEY)
+            .expect("every returned proof must carry its path provenance")
+    }
+
+    /// Drive `generate_and_verify_core` against the REAL mock backend (real source
+    /// scan, canned kernel) with an injected hammer seam. `used_live` is `false`
+    /// here on purpose: the production seam's live gate is bypassed so the
+    /// fallback's control flow can be exercised without a toolchain, while the
+    /// mock backend still runs a genuine source scan on whatever code it verifies.
+    fn run_core_with_hammer(
+        provider: &dyn ModelProvider,
+        hammer: &HammerSeam,
+    ) -> (String, VerificationReport) {
+        let store = store();
+        let config = mock_config();
+        let backend = backend_for(&config, FormalSystem::Lean, true);
+        generate_and_verify_core(
+            &store,
+            &config,
+            provider,
+            FormalSystem::Lean,
+            "True",
+            &[],
+            None,
+            CorrectionConfig::default(),
+            backend.as_ref(),
+            false,
+            hammer,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn model_success_returns_immediately_with_model_provenance_and_no_hammer_call() {
+        // A clean model proof must short-circuit: the fallback never runs, so the
+        // hammer seam is never touched and the path is honestly "model".
+        let provider = CannedProvider {
+            code: "theorem t : True := trivial".into(),
+        };
+        let calls = Cell::new(0usize);
+        let hammer = |_c: &Config, _s: FormalSystem, _g: &str| -> Option<String> {
+            calls.set(calls.get() + 1);
+            Some("theorem t : True := trivial".into())
+        };
+        let (code, report) = run_core_with_hammer(&provider, &hammer);
+
+        assert!(report.lexically_verified, "model proof must verify");
+        assert!(code.contains("trivial"));
+        assert_eq!(calls.get(), 0, "a model success must never call the hammer");
+        let p = proof_path_of(&report);
+        assert_eq!(p["path"], "model");
+        assert_eq!(p["hammer_attempted"], false);
+    }
+
+    #[test]
+    fn model_failure_then_hammer_success_returns_hammer_result_with_hammer_provenance() {
+        // Every model candidate is rejected (the source scan flags `sorry`); the
+        // hammer proposes a clean proof of the SAME goal, the SAME gate accepts it,
+        // and that gate-accepted proof is what comes back, tagged "hammer".
+        let provider = CannedProvider {
+            code: "theorem mfail : True := by sorry".into(),
+        };
+        let calls = Cell::new(0usize);
+        let hammer = |_c: &Config, _s: FormalSystem, _g: &str| -> Option<String> {
+            calls.set(calls.get() + 1);
+            Some("theorem hammered : True := trivial".into())
+        };
+        let (code, report) = run_core_with_hammer(&provider, &hammer);
+
+        assert!(report.lexically_verified, "the hammer proof must verify");
+        assert_eq!(calls.get(), 1, "the hammer runs exactly once on failure");
+        assert!(
+            code.contains("hammered"),
+            "the accepted (hammer) proof is returned, not the model failure: {code}"
+        );
+        let p = proof_path_of(&report);
+        assert_eq!(p["path"], "hammer");
+        assert_eq!(p["hammer_attempted"], true);
+    }
+
+    #[test]
+    fn model_failure_and_hammer_failure_returns_the_original_model_failure() {
+        // Both paths fail the gate. The result must be the ORIGINAL model failure,
+        // never a synthesized success and never silently swapped for the hammer's
+        // own (equally failed) candidate.
+        let provider = CannedProvider {
+            code: "theorem mfail : True := by sorry".into(),
+        };
+        let hammer = |_c: &Config, _s: FormalSystem, _g: &str| -> Option<String> {
+            Some("theorem hfail : True := by sorry".into())
+        };
+        let (code, report) = run_core_with_hammer(&provider, &hammer);
+
+        assert!(
+            !report.lexically_verified,
+            "neither path passed, so nothing may be marked verified"
+        );
+        assert!(
+            code.contains("mfail"),
+            "the original model failure is returned, not the hammer's: {code}"
+        );
+        let p = proof_path_of(&report);
+        assert_eq!(p["path"], "model");
+        // The fallback WAS attempted; that it failed is recorded, not hidden.
+        assert_eq!(p["hammer_attempted"], true);
+    }
+
+    /// A backend that fails model code cleanly but ERRORS when asked to verify the
+    /// hammer's candidate, so the fallback's error-swallowing can be exercised.
+    struct GateErrorBackend;
+    impl FormalBackend for GateErrorBackend {
+        fn system(&self) -> FormalSystem {
+            FormalSystem::Lean
+        }
+        fn compile_success_signal(&self) -> crate::prover::formal::SuccessSignal {
+            crate::prover::formal::SuccessSignal::NonZeroExitIsHonest
+        }
+        fn is_mock(&self) -> bool {
+            true
+        }
+        // Model code fails cleanly; the hammer's marked candidate makes the gate
+        // itself error, standing in for a worker/exec failure mid-verification.
+        fn verify(&self, _cfg: &Config, code: &str, _stmt: &str) -> Result<VerificationReport> {
+            if code.contains("HAMMER_ERROR") {
+                anyhow::bail!("simulated hammer gate error");
+            }
+            Ok(failed_report())
+        }
+        // Unreachable: `verify` is overridden, so the layer methods never run. They
+        // exist only because the trait requires them.
+        fn scaffold(
+            &self,
+            _cfg: &Config,
+            _code: &str,
+            _name: &str,
+        ) -> Result<crate::prover::formal::Workspace> {
+            unreachable!("verify is overridden")
+        }
+        fn compile(
+            &self,
+            _ws: &crate::prover::formal::Workspace,
+        ) -> Result<crate::prover::formal::CompileReport> {
+            unreachable!("verify is overridden")
+        }
+        fn audit_axioms(
+            &self,
+            _ws: &crate::prover::formal::Workspace,
+            _thm: &str,
+            _whitelist: &[String],
+        ) -> Result<crate::prover::formal::AxiomReport> {
+            unreachable!("verify is overridden")
+        }
+        fn kernel_recheck(
+            &self,
+            _ws: &crate::prover::formal::Workspace,
+        ) -> Result<crate::prover::formal::RecheckReport> {
+            unreachable!("verify is overridden")
+        }
+        fn source_scan(&self, _code: &str) -> Result<crate::prover::formal::ScanReport> {
+            unreachable!("verify is overridden")
+        }
+    }
+
+    #[test]
+    fn a_hammer_gate_error_is_swallowed_and_the_model_failure_stands() {
+        // Fail closed: an error thrown while verifying the hammer candidate must
+        // not panic and must leave the original model failure exactly as it was.
+        let store = store();
+        let config = mock_config();
+        let provider = CannedProvider {
+            code: "theorem model_only : True := by sorry".into(),
+        };
+        let hammer = |_c: &Config, _s: FormalSystem, _g: &str| -> Option<String> {
+            Some("theorem t : True := by HAMMER_ERROR".into())
+        };
+        let backend = GateErrorBackend;
+        let (code, report) = generate_and_verify_core(
+            &store,
+            &config,
+            &provider,
+            FormalSystem::Lean,
+            "True",
+            &[],
+            None,
+            CorrectionConfig::default(),
+            &backend,
+            false,
+            &hammer,
+        )
+        .unwrap();
+
+        assert!(
+            !report.lexically_verified,
+            "a swallowed hammer error can never produce a verified verdict"
+        );
+        assert!(
+            code.contains("model_only"),
+            "the untouched model failure is returned: {code}"
+        );
+        let p = proof_path_of(&report);
+        assert_eq!(p["path"], "model");
+        // The attempt happened (and threw); that is recorded honestly.
+        assert_eq!(p["hammer_attempted"], true);
     }
 }
