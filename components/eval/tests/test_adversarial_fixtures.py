@@ -16,6 +16,9 @@ from theoremata_tools.benchmarks.adversarial import (
     EXPECT_REJECT,
     EXPECTED_VERDICTS,
     HIGHER_DYSON_PAIR,
+    MAXWELL_EQUATIONS_ATTRIBUTION,
+    MAXWELL_EQUATIONS_TOTAL_THEOREMS,
+    MAXWELL_EQUATIONS_TRIVIAL_THEOREMS,
     RAMANUJAN_TAU_HYPOTHESES,
     REJECT_REASONS,
     TRIVIAL_EXISTENTIAL_DIR,
@@ -31,6 +34,7 @@ _VENDORED_NAMES = (
     "higher_dyson",
     "erdos_public",
     "ramanujan_tau",
+    "maxwell_equations",
 )
 
 #: Corpora we wrote, committed under ``components/eval/fixtures/``. These are ALWAYS
@@ -336,6 +340,74 @@ def test_ramanujan_tau_is_conditional_and_carries_its_hypotheses():
     assert item["expected"]["hypotheses"] == RAMANUJAN_TAU_HYPOTHESES
     assert "hypotheses" in item["expected"]["required_report_fields"]
     assert "warnings" in item["expected"]["required_report_fields"]
+
+
+# --------------------------------------------------------------------------- #
+# maxwell_equations: third-party, MIT, vendored under the gitignored resources/
+# --------------------------------------------------------------------------- #
+
+def test_maxwell_equations_is_a_name_claim_reject():
+    items = _items("maxwell_equations")
+    if not items:
+        pytest.skip("corpus absent")
+    (item,) = items
+    assert item["expected"]["verdict"] == EXPECT_REJECT
+    # The point of registering it: the fourth reason was backed only by our own
+    # clean-room probe, which can confirm nothing except that we catch what we wrote.
+    assert item["expected"]["reason"] == "name_claims_more_than_statement"
+    assert item["provenance"]["third_party"] is True
+
+
+def test_maxwell_equations_records_its_licence_and_attribution():
+    items = _items("maxwell_equations")
+    if not items:
+        pytest.skip("corpus absent")
+    (item,) = items
+    # MIT is what permits the excerpt to exist at all, and the notice has to travel
+    # with it, so both facts live in the item rather than only in the mining doc.
+    assert item["provenance"]["license"] == "MIT"
+    assert item["provenance"]["attribution"] == MAXWELL_EQUATIONS_ATTRIBUTION
+    assert item["provenance"]["untrusted"] is True
+
+
+def test_maxwell_equations_admits_we_cannot_catch_it_yet():
+    items = _items("maxwell_equations")
+    if not items:
+        pytest.skip("corpus absent")
+    (item,) = items
+    # Same admission the clean-room probe carries, and for the same reason: the file
+    # is sorry-free, axiom-clean and statement-preserving, so no gate we ship objects.
+    assert item["provenance"]["expected_to_fail_today"] is True
+    assert item["provenance"]["occurrences_in_corpus"] == (
+        MAXWELL_EQUATIONS_TRIVIAL_THEOREMS
+    )
+    assert item["provenance"]["theorems_in_corpus"] == MAXWELL_EQUATIONS_TOTAL_THEOREMS
+
+
+def test_maxwell_equations_excerpt_reaches_the_offending_theorem():
+    items = _items("maxwell_equations")
+    if not items:
+        pytest.skip("corpus absent")
+    (item,) = items
+    excerpt = item["expected"]["excerpt"]
+    # The theorem starts past the default excerpt budget. An excerpt that stops short
+    # of it would make the item unreviewable without opening the vendored file, which
+    # is exactly what the excerpt exists to avoid.
+    assert "theorem xHyperbolicity" in excerpt
+    assert "= (xFluxJacobianEigenExprs C P U).lambda1" in excerpt
+
+
+def test_maxwell_equations_surfaces_only_lean_sources():
+    items = _items("maxwell_equations")
+    if not items:
+        pytest.skip("corpus absent")
+    for item in items:
+        path = item["provenance"]["path"]
+        assert path.endswith(".lean"), path
+        # README.md is the author's claim about the artifact and must never reach an
+        # item; the mining report replaces it with measurements.
+        assert "README" not in path
+        assert "Highlights" not in item["expected"]["excerpt"]
 
 
 # --------------------------------------------------------------------------- #

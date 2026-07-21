@@ -99,6 +99,7 @@ _CORPUS_GLOB = {
     "higher_dyson": "HigherDyson-main",
     "erdos_public": "erdos-public-main",
     "ramanujan_tau": "ramanujan-tau-misses-primes-main",
+    "maxwell_equations": "MaxwellEquations-main",
     # trivial_existential ships a committed clean-room Lean pair (no resources
     # corpus); glob a never-present dir so `_corpus_present` reports absent and the
     # loader is handled via `_COMMITTED_FIXTURE` below.
@@ -136,7 +137,7 @@ def test_registry_lists_all_tracks():
         "adversarial",
         "open_conjecture",
     }
-    assert len(ALL_NAMES) == 40
+    assert len(ALL_NAMES) == 41
 
 
 def test_load_unknown_benchmark_raises():
