@@ -2,8 +2,8 @@
 
 # Theoremata
 
-An AI mathematician that runs in your terminal, proves theorems inside a real proof
-assistant, and hands you a proof you can check yourself.
+A mathematics agent that runs in your terminal. It breaks conjectures with counterexample
+search, proves the survivors, and verifies every result down to a kernel.
 
 ![Rust](https://img.shields.io/badge/Rust-2021-000000?style=flat-square&logo=rust&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white)
