@@ -616,15 +616,30 @@ def load_trivial_existential() -> list[dict[str, Any]]:
     Lean 4 in about a second. It is therefore the only adversarial fixture we can
     afford to run on every commit.
 
-    EXPECTED TO FAIL TODAY, and recorded as such on the probe item. We hold no gate
-    that catches this. It has no ``sorry``, no ``admit``, no custom ``axiom`` and no
-    ``native_decide``; ``#print axioms`` on the probe's theorem reports no axioms at
-    all. Statement preservation passes, because the statement was preserved: the
-    statement is simply empty. Catching it needs a check we have not built, of the
-    form "is this proposition trivial relative to what its name and docstring
-    assert" -- roughly, does the statement still hold when the definitions it names
-    are replaced by unrelated constants. The probe file demonstrates exactly that
-    substitution, so it also serves as the specification of the missing check.
+    NO LONGER EXPECTED TO FAIL. This docstring used to say we held no gate that
+    caught the probe, and that the check we needed was of the form "does the
+    statement still hold when the definitions it names are replaced by unrelated
+    constants". That check now exists as
+    :mod:`theoremata_tools.statement_triviality`, and it was run against both halves
+    of this pair on this machine, with no Mathlib and no build directory, in about a
+    second each:
+
+    * ``probe.lean`` / ``spectrumIsOrdered`` -> ``trivial``. The unchanged proof
+      closed the goal after ``spectrum`` was replaced by each of two mutually
+      distinct constants.
+    * ``control.lean`` / ``spectrumIsOrdered`` -> ``not_shown_trivial``. The mutated
+      statement elaborated (stage A passed) and the unchanged proof then failed to
+      close it, which is the ordering that makes the negative result mean something
+      rather than being an accident of a broken mutant.
+
+    The control half is the part that matters. Flagging the probe alone would be
+    satisfied by a heuristic that flags every short existential, and that heuristic
+    would fire on honest mathematics. What the pair establishes is that the checker
+    separates the two.
+
+    Everything the probe evades is still true of it: no ``sorry``, no ``admit``, no
+    custom ``axiom``, no ``native_decide``, and ``#print axioms`` reports nothing.
+    It is caught by the triviality check specifically, and by nothing else we ship.
 
     Unlike every other loader here, this one RAISES when a file is absent. The other
     corpora live under gitignored ``resources/`` where absence is the CI norm; these
@@ -662,11 +677,11 @@ def load_trivial_existential() -> list[dict[str, Any]]:
                     )
                 ),
                 notes=(
-                    "Probe half. WE EXPECT TO FAIL THIS TODAY: the file is "
-                    "sorry-free, axiom-free and statement-preserving, so no gate "
-                    "we currently run objects to it. Catching it requires a "
-                    "triviality check on the statement relative to its name, which "
-                    "we have not built."
+                    "Probe half, and WE NOW CATCH IT. The file is still sorry-free, "
+                    "axiom-free and statement-preserving, so every crude signal "
+                    "still passes it; statement_triviality returns `trivial` on "
+                    "spectrumIsOrdered because the unchanged proof closes the goal "
+                    "after `spectrum` is replaced by two distinct constants."
                     if is_probe
                     else "Control half, stating the same named property honestly. "
                     "Rejecting this is a false positive, and a triviality heuristic "
@@ -686,9 +701,16 @@ def load_trivial_existential() -> list[dict[str, Any]]:
                     "clean_room": True,
                     "in_tree": True,
                     "mathlib_free": True,
-                    # Machine-readable form of the note above, matching the
-                    # convention borwein_vacuity uses for the same admission.
-                    "expected_to_fail_today": is_probe,
+                    # Was `is_probe` while nothing we shipped caught the probe.
+                    # statement_triviality now does, verified by running it rather
+                    # than by reading its docstring, so the admission is retired.
+                    # False on BOTH halves, which for the control has always been
+                    # the claim: nothing should ever object to it.
+                    "expected_to_fail_today": False,
+                    # Which checker, so a run that regresses can say what broke
+                    # rather than only that something did. Empty on the control:
+                    # naming a checker there would read as "this is caught".
+                    "caught_by": ["statement_triviality"] if is_probe else [],
                 },
             )
         )
@@ -731,10 +753,22 @@ def load_maxwell_equations() -> list[dict[str, Any]]:
     ``proofs/maxwell_1d.lean`` compiles clean, ``#print axioms`` on the theorem
     reports the three standard Lean axioms and nothing else, and replacing the
     eigenvalue body with unrelated constants leaves the identical proof script still
-    succeeding. The neighbouring ``xWaveStability``, which is substantive, breaks
-    under the same substitution with six unsolved goals. That contrast is the
-    evidence: the statement cannot tell a real eigenvalue computation from a wrong
-    constant, and a statement next to it can.
+    succeeding. The neighbouring ``xWaveStability`` breaks under THAT substitution,
+    which replaced only the eigenvalues, with six unsolved goals. That contrast is
+    the evidence: the statement cannot tell a real eigenvalue computation from a
+    wrong constant, and a statement next to it can.
+
+    CAVEAT, measured here and recorded because it qualifies the contrast above.
+    ``statement_triviality`` also returns ``trivial`` on ``xWaveStability``, and
+    that verdict should not be relied on. Its statement is relational,
+    ``|mu_i| >= |lambda_i|``, over two definitions, and the checker replaces every
+    definition a statement mentions with the SAME sentinel. Both sides then become
+    the same constant, the inequality holds reflexively, and the ``simp`` proof
+    closes it. That is an artifact of co-mutating with one sentinel, not a finding
+    about ``xWaveStability``, which is why no fixture here registers it. It is a
+    limitation of the checker and is reported rather than papered over.
+    ``xHyperbolicity`` is unaffected: it mentions one definition, and
+    ``exists r, r = expr`` is closed by reflexivity whatever ``expr`` is.
 
     Why this is registered even though ``trivial_existential`` already backs the same
     reason: that pair is our own clean-room restatement of a pattern we described, so
@@ -748,9 +782,29 @@ def load_maxwell_equations() -> list[dict[str, Any]]:
     require asserting an accept on a file carrying the probe. The clean-room pair
     supplies the control side of the contrast instead.
 
-    EXPECTED TO FAIL TODAY, for the same reason the clean-room probe does: the file
-    has no ``sorry``, no ``admit``, no custom axiom and no ``native_decide``, and the
-    statement is preserved, so nothing we ship objects to it.
+    NO LONGER EXPECTED TO FAIL. This item used to carry the same admission the
+    clean-room probe did. :mod:`theoremata_tools.statement_triviality` now catches
+    it, and it was run here rather than assumed, with ``lake env lean`` against our
+    built Mathlib workspace::
+
+        verdict      trivial
+        theorem      xHyperbolicity
+        mutated_defs ['xFluxJacobianEigenExprs']
+        baseline     ok
+        stage A      ok for both sentinels (mutated statement elaborates)
+        stage B      ok for both sentinels (unchanged proof still closes it)
+
+    Stage A passing is what makes stage B mean anything: the mutated statement was
+    well typed, so the proof surviving it is evidence about the statement rather
+    than an artifact of a broken mutant. The file still has no ``sorry``, no
+    ``admit``, no custom axiom and no ``native_decide``, and the statement is still
+    preserved. Every crude signal still passes it. The triviality check is the only
+    thing we ship that does not.
+
+    Why this mattered more than flipping the clean-room probe: that pair is our own
+    restatement of a pattern, so catching it only shows we catch what we wrote. This
+    is a published third-party artifact generated by someone else's tool, and it is
+    caught by the same check, on the same evidence.
 
     Only ``proofs/*.lean`` is globbed. ``README.md`` carries the author's claims about
     the artifact and is never ingested; the measurements above replace it.
@@ -777,14 +831,14 @@ def load_maxwell_equations() -> list[dict[str, Any]]:
                 "whatsoever, so the hyperbolicity claim exists only in the name."
             ),
             notes=(
-                "WE EXPECT TO FAIL THIS TODAY. Sorry-free, axiom-free beyond the "
-                "three standard Lean axioms, and statement-preserving, so no gate we "
-                "run objects to it. Verified by compiling with Lean 4.32.0-rc1 and "
-                "Mathlib master: substituting unrelated constants for the eigenvalues "
-                "leaves the same proof succeeding, while the neighbouring "
-                "substantive xWaveStability fails under the same substitution. "
-                "README.md is the author's claim about the artifact and is not "
-                "ingested."
+                "WE NOW CATCH THIS. Sorry-free, axiom-free beyond the three standard "
+                "Lean axioms, and statement-preserving, so every crude signal still "
+                "passes it. statement_triviality returns `trivial` on "
+                "xHyperbolicity: with Lean 4.32.0-rc1 and our built Mathlib, "
+                "replacing xFluxJacobianEigenExprs with each of two distinct "
+                "constants leaves the mutated statement well typed and the unchanged "
+                "proof still closing it. README.md is the author's claim about the "
+                "artifact and is not ingested."
             ),
             extra_provenance={
                 "attribution": MAXWELL_EQUATIONS_ATTRIBUTION,
@@ -792,15 +846,173 @@ def load_maxwell_equations() -> list[dict[str, Any]]:
                 "theorem": "maxwell_1d.xHyperbolicity",
                 "occurrences_in_corpus": MAXWELL_EQUATIONS_TRIVIAL_THEOREMS,
                 "theorems_in_corpus": MAXWELL_EQUATIONS_TOTAL_THEOREMS,
-                # Same machine-readable admission the clean-room probe carries, so a
-                # run can report "expected to fail" rather than a bare red.
-                "expected_to_fail_today": True,
+                # Was True while nothing we shipped caught this shape. Retired on
+                # the strength of a real run of statement_triviality against our
+                # Mathlib, not on the strength of the checker existing.
+                "expected_to_fail_today": False,
+                "caught_by": ["statement_triviality"],
+                # The definition the mutation replaced. Recorded so a regression
+                # can be read as "the check stopped reaching this def" rather than
+                # only as "the verdict changed".
+                "triviality_mutated_def": "xFluxJacobianEigenExprs",
                 "compiles": True,
                 "third_party": True,
             },
         )
     ]
     _loaded("maxwell_equations", len(items), "third-party name/claim probe")
+    return items
+
+
+# --------------------------------------------------------------------------- #
+# 8. TauCeti: the first third-party corpus that came back CLEAN, and elaborates
+# --------------------------------------------------------------------------- #
+
+#: Apache-2.0, unlike the MIT default the rest of this module carries, so the
+#: licence has to be set per item rather than inherited.
+TAU_CETI_LICENSE = "Apache-2.0"
+
+#: Holders are per-file. 520 of the 579 Lean files carry this notice, four carry
+#: "Lean FRO, LLC", one carries an individual, and 54 carry none. Every file we
+#: register below was checked to carry exactly this one, so the single constant is
+#: accurate for the registered set rather than for the corpus as a whole.
+TAU_CETI_ATTRIBUTION = "Copyright (c) 2026 The Tau Ceti contributors"
+
+#: What TauCeti's own ``lake-manifest.json`` pins. Recorded because it is NOT the
+#: Mathlib the elaboration below ran against, and a reader has to be able to see
+#: that gap rather than infer it.
+TAU_CETI_MATHLIB_REV = "f4e566ca02d995d16c590cdfe4dc051cc80f4624"
+
+#: TauCeti's ``lean-toolchain``. This one DOES match the toolchain our built
+#: Mathlib pins, which is why a compile failure here would have been attributable
+#: rather than excusable as version drift. There were none.
+TAU_CETI_TOOLCHAIN = "leanprover/lean4:v4.32.0-rc1"
+
+#: Module path -> theorem/lemma/example count measured in the file.
+#:
+#: SPELLED OUT, NOT GLOBBED, and this is the whole honesty of the item. TauCeti is
+#: 579 Lean files; only the 113 whose imports are Mathlib-only can be handed to a
+#: bare elaborator, because the rest import sibling TauCeti modules that would need
+#: the package built, and we do not run ``lake build`` inside a vendored tree.
+#: These eleven are the ones we ACTUALLY RAN, one per subject area, and each one is
+#: registered because it came back rc=0 with zero errors and zero sorries. A glob
+#: would have registered files we never elaborated, and an accept fixture asserting
+#: a green we never reproduced is worse than no fixture at all.
+_TAU_CETI_ELABORATED: dict[str, int] = {
+    "TauCeti/Algebra/HopfAlgebra/HopfIdeal/Basic.lean": 39,
+    "TauCeti/Algebra/Polynomial/Card/BoundedCoeff.lean": 6,
+    "TauCeti/AlgebraicGeometry/WeilDivisor/Basic.lean": 92,
+    "TauCeti/Analysis/Complex/Conformal/Reflection.lean": 34,
+    "TauCeti/Analysis/Contour/Cauchy/PrincipalValue/Basic.lean": 42,
+    "TauCeti/Analysis/PDE/Uniform/Ellipticity.lean": 71,
+    "TauCeti/FieldTheory/SquareClassGroup.lean": 5,
+    "TauCeti/KnotTheory/Grid/Diagram/Basic.lean": 131,
+    "TauCeti/LinearAlgebra/Complex/LinearPart.lean": 49,
+    "TauCeti/NumberTheory/LegendreSymbol/SquareClass.lean": 7,
+    "TauCeti/Topology/Homotopy/Isotopy/Basic.lean": 58,
+}
+
+#: Measured over the whole corpus, for context on the eleven.
+TAU_CETI_FILES_IN_CORPUS = 579
+TAU_CETI_MATHLIB_ONLY_FILES = 113
+
+
+def _tau_ceti_id(module_path: str) -> str:
+    """``TauCeti/A/B/Basic.lean`` -> ``tau_ceti:a.b.basic``."""
+    stem = module_path.removeprefix("TauCeti/").removesuffix(".lean")
+    return "tau_ceti:" + stem.replace("/", ".").lower()
+
+
+def load_tau_ceti() -> list[dict[str, Any]]:
+    """Eleven ACCEPT fixtures that were elaborated here, against our own Mathlib.
+
+    This registry was accept-poor: seven ``expect_accept`` against five
+    ``expect_reject``, and four of those accepts had at one point been pointed at
+    ``sorry`` stubs. Reject fixtures are the hard ones to find, but an accept set
+    that thin means a gate which simply refuses everything scores well. TauCeti is
+    the first third-party Lean corpus we mined that came back clean: 579 files,
+    6,330 theorem/lemma/example blocks, no ``sorry``, no ``admit``, no
+    ``native_decide``, no author-declared ``axiom``, no ``sorryAx``, and none of the
+    trivial-existential shape that ``maxwell_equations`` exhibits.
+
+    THE THING THAT HAD TO BE CHECKED BEFORE REGISTERING ANY OF IT
+    ------------------------------------------------------------
+    TauCeti pins Mathlib at ``f4e566ca02d995d16c590cdfe4dc051cc80f4624``. The
+    Mathlib built on this machine is a different, locally built ``master``
+    snapshot that ships no git metadata, so its revision cannot even be read. A
+    corpus that only compiles against its own pin is not something we can assert an
+    accept on, because every run would be a version-drift skip.
+
+    So it was run. Each of the eleven files below was elaborated with
+    ``lake env lean`` from our Mathlib workspace, and every one returned rc=0 with
+    zero ``error:`` lines and zero ``sorry`` diagnostics, in 11 to 19 seconds each.
+    That is a green across a Mathlib revision gap, which is stronger evidence than
+    compiling under the pin would have been. The Lean toolchain, by contrast, does
+    match exactly (``leanprover/lean4:v4.32.0-rc1`` on both sides), so a failure
+    here would have been a real contradiction rather than something to excuse.
+
+    WHY ELEVEN AND NOT 579
+    ----------------------
+    Only 113 of the 579 files import Mathlib alone; the remainder import sibling
+    TauCeti modules, which would require building the vendored package, and we do
+    not run ``lake build`` inside untrusted third-party trees. Of those 113 we ran
+    twelve and registered the eleven that also carry a per-file copyright notice,
+    dropping the one that carries none so that attribution travels with every
+    excerpt. Nothing here is registered on the strength of the mining report alone.
+
+    Only ``.lean`` under ``TauCeti/`` is globbed. TauCeti ships ``README.md``,
+    ``AGENTS.md`` and ``COORDINATION.md``, the last two of which are imperative
+    prose addressed at an agent, and none of them is ever ingested.
+
+    Returns ``[]`` when the corpus is absent, as every ``resources/``-backed loader
+    must.
+    """
+    items: list[dict[str, Any]] = []
+    for module_path, theorems in sorted(_TAU_CETI_ELABORATED.items()):
+        files = find_files(f"TauCeti-main/**/{module_path}")
+        if not files:
+            continue
+        subject = module_path.removeprefix("TauCeti/").split("/")[0]
+        items.append(
+            make_adversarial_item(
+                id=_tau_ceti_id(module_path),
+                verdict=EXPECT_ACCEPT,
+                corpus="tau_ceti",
+                path=files[0],
+                informal=(
+                    f"A TauCeti {subject} development: {theorems} theorem, lemma "
+                    "and example blocks, sorry-free and axiom-free, which "
+                    "elaborates cleanly here against a Mathlib revision other than "
+                    "the one it pins."
+                ),
+                notes=(
+                    "ACCEPT fixture backed by a real elaboration on this machine, "
+                    "not by a mining report. Rejecting it is a false positive on "
+                    "honest third-party mathematics."
+                ),
+                extra_provenance={
+                    "license": TAU_CETI_LICENSE,
+                    "attribution": TAU_CETI_ATTRIBUTION,
+                    "third_party": True,
+                    "subject": subject,
+                    "theorem_blocks": theorems,
+                    "module_path": module_path,
+                    # The claim that distinguishes this corpus from the four
+                    # accepts that once pointed at sorry stubs: we ran it.
+                    "elaborated_here": True,
+                    "elaborated_with": "lake env lean, our built Mathlib workspace",
+                    "toolchain_pinned": TAU_CETI_TOOLCHAIN,
+                    "toolchain_matches_ours": True,
+                    "mathlib_rev_pinned": TAU_CETI_MATHLIB_REV,
+                    "mathlib_rev_ours": "unknown (local master snapshot, no git metadata)",
+                    "mathlib_rev_matches": False,
+                    "imports": "mathlib_only",
+                },
+            )
+        )
+    if not items:
+        return _skip("tau_ceti")
+    _loaded("tau_ceti", len(items), "elaborated accept corpus")
     return items
 
 
@@ -812,9 +1024,10 @@ ADVERSARIAL_LOADERS: dict[str, Callable[[], list[dict[str, Any]]]] = {
     "ramanujan_tau": load_ramanujan_tau,
     "trivial_existential": load_trivial_existential,
     "maxwell_equations": load_maxwell_equations,
+    "tau_ceti": load_tau_ceti,
 }
 
-#: Track/kind catalogue entries, consumed by :mod:`.registry`. All seven sit on the
+#: Track/kind catalogue entries, consumed by :mod:`.registry`. All eight sit on the
 #: ``adversarial`` track because what they test is gate behaviour, not a corpus.
 ADVERSARIAL_TRACK_KIND: dict[str, tuple[str, str]] = {
     "borwein_vacuity": (TRACK, "expected_verdict"),
@@ -824,4 +1037,5 @@ ADVERSARIAL_TRACK_KIND: dict[str, tuple[str, str]] = {
     "ramanujan_tau": (TRACK, "expected_verdict"),
     "trivial_existential": (TRACK, "expected_verdict"),
     "maxwell_equations": (TRACK, "expected_verdict"),
+    "tau_ceti": (TRACK, "expected_verdict"),
 }

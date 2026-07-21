@@ -5,7 +5,18 @@ everything that touches a corpus is written as "either empty, or well formed".
 The invariants that do NOT depend on the corpus (the verdict vocabulary, the
 validation that rejects a typo) are asserted unconditionally, because those are
 what stop the fixture set from silently asserting nothing.
+
+TWO TIERS, and the split is deliberate. The pure tier below runs everywhere and
+starts no Lean process. The live tier actually INVOKES
+:mod:`theoremata_tools.statement_triviality` against the reject fixtures whose
+reason is ``name_claims_more_than_statement``, because a fixture set that merely
+records "a checker exists which would catch this" asserts nothing about the
+checker. Every live test skips, never fails, when Lean, Mathlib or the gitignored
+corpus is absent, following the gating in
+``components/verify/tests/test_statement_triviality.py``.
 """
+from pathlib import Path
+
 import pytest
 
 from theoremata_tools.benchmarks import list_benchmarks, load_benchmark
@@ -21,6 +32,10 @@ from theoremata_tools.benchmarks.adversarial import (
     MAXWELL_EQUATIONS_TRIVIAL_THEOREMS,
     RAMANUJAN_TAU_HYPOTHESES,
     REJECT_REASONS,
+    TAU_CETI_ATTRIBUTION,
+    TAU_CETI_LICENSE,
+    TAU_CETI_MATHLIB_REV,
+    TAU_CETI_TOOLCHAIN,
     TRIVIAL_EXISTENTIAL_DIR,
     TRIVIAL_EXISTENTIAL_PAIR,
     make_adversarial_item,
@@ -35,6 +50,7 @@ _VENDORED_NAMES = (
     "erdos_public",
     "ramanujan_tau",
     "maxwell_equations",
+    "tau_ceti",
 )
 
 #: Corpora we wrote, committed under ``components/eval/fixtures/``. These are ALWAYS
@@ -370,14 +386,18 @@ def test_maxwell_equations_records_its_licence_and_attribution():
     assert item["provenance"]["untrusted"] is True
 
 
-def test_maxwell_equations_admits_we_cannot_catch_it_yet():
+def test_maxwell_equations_no_longer_admits_we_cannot_catch_it():
     items = _items("maxwell_equations")
     if not items:
         pytest.skip("corpus absent")
     (item,) = items
-    # Same admission the clean-room probe carries, and for the same reason: the file
-    # is sorry-free, axiom-clean and statement-preserving, so no gate we ship objects.
-    assert item["provenance"]["expected_to_fail_today"] is True
+    # This used to assert the admission was True. It stayed True after
+    # statement_triviality shipped and demonstrably flagged this very theorem,
+    # which is exactly the staleness the live section below now prevents: the
+    # flag is asserted against a checker we run rather than against prose.
+    assert item["provenance"]["expected_to_fail_today"] is False
+    assert item["provenance"]["caught_by"] == ["statement_triviality"]
+    assert item["provenance"]["triviality_mutated_def"] == "xFluxJacobianEigenExprs"
     assert item["provenance"]["occurrences_in_corpus"] == (
         MAXWELL_EQUATIONS_TRIVIAL_THEOREMS
     )
@@ -450,13 +470,17 @@ def test_trivial_existential_pair_is_probe_and_control():
     assert probe["id"] != control["id"]
 
 
-def test_trivial_existential_probe_admits_we_cannot_catch_it_yet():
-    # The admission is machine-readable so a run can report "0 caught, 1 expected
-    # to fail" instead of a bare red, and so removing the flag is a deliberate act
-    # once a triviality check exists.
+def test_trivial_existential_probe_no_longer_admits_we_cannot_catch_it():
+    # The admission was machine-readable so that retiring it would be a deliberate
+    # act once a triviality check existed. It now exists and catches the probe, so
+    # both halves read False, and the two are told apart by `caught_by` instead.
     items = {i["provenance"]["role"]: i for i in _items("trivial_existential")}
-    assert items["probe"]["provenance"]["expected_to_fail_today"] is True
+    assert items["probe"]["provenance"]["expected_to_fail_today"] is False
     assert items["control"]["provenance"]["expected_to_fail_today"] is False
+    assert items["probe"]["provenance"]["caught_by"] == ["statement_triviality"]
+    # Empty on the control, because naming a checker there would read as an
+    # assertion that something objects to it, which nothing may.
+    assert items["control"]["provenance"]["caught_by"] == []
 
 
 def test_trivial_existential_probe_is_trivial_and_control_is_not():
@@ -487,3 +511,322 @@ def test_trivial_existential_probe_is_trivial_and_control_is_not():
     # Mathlib-free, so the pair runs on every commit rather than nightly.
     assert "import" not in probe_code
     assert "import" not in control_code
+
+
+# --------------------------------------------------------------------------- #
+# tau_ceti: third-party, Apache-2.0, and the first ACCEPT corpus we elaborated
+# --------------------------------------------------------------------------- #
+
+def test_tau_ceti_items_are_all_plain_accepts():
+    items = _items("tau_ceti")
+    if not items:
+        pytest.skip("corpus absent")
+    # The registry was accept-poor (7 accepts against 5 rejects), which is the
+    # gap this corpus exists to close. A conditional accept smuggled in here
+    # would not close it: expect_accept_conditional demands hypotheses in the
+    # report and is a different assertion entirely.
+    assert all(i["expected"]["verdict"] == EXPECT_ACCEPT for i in items)
+    assert all(i["expected"]["reason"] is None for i in items)
+
+
+def test_tau_ceti_records_its_licence_and_per_file_attribution():
+    items = _items("tau_ceti")
+    if not items:
+        pytest.skip("corpus absent")
+    for item in items:
+        # Apache-2.0, not the MIT default the rest of this module inherits. The
+        # licence is what permits the excerpt to exist, so it travels with it.
+        assert item["provenance"]["license"] == TAU_CETI_LICENSE
+        assert item["provenance"]["attribution"] == TAU_CETI_ATTRIBUTION
+        assert item["provenance"]["untrusted"] is True
+        assert item["provenance"]["third_party"] is True
+
+
+def test_tau_ceti_accepts_claim_only_an_elaboration_we_performed():
+    """The whole reason this corpus is registerable, asserted as data.
+
+    Four accept fixtures in this module once pointed at ``sorry`` stubs, so an
+    accept that claims a green nobody reproduced is a known failure mode here.
+    Every TauCeti item carries the elaboration claim explicitly, including the
+    honest half: the pinned Mathlib revision is NOT the one we ran against.
+    """
+    items = _items("tau_ceti")
+    if not items:
+        pytest.skip("corpus absent")
+    for item in items:
+        prov = item["provenance"]
+        assert prov["elaborated_here"] is True
+        assert prov["imports"] == "mathlib_only"
+        # The toolchain matches exactly, which is why a failure would have been a
+        # contradiction rather than something excusable as version drift.
+        assert prov["toolchain_pinned"] == TAU_CETI_TOOLCHAIN
+        assert prov["toolchain_matches_ours"] is True
+        # The Mathlib revision does not, and the item says so rather than
+        # implying a match by staying silent.
+        assert prov["mathlib_rev_pinned"] == TAU_CETI_MATHLIB_REV
+        assert prov["mathlib_rev_matches"] is False
+
+
+def test_tau_ceti_surfaces_only_lean_sources_under_the_library():
+    items = _items("tau_ceti")
+    if not items:
+        pytest.skip("corpus absent")
+    for item in items:
+        path = item["provenance"]["path"].replace("\\", "/")
+        assert path.endswith(".lean"), path
+        assert "/TauCeti/" in path, path
+        # TauCeti ships AGENTS.md and COORDINATION.md, which are imperative prose
+        # addressed at an agent, plus a README of author claims. None of the three
+        # may ever reach an item, and other tests in this tree pin those files.
+        for forbidden in ("README", "AGENTS", "CLAUDE", "COORDINATION"):
+            assert forbidden not in path, path
+
+
+def test_tau_ceti_ids_are_unique_and_namespaced():
+    items = _items("tau_ceti")
+    if not items:
+        pytest.skip("corpus absent")
+    ids = [i["id"] for i in items]
+    assert len(ids) == len(set(ids))
+    assert all(i.startswith("tau_ceti:") for i in ids)
+
+
+def test_adversarial_registry_is_no_longer_accept_poor():
+    """The measurement that motivated the corpus, kept as a live number.
+
+    Skipped rather than asserted when the vendored corpora are missing, because
+    with ``resources/`` absent the only items that load are our own in-tree pair
+    and the ratio would be a statement about nothing.
+    """
+    if not _items("tau_ceti"):
+        pytest.skip("tau_ceti corpus absent, so the ratio measures nothing")
+    accepts, rejects = 0, 0
+    for name in _NAMES:
+        for item in _items(name):
+            verdict = item["expected"]["verdict"]
+            accepts += verdict in (EXPECT_ACCEPT, EXPECT_ACCEPT_CONDITIONAL)
+            rejects += verdict == EXPECT_REJECT
+    # A gate that refuses everything must not be able to score well here.
+    assert accepts > rejects * 2, (accepts, rejects)
+
+
+# --------------------------------------------------------------------------- #
+# The name/claim reason, actually exercised
+#
+# Everything above asserts what the fixtures SAY. This section runs the checker
+# they are about. The pure half starts no Lean process so CI still exercises
+# something real; the live half drives an elaborator and skips when it cannot.
+# --------------------------------------------------------------------------- #
+
+#: components/eval/tests/this_file.py -> [0]=tests [1]=eval [2]=components [3]=root
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_MATHLIB = _REPO_ROOT / "resources" / "mathlib4-master" / "mathlib4-master"
+
+try:
+    from theoremata_tools.statement_triviality import (
+        VERDICT_NOT_SHOWN_TRIVIAL,
+        VERDICT_TRIVIAL,
+        VERDICT_WITHHELD,
+        check_statement_triviality,
+        lean_available,
+        plan_mutation,
+    )
+except ImportError:  # pragma: no cover - the verify component is a sibling
+    _TRIVIALITY_IMPORT_OK = False
+else:
+    _TRIVIALITY_IMPORT_OK = True
+
+try:
+    from theoremata_tools.opaque_statement import (
+        VERDICT_OPAQUE,
+        check_statement_constants,
+    )
+except ImportError:  # pragma: no cover
+    _OPAQUE_IMPORT_OK = False
+else:
+    _OPAQUE_IMPORT_OK = True
+
+needs_checker = pytest.mark.skipif(
+    not _TRIVIALITY_IMPORT_OK,
+    reason="theoremata_tools.statement_triviality is not importable here",
+)
+
+# `lean_available` shells out, so it is evaluated once at collection rather than
+# once per test. A box with no toolchain skips; it never reds.
+needs_lean = pytest.mark.skipif(
+    not (_TRIVIALITY_IMPORT_OK and lean_available()),
+    reason="no Lean toolchain on PATH",
+)
+
+#: Which fixture ids carry ``name_claims_more_than_statement``, and which theorem
+#: in each file the reason is about. The theorem name cannot be derived from the
+#: item, and guessing it would make a green here meaningless.
+_NAME_CLAIM_TARGETS = {
+    "trivial_existential:probe": "spectrumIsOrdered",
+    "maxwell_equations:hyperbolicity": "xHyperbolicity",
+}
+
+
+def _name_claim_items() -> dict:
+    out = {}
+    for name in _NAMES:
+        for item in _items(name):
+            if item["expected"]["reason"] == "name_claims_more_than_statement":
+                out[item["id"]] = item
+    return out
+
+
+def _abs_path(item) -> Path:
+    raw = Path(item["provenance"]["path"])
+    return raw if raw.is_absolute() else (_REPO_ROOT / raw)
+
+
+def test_every_name_claim_reject_has_a_named_target_theorem():
+    # Pure. Guards the table above: a new fixture carrying this reason and no
+    # entry would silently stop being exercised by everything below it.
+    unknown = set(_name_claim_items()) - set(_NAME_CLAIM_TARGETS)
+    assert not unknown, (
+        "these fixtures claim name_claims_more_than_statement but name no "
+        f"theorem for the checker to run on: {sorted(unknown)}"
+    )
+
+
+@needs_checker
+def test_name_claim_rejects_are_inside_the_checkers_covered_class():
+    """Pure: planning runs no Lean, so this executes on a bare CI box.
+
+    A ``withheld`` plan would mean the checker declines to look at the very
+    fixtures whose reason it is supposed to back, which is a silent hole that no
+    amount of green elsewhere would reveal.
+    """
+    items = _name_claim_items()
+    if not items:
+        pytest.skip("no name_claims_more_than_statement fixtures loaded")
+    for item_id, item in sorted(items.items()):
+        path = _abs_path(item)
+        if not path.is_file():
+            continue
+        plan = plan_mutation(
+            path.read_text(encoding="utf-8", errors="replace"),
+            _NAME_CLAIM_TARGETS[item_id],
+        )
+        assert plan["verdict"] != VERDICT_WITHHELD, (item_id, plan.get("reason"))
+        assert plan["mutated_defs"], item_id
+
+
+@needs_checker
+def test_no_name_claim_fixture_still_claims_we_cannot_catch_it():
+    """The staleness this section exists to stop from coming back.
+
+    Both fixtures carried ``expected_to_fail_today: True`` after the checker that
+    catches them had already shipped. The flag is only worth having if a stale
+    True is loud, so it is pinned here alongside the checker that retired it.
+    """
+    items = _name_claim_items()
+    if not items:
+        pytest.skip("no name_claims_more_than_statement fixtures loaded")
+    for item_id, item in sorted(items.items()):
+        assert item["provenance"]["expected_to_fail_today"] is False, item_id
+        assert "statement_triviality" in item["provenance"]["caught_by"], item_id
+
+
+@needs_lean
+def test_probe_is_flagged_trivial_and_control_is_not(tmp_path):
+    """The in-tree pair, both halves, with a real elaborator.
+
+    Mathlib-free and import-free, so this costs about a second per half and needs
+    no build directory: it runs wherever any Lean 4 exists.
+
+    THE CONTROL IS THE POINT. Flagging the probe alone is satisfied by a heuristic
+    that flags every short existential proved by an anonymous constructor, and that
+    heuristic fires on honest mathematics. Only the contrast shows the checker is
+    reading the statement rather than its shape.
+    """
+    items = {i["provenance"]["role"]: i for i in _items("trivial_existential")}
+    probe, control = items["probe"], items["control"]
+
+    hit = check_statement_triviality(
+        str(_abs_path(probe)),
+        _NAME_CLAIM_TARGETS[probe["id"]],
+        work_dir=str(tmp_path / "probe"),
+        timeout=300.0,
+    )
+    assert hit["verdict"] == VERDICT_TRIVIAL, hit
+    assert hit["mutated_defs"] == ["spectrum"]
+    # Evidence, not inference: every stage really compiled, so the accusation
+    # rests on the proof surviving rather than on a mutant that never ran.
+    assert all(s["ok"] for s in hit["stages"]), hit["stages"]
+
+    miss = check_statement_triviality(
+        str(_abs_path(control)),
+        "spectrumIsOrdered",
+        work_dir=str(tmp_path / "control"),
+        timeout=300.0,
+    )
+    assert miss["verdict"] != VERDICT_TRIVIAL, miss
+    assert miss["verdict"] == VERDICT_NOT_SHOWN_TRIVIAL, miss
+    # And it survived for the right reason: the mutated statement elaborated
+    # (stage A ok) and the proof then failed to close it (stage B not ok). A
+    # stage-A failure would have been the checker declining to look, not the
+    # control passing on its merits.
+    stage_a = [s for s in miss["stages"] if s.get("stage") == "A"]
+    stage_b = [s for s in miss["stages"] if s.get("stage") == "B"]
+    assert stage_a and all(s["ok"] for s in stage_a)
+    assert stage_b and not stage_b[-1]["ok"]
+
+
+@needs_lean
+@pytest.mark.skipif(
+    not (_MATHLIB / ".lake" / "build" / "lib" / "lean" / "Mathlib.olean").is_file(),
+    reason="no BUILT Mathlib at resources/mathlib4-master (gitignored; CI has none)",
+)
+def test_maxwell_hyperbolicity_is_flagged_trivial(tmp_path):
+    """The third-party half, which is the one that establishes anything.
+
+    The clean-room pair can only ever show we catch the shape we ourselves wrote.
+    This is a published artifact from someone else's generator, and the same check
+    reaches the same verdict on it.
+
+    Minutes, not seconds: the file imports Mathlib and the staged check compiles
+    five mutants. Skipped wherever the corpus or the built Mathlib is missing,
+    which is every CI box, since ``resources/`` is gitignored.
+    """
+    items = _items("maxwell_equations")
+    if not items:
+        pytest.skip("MaxwellEquations corpus absent")
+    (item,) = items
+    out = check_statement_triviality(
+        str(_abs_path(item)),
+        _NAME_CLAIM_TARGETS[item["id"]],
+        work_dir=str(tmp_path),
+        lake_workspace=str(_MATHLIB),
+        timeout=1800.0,
+    )
+    if out["verdict"] == VERDICT_WITHHELD:
+        # Failing closed is the checker behaving correctly, and a Mathlib that
+        # cannot elaborate the vendored file is not evidence about the fixture.
+        pytest.skip(f"triviality check withheld, so it settles nothing: {out['reason']}")
+    assert out["verdict"] == VERDICT_TRIVIAL, out
+    assert out["mutated_defs"] == [item["provenance"]["triviality_mutated_def"]]
+    assert all(s["ok"] for s in out["stages"]), out["stages"]
+
+
+@needs_lean
+@pytest.mark.skipif(
+    not _OPAQUE_IMPORT_OK, reason="theoremata_tools.opaque_statement is not importable"
+)
+def test_opaque_statement_does_not_explain_the_probe():
+    """The two checkers are orthogonal, and only one of them owns this reason.
+
+    ``opaque_statement`` accuses when a constant in the STATEMENT carries
+    ``sorryAx``. The probe's constants are all real definitions with real bodies,
+    so it must report nothing. Running it here is what keeps the credit attached
+    to ``statement_triviality``: if the opaque check also fired, the fixture would
+    not be demonstrating what its reason says it demonstrates.
+    """
+    probe = {i["provenance"]["role"]: i for i in _items("trivial_existential")}["probe"]
+    source = _abs_path(probe).read_text(encoding="utf-8")
+    out = check_statement_constants(source, "spectrumIsOrdered", timeout=300.0)
+    # `unknown` is the withheld posture and is a legitimate outcome of a probe we
+    # could not run; the only forbidden answer here is an accusation.
+    assert out["verdict"] != VERDICT_OPAQUE, out
