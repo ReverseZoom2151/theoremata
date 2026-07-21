@@ -730,23 +730,30 @@ pub trait FormalBackend {
         });
         let bundle_satisfiable = vacuity.as_ref().map_or(true, |v| v.clean);
 
-        // --- Statement-quality accusers (ADVISORY layer) ----------------------
+        // --- Statement-quality accusers --------------------------------------
         // Two detectors that ask whether the STATEMENT says anything, rather
         // than whether the derivation is sound. Both can only ACCUSE: every
         // other outcome, including an unavailable worker, is silence and cannot
-        // move the verdict. Their invocation is behind default-off switches
-        // because each one spawns Lean compiles.
-        let quality_gates = crate::prover::statement_quality::StatementQualityGates::from_config(cfg);
+        // move the verdict.
+        //
+        // There is no switch. Cost is guarded structurally inside `consult`: a
+        // zero-cost precondition per detector (a `structure` token for
+        // triviality, `sorryAx` in the axiom closure just computed above for
+        // opaque), then a pure-Python probe, and only then Lean; plus a cache
+        // keyed on the resolved environment fingerprint. `axioms` is passed in
+        // precisely so the opaque detector costs nothing on the proofs where it
+        // provably has nothing to find.
         let statement_quality = crate::prover::statement_quality::consult(
             cfg,
-            quality_gates,
             system,
+            self.is_mock(),
             &ws,
             code,
             &name,
+            &axioms,
         );
-        // Blocking requires BOTH the enforcement switch and a positive
-        // accusation; silence can never reach this.
+        // Only a CORROBORATED accusation reaches this, per the single rule in
+        // `statement_quality::AccusationPolicy`; silence never can.
         let quality_blocks = statement_quality.blocks();
 
         // Conjoin ONLY behind the (default-off) switches. With the gates off this
@@ -799,13 +806,17 @@ pub trait FormalBackend {
                 },
                 // Statement-quality accusers. `accused` is the only actionable
                 // field; `blocked` records whether it actually moved
-                // `lexically_verified`. There is deliberately no field here
-                // meaning "the statement is good": not being accused is the
-                // absence of evidence of emptiness, never evidence of content.
+                // `lexically_verified`, and `blockers` names which detector did.
+                // The two lists differ whenever an accusation was advisory under
+                // the policy, which is the point of separating them. There is
+                // deliberately no field here meaning "the statement is good":
+                // not being accused is the absence of evidence of emptiness,
+                // never evidence of content.
                 "statement_quality": {
                     "accused": statement_quality.accuses(),
                     "accusers": statement_quality.accusers(),
                     "blocked": quality_blocks,
+                    "blockers": statement_quality.blockers(),
                     "report": statement_quality,
                 },
             }),
