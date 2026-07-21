@@ -866,6 +866,81 @@ pub fn notice_cell(text: &str) -> Cell {
     })
 }
 
+/// The startup card: a bordered box that names the product, states what it is,
+/// shows the active model and project, and lists the first few keys. It is
+/// pushed as the first transcript cell so it scrolls away as the conversation
+/// grows (the Codex session-header pattern), rather than occupying fixed chrome.
+struct WelcomeCell {
+    model: String,
+    project: String,
+}
+impl HistoryCell for WelcomeCell {
+    fn lines(&self, width: u16) -> Vec<Line<'static>> {
+        // Inner width: content area between the borders, capped so the card does
+        // not sprawl on a wide terminal (an eyeballed, Codex-like ceiling).
+        let inner = (width.saturating_sub(4) as usize).clamp(0, 60);
+        if inner < 12 {
+            // Too narrow to box cleanly; fall back to a plain two-line intro.
+            return vec![
+                Line::from(Span::styled("Theoremata", theme::bold())),
+                Line::from(Span::styled(
+                    "an AI mathematician; verify to a kernel",
+                    theme::dim(),
+                )),
+            ];
+        }
+
+        // Each content row is (text, style); the border math pads to `inner`.
+        let kv = |k: &str, v: &str| -> (String, Style) { (format!("{k:<8}{v}"), theme::dim()) };
+        let rows: Vec<(String, Style)> = vec![
+            ("Theoremata".to_string(), theme::user()),
+            (
+                "an AI mathematician: prove conjectures, verify to a".to_string(),
+                theme::dim(),
+            ),
+            (
+                "kernel, and keep receipts you can re-check.".to_string(),
+                theme::dim(),
+            ),
+            (String::new(), theme::dim()),
+            kv("model", &self.model),
+            kv("project", &self.project),
+            (String::new(), theme::dim()),
+            (
+                "type to chat  \u{b7}  / for commands  \u{b7}  Ctrl-C to quit".to_string(),
+                theme::dim(),
+            ),
+        ];
+
+        let mut out = Vec::with_capacity(rows.len() + 2);
+        let top = format!("\u{250c}{}\u{2510}", theme::RULE.repeat(inner + 2));
+        let bot = format!("\u{2514}{}\u{2518}", theme::RULE.repeat(inner + 2));
+        out.push(Line::from(Span::styled(top, theme::dim())));
+        for (text, style) in rows {
+            // Truncate an over-long row to the inner width, then pad to it so the
+            // right border lines up regardless of content length.
+            let mut t: String = text.chars().take(inner).collect();
+            let pad = inner.saturating_sub(t.chars().count());
+            t.push_str(&" ".repeat(pad));
+            out.push(Line::from(vec![
+                Span::styled("\u{2502} ", theme::dim()),
+                Span::styled(t, style),
+                Span::styled(" \u{2502}", theme::dim()),
+            ]));
+        }
+        out.push(Line::from(Span::styled(bot, theme::dim())));
+        out
+    }
+}
+
+/// Build the startup welcome card for the given active model and project.
+pub fn welcome_cell(model: &str, project: &str) -> Cell {
+    Box::new(WelcomeCell {
+        model: model.to_string(),
+        project: project.to_string(),
+    })
+}
+
 struct ErrorCell {
     text: String,
 }

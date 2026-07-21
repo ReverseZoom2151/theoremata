@@ -9,8 +9,10 @@
 //! resize and interrupt are all processed every ~50ms regardless of what a
 //! worker is doing.
 //!
-//! Layout: a full-width transcript on top, the command popup (when active) just
-//! above the composer, the composer, and a one-line footer. The three sibling
+//! Layout, top to bottom: a startup welcome card (product name, active model,
+//! project, key hints) that scrolls away as the first transcript cell, the
+//! full-width scrolling transcript, a one-row gap, the command popup (when
+//! active), the composer in a bordered box, and a one-line status footer. The three sibling
 //! leaf modules (`cell`, `composer`, `command_popup`) are treated as fixed,
 //! unit-tested dependencies; this module wires them to the store, the model, and
 //! the event bus.
@@ -43,7 +45,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, BorderType, Borders, Paragraph},
     Terminal,
 };
 use serde_json::Value;
@@ -143,7 +145,7 @@ fn run_loop(
         project_id: project_id.into(),
         composer,
         popup: CommandPopup::new(),
-        history: hydrate(store, project_id),
+        history: opening_history(store, project_id),
         active_stream: None,
         scroll: None,
         last_total: 0,
@@ -489,7 +491,7 @@ fn handle_project(app: &mut App, store: &Store, rest: &str) {
         Ok(projects) => match projects.iter().find(|p| p.name == rest) {
             Some(p) => {
                 app.project_id = p.id.clone();
-                app.history = hydrate(store, &app.project_id);
+                app.history = opening_history(store, &app.project_id);
                 app.scroll = None;
                 app.history.push(cell::notice_cell(&format!(
                     "switched to project '{}'",
@@ -520,7 +522,7 @@ fn handle_new(app: &mut App, store: &Store, rest: &str) {
     match store.create_project(name, theorem) {
         Ok(p) => {
             app.project_id = p.id;
-            app.history = hydrate(store, &app.project_id);
+            app.history = opening_history(store, &app.project_id);
             app.scroll = None;
             app.history.push(cell::notice_cell(&format!(
                 "created and switched to '{name}'"
@@ -860,6 +862,19 @@ fn parse_falsify_args(rest: &str) -> Result<(Value, String)> {
 /// Rebuild the transcript from the durable conversation log. Called on launch
 /// and on every project switch; thereafter cells are appended in memory as
 /// things happen, so a frame no longer re-queries the DB.
+/// The transcript a session (or a project switch) opens with: the welcome card
+/// first, then any prior conversation. The card names the product, the active
+/// model, and the project, so the very first screen explains what this is.
+fn opening_history(store: &Store, project_id: &str) -> Vec<Cell> {
+    let project = store
+        .project(project_id)
+        .map(|p| p.name)
+        .unwrap_or_else(|_| project_id.to_string());
+    let mut cells: Vec<Cell> = vec![cell::welcome_cell(&current_model(), &project)];
+    cells.extend(hydrate(store, project_id));
+    cells
+}
+
 fn hydrate(store: &Store, project_id: &str) -> Vec<Cell> {
     let mut cells: Vec<Cell> = Vec::new();
     if let Ok(messages) = store.messages(project_id, 100) {
@@ -987,19 +1002,22 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
     let full = Rect::new(0, 0, size.width, size.height);
 
     let popup_h = app.popup.height();
-    // +1 row for the composer's top-border separator from the transcript.
-    let composer_h = app.composer.desired_height(size.width).max(1) + 1;
+    // The composer is a full bordered box: input height plus a top and bottom
+    // border. A one-row gap above the input zone keeps the transcript from
+    // butting straight into the box, which was the "squeezed" look.
+    let composer_h = app.composer.desired_height(size.width).max(1) + 2;
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(3),
-            Constraint::Length(popup_h),
-            Constraint::Length(composer_h),
-            Constraint::Length(1),
+            Constraint::Min(3),             // transcript (scrolls)
+            Constraint::Length(1),          // breathing room above the input zone
+            Constraint::Length(popup_h),    // slash-command popup (0 when inactive)
+            Constraint::Length(composer_h), // the composer box
+            Constraint::Length(1),          // one-line status footer
         ])
         .split(full);
     let (transcript_area, popup_area, composer_area, footer_area) =
-        (areas[0], areas[1], areas[2], areas[3]);
+        (areas[0], areas[2], areas[3], areas[4]);
 
     // Build the whole transcript into one line list at the transcript width.
     // Committed cells never change; only the streamed preview re-renders each
@@ -1045,8 +1063,10 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) ->
         f.render_widget(
             Paragraph::new(composer_lines).block(
                 Block::default()
-                    .borders(Borders::TOP)
-                    .border_style(Style::default().add_modifier(Modifier::DIM)),
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().add_modifier(Modifier::DIM))
+                    .title(Span::styled(" message ", cell::theme::dim())),
             ),
             composer_area,
         );
