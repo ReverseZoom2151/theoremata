@@ -39,6 +39,7 @@ import sys
 from typing import Any, Callable
 
 from theoremata_tools import grader as base_grader
+from theoremata_tools import judge_binding
 
 # --------------------------------------------------------------------------- #
 # Error taxonomy
@@ -361,7 +362,10 @@ def _default_llm_judge(problem: str, steps: list[str]) -> dict[str, Any]:
     except Exception as exc:  # provider component not importable
         return {"per_step": [], "verdict": "unknown", "error": f"judge_unavailable:{exc}"}
 
-    request = {
+    # The problem text and steps are untrusted, so the per-step statuses are
+    # read only from the region after a per-call unpredictable marker.
+    marker = judge_binding.mint_marker()
+    request = judge_binding.bind_request({
         "role": "proof_step_judge",
         "task": (
             "You are grading a mathematical proof with a rubric. Decompose the "
@@ -374,13 +378,18 @@ def _default_llm_judge(problem: str, steps: list[str]) -> dict[str, Any]:
         ),
         "context": {"problem": problem, "steps": steps},
         "output_schema": _JUDGE_SCHEMA,
-    }
+    }, marker)
     try:
         content, model = generate(request)
-        content.setdefault("_model", model)
-        return content
     except Exception as exc:  # noqa: BLE001
         return {"per_step": [], "verdict": "unknown", "error": f"judge_error:{exc}"}
+    verdict, unbound_reason = judge_binding.unbind(content, marker)
+    if verdict is None:
+        # Fail closed: no bound verdict means no judge result, so the caller
+        # falls back to the deterministic path rather than trusting the reply.
+        return {"per_step": [], "verdict": "unknown", "error": unbound_reason}
+    verdict.setdefault("_model", model)
+    return verdict
 
 
 def _normalize_judge_steps(
@@ -836,7 +845,10 @@ def _default_scheme_model(problem: str, reference: str) -> dict[str, Any]:
     """
     from theoremata_tools.model_provider import generate
 
-    request = {
+    # The reference solution is untrusted text, so the scheme is read only from
+    # the region after a per-call unpredictable marker.
+    marker = judge_binding.mint_marker()
+    request = judge_binding.bind_request({
         "role": "marking_scheme_author",
         "task": (
             "You are an olympiad head grader. From the problem and its REFERENCE "
@@ -849,9 +861,13 @@ def _default_scheme_model(problem: str, reference: str) -> dict[str, Any]:
         ),
         "context": {"problem": problem, "reference_solution": reference},
         "output_schema": _SCHEME_GEN_SCHEMA,
-    }
+    }, marker)
     content, model = generate(request)
-    scheme = _normalize_scheme(content)
+    bound, unbound_reason = judge_binding.unbind(content, marker)
+    if bound is None:
+        # Fail closed: raising sends the caller to the deterministic template.
+        raise ValueError(unbound_reason)
+    scheme = _normalize_scheme(bound)
     if not scheme["checkpoints"]:
         raise ValueError("provider returned a scheme with no checkpoints")
     scheme["source"] = f"model:{model}"

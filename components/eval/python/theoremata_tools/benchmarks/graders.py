@@ -49,6 +49,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from theoremata_tools import grader as base_grader
+from theoremata_tools import judge_binding
 
 from .schema import AXIOMS_WHITELIST
 
@@ -569,30 +570,41 @@ def _default_llm_judge(gold: str, pred: str) -> dict[str, Any]:
         from theoremata_tools.model_provider import generate
     except Exception as exc:  # provider component not on path
         return {"equivalent": False, "reason": f"judge_unavailable:{exc}"}
-    request = {
-        "role": "answer_equivalence_judge",
-        "task": (
-            "Decide if the predicted answer is mathematically EQUIVALENT to the "
-            "gold answer. Exact forms only: 1/2 == 0.5 is True, but a decimal "
-            "approximation of an exact expression (2*pi vs 6.28) is False."
-        ),
-        "context": {"gold": gold, "pred": pred},
-        "output_schema": {
-            "type": "object",
-            "required": ["equivalent"],
-            "properties": {"equivalent": {"type": "boolean"},
-                           "analysis": {"type": "string"}},
+    # gold/pred are untrusted corpus text, so the verdict is read only from the
+    # region after a per-call marker the corpus author could not have predicted.
+    marker = judge_binding.mint_marker()
+    request = judge_binding.bind_request(
+        {
+            "role": "answer_equivalence_judge",
+            "task": (
+                "Decide if the predicted answer is mathematically EQUIVALENT to "
+                "the gold answer. Exact forms only: 1/2 == 0.5 is True, but a "
+                "decimal approximation of an exact expression (2*pi vs 6.28) is "
+                "False."
+            ),
+            "context": {"gold": gold, "pred": pred},
+            "output_schema": {
+                "type": "object",
+                "required": ["equivalent"],
+                "properties": {"equivalent": {"type": "boolean"},
+                               "analysis": {"type": "string"}},
+            },
         },
-    }
+        marker,
+    )
     try:
         content, model = generate(request)
-        return {
-            "equivalent": bool(content.get("equivalent")),
-            "reason": f"llm_judge:{model}",
-            "analysis": content.get("analysis"),
-        }
     except Exception as exc:  # noqa: BLE001
         return {"equivalent": False, "reason": f"judge_error:{exc}"}
+    verdict, unbound_reason = judge_binding.unbind(content, marker)
+    if verdict is None:
+        # Fail closed: an unbound reply is no verdict at all, never a pass.
+        return {"equivalent": False, "reason": unbound_reason}
+    return {
+        "equivalent": bool(verdict.get("equivalent")),
+        "reason": f"llm_judge:{model}",
+        "analysis": verdict.get("analysis"),
+    }
 
 
 def grade_nl_answer(
