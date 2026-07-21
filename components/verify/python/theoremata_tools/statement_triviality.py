@@ -456,9 +456,26 @@ def _open_scopes(prefix: str, mask: list[bool]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _constant_body(fields: list[tuple[str, str]], sentinel: int) -> str:
-    inner = ", ".join(f"{fname} := ({sentinel} : {ftype})" for fname, ftype in fields)
-    return " { " + inner + " }"
+def _constant_body(fields: list[tuple[str, str]], sentinel: int, slot: int) -> str:
+    """One mutated definition body, with a DISTINCT constant per field slot.
+
+    Every slot must differ, across fields and across definitions alike. Giving
+    them all one value is a false-positive generator: a relational statement
+    such as `|mu| >= |lambda|` over two definitions collapses both sides to the
+    same constant, the relation then holds reflexively, and a substantive
+    theorem is reported trivial. Two mutually distinct sentinel RUNS defend
+    against a single lucky value but not against that co-mutation, because both
+    sides move together in each run.
+
+    Distinctness cannot cause a missed detection in the other direction: a
+    statement that is genuinely trivial is true for ANY values, so it stays
+    trivial when the values differ. The change is therefore strictly
+    discriminating.
+    """
+    parts = []
+    for i, (fname, ftype) in enumerate(fields):
+        parts.append(f"{fname} := ({sentinel + slot + i} : {ftype})")
+    return " { " + ", ".join(parts) + " }"
 
 
 def render_mutant(source: str, plan: dict, sentinel: int, with_proof: bool = True) -> str:
@@ -480,6 +497,16 @@ def render_mutant(source: str, plan: dict, sentinel: int, with_proof: bool = Tru
         pieces = [text[: plan["proof_start"]] + "\n  sorry\n"]
     body = pieces[0]
 
+    # Slot bases are assigned in the plan's own declaration order, NOT in the
+    # reversed edit order below, so a definition always receives the same
+    # constants no matter how the edits happen to be sequenced. Spacing by the
+    # field count keeps every slot in the file distinct.
+    slot_base: dict[int, int] = {}
+    next_slot = 0
+    for d in plan["mutated_defs"]:
+        slot_base[id(d)] = next_slot
+        next_slot += max(1, len(d["fields"]))
+
     edits = sorted(plan["mutated_defs"], key=lambda d: d["body_start"], reverse=True)
     for d in edits:
         stop = min(d["decl_end"], len(body))
@@ -487,7 +514,7 @@ def render_mutant(source: str, plan: dict, sentinel: int, with_proof: bool = Tru
             continue
         body = (
             body[: d["body_start"]]
-            + _constant_body(d["fields"], sentinel)
+            + _constant_body(d["fields"], sentinel, slot_base[id(d)])
             + "\n\n"
             + body[stop:]
         )

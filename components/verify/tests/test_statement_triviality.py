@@ -9,6 +9,7 @@ skips, never fails, when Lean or the third-party corpus is absent.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -73,7 +74,10 @@ def test_render_replaces_body_keeps_signature_and_truncates():
     # Signature preserved byte for byte, which is what keeps the mutant well
     # typed whenever the original was.
     assert "def mk (n : Int) : Box :=" in out
-    assert "{ lo := (7 : Int), hi := (7 : Int) }" in out
+    # One distinct constant per field slot. This previously asserted the same
+    # value for both, which was the co-mutation false-positive documented in
+    # test_each_mutated_slot_gets_a_distinct_constant.
+    assert "{ lo := (7 : Int), hi := (8 : Int) }" in out
     assert "n + 1" not in out
     # Declarations after the target are dropped so an unrelated later breakage
     # cannot masquerade as evidence.
@@ -273,3 +277,50 @@ def test_maxwell_xhyperbolicity(tmp_path):
     assert out["verdict"] in {VERDICT_TRIVIAL, VERDICT_NOT_SHOWN_TRIVIAL, VERDICT_WITHHELD}
     if any(s.get("stage") == "baseline" and not s["ok"] for s in out.get("stages", [])):
         assert out["verdict"] == VERDICT_WITHHELD
+
+
+# --------------------------------------------------------------------------- #
+# Co-mutation regression
+# --------------------------------------------------------------------------- #
+
+_TWO_DEF_SOURCE = """\
+structure Speeds where
+  lo : Int
+  hi : Int
+
+def leftSpeeds (n : Int) : Speeds := { lo := n, hi := n + 1 }
+
+def rightSpeeds (n : Int) : Speeds := { lo := n + 2, hi := n + 3 }
+
+theorem speedsRelated (n : Int) :
+    (leftSpeeds n).lo <= (rightSpeeds n).hi := by
+  simp [leftSpeeds, rightSpeeds]
+  omega
+"""
+
+
+def test_each_mutated_slot_gets_a_distinct_constant():
+    """Co-mutation false positive, pinned.
+
+    Giving every mutated definition the SAME constant made a relational
+    statement hold reflexively, so a substantive theorem was reported trivial.
+    It was found on a real corpus theorem (maxwell_1d.xWaveStability, a
+    `|mu| >= |lambda|` relation over two definitions) which the checker accused
+    before this. Two mutually distinct sentinel RUNS do not defend against it,
+    because within each run both sides still move together.
+
+    Distinctness cannot hide a real triviality: a genuinely trivial statement
+    is true for any values, so it stays trivial when the values differ.
+    """
+    plan = plan_mutation(_TWO_DEF_SOURCE, "speedsRelated")
+    assert plan["ok"], plan
+    assert len(plan["mutated_defs"]) == 2
+
+    for sentinel in SENTINELS:
+        mutant = render_mutant(_TWO_DEF_SOURCE, plan, sentinel, with_proof=True)
+        constants = re.findall(r":=\s*\((\d+)\s*:", mutant)
+        assert len(constants) == 4, mutant
+        assert len(set(constants)) == 4, (
+            f"every slot must differ, got {constants}; equal constants make a "
+            "relational statement hold reflexively"
+        )
