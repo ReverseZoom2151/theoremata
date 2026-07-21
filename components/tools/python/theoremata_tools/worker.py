@@ -595,6 +595,12 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         # "not_shown_trivial" and "withheld" mean no signal, never approval:
         # surviving mutation does not make a statement meaningful.
         return statement_triviality_run(request)
+    if tool == "eval_power":
+        from theoremata_tools.eval_power import run as eval_power_run
+
+        # Planning only. Nothing it returns is evidence that a finished
+        # comparison is significant; the result carries its own disclaimer.
+        return eval_power_run(request)
     if tool == "opaque_statement":
         from theoremata_tools.opaque_statement import run as opaque_statement_run
 
