@@ -547,6 +547,15 @@ enum Command {
         /// Shrink the proof behind a real gate re-check. Costs prover calls.
         #[arg(long)]
         minimize: bool,
+        /// Weight on the state-value critic in the frontier score, in nats of
+        /// log-probability per unit of critic value, PER STEP. It is scale-free
+        /// because the critic is accumulated in the numerator and divided by the
+        /// same length normalization as the policy, so one number means the same
+        /// thing at every depth. 0.0 (the default) is byte-identical to no
+        /// critic: no CriticScorer is constructed and the score branch evaluates
+        /// the pre-seam expression.
+        #[arg(long, default_value_t = 0.0)]
+        critic_weight: f64,
     },
     /// Consult a Wolfram Engine or Wolfram|Alpha as an UNTRUSTED oracle.
     ///
@@ -1491,6 +1500,7 @@ pub fn run() -> Result<()> {
             alphas,
             budget,
             minimize,
+            critic_weight,
         } => {
             let system = parse_system(&system)?;
             let alphas: Vec<f64> = alphas
@@ -1512,6 +1522,7 @@ pub fn run() -> Result<()> {
                     &alphas,
                     budget,
                     minimize,
+                    critic_weight,
                 )?,
             )?
         }

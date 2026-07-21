@@ -49,9 +49,12 @@
 //! scorer, root, alphas, and budget it returns byte-identical results.
 
 use super::best_first::{
-    best_first_search, BestFirstConfig, BestFirstOutcome, ExpanderScorer, TacticScorer,
+    best_first_search, best_first_search_with_critic, BestFirstConfig, BestFirstOutcome,
+    ExpanderScorer, TacticScorer,
 };
+use super::critic_scorer::{critic_from_config, CriticScorer};
 use super::driver::{GoalState, TacticExpander, TacticStep};
+use super::mcts::SearchConfig;
 use super::minimize::MinimizeOutcome;
 use crate::{
     config::Config,
@@ -66,6 +69,7 @@ use crate::{
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Multi-alpha accumulative union (over the value-free best-first search)
@@ -131,7 +135,33 @@ pub fn multi_alpha_union<Sc: TacticScorer>(
     alphas: &[f64],
     per_alpha_budget: usize,
 ) -> HybridOutcome {
-    multi_alpha_union_inner(scorer, root, alphas, per_alpha_budget).0
+    // No critic and a zero weight: the pre-seam sweep, unchanged.
+    multi_alpha_union_inner(scorer, root, alphas, per_alpha_budget, 0.0, None).0
+}
+
+/// [`multi_alpha_union`] with a trained state-value critic steering every pass.
+///
+/// The SAME `Arc` is cloned into each alpha pass, so all arms of the sweep see one
+/// critic object and therefore identical `V(s)` for identical states. Rebuilding a
+/// critic per pass would leave the arms silently incomparable, which would corrupt
+/// the union's whole premise (that the passes differ only in `alpha`).
+pub fn multi_alpha_union_with_critic<Sc: TacticScorer>(
+    scorer: &mut Sc,
+    root: Sc::State,
+    alphas: &[f64],
+    per_alpha_budget: usize,
+    critic_weight: f64,
+    critic: Option<Arc<dyn CriticScorer>>,
+) -> HybridOutcome {
+    multi_alpha_union_inner(
+        scorer,
+        root,
+        alphas,
+        per_alpha_budget,
+        critic_weight,
+        critic,
+    )
+    .0
 }
 
 /// The sweep, additionally returning the [`BestFirstOutcome`] of the pass that
@@ -146,6 +176,8 @@ fn multi_alpha_union_inner<Sc: TacticScorer>(
     root: Sc::State,
     alphas: &[f64],
     per_alpha_budget: usize,
+    critic_weight: f64,
+    critic: Option<Arc<dyn CriticScorer>>,
 ) -> (HybridOutcome, Option<BestFirstOutcome<Sc::State>>) {
     let mut runs: Vec<AlphaRun> = Vec::with_capacity(alphas.len());
     let mut union: BTreeSet<String> = BTreeSet::new();
@@ -160,8 +192,16 @@ fn multi_alpha_union_inner<Sc: TacticScorer>(
             max_steps: per_alpha_budget,
             seed: 0,
             hint_weight: 0.0,
+            critic_weight,
         };
-        let out = best_first_search(scorer, root.clone(), &cfg);
+        // With no critic this calls the exact entry point the sweep called before,
+        // so the default sweep has no critic-shaped code on its path at all. With a
+        // critic, every pass gets a CLONE OF THE SAME Arc, so the arms stay
+        // comparable.
+        let out = match &critic {
+            None => best_first_search(scorer, root.clone(), &cfg),
+            Some(c) => best_first_search_with_critic(scorer, root.clone(), &cfg, Some(c.clone())),
+        };
 
         for key in &out.order {
             union.insert(key.clone());
@@ -265,7 +305,38 @@ pub fn multi_alpha_union_minimized<Sc: TacticScorer, F>(
 where
     F: FnMut(&[String]) -> bool,
 {
-    let (outcome, best_outcome) = multi_alpha_union_inner(scorer, root, alphas, per_alpha_budget);
+    multi_alpha_union_minimized_with_critic(scorer, root, alphas, per_alpha_budget, 0.0, None, replay)
+}
+
+/// [`multi_alpha_union_minimized`] with a critic steering the sweep.
+///
+/// The critic reaches the SEARCH only. `replay` remains the entire soundness
+/// boundary, and the critic is not passed to it, cannot be it, and does not
+/// influence which sequence is handed to it beyond having changed the order the
+/// frontier was explored in. Everything the doc on
+/// [`multi_alpha_union_minimized`] says about `replay` applies here verbatim: in
+/// particular, do not use a critic as `replay`.
+#[allow(clippy::too_many_arguments)]
+pub fn multi_alpha_union_minimized_with_critic<Sc: TacticScorer, F>(
+    scorer: &mut Sc,
+    root: Sc::State,
+    alphas: &[f64],
+    per_alpha_budget: usize,
+    critic_weight: f64,
+    critic: Option<Arc<dyn CriticScorer>>,
+    replay: F,
+) -> (HybridOutcome, Option<MinimizeOutcome>)
+where
+    F: FnMut(&[String]) -> bool,
+{
+    let (outcome, best_outcome) = multi_alpha_union_inner(
+        scorer,
+        root,
+        alphas,
+        per_alpha_budget,
+        critic_weight,
+        critic,
+    );
     // No solving pass ⇒ no arena to shrink and nothing to re-check. Returning None
     // (rather than an empty minimize outcome) keeps "we never ran the gate"
     // distinguishable from "the gate rejected", which the caller logs differently.
@@ -290,6 +361,26 @@ pub struct GoalFeatures {
     /// critic the MCGS side has nothing to guide it, so the whole budget goes to
     /// the value-free best-first side.
     pub critic_available: bool,
+}
+
+impl GoalFeatures {
+    /// Build the features with `critic_available` derived from the ONE factory that
+    /// decides whether a critic exists, [`critic_from_config`].
+    ///
+    /// Setting the flag by hand is how it becomes a lie: a caller can claim a critic
+    /// and route budget to an arm that then runs unguided, or deny one that is
+    /// actually wired. Deriving it from the same `SearchConfig` the search itself is
+    /// built from makes "available" mean exactly "the search will receive one".
+    ///
+    /// Note this is still only used by [`route`], and [`route`] still has no
+    /// production caller. Deriving the flag removes the possibility of it being
+    /// wrong; it does not by itself put the routing on the live path.
+    pub fn from_config(difficulty: f64, cfg: &SearchConfig) -> Self {
+        Self {
+            difficulty,
+            critic_available: critic_from_config(cfg).is_some(),
+        }
+    }
 }
 
 /// How a total compute budget is partitioned between the value-free best-first
@@ -664,6 +755,7 @@ pub fn run_alpha_sweep_search(
     alphas: &[f64],
     per_alpha_budget: usize,
     minimize: bool,
+    critic_weight: f64,
 ) -> Result<Value> {
     let statement = statement.trim();
     if statement.is_empty() {
@@ -689,27 +781,55 @@ pub fn run_alpha_sweep_search(
     };
     let mut scorer = ExpanderScorer(ProviderExpander::new(provider, statement, system));
 
+    // The production critic gate. `critic_from_config` returns `None` at
+    // `critic_weight == 0.0` (the default), so the shipped path builds no critic and
+    // the sweep is exactly what it was. A non-zero weight yields the deterministic
+    // `HeuristicCritic`; swapping a trained value head in later is a one-line change
+    // inside that factory, with nothing here to touch.
+    let search_cfg = SearchConfig {
+        critic_weight,
+        ..SearchConfig::default()
+    };
+    let critic = critic_from_config(&search_cfg);
+    let critic_available = critic.is_some();
+
     // `skipped_reason` is set on every path that does not run the gate, so the
     // summary can always say WHY rather than leaving a reader to guess.
     let (outcome, minimized, mut skipped_reason) = if !minimize {
         (
-            multi_alpha_union(&mut scorer, root, &alphas, budget),
+            multi_alpha_union_with_critic(
+                &mut scorer,
+                root,
+                &alphas,
+                budget,
+                critic_weight,
+                critic.clone(),
+            ),
             None,
             Some("not_requested"),
         )
     } else if !checker_live {
         (
-            multi_alpha_union(&mut scorer, root, &alphas, budget),
+            multi_alpha_union_with_critic(
+                &mut scorer,
+                root,
+                &alphas,
+                budget,
+                critic_weight,
+                critic.clone(),
+            ),
             None,
             Some("no_live_checker"),
         )
     } else {
         let mut gate = GateReplay::for_system(config, system, statement);
-        let (outcome, minimized) = multi_alpha_union_minimized(
+        let (outcome, minimized) = multi_alpha_union_minimized_with_critic(
             &mut scorer,
             root,
             &alphas,
             budget,
+            critic_weight,
+            critic.clone(),
             replay::as_closure(&mut gate),
         );
         // `None` here means the sweep never solved, so there was no arena to
@@ -777,6 +897,14 @@ pub fn run_alpha_sweep_search(
         "best_alpha": outcome.best_alpha,
         "union_coverage": outcome.union_keys.len(),
         "runs": runs,
+        // Reported so a reader can tell a critic-steered sweep from a policy-only
+        // one after the fact. `available` is the factory's verdict, not a wish, so
+        // it cannot claim a critic the search did not receive. Neither field says
+        // anything about correctness: the critic only reordered exploration.
+        "critic": {
+            "weight": critic_weight,
+            "available": critic_available,
+        },
         // The ONLY field that may be emitted as a proof, and only when non-null.
         "verified_tactics": accepted,
         "minimization": minimization,
@@ -1150,6 +1278,146 @@ mod tests {
         assert!(easy.bf_budget <= (BF_RATIO_MAX * 1_000.0) as usize + 1);
     }
 
+    // ---- The critic seam across the sweep ------------------------------------
+
+    /// A deterministic critic keyed on the state text, plus a call counter so a
+    /// test can observe that ONE object served every alpha pass.
+    struct CountingCritic {
+        prefix: &'static str,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl CriticScorer for CountingCritic {
+        fn score(&self, state: &dyn super::super::critic_scorer::GoalStateLike) -> f64 {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if state.state_text().starts_with(self.prefix) {
+                1.0
+            } else {
+                0.0
+            }
+        }
+    }
+
+    /// The default sweep is unchanged: a zero weight with no critic reproduces
+    /// `multi_alpha_union` exactly, and so does an INJECTED critic at weight zero.
+    #[test]
+    fn the_sweep_is_unchanged_at_the_default_critic_weight() {
+        let alphas = [0.0, 1.0];
+        let mut s = two_path_scorer();
+        let baseline = multi_alpha_union(&mut s, MockGoal::open("root"), &alphas, 50);
+
+        let mut s = two_path_scorer();
+        let no_critic =
+            multi_alpha_union_with_critic(&mut s, MockGoal::open("root"), &alphas, 50, 0.0, None);
+        assert_eq!(no_critic, baseline);
+
+        let mut s = two_path_scorer();
+        let with_critic = multi_alpha_union_with_critic(
+            &mut s,
+            MockGoal::open("root"),
+            &alphas,
+            50,
+            0.0,
+            Some(Arc::new(CountingCritic {
+                prefix: "D",
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })),
+        );
+        assert_eq!(with_critic, baseline);
+    }
+
+    /// One critic object serves every alpha pass. If the sweep rebuilt a critic per
+    /// pass the arms would be silently incomparable; sharing the `Arc` is what
+    /// guarantees identical states score identically across arms.
+    #[test]
+    fn one_critic_object_serves_every_alpha_pass() {
+        let critic = Arc::new(CountingCritic {
+            prefix: "D",
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let alphas = [0.0, 0.5, 1.0];
+        let mut s = two_path_scorer();
+        let out = multi_alpha_union_with_critic(
+            &mut s,
+            MockGoal::open("root"),
+            &alphas,
+            50,
+            1.0,
+            Some(critic.clone()),
+        );
+        assert_eq!(out.runs.len(), alphas.len());
+        // Every pass consulted the SAME object, so the shared counter saw all of
+        // them. A per-pass critic would leave this at whatever one pass spent.
+        assert!(
+            critic.calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the injected critic must actually be consulted"
+        );
+        // Rerunning with a fresh, equivalent critic gives the identical outcome:
+        // the search depends on the critic's VALUES, not on its identity.
+        let mut s = two_path_scorer();
+        let again = multi_alpha_union_with_critic(
+            &mut s,
+            MockGoal::open("root"),
+            &alphas,
+            50,
+            1.0,
+            Some(Arc::new(CountingCritic {
+                prefix: "D",
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })),
+        );
+        assert_eq!(out, again);
+    }
+
+    /// A critic reorders the sweep but can never make it claim a proof it did not
+    /// find, and the minimizer's gate stays the sole soundness boundary.
+    #[test]
+    fn critic_cannot_manufacture_a_solution_in_the_sweep() {
+        // A state space with no closed state at all.
+        let mut s = TableScorer::new()
+            .edge("root", "a", 0.5f64.ln(), MockGoal::open("A"))
+            .edge("A", "b", 0.5f64.ln(), MockGoal::open("B"));
+        let mut gate_calls = 0;
+        let (outcome, minimized) = multi_alpha_union_minimized_with_critic(
+            &mut s,
+            MockGoal::open("root"),
+            &[0.0, 1.0],
+            50,
+            100.0,
+            Some(Arc::new(CountingCritic {
+                prefix: "",
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })),
+            |_| {
+                gate_calls += 1;
+                true
+            },
+        );
+        assert!(!outcome.solved);
+        assert!(outcome.proof_tactics.is_empty());
+        assert!(minimized.is_none(), "no arena to shrink, so no gate run");
+        assert_eq!(gate_calls, 0);
+    }
+
+    /// `critic_available` is derived from the one factory that decides whether a
+    /// critic exists, so it cannot claim a critic the search would not receive.
+    #[test]
+    fn critic_available_is_derived_from_the_factory_not_asserted() {
+        let off = GoalFeatures::from_config(0.5, &SearchConfig::default());
+        assert!(!off.critic_available, "default weight means no critic");
+        assert_eq!(route(off, 100).bf_budget, 100);
+
+        let on = GoalFeatures::from_config(
+            0.5,
+            &SearchConfig {
+                critic_weight: 0.5,
+                ..SearchConfig::default()
+            },
+        );
+        assert!(on.critic_available);
+        assert!(route(on, 100).mcgs_budget > 0);
+    }
+
     // ---- run_split combinator ------------------------------------------------
 
     #[test]
@@ -1291,6 +1559,7 @@ mod tests {
             &[0.0, 1.0],
             20,
             false,
+            0.0,
         )
         .expect("the sweep runs offline");
 
@@ -1324,6 +1593,7 @@ mod tests {
             &[0.0],
             20,
             true,
+            0.0,
         )
         .expect("a missing checker is not an error");
 
@@ -1356,6 +1626,7 @@ mod tests {
             &[0.0, 0.5, 1.0],
             10,
             true,
+            0.0,
         )
         .expect("an unsolved sweep is not an error");
 
@@ -1379,6 +1650,7 @@ mod tests {
             &[0.0, 1.0],
             20,
             true,
+            0.0,
         )
         .expect("sweep runs");
 
@@ -1436,6 +1708,7 @@ mod tests {
             &[],
             10,
             false,
+            0.0,
         )
         .expect("sweep runs");
         assert_eq!(summary["alphas"], json!(DEFAULT_ALPHAS.to_vec()));
@@ -1454,6 +1727,7 @@ mod tests {
             &[0.0],
             10,
             false,
+            0.0,
         )
         .is_err());
     }
@@ -1499,6 +1773,7 @@ mod tests {
             &[0.0],
             10,
             true,
+            0.0,
         )
         .expect("a model failure degrades the search, it does not abort it");
         assert_eq!(summary["solved"], false);

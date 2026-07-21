@@ -54,10 +54,12 @@
 //! injected policy that scores tactics, which lives entirely behind the
 //! [`TacticScorer`] seam.
 
+use super::critic_scorer::{CriticScorer, GoalStateLike};
 use super::driver::{GoalState, TacticExpander};
 use super::minimize::{minimize_proof_checked, AdjacencyGraph, MinimizeOutcome};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::sync::Arc;
 
 /// Smallest prior treated as non-zero when converting a `[0,1]` prior to a
 /// log-probability (avoids `ln(0) = -∞`).
@@ -183,6 +185,20 @@ pub struct BestFirstConfig {
     /// identical to the policy-only search; raise it to let producers nudge
     /// scheduling orthogonally to log-prob.
     pub hint_weight: f64,
+    /// Weight on the trained state-value critic `V(s)` (the
+    /// [`super::critic_scorer`] seam), in the **same nats-per-step units as
+    /// `logprob`**: the critic's value for each state on the path is accumulated
+    /// into the frontier score's numerator, alongside `Σ log p`, and divided by the
+    /// same `L^alpha`. See [`frontier_score`] for why it sits in the numerator
+    /// rather than being added to the normalized score.
+    ///
+    /// Default `0.0`, which makes the critic term structurally absent (the
+    /// numerator is then literally `cum_logprob`), so the frontier ordering is the
+    /// policy-only ordering the search has today. Because a per-step `|log p|` is
+    /// typically in the `0.1 .. 3` nats range and `V(s) ∈ [0, 1]`, a
+    /// `critic_weight` of order `1` is the natural starting scale: it makes the
+    /// critic worth roughly one average tactic's worth of log-probability per step.
+    pub critic_weight: f64,
 }
 
 impl Default for BestFirstConfig {
@@ -192,6 +208,7 @@ impl Default for BestFirstConfig {
             max_steps: 1_000,
             seed: 0,
             hint_weight: 0.0,
+            critic_weight: 0.0,
         }
     }
 }
@@ -203,6 +220,86 @@ impl Default for BestFirstConfig {
 fn length_normalized_score(cum_logprob: f64, depth: usize, alpha: f64) -> f64 {
     let l = (depth as f64).max(1.0);
     cum_logprob / l.powf(alpha)
+}
+
+/// Read a state's critic value for the frontier, or `0.0` when there is no usable
+/// one.
+///
+/// `0.0` is the correct neutral here (unlike the driver and [`super::mcts`], where
+/// the fallback is that node's `progress`): the critic contributes an *additive
+/// per-step bonus* to the numerator, so "no opinion" must contribute nothing. Two
+/// cases fall back:
+/// * no critic injected, and
+/// * a non-finite value (`NaN` / `±inf`), the only way an untrained or erroring
+///   implementation can signal failure through an `f64`. A `NaN` reaching the
+///   frontier would be catastrophic here: [`QueueItem`] orders by `total_cmp`,
+///   which sorts `NaN` above every finite score, so one poisoned node would jump
+///   the whole queue and the pop order would stop reflecting the search at all.
+///
+/// Finite values are clamped to the documented `[0, 1]` contract, which is what
+/// bounds the per-step critic contribution and makes the scale analysis on
+/// [`BestFirstConfig::critic_weight`] hold.
+fn critic_value<S: GoalState>(critic: Option<&Arc<dyn CriticScorer>>, state: &S) -> f64 {
+    match critic {
+        None => 0.0,
+        Some(c) => {
+            let v = c.score(state as &dyn GoalStateLike);
+            if v.is_finite() {
+                v.clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        }
+    }
+}
+
+/// The full frontier priority of a node: the length-normalized path score plus the
+/// hint term.
+///
+/// # Where the critic goes, and why it is not simply added on
+///
+/// The base score is `Σ log p / L^alpha`. Since every `log p ≤ 0` and their
+/// magnitudes are roughly i.i.d., `Σ log p` grows linearly in the path length `L`,
+/// so the base score's magnitude grows like `L^(1-alpha)`: with the default
+/// `alpha = 0.5`, like `√L`. A critic term added *outside* the normalization would
+/// be bounded by `critic_weight` at every depth, so it would swamp the base score
+/// at `L = 1` and be negligible by `L = 100`. That is a depth-dependent, and
+/// therefore meaningless, preference: the same `critic_weight` would mean two
+/// different things at two different points in the same search.
+///
+/// So the critic enters the **numerator**, as a per-step term accumulated along the
+/// path exactly like `log p`, and is divided by the same `L^alpha`:
+///
+/// `(Σ_t log p(a_t|s_t) + critic_weight · Σ_t V(s_t)) / L^alpha  +  hint_weight · Σ_t hint_t`
+///
+/// Both numerator sums scale linearly in `L`, so their ratio (the critic's
+/// influence relative to the policy's) is invariant in depth. `critic_weight` is
+/// then a single scale-free number: "how many nats of log-probability one unit of
+/// critic value is worth, per step".
+///
+/// The hint term is left exactly where it was (added outside, unnormalized). That
+/// is pre-existing behaviour with its own default-zero knob and changing it is not
+/// this seam's business.
+///
+/// # Byte-identity at `critic_weight == 0.0`
+///
+/// The zero branch does not compute `cum_logprob + 0.0 * cum_critic`; it evaluates
+/// literally `cum_logprob`, the same expression the search used before this seam
+/// existed. So there is no float-arithmetic step to reason about at all on the
+/// default path.
+fn frontier_score(
+    cum_logprob: f64,
+    cum_critic: f64,
+    cum_hint: f64,
+    depth: usize,
+    cfg: &BestFirstConfig,
+) -> f64 {
+    let numerator = if cfg.critic_weight == 0.0 {
+        cum_logprob
+    } else {
+        cum_logprob + cfg.critic_weight * cum_critic
+    };
+    length_normalized_score(numerator, depth, cfg.alpha) + cfg.hint_weight * cum_hint
 }
 
 /// One node in the best-first search arena.
@@ -222,6 +319,16 @@ struct Node<S> {
     /// stays pure. Folded into the frontier score via
     /// [`BestFirstConfig::hint_weight`].
     cum_hint: f64,
+    /// Cumulative `Σ V(s_t)` over the states on the path from the root, excluding
+    /// the root itself. Kept separate from `cum_logprob` for the same reason
+    /// `cum_hint` is: the log-prob signal is what DPO mining and length
+    /// normalization are defined on, and a value estimate is not a log-probability.
+    /// Folded into the frontier numerator by [`frontier_score`].
+    ///
+    /// The root is excluded because its value is common to every frontier node and
+    /// so cancels out of all comparisons, and excluding it keeps the root's own
+    /// score exactly `0.0` as before.
+    cum_critic: f64,
     /// Discarded sibling tactics recorded when this node was expanded — the DPO
     /// losers proposed at this state. Empty until the node is expanded.
     discarded: Vec<String>,
@@ -421,6 +528,61 @@ pub fn best_first_search<Sc: TacticScorer>(
     root: Sc::State,
     cfg: &BestFirstConfig,
 ) -> BestFirstOutcome<Sc::State> {
+    // No critic is constructed and none can be invoked on this path, so the search
+    // is the pre-seam search independently of what `cfg.critic_weight` says (the
+    // gate inside `best_first_search_with_critic` zeroes it when there is no
+    // critic). Every existing caller keeps this signature.
+    best_first_search_with_critic(scorer, root, cfg, None)
+}
+
+/// [`best_first_search`] with an injectable trained state-value critic folded into
+/// the frontier priority: the [`super::critic_scorer`] seam, applied to the
+/// production search.
+///
+/// # What the critic may and may not do
+///
+/// It changes the ORDER in which states leave the frontier and nothing else. It is
+/// read at exactly one place, [`frontier_score`], and its value is never stored on
+/// a proof path, never consulted by
+/// [`is_closed`](super::driver::GoalState::is_closed), never reaches
+/// [`BestFirstOutcome::minimized_proof`] or its `replay` gate, and never enters
+/// [`dpo_pairs`]. `solved` is set only when a state the scorer itself produced is
+/// popped and reports `is_closed()`. So a wrong critic costs expansions, never
+/// soundness, and cannot promote anything toward acceptance.
+///
+/// # Determinism
+///
+/// [`critic_value`] guarantees a finite, `[0, 1]`-clamped contribution, so every
+/// `QueueItem::score` stays finite and `total_cmp` remains a total order over them.
+/// Exactly-equal scores still fall through to the `seq` tie-break (earlier
+/// insertion pops first), which is unchanged. A `CriticScorer` is contractually a
+/// pure function of the state text, so re-running the same search re-derives the
+/// same scores.
+///
+/// # Safety at the default
+///
+/// `critic_weight` is forced to `0.0` whenever `critic` is `None`, so config alone
+/// can never alter behaviour; and at `critic_weight == 0.0` [`frontier_score`]
+/// evaluates the pre-seam expression literally.
+pub fn best_first_search_with_critic<Sc: TacticScorer>(
+    scorer: &mut Sc,
+    root: Sc::State,
+    cfg: &BestFirstConfig,
+    critic: Option<Arc<dyn CriticScorer>>,
+) -> BestFirstOutcome<Sc::State> {
+    // Gate the weight on a critic being present. Without this, a non-zero weight
+    // with no critic would multiply into an all-zero `cum_critic` and merely look
+    // inert; making it explicit means there is one statement to read rather than an
+    // invariant to trust.
+    let cfg = &BestFirstConfig {
+        critic_weight: if critic.is_some() {
+            cfg.critic_weight
+        } else {
+            0.0
+        },
+        ..*cfg
+    };
+    let critic = critic.as_ref();
     let mut arena: Vec<Node<Sc::State>> = Vec::new();
     let mut heap: BinaryHeap<QueueItem> = BinaryHeap::new();
     let mut expanded: HashSet<String> = HashSet::new();
@@ -433,11 +595,12 @@ pub fn best_first_search<Sc: TacticScorer>(
         depth: 0,
         cum_logprob: 0.0,
         cum_hint: 0.0,
+        cum_critic: 0.0,
         discarded: Vec::new(),
     });
     let mut seq = 0u64;
     heap.push(QueueItem {
-        score: length_normalized_score(0.0, 0, cfg.alpha),
+        score: frontier_score(0.0, 0.0, 0.0, 0, cfg),
         seq,
         node: 0,
     });
@@ -476,10 +639,16 @@ pub fn best_first_search<Sc: TacticScorer>(
         let parent_depth = arena[node].depth;
         let parent_cum = arena[node].cum_logprob;
         let parent_hint = arena[node].cum_hint;
+        let parent_critic = arena[node].cum_critic;
         for st in expansion.live {
             let child_depth = parent_depth + 1;
             let child_cum = parent_cum + st.logprob;
             let child_hint = parent_hint + st.prio_hint;
+            // One critic call per generated edge, evaluated before the state moves
+            // into the arena. `critic_value` returns a hard `0.0` when no critic is
+            // injected, so this is not merely cheap on the default path, it is the
+            // constant `0.0` and `cum_critic` stays `0.0` throughout.
+            let child_critic = parent_critic + critic_value(critic, &st.next);
             let child = arena.len();
             arena.push(Node {
                 state: st.next,
@@ -488,12 +657,12 @@ pub fn best_first_search<Sc: TacticScorer>(
                 depth: child_depth,
                 cum_logprob: child_cum,
                 cum_hint: child_hint,
+                cum_critic: child_critic,
                 discarded: Vec::new(),
             });
             seq += 1;
             heap.push(QueueItem {
-                score: length_normalized_score(child_cum, child_depth, cfg.alpha)
-                    + cfg.hint_weight * child_hint,
+                score: frontier_score(child_cum, child_critic, child_hint, child_depth, cfg),
                 seq,
                 node: child,
             });
@@ -898,6 +1067,283 @@ mod tests {
         );
         assert!(out.solved);
         assert_eq!(out.proof_tactics(), vec!["close", "close"]);
+    }
+
+    // ---- The trained-critic seam --------------------------------------------
+
+    /// A deterministic critic that rates any state whose key starts with `"Good"`
+    /// as close to done. It reads only `state_text()`, the textual contract a real
+    /// critic sees, and is a pure function of it.
+    struct KeyCritic {
+        prefix: &'static str,
+    }
+    impl CriticScorer for KeyCritic {
+        fn score(&self, state: &dyn GoalStateLike) -> f64 {
+            if state.state_text().starts_with(self.prefix) {
+                1.0
+            } else {
+                0.0
+            }
+        }
+    }
+
+    /// A critic that returns `NaN`, the failure signal an untrained or erroring
+    /// implementation can emit through an `f64`.
+    struct NanCritic;
+    impl CriticScorer for NanCritic {
+        fn score(&self, _state: &dyn GoalStateLike) -> f64 {
+            f64::NAN
+        }
+    }
+
+    /// A branching scorer: from the root, a LOW-log-prob branch through `Good*`
+    /// states and a HIGH-log-prob branch through `Bad*` states, both dead ends of
+    /// equal depth. Policy alone expands `Bad1` first; a critic that likes `Good*`
+    /// must be able to flip that.
+    fn split_scorer() -> TableScorer {
+        TableScorer::new()
+            .edge("root", "bad", 0.9f64.ln(), MockGoal::open("Bad1"))
+            .edge("root", "good", 0.1f64.ln(), MockGoal::open("Good1"))
+            .edge("Bad1", "bad2", 0.9f64.ln(), MockGoal::open("Bad2"))
+            .edge("Good1", "good2", 0.9f64.ln(), MockGoal::open("Good2"))
+    }
+
+    fn arc(c: impl CriticScorer + 'static) -> Arc<dyn CriticScorer> {
+        Arc::new(c)
+    }
+
+    /// The safety property that makes this landable on the production path: at
+    /// `critic_weight == 0.0` an injected critic changes NOTHING, whatever it says.
+    /// `order` is the full observable trace of which states the frontier popped and
+    /// in what sequence, so equality of `order` is equality of the search.
+    #[test]
+    fn critic_weight_zero_is_identical_to_the_critic_free_search() {
+        let cfg = BestFirstConfig::default(); // critic_weight == 0.0
+        let mut base_scorer = split_scorer();
+        let baseline = best_first_search(&mut base_scorer, MockGoal::open("root"), &cfg);
+
+        for critic in [
+            None,
+            Some(arc(KeyCritic { prefix: "Good" })),
+            Some(arc(KeyCritic { prefix: "Bad" })),
+            Some(arc(NanCritic)),
+        ] {
+            let mut s = split_scorer();
+            let got =
+                best_first_search_with_critic(&mut s, MockGoal::open("root"), &cfg, critic);
+            assert_eq!(got.order, baseline.order);
+            assert_eq!(got.solved, baseline.solved);
+            assert_eq!(got.steps, baseline.steps);
+        }
+    }
+
+    /// With no critic injected, `critic_weight` is inert for EVERY value, so no
+    /// config value alone can change the production search.
+    #[test]
+    fn weight_without_a_critic_is_inert_at_every_value() {
+        let mut base_scorer = split_scorer();
+        let baseline = best_first_search(
+            &mut base_scorer,
+            MockGoal::open("root"),
+            &BestFirstConfig::default(),
+        );
+        for w in [0.0, 1.0, 25.0, -25.0] {
+            let cfg = BestFirstConfig {
+                critic_weight: w,
+                ..BestFirstConfig::default()
+            };
+            let mut s = split_scorer();
+            let got = best_first_search_with_critic(&mut s, MockGoal::open("root"), &cfg, None);
+            assert_eq!(got.order, baseline.order, "no critic, critic_weight={w}");
+        }
+    }
+
+    /// The seam is LIVE on the production path: with a critic and a non-zero
+    /// weight, the critic's verdict changes which branch the frontier explores
+    /// first, and flipping the critic flips the order back. So it is the critic
+    /// deciding, not a fixed tie-break.
+    #[test]
+    fn critic_reorders_the_frontier_when_weighted() {
+        let pos = |order: &[String], k: &str| order.iter().position(|s| s == k).unwrap();
+        // The two branches differ by `ln(0.9) - ln(0.1)` = about 2.2 nats per step,
+        // so a weight of 4.0 is the honest "critic outweighs a 2.2-nat policy gap"
+        // setting. A smaller weight would correctly leave the policy in charge,
+        // which is the point of the term being on a comparable scale.
+        let cfg = BestFirstConfig {
+            critic_weight: 4.0,
+            ..BestFirstConfig::default()
+        };
+
+        // Policy alone prefers the Bad branch (higher log-prob).
+        let mut s = split_scorer();
+        let policy_only = best_first_search(&mut s, MockGoal::open("root"), &cfg);
+        assert!(pos(&policy_only.order, "Bad1") < pos(&policy_only.order, "Good1"));
+
+        // A critic that likes Good* pulls it ahead.
+        let mut s = split_scorer();
+        let good = best_first_search_with_critic(
+            &mut s,
+            MockGoal::open("root"),
+            &cfg,
+            Some(arc(KeyCritic { prefix: "Good" })),
+        );
+        assert!(
+            pos(&good.order, "Good1") < pos(&good.order, "Bad1"),
+            "the critic-preferred branch must be explored first (order {:?})",
+            good.order
+        );
+
+        // Inverting the critic restores the policy's own preference.
+        let mut s = split_scorer();
+        let bad = best_first_search_with_critic(
+            &mut s,
+            MockGoal::open("root"),
+            &cfg,
+            Some(arc(KeyCritic { prefix: "Bad" })),
+        );
+        assert!(pos(&bad.order, "Bad1") < pos(&bad.order, "Good1"));
+    }
+
+    /// The critic term rides in the numerator, so its influence relative to the
+    /// policy term does not drift with depth. Concretely: the critic's advantage
+    /// over a fixed per-step log-prob gap is the SAME at depth 1 and at depth 8. A
+    /// term added outside the `L^alpha` normalization would fail this, because the
+    /// base score's magnitude grows like `L^(1-alpha)` while a bounded outside term
+    /// does not.
+    #[test]
+    fn the_critic_term_keeps_its_scale_against_the_base_score_at_every_depth() {
+        let cfg = BestFirstConfig {
+            critic_weight: 1.0,
+            ..BestFirstConfig::default()
+        };
+        // Per-step log-prob gap of `gap` nats against a per-step critic gap of 1.0.
+        let step = 0.5f64.ln();
+        let gap = 0.25f64.ln() - step; // the extra nats the weaker sibling loses
+        for depth in [1usize, 2, 8, 64] {
+            let d = depth as f64;
+            // Branch P: better log-prob every step, critic says 0 every step.
+            let p = frontier_score(d * step, 0.0, 0.0, depth, &cfg);
+            // Branch C: worse log-prob every step, critic says 1 every step.
+            let c = frontier_score(d * (step + gap), d, 0.0, depth, &cfg);
+            // The critic's net advantage, normalized by the base score's own scale.
+            let advantage = (c - p) / d.powf(1.0 - cfg.alpha);
+            let expected = 1.0 + gap; // critic_weight * 1.0 + gap, per step
+            assert!(
+                (advantage - expected).abs() < 1e-9,
+                "critic-vs-policy scale must be depth-invariant (depth {depth}: {advantage} vs {expected})"
+            );
+        }
+    }
+
+    /// A critic cannot make anything true. On a search with no closed state, a
+    /// critic pinned at the maximum must not flip `solved`, must not invent a proof
+    /// path, must not produce DPO pairs, and must not let the minimizer accept
+    /// anything (the gate is never even consulted for an unsolved search).
+    #[test]
+    fn critic_never_decides_that_something_is_proved() {
+        let cfg = BestFirstConfig {
+            critic_weight: 50.0,
+            ..BestFirstConfig::default()
+        };
+        let mut s = split_scorer(); // no MockGoal::closed anywhere
+        let out = best_first_search_with_critic(
+            &mut s,
+            MockGoal::open("root"),
+            &cfg,
+            Some(arc(KeyCritic { prefix: "Good" })),
+        );
+        assert!(!out.solved, "only `is_closed` may declare a solve");
+        assert!(out.proof_tactics().is_empty());
+        assert!(dpo_pairs(&out).is_empty());
+
+        let mut gate_calls = 0;
+        let minimized = out.minimized_proof(|_| {
+            gate_calls += 1;
+            true // a gate that says yes to everything must still be unreachable
+        });
+        assert_eq!(gate_calls, 0, "the gate must not run for an unsolved search");
+        assert_eq!(minimized.status, MinimizeStatus::NoProofFound);
+        assert!(minimized.accepted.is_none());
+    }
+
+    /// A `NaN` critic must be neutralised BEFORE it reaches the ordering.
+    /// `QueueItem` orders by `total_cmp`, which sorts `NaN` above every finite
+    /// score, so an unneutralised `NaN` would let one node jump the whole queue.
+    /// Degrading it to `0.0` recovers the policy-only order exactly.
+    #[test]
+    fn a_non_finite_critic_cannot_poison_the_frontier() {
+        let cfg = BestFirstConfig {
+            critic_weight: 3.0,
+            ..BestFirstConfig::default()
+        };
+        let mut base = split_scorer();
+        let baseline = best_first_search(&mut base, MockGoal::open("root"), &cfg);
+        let mut s = split_scorer();
+        let got = best_first_search_with_critic(
+            &mut s,
+            MockGoal::open("root"),
+            &cfg,
+            Some(arc(NanCritic)),
+        );
+        assert_eq!(got.order, baseline.order);
+    }
+
+    /// Exactly-equal scores still fall through to the `seq` tie-break: the
+    /// earlier-inserted sibling pops first. Two siblings with identical log-prob
+    /// and an identical critic verdict tie exactly, and the scorer's proposal order
+    /// decides, as it did before the seam existed.
+    #[test]
+    fn equal_scores_still_break_toward_the_earlier_insertion() {
+        let cfg = BestFirstConfig {
+            critic_weight: 4.0,
+            ..BestFirstConfig::default()
+        };
+        let build = || {
+            TableScorer::new()
+                .edge("root", "first", 0.5f64.ln(), MockGoal::open("Good_a"))
+                .edge("root", "second", 0.5f64.ln(), MockGoal::open("Good_b"))
+        };
+        let mut s = build();
+        let out = best_first_search_with_critic(
+            &mut s,
+            MockGoal::open("root"),
+            &cfg,
+            Some(arc(KeyCritic { prefix: "Good" })),
+        );
+        assert_eq!(out.order, vec!["root", "Good_a", "Good_b"]);
+
+        // Reversing the proposal order reverses the pop order, confirming it is
+        // insertion order and not the key that decides.
+        let mut s = TableScorer::new()
+            .edge("root", "second", 0.5f64.ln(), MockGoal::open("Good_b"))
+            .edge("root", "first", 0.5f64.ln(), MockGoal::open("Good_a"));
+        let out = best_first_search_with_critic(
+            &mut s,
+            MockGoal::open("root"),
+            &cfg,
+            Some(arc(KeyCritic { prefix: "Good" })),
+        );
+        assert_eq!(out.order, vec!["root", "Good_b", "Good_a"]);
+    }
+
+    /// Determinism: the same critic-steered search re-run gives the same trace.
+    #[test]
+    fn critic_guided_search_is_reproducible() {
+        let cfg = BestFirstConfig {
+            critic_weight: 2.0,
+            ..BestFirstConfig::default()
+        };
+        let run = || {
+            let mut s = split_scorer();
+            best_first_search_with_critic(
+                &mut s,
+                MockGoal::open("root"),
+                &cfg,
+                Some(arc(KeyCritic { prefix: "Good" })),
+            )
+            .order
+        };
+        assert_eq!(run(), run());
     }
 
     // ---- DPO preference-pair extraction -------------------------------------
