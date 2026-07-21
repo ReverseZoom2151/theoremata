@@ -2,9 +2,10 @@
 
 # Theoremata
 
-**the model proposes, the kernel decides**
+### an AI mathematician that shows its work
 
-Falsify the conjecture. Prove it. Re-check it through a kernel. Emit a certificate someone who distrusts you can verify offline.
+Hand it a conjecture. It tries to break it, drafts a proof the way a mathematician would,
+fills every gap inside a proof assistant, and gives you a receipt you can check yourself.
 
 ![Rust](https://img.shields.io/badge/Rust-2021-000000?style=flat-square&logo=rust&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white)
@@ -22,31 +23,40 @@ Falsify the conjecture. Prove it. Re-check it through a kernel. Emit a certifica
 
 ---
 
-## What it is
+## What it does
 
-Writing a proof is not the hard part. Trusting one is.
+**It attacks your conjecture before it believes it.**
+Every claim goes to an executable counter-search first. If a counterexample exists you get
+it in seconds, instead of a week of proof attempts that were never going to close. Surviving
+that is how a conjecture earns real effort.
 
-A model that emits fluent Lean can still emit a proof that leans on `sorry`, admits an
-axiom it should not, or type-checks a statement that quietly drifted from the theorem you
-asked about. Theoremata treats generation as cheap and untrusted, and makes verification
-the authoritative step. Search, memory, retrieval, learning, and evaluation all hang off
-that one decision.
+**It drafts, then makes it rigorous.**
+It writes an informal outline the way a person would, marks the steps that are still
+hand-waving, and turns each one into a formal obligation it has to discharge. Nothing gets
+waved through because the surrounding prose sounded convincing.
 
-Three rules run through the whole system:
+**It builds its own toolkit as it works.**
+Between attempts it invents auxiliary lemmas, tries to prove or disprove each, and keeps
+the survivors in a growing library. The pool it draws on gets richer as it goes, so the
+tenth theorem stands on everything it learned from the first nine.
 
-- **Falsify before you prove.** A conjecture earns formal effort by surviving an
-  executable counter-search first. One that does not is rejected with a concrete
-  counterexample.
-- **Compiling is not verifying.** Every accepted proof clears a four-layer gate, and a
-  compiler's exit code is never trusted on its own.
-- **A certificate should be re-checkable by someone who does not trust you.** Where the
-  result admits one, the system emits a self-describing proof-log that a small independent
-  checker re-verifies from the raw numbers in exact arithmetic.
+**It scales past one theorem.**
+Point it at a paper's blueprint and it works the whole dependency graph, proving lemmas
+before the results that lean on them.
 
-The system prefers to abstain over certifying something it cannot stand behind. A mock or
-offline check can never mark a result verified. Only a live prover run can.
+**It hands you a receipt, not a claim.**
+A proof an independent kernel re-checked, and for many results a certificate a small
+separate program re-verifies from the raw numbers in exact arithmetic. You do not have to
+trust the model. You do not have to trust us either.
+
+The last one is the whole point. Anything can generate convincing mathematics; the useful
+question is whether you can check it without taking anyone's word for it.
 
 ## The gate
+
+Here is why the receipt is worth something. A model can emit fluent Lean that leans on
+`sorry`, admits an axiom it should not, or type-checks a statement that quietly drifted
+from the theorem you asked about. All three compile. So compiling is not the bar.
 
 Six proof assistants, one gate (`components/prover/formal.rs`). Which prover you use is a
 config choice, not a rewrite.
