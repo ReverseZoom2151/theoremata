@@ -427,3 +427,302 @@ def test_run_stratified_and_ranking_and_fingerprint():
 def test_run_unknown_op_raises():
     with pytest.raises(ValueError):
         run({"op": "nope"})
+
+
+# =========================================================================== #
+# Deterministic audit sampling
+# =========================================================================== #
+
+from theoremata_tools.eval_integrity import (  # noqa: E402
+    DEFAULT_AUDIT_FRACTION,
+    PIN_SEMANTICS,
+    EvidenceError,
+    EvidencePin,
+    Finding,
+    JudgedItem,
+    SampledRate,
+    SamplingError,
+    audit_agreement,
+    audit_key,
+    audit_key_position,
+    check_findings,
+    content_digest,
+    pin_evidence,
+    select_audit_sample,
+    verify_pins,
+)
+
+_SALT = "run-2026-07-21-a"
+_OTHER_SALT = "run-2026-07-21-b"
+
+
+def _confident_ids(n=1000, prefix="item-"):
+    return [f"{prefix}{i:04d}" for i in range(n)]
+
+
+def test_audit_key_is_a_pure_function_of_id_and_salt():
+    assert audit_key("item-1", _SALT) == audit_key("item-1", _SALT)
+    assert audit_key("item-1", _SALT) != audit_key("item-1", _OTHER_SALT)
+    assert audit_key("item-1", _SALT) != audit_key("item-2", _SALT)
+    # The NUL separator stops ("ab","c") colliding with ("a","bc").
+    assert audit_key("c", "ab") != audit_key("bc", "a")
+    assert 0.0 <= audit_key_position("item-1", _SALT) < 1.0
+
+
+def test_same_inputs_give_the_same_sample():
+    ids = _confident_ids()
+    a = select_audit_sample(ids, _SALT)
+    b = select_audit_sample(ids, _SALT)
+    assert a.item_ids == b.item_ids
+    assert a.item_ids != ()
+
+
+def test_sample_is_independent_of_input_order_and_duplication():
+    """No dependence on iteration order, dict ordering, or the clock."""
+    ids = _confident_ids()
+    expected = select_audit_sample(ids, _SALT).item_ids
+    shuffled = list(reversed(ids))
+    duplicated = ids + ids[:100]
+    assert select_audit_sample(shuffled, _SALT).item_ids == expected
+    assert select_audit_sample(duplicated, _SALT).item_ids == expected
+    # Mappings in a different key order describe the same items.
+    as_mappings = [{"id": i, "confident": True, "label": "ok"} for i in shuffled]
+    assert select_audit_sample(as_mappings, _SALT).item_ids == expected
+
+
+def test_a_different_salt_gives_a_different_sample():
+    ids = _confident_ids()
+    a = set(select_audit_sample(ids, _SALT).item_ids)
+    b = set(select_audit_sample(ids, _OTHER_SALT).item_ids)
+    assert a != b
+    # Not merely different: substantially so, as independent draws should be.
+    assert len(a & b) < 0.5 * min(len(a), len(b))
+
+
+def test_sampled_fraction_is_about_the_requested_fraction():
+    ids = _confident_ids(2000)
+    sample = select_audit_sample(ids, _SALT, DEFAULT_AUDIT_FRACTION)
+    assert sample.denominator == 2000
+    assert 150 <= sample.size <= 250, sample.size
+    assert sample.coverage == pytest.approx(sample.size / 2000)
+
+
+def test_growing_the_set_never_evicts_an_already_sampled_item():
+    """A sample taken mid-run stays valid as the run grows."""
+    first = select_audit_sample(_confident_ids(500), _SALT)
+    later = select_audit_sample(_confident_ids(1000), _SALT)
+    assert set(first.item_ids) <= set(later.item_ids)
+
+
+def test_only_confident_items_are_sampled_by_default():
+    items = [
+        JudgedItem(item_id=i, label="ok", confident=(int(i.split("-")[1]) % 2 == 0))
+        for i in _confident_ids(400)
+    ]
+    sample = select_audit_sample(items, _SALT)
+    assert sample.population == 400
+    assert sample.denominator == 200
+    assert sample.n_unconfident == 200
+    assert all(int(i.split("-")[1]) % 2 == 0 for i in sample.item_ids)
+    # The bias this prevents: sampling the unconfident cases instead would be a
+    # different, non-comparable population.
+    other = select_audit_sample(items, _SALT, confident_only=False)
+    assert other.denominator == 400
+    assert set(sample.item_ids) < set(other.item_ids)
+
+
+def test_sampling_requires_a_salt_and_a_legal_fraction():
+    with pytest.raises(SamplingError):
+        select_audit_sample(["a"], "")
+    with pytest.raises(SamplingError):
+        select_audit_sample(["a"], _SALT, 1.5)
+    with pytest.raises(SamplingError):
+        JudgedItem(item_id="")
+
+
+def test_fraction_zero_and_one_are_the_honest_extremes():
+    ids = _confident_ids(200)
+    assert select_audit_sample(ids, _SALT, 0.0).item_ids == ()
+    assert set(select_audit_sample(ids, _SALT, 1.0).item_ids) == set(ids)
+
+
+# =========================================================================== #
+# Disclosure of a sampled rate
+# =========================================================================== #
+
+def test_a_sampled_rate_always_discloses_fraction_salt_and_denominator():
+    rate = SampledRate(
+        name="judge_review_agreement",
+        numerator=15,
+        reviewed=35,
+        audit_fraction=DEFAULT_AUDIT_FRACTION,
+        audit_salt=_SALT,
+        denominator=350,
+        population=400,
+    )
+    payload = rate.to_dict()
+    assert payload["sampled"] is True
+    assert payload["audit_fraction"] == DEFAULT_AUDIT_FRACTION
+    assert payload["audit_salt"] == _SALT
+    assert payload["denominator"] == 350
+    assert payload["rate"] == pytest.approx(15 / 35)
+    for needle in ("35 of 350", _SALT, "sample estimate", "0.1"):
+        assert needle in payload["disclosure"]
+
+
+def test_a_rate_over_zero_reviews_is_absent_not_zero():
+    rate = SampledRate("x", 0, 0, 0.1, _SALT, 100, 100)
+    assert rate.rate is None
+    assert rate.to_dict()["rate"] is None
+
+
+def test_audit_agreement_reports_a_disclosed_rate():
+    items = [JudgedItem(item_id=i, label="correct") for i in _confident_ids(500)]
+    sample = select_audit_sample(items, _SALT)
+    # Reviewer disagrees on every third sampled item.
+    truth = {
+        item_id: ("correct" if idx % 3 else "incorrect")
+        for idx, item_id in enumerate(sample.item_ids)
+    }
+    report = audit_agreement(items, _SALT, truth)
+
+    assert report["sample"]["item_ids"] == list(sample.item_ids)
+    agreement = report["agreement"]
+    assert agreement["sampled"] is True
+    assert agreement["audit_salt"] == _SALT
+    assert agreement["audit_fraction"] == DEFAULT_AUDIT_FRACTION
+    assert agreement["denominator"] == 500
+    assert agreement["reviewed"] == len(sample.item_ids)
+    expected_agree = sum(1 for i, _ in enumerate(sample.item_ids) if i % 3)
+    assert agreement["numerator"] == expected_agree
+    assert report["n_unreviewed"] == 0
+    assert len(report["disagreements"]) == agreement["reviewed"] - expected_agree
+
+
+def test_unreviewed_sampled_items_are_counted_not_scored_as_agreement():
+    items = [JudgedItem(item_id=i, label="correct") for i in _confident_ids(300)]
+    sample = select_audit_sample(items, _SALT)
+    partial = {item_id: "correct" for item_id in sample.item_ids[:3]}
+    report = audit_agreement(items, _SALT, partial)
+    assert report["agreement"]["reviewed"] == 3
+    assert report["agreement"]["numerator"] == 3
+    assert report["n_unreviewed"] == len(sample.item_ids) - 3
+    # The denominator still discloses the whole confident population.
+    assert report["agreement"]["denominator"] == 300
+
+
+# =========================================================================== #
+# Evidence pinning by content hash
+# =========================================================================== #
+
+def test_content_digest_pins_bytes_and_is_stable():
+    assert content_digest("abc") == content_digest(b"abc")
+    assert content_digest("abc").startswith("sha256:")
+    assert content_digest("abc") != content_digest("abd")
+    with pytest.raises(EvidenceError):
+        content_digest({"not": "bytes"})
+
+
+def test_pin_detects_a_later_mutation():
+    pin = EvidencePin.of("src/a.lean", "theorem t : True := by trivial\n")
+    assert pin.matches("theorem t : True := by trivial\n")
+    assert not pin.matches("theorem t : True := by sorry\n")
+    assert pin.size_bytes == len("theorem t : True := by trivial\n")
+
+
+def test_every_finding_names_a_pinned_artifact():
+    """The 338-of-338, zero-dangling property."""
+    artifacts = {f"src/f{i}.lean": f"content {i}" for i in range(20)}
+    pins = pin_evidence(artifacts)
+    findings = [
+        Finding(finding_id=f"F{i}", path=f"src/f{i % 20}.lean") for i in range(338)
+    ]
+    report = check_findings(findings, pins)
+    assert report["n_findings"] == 338
+    assert report["n_pinned"] == 338
+    assert report["n_dangling"] == 0
+    assert report["all_pinned"] is True
+    assert report["dangling"] == []
+
+
+def test_a_finding_outside_the_pinned_set_is_dangling_not_dropped():
+    pins = pin_evidence({"src/a.lean": "a"})
+    report = check_findings(
+        [
+            {"id": "F1", "file": "src/a.lean"},
+            {"id": "F2", "file": "src/ghost.lean"},
+        ],
+        pins,
+    )
+    assert report["n_findings"] == 2
+    assert report["n_dangling"] == 1
+    assert report["dangling"] == ["src/ghost.lean"]
+    assert report["all_pinned"] is False
+    with pytest.raises(EvidenceError):
+        check_findings([{"id": "F3"}], pins)
+
+
+def test_verify_pins_flags_mutation_and_absence():
+    pins = pin_evidence({"a": "one", "b": "two", "c": "three"})
+    report = verify_pins(pins, {"a": "one", "b": "TWO"})
+    assert report["n_pins"] == 3
+    assert report["n_intact"] == 1
+    assert report["n_mutated"] == 1
+    assert report["mutated"][0]["path"] == "b"
+    assert report["mutated"][0]["pinned_digest"] != report["mutated"][0]["current_digest"]
+    assert report["missing"] == ["c"]
+    assert report["all_intact"] is False
+
+    clean = verify_pins(pins, {"a": "one", "b": "two", "c": "three"})
+    assert clean["all_intact"] is True
+
+
+def test_every_pin_report_says_a_hash_pins_bytes_only():
+    """A pin must never be quietly upgraded into a correctness claim."""
+    pins = pin_evidence({"a": "one"})
+    assert "does not make the judgement correct" in PIN_SEMANTICS
+    assert pins["a"].to_dict()["pin_semantics"] == PIN_SEMANTICS
+    assert check_findings([Finding("F1", "a")], pins)["pin_semantics"] == PIN_SEMANTICS
+    assert verify_pins(pins, {"a": "one"})["pin_semantics"] == PIN_SEMANTICS
+
+
+# =========================================================================== #
+# Worker dispatch for the new ops
+# =========================================================================== #
+
+def test_run_dispatches_the_new_ops():
+    ids = _confident_ids(300)
+    sample = run({"op": "select_audit_sample", "salt": _SALT, "items": ids})
+    assert sample["salt"] == _SALT
+    assert sample["item_ids"] == list(select_audit_sample(ids, _SALT).item_ids)
+
+    truth = {i: "correct" for i in sample["item_ids"]}
+    agreement = run(
+        {
+            "op": "audit_agreement",
+            "salt": _SALT,
+            "items": [{"id": i, "label": "correct"} for i in ids],
+            "ground_truth": truth,
+        }
+    )
+    assert agreement["agreement"]["rate"] == pytest.approx(1.0)
+    assert agreement["agreement"]["sampled"] is True
+    assert agreement["agreement"]["audit_salt"] == _SALT
+
+    pinned = run({"op": "pin_evidence", "artifacts": {"src/a.lean": "a"}})
+    assert pinned["n_pins"] == 1
+    assert pinned["pins"]["src/a.lean"]["digest"] == content_digest("a")
+
+    checked = run(
+        {
+            "op": "check_findings",
+            "findings": [{"id": "F1", "path": "src/a.lean"}],
+            "pins": pinned["pins"],
+        }
+    )
+    assert checked["all_pinned"] is True
+
+    verified = run(
+        {"op": "verify_pins", "pins": pinned["pins"], "current": {"src/a.lean": "b"}}
+    )
+    assert verified["n_mutated"] == 1

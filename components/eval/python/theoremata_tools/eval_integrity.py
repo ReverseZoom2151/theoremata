@@ -29,6 +29,16 @@ specific way of fooling ourselves is otherwise available:
   score with the verifier's verdict, and :func:`ranking_quality` measures how
   often a higher-scored candidate was the verified one. This is the only signal
   that says whether the best-first priority function ranks truth well.
+* **Deterministic audit sampling**: :func:`select_audit_sample` picks a fixed
+  fraction of the *confident* judge labels for expensive review, keyed on
+  ``sha256(salt, item_id)``. Auditing only the hard or disagreeing cases measures
+  agreement on a biased slice; the resulting number is uninterpretable. Rates
+  derived from a sample come back as a :class:`SampledRate`, which cannot be
+  serialized without its fraction, salt and denominator.
+* **Evidence pinning**: :func:`pin_evidence` hashes the artifact a judgement was
+  made about, :func:`check_findings` proves every finding names something in the
+  pinned set, and :func:`verify_pins` detects a later mutation. A content hash
+  pins bytes only; it never makes a judgement correct.
 * **Environment fingerprint** — :func:`environment_fingerprint` hashes
   (toolchain, corpus/mathlib pin, import manifest). A cached or reported pass
   is comparable only inside one fingerprint.
@@ -632,6 +642,514 @@ def same_environment(fingerprint_a: str, fingerprint_b: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Deterministic audit sampling
+# --------------------------------------------------------------------------- #
+# A cheap automated judge labels a large set. Some of those labels get expensive
+# human or ground-truth review. Which ones is the whole question.
+#
+# The tempting queue is "review the hard cases and the ones the judges disagreed
+# about". That queue is stratified toward exactly the items where the judge is
+# weakest, so an agreement rate measured on it is not an estimate of agreement on
+# the population: it is an estimate of agreement on the worst slice, and it can
+# understate or overstate the real number by an unbounded amount. The mined
+# corpus reported 15 of 35 human-versus-AI agreement off such a queue, which is
+# why that figure cannot be interpreted at all.
+#
+# The fix is to audit a fixed fraction of the CONFIDENT cases, chosen by hashing
+# (item id, run salt). Deterministic means: reproducible from the two inputs
+# alone, independent of iteration order, dict ordering, the clock, and any RNG,
+# and therefore impossible to re-roll until the audit looks good. Publish the
+# salt with the run and anyone can recompute the identical sample.
+
+#: Default share of confident items sent for expensive review.
+DEFAULT_AUDIT_FRACTION = 0.10
+
+#: Bits of the digest consumed to place an item in [0, 1). 64 bits is far more
+#: resolution than any realistic fraction needs.
+_KEY_BITS = 64
+_KEY_HEX = _KEY_BITS // 4
+_KEY_SPACE = float(1 << _KEY_BITS)
+
+
+class SamplingError(ValueError):
+    """An audit sample was requested with parameters that cannot be honored."""
+
+
+def audit_key(item_id: str, salt: str) -> str:
+    """Stable selection key for one item under one run salt.
+
+    ``sha256(salt || 0x00 || item_id)``. The NUL separator is what stops
+    ``("ab", "c")`` and ``("a", "bc")`` from colliding, which would otherwise let
+    a crafted id impersonate another item's key. The salt goes first so that a
+    run salt cannot be forged by appending to an id.
+    """
+    blob = f"{salt}\x00{item_id}".encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def audit_key_position(item_id: str, salt: str) -> float:
+    """The item's position in ``[0, 1)`` under this salt.
+
+    Selection is ``position < fraction``. This is a function of the pair alone,
+    so it does not matter in what order the items arrive or how many there are.
+    """
+    return int(audit_key(item_id, salt)[:_KEY_HEX], 16) / _KEY_SPACE
+
+
+@dataclass(frozen=True)
+class JudgedItem:
+    """One item a cheap automated judge has labelled.
+
+    ``confident`` is the judge's own claim that it is sure. It is the population
+    the audit samples from, because a confident label is precisely the one nobody
+    would otherwise check.
+    """
+
+    item_id: str
+    label: Any = None
+    confident: bool = True
+    payload: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.item_id:
+            raise SamplingError("every judged item needs a non-empty item_id")
+        object.__setattr__(self, "item_id", str(self.item_id))
+        object.__setattr__(self, "confident", bool(self.confident))
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any]) -> "JudgedItem":
+        return cls(
+            item_id=str(data.get("item_id", data.get("id", ""))),
+            label=data.get("label"),
+            confident=bool(data.get("confident", True)),
+            payload=dict(data.get("payload", {}) or {}),
+        )
+
+
+def _coerce_items(items: Iterable[Any]) -> list[JudgedItem]:
+    out: list[JudgedItem] = []
+    for item in items:
+        if isinstance(item, JudgedItem):
+            out.append(item)
+        elif isinstance(item, Mapping):
+            out.append(JudgedItem.from_mapping(item))
+        elif isinstance(item, str):
+            out.append(JudgedItem(item_id=item))
+        else:
+            raise TypeError(
+                f"expected JudgedItem, mapping or str id, got {type(item).__name__}"
+            )
+    return out
+
+
+@dataclass(frozen=True)
+class AuditSample:
+    """A reproducible audit sample plus everything needed to re-derive it.
+
+    ``salt`` and ``fraction`` are carried on the sample rather than left in the
+    caller's head, because a rate computed from this sample must disclose both
+    (see :class:`SampledRate`). ``denominator`` is the confident population the
+    fraction was applied to, which is the number a reader needs to judge how
+    much the sampled rate is actually worth.
+    """
+
+    salt: str
+    fraction: float
+    item_ids: tuple[str, ...]
+    denominator: int
+    population: int
+    n_unconfident: int
+
+    @property
+    def size(self) -> int:
+        return len(self.item_ids)
+
+    @property
+    def coverage(self) -> float:
+        """Realized share of the confident population, not the requested one."""
+        return (self.size / self.denominator) if self.denominator else 0.0
+
+    def contains(self, item_id: str) -> bool:
+        return item_id in set(self.item_ids)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "salt": self.salt,
+            "fraction": self.fraction,
+            "item_ids": list(self.item_ids),
+            "size": self.size,
+            "denominator": self.denominator,
+            "population": self.population,
+            "n_unconfident": self.n_unconfident,
+            "coverage": self.coverage,
+        }
+
+
+def select_audit_sample(
+    items: Iterable[Any],
+    salt: str,
+    fraction: float = DEFAULT_AUDIT_FRACTION,
+    *,
+    confident_only: bool = True,
+) -> AuditSample:
+    """Pick the audit sample deterministically from ``(item_id, salt)``.
+
+    An item is selected exactly when ``audit_key_position(item_id, salt) <
+    fraction``. Consequences that matter:
+
+    * The result does not depend on input order, on how many items were passed,
+      or on anything mutable. Feeding the same ids shuffled gives the same
+      sample.
+    * There is no RNG and no clock, so the sample cannot be re-rolled until it
+      looks favourable. Publishing the salt makes the choice checkable by anyone.
+    * Adding new items never removes an existing one from the sample, so a sample
+      taken mid-run stays valid as the run grows.
+
+    ``confident_only`` (the default) restricts the population to items the judge
+    was confident about. That is the point of the mechanism: the confident cases
+    are the ones nothing else will ever check.
+
+    Duplicate ids are collapsed, and the id list is returned sorted, so the
+    output is canonical.
+    """
+    if not isinstance(salt, str) or not salt:
+        raise SamplingError("audit sampling requires a non-empty run salt")
+    fraction = float(fraction)
+    if not 0.0 <= fraction <= 1.0:
+        raise SamplingError(f"fraction must be in [0, 1], got {fraction!r}")
+
+    coerced = _coerce_items(items)
+    population = len({i.item_id for i in coerced})
+    pool_ids = sorted(
+        {i.item_id for i in coerced if i.confident or not confident_only}
+    )
+    n_unconfident = population - len(pool_ids)
+
+    selected = tuple(
+        item_id
+        for item_id in pool_ids
+        if audit_key_position(item_id, salt) < fraction
+    )
+    return AuditSample(
+        salt=salt,
+        fraction=fraction,
+        item_ids=selected,
+        denominator=len(pool_ids),
+        population=population,
+        n_unconfident=n_unconfident,
+    )
+
+
+@dataclass(frozen=True)
+class SampledRate:
+    """A rate measured on an audit sample, which cannot be reported bare.
+
+    Every serialization carries ``sampled: true`` alongside the fraction, the
+    salt and the denominator. That is the entire reason this type exists: a rate
+    computed on 10 percent of the confident cases and printed as though it
+    covered the run is the specific failure the audit mechanism was built to
+    prevent, and a plain float has nowhere to keep the caveat.
+
+    ``rate`` is ``None`` when nothing was reviewed. A rate over zero reviews is
+    not 0.0 and not 1.0; it is absent.
+    """
+
+    name: str
+    numerator: int
+    reviewed: int
+    audit_fraction: float
+    audit_salt: str
+    denominator: int
+    population: int
+
+    @property
+    def rate(self) -> Any:
+        return (self.numerator / self.reviewed) if self.reviewed else None
+
+    @property
+    def disclosure(self) -> str:
+        """One sentence that must travel with the number wherever it goes."""
+        return (
+            f"{self.name} measured on a deterministic audit sample: "
+            f"{self.reviewed} of {self.denominator} confident items "
+            f"(population {self.population}), fraction "
+            f"{self.audit_fraction:.4g}, salt {self.audit_salt!r}. "
+            "Reproduce with select_audit_sample(items, salt, fraction). "
+            "This is a sample estimate, not a rate over the full run."
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "rate": self.rate,
+            "numerator": self.numerator,
+            "reviewed": self.reviewed,
+            "sampled": True,
+            "audit_fraction": self.audit_fraction,
+            "audit_salt": self.audit_salt,
+            "denominator": self.denominator,
+            "population": self.population,
+            "disclosure": self.disclosure,
+        }
+
+    def __str__(self) -> str:  # pragma: no cover - convenience only
+        shown = "n/a" if self.rate is None else f"{self.rate:.4g}"
+        return f"{self.name}={shown} [{self.disclosure}]"
+
+
+def audit_agreement(
+    items: Iterable[Any],
+    salt: str,
+    ground_truth: Mapping[str, Any],
+    fraction: float = DEFAULT_AUDIT_FRACTION,
+    *,
+    confident_only: bool = True,
+) -> dict[str, Any]:
+    """Judge-versus-review agreement over a deterministic audit sample.
+
+    ``ground_truth`` maps item id to the reviewed label; ids absent from it were
+    not reviewed and are counted as ``n_unreviewed`` rather than quietly treated
+    as agreements. The returned ``agreement`` is a :class:`SampledRate` dict, so
+    the fraction, the salt and the denominator travel with the number.
+
+    Nothing here says the judge is right. It says how often the judge and the
+    reviewer said the same thing on an unbiased slice of the confident cases.
+    """
+    coerced = _coerce_items(items)
+    sample = select_audit_sample(
+        coerced, salt, fraction, confident_only=confident_only
+    )
+    by_id = {i.item_id: i for i in coerced}
+
+    agree = 0
+    reviewed = 0
+    unreviewed: list[str] = []
+    disagreements: list[dict[str, Any]] = []
+    for item_id in sample.item_ids:
+        if item_id not in ground_truth:
+            unreviewed.append(item_id)
+            continue
+        reviewed += 1
+        judged = by_id[item_id].label
+        truth = ground_truth[item_id]
+        if judged == truth:
+            agree += 1
+        else:
+            disagreements.append(
+                {"item_id": item_id, "judge_label": judged, "review_label": truth}
+            )
+
+    rate = SampledRate(
+        name="judge_review_agreement",
+        numerator=agree,
+        reviewed=reviewed,
+        audit_fraction=sample.fraction,
+        audit_salt=sample.salt,
+        denominator=sample.denominator,
+        population=sample.population,
+    )
+    return {
+        "agreement": rate.to_dict(),
+        "sample": sample.to_dict(),
+        "n_unreviewed": len(unreviewed),
+        "unreviewed": unreviewed,
+        "disagreements": disagreements,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Evidence pinning by content hash
+# --------------------------------------------------------------------------- #
+# A judgement is about an artifact. Naming the artifact by path is not enough:
+# the file changes, and then nobody can tell whether the finding was about what
+# is on disk now. Pinning the content hash makes the pairing checkable, and makes
+# a later mutation detectable rather than invisible.
+#
+# In the mined corpus this produced a concrete, checkable result: 338 of 338
+# findings named a file that was present in the pinned diff, zero dangling
+# references. That is exactly the property :func:`check_findings` measures.
+#
+# What a content hash does NOT do: it does not make the judgement correct, and it
+# does not make the artifact good. It pins bytes. Every report below repeats that
+# in ``pin_semantics`` so the guarantee is never quietly upgraded.
+
+#: The one sentence that must accompany any pin-based claim.
+PIN_SEMANTICS = (
+    "A content hash pins bytes and nothing more: it proves which exact artifact "
+    "was judged and makes a later mutation detectable. It does not make the "
+    "judgement correct, complete, or well-founded."
+)
+
+
+class EvidenceError(ValueError):
+    """A pin is malformed, or a finding refers to evidence that was not pinned."""
+
+
+def content_digest(content: Any) -> str:
+    """``sha256:<hex>`` over the artifact's bytes.
+
+    ``str`` is encoded as UTF-8; ``bytes`` is hashed as given. Anything else is
+    refused rather than coerced, because ``repr``-hashing an arbitrary object
+    would pin a Python rendering instead of the artifact.
+    """
+    if isinstance(content, bytes):
+        raw = content
+    elif isinstance(content, str):
+        raw = content.encode("utf-8")
+    else:
+        raise EvidenceError(
+            f"can only pin bytes or str, got {type(content).__name__}"
+        )
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+@dataclass(frozen=True)
+class EvidencePin:
+    """One artifact pinned by content at the moment it was judged."""
+
+    path: str
+    digest: str
+    size_bytes: int
+
+    @classmethod
+    def of(cls, path: str, content: Any) -> "EvidencePin":
+        raw = content.encode("utf-8") if isinstance(content, str) else content
+        if not isinstance(raw, bytes):
+            raise EvidenceError(
+                f"can only pin bytes or str, got {type(content).__name__}"
+            )
+        return cls(path=str(path), digest=content_digest(raw), size_bytes=len(raw))
+
+    def matches(self, content: Any) -> bool:
+        """Whether ``content`` is byte-identical to what was judged."""
+        return content_digest(content) == self.digest
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "path": self.path,
+            "digest": self.digest,
+            "size_bytes": self.size_bytes,
+            "pin_semantics": PIN_SEMANTICS,
+        }
+
+
+def pin_evidence(artifacts: Mapping[str, Any]) -> dict[str, EvidencePin]:
+    """Pin every ``path -> content`` pair. The pinned set is the judged set."""
+    return {str(path): EvidencePin.of(path, content) for path, content in artifacts.items()}
+
+
+@dataclass(frozen=True)
+class Finding:
+    """One judgement, naming the artifact it was made about."""
+
+    finding_id: str
+    path: str
+    detail: Any = None
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any]) -> "Finding":
+        path = data.get("path", data.get("file"))
+        if not path:
+            raise EvidenceError(
+                f"finding {data.get('finding_id', data.get('id'))!r} names no artifact"
+            )
+        return cls(
+            finding_id=str(data.get("finding_id", data.get("id", ""))),
+            path=str(path),
+            detail=data.get("detail"),
+        )
+
+
+def _coerce_findings(findings: Iterable[Any]) -> list[Finding]:
+    out: list[Finding] = []
+    for f in findings:
+        if isinstance(f, Finding):
+            out.append(f)
+        elif isinstance(f, Mapping):
+            out.append(Finding.from_mapping(f))
+        else:
+            raise TypeError(f"expected Finding or mapping, got {type(f).__name__}")
+    return out
+
+
+def check_findings(
+    findings: Iterable[Any], pins: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Check that every finding names an artifact that was actually pinned.
+
+    A finding whose path is absent from ``pins`` is *dangling*: the judgement is
+    about something outside the evidence set, so it cannot be checked against
+    what was judged. Those are listed, not dropped.
+
+    Returns ``{"n_findings", "n_pinned", "n_dangling", "dangling", "all_pinned",
+    "pin_semantics"}``. ``all_pinned`` being true is the "338 of 338, zero
+    dangling" property; it says the findings and the evidence line up, and says
+    nothing at all about whether the findings are right.
+    """
+    items = _coerce_findings(findings)
+    known = set(pins.keys())
+    dangling = sorted({f.path for f in items if f.path not in known})
+    n_dangling = sum(1 for f in items if f.path not in known)
+    return {
+        "n_findings": len(items),
+        "n_pinned": len(items) - n_dangling,
+        "n_dangling": n_dangling,
+        "dangling": dangling,
+        "all_pinned": n_dangling == 0,
+        "pin_semantics": PIN_SEMANTICS,
+    }
+
+
+def verify_pins(
+    pins: Mapping[str, Any], current: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Re-check pinned artifacts against their current content.
+
+    ``pins`` maps path to an :class:`EvidencePin` or its dict form; ``current``
+    maps path to the bytes/str on disk now. A path whose bytes changed is
+    ``mutated``; a path absent from ``current`` is ``missing``. Both make every
+    finding about that artifact unsafe to re-use, which is the whole point of
+    pinning rather than merely naming.
+    """
+    mutated: list[dict[str, Any]] = []
+    missing: list[str] = []
+    intact = 0
+    for path in sorted(pins.keys()):
+        pin = pins[path]
+        if isinstance(pin, Mapping):
+            pin = EvidencePin(
+                path=str(pin.get("path", path)),
+                digest=str(pin["digest"]),
+                size_bytes=int(pin.get("size_bytes", 0)),
+            )
+        if not isinstance(pin, EvidencePin):
+            raise EvidenceError(f"pin for {path!r} is not an EvidencePin")
+        if path not in current:
+            missing.append(path)
+            continue
+        if pin.matches(current[path]):
+            intact += 1
+        else:
+            mutated.append(
+                {
+                    "path": path,
+                    "pinned_digest": pin.digest,
+                    "current_digest": content_digest(current[path]),
+                }
+            )
+    return {
+        "n_pins": len(pins),
+        "n_intact": intact,
+        "n_mutated": len(mutated),
+        "n_missing": len(missing),
+        "mutated": mutated,
+        "missing": missing,
+        "all_intact": not mutated and not missing,
+        "pin_semantics": PIN_SEMANTICS,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # JSON dispatch (worker.py hook) + CLI
 # --------------------------------------------------------------------------- #
 
@@ -648,6 +1166,11 @@ def run(request: dict[str, Any]) -> dict[str, Any]:
     * ``ranking_quality`` -> single-group telemetry
     * ``aggregate_ranking_quality`` -> pooled telemetry over ``groups``
     * ``environment_fingerprint`` -> ``{"fingerprint": hex}``
+    * ``select_audit_sample`` -> the deterministic sample + its disclosure fields
+    * ``audit_agreement`` -> judge-versus-review agreement as a disclosed rate
+    * ``pin_evidence`` -> ``path -> {digest, size_bytes}``
+    * ``check_findings`` -> dangling-reference audit over the pinned set
+    * ``verify_pins`` -> re-check pinned artifacts for later mutation
     """
     op = request.get("op", "outcome_rates")
     if op == "export_preference_corpus":
@@ -675,6 +1198,43 @@ def run(request: dict[str, Any]) -> dict[str, Any]:
                 request.get("corpus_pin"),
                 request.get("import_manifest"),
             ),
+        }
+    if op == "select_audit_sample":
+        sample = select_audit_sample(
+            request.get("items", []),
+            str(request["salt"]),
+            float(request.get("fraction", DEFAULT_AUDIT_FRACTION)),
+            confident_only=bool(request.get("confident_only", True)),
+        )
+        return {"op": op, **sample.to_dict()}
+    if op == "audit_agreement":
+        return {
+            "op": op,
+            **audit_agreement(
+                request.get("items", []),
+                str(request["salt"]),
+                dict(request.get("ground_truth", {})),
+                float(request.get("fraction", DEFAULT_AUDIT_FRACTION)),
+                confident_only=bool(request.get("confident_only", True)),
+            ),
+        }
+    if op == "pin_evidence":
+        pins = pin_evidence(request.get("artifacts", {}))
+        return {
+            "op": op,
+            "pins": {path: pin.to_dict() for path, pin in pins.items()},
+            "n_pins": len(pins),
+            "pin_semantics": PIN_SEMANTICS,
+        }
+    if op == "check_findings":
+        return {
+            "op": op,
+            **check_findings(request.get("findings", []), request.get("pins", {})),
+        }
+    if op == "verify_pins":
+        return {
+            "op": op,
+            **verify_pins(request.get("pins", {}), request.get("current", {})),
         }
     raise ValueError(f"unknown op: {op}")
 

@@ -595,6 +595,14 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         # "not_shown_trivial" and "withheld" mean no signal, never approval:
         # surviving mutation does not make a statement meaningful.
         return statement_triviality_run(request)
+    if tool == "mcp_client":
+        from theoremata_tools.mcp_client import run as mcp_client_run
+
+        # Everything an external MCP server returns is UNTRUSTED INPUT, never
+        # instructions: tool names, descriptions and results alike. The client
+        # fences and flags it; a caller must not strip that. `command` must come
+        # from configuration, never from a server response.
+        return mcp_client_run(request)
     if tool == "eval_power":
         from theoremata_tools.eval_power import run as eval_power_run
 
