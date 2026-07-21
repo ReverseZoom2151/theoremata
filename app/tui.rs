@@ -270,6 +270,55 @@ fn handle_slash(
             app.status = status;
             app.output = output;
         }
+        "/project" => {
+            // No arg: list projects and mark the current one. An arg: switch to
+            // that project by name (the loop reloads from app.project_id, so the
+            // whole cockpit follows). Fail closed on an unknown name.
+            match store.list_projects() {
+                Ok(projects) if rest.is_empty() => {
+                    let mut out = Vec::new();
+                    for p in &projects {
+                        let here = if p.id == app.project_id { "* " } else { "  " };
+                        out.push(format!("{here}{:<20} {}", p.name, p.theorem));
+                    }
+                    out.push(String::new());
+                    out.push("/project <name>  switch    /new <name> | <theorem>  create".into());
+                    app.status = format!("{} project(s)", projects.len());
+                    app.output = out;
+                }
+                Ok(projects) => match projects.iter().find(|p| p.name == rest) {
+                    Some(p) => {
+                        app.project_id = p.id.clone();
+                        app.selected = 0;
+                        app.output.clear();
+                        app.status = format!("switched to project '{}'", p.name);
+                    }
+                    None => app.status = format!("no project named '{rest}' (try /project)"),
+                },
+                Err(e) => app.status = format!("could not list projects: {e}"),
+            }
+        }
+        "/new" => {
+            // `/new <name> | <theorem>`: create a project and switch to it, so a
+            // fresh chat can set a real goal without dropping to the CLI.
+            let (name, theorem) = match rest.split_once('|') {
+                Some((n, t)) => (n.trim(), t.trim()),
+                None => ("", ""),
+            };
+            if name.is_empty() || theorem.is_empty() {
+                app.status = "usage: /new <name> | <theorem>".into();
+            } else {
+                match store.create_project(name, theorem) {
+                    Ok(p) => {
+                        app.project_id = p.id;
+                        app.selected = 0;
+                        app.output.clear();
+                        app.status = format!("created and switched to '{name}'");
+                    }
+                    Err(e) => app.status = format!("could not create project: {e}"),
+                }
+            }
+        }
         "/prove" => {
             let (system, target) = split_leading_system(rest);
             if target.is_empty() {
@@ -386,6 +435,8 @@ fn slash(
             out.push(String::new());
             out.push("Actions (do real work, may block for minutes):".into());
             out.push("/model [name]          list ollama models / switch active model".into());
+            out.push("/project [name]        list projects / switch to one".into());
+            out.push("/new <name> | <thm>    create a project and switch to it".into());
             out.push("/prove [sys] <target>  formalize+prove+gate a node/index/statement".into());
             out.push("/hammer <sys> <goal>   hammer-assisted native proof + gate".into());
             out.push("/falsify <json> <claim> numeric counterexample search".into());

@@ -59,8 +59,11 @@ struct Cli {
     config: Option<PathBuf>,
     #[arg(long, global = true)]
     json: bool,
+    // Optional so a bare `theoremata` (no subcommand) boots straight into the
+    // agent chat, the way `claude` / `aider` open when you type their name. A
+    // real subcommand still dispatches normally.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 #[derive(Subcommand)]
 enum Command {
@@ -573,16 +576,32 @@ enum Command {
     },
 }
 
+/// The project a bare `theoremata` opens its chat on: the most recently updated
+/// one, or a freshly created `scratch` workspace on a first run. There is always
+/// somewhere to start talking; specific projects are reachable via the chat's
+/// /new and /project, or the `new` / `chat` subcommands.
+fn resolve_home_project(store: &Store) -> Result<String> {
+    let projects = store.list_projects()?;
+    if let Some(latest) = projects.iter().max_by_key(|p| p.updated_at) {
+        return Ok(latest.id.clone());
+    }
+    let project = store.create_project(
+        "scratch",
+        "scratch workspace (set a real goal with /new, or just start chatting)",
+    )?;
+    Ok(project.id)
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let config = Config::load(cli.config.as_deref())?;
     // A subprocess bridge must use the same Store selected by `mcp`, rather
     // than re-resolving a potentially different default configuration.
     let database = match &cli.command {
-        Command::Api {
+        Some(Command::Api {
             database: Some(database),
             ..
-        } => database,
+        }) => database,
         _ => &config.database,
     };
     let store = Store::open(database)?;
@@ -590,7 +609,15 @@ pub fn run() -> Result<()> {
         Some(c) => Box::new(CommandProvider::new(c)),
         None => Box::new(OfflineProvider),
     };
-    match cli.command {
+    // Bare `theoremata`: open the agent chat directly. Reopen the most recent
+    // project, or create a `scratch` workspace on a first run, so there is always
+    // somewhere to start talking. Projects can be created or switched from inside
+    // the chat with /new and /project.
+    let Some(command) = cli.command else {
+        let project = resolve_home_project(&store)?;
+        return tui::run(&store, &config, provider.as_ref(), &project);
+    };
+    match command {
         Command::Init => {
             config.initialize()?;
             print_value(
