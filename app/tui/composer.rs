@@ -91,10 +91,35 @@ impl Composer {
             return None;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        // A "command chord" is Ctrl-only or Alt-only. Windows AltGr arrives as
+        // Ctrl+Alt together, so we must NOT treat that as a chord: those users
+        // type real characters (braces, etc.) with AltGr, and swallowing them
+        // would break input on non-US layouts.
+        let ctrl_only = ctrl && !alt;
+        let alt_only = alt && !ctrl;
+        // Word-wise motion and delete accept either Ctrl or Alt as the modifier,
+        // matching the two conventions terminals emit for the same intent.
+        let word_mod = ctrl_only || alt_only;
         match key.code {
             KeyCode::Enter => return self.on_enter(shift),
-            KeyCode::Char(c) if !ctrl => self.insert_char(c),
+            // Readline word delete: Ctrl+W, plus Alt/Ctrl+Backspace.
+            KeyCode::Char('w') if ctrl_only => self.delete_prev_word(),
+            KeyCode::Backspace if word_mod => self.delete_prev_word(),
+            // Emacs line-start / line-end motion (mirrors Home/End below).
+            KeyCode::Char('a') if ctrl_only => self.cursor_col = 0,
+            KeyCode::Char('e') if ctrl_only => self.cursor_col = self.cur_len(),
+            // Kill to line end / start: Ctrl+K / Ctrl+U.
+            KeyCode::Char('k') if ctrl_only => self.kill_to_line_end(),
+            KeyCode::Char('u') if ctrl_only => self.kill_to_line_start(),
+            // Word motion: Ctrl/Alt + Left/Right.
+            KeyCode::Left if word_mod => self.move_word_left(),
+            KeyCode::Right if word_mod => self.move_word_right(),
+            // A plain (or Shift, or AltGr) printable char is inserted; a Ctrl-only
+            // or Alt-only char is a chord the arms above already handled or that
+            // the app loop owns, so it must not be typed into the buffer.
+            KeyCode::Char(c) if !ctrl_only && !alt_only => self.insert_char(c),
             KeyCode::Backspace => self.backspace(),
             KeyCode::Delete => self.delete(),
             KeyCode::Left => self.move_left(),
@@ -103,8 +128,8 @@ impl Composer {
             KeyCode::End => self.cursor_col = self.cur_len(),
             KeyCode::Up => self.on_up(),
             KeyCode::Down => self.on_down(),
-            // Everything else (Ctrl-chords, F-keys, Tab, Esc, ...) is the app
-            // loop's concern, not the editor's. Ignore, never panic.
+            // Everything else (remaining Ctrl-chords, F-keys, Tab, Esc, ...) is the
+            // app loop's concern, not the editor's. Ignore, never panic.
             _ => {}
         }
         None
@@ -347,6 +372,85 @@ impl Composer {
             self.cursor_row += 1;
             self.cursor_col = 0;
         }
+    }
+
+    /// Column where the word before the cursor begins: skip any run of
+    /// whitespace immediately left of the cursor, then the word before it. Word
+    /// motion stays within the current line so the cursor math is trivial and
+    /// codepoint-safe; crossing a line boundary is left to the char-wise fallers.
+    fn prev_word_col(&self) -> usize {
+        let chars: Vec<char> = self.lines[self.cursor_row].chars().collect();
+        let mut i = self.cursor_col.min(chars.len());
+        while i > 0 && chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && !chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        i
+    }
+
+    /// Column just past the word after the cursor: skip a run of whitespace, then
+    /// the following word.
+    fn next_word_col(&self) -> usize {
+        let chars: Vec<char> = self.lines[self.cursor_row].chars().collect();
+        let len = chars.len();
+        let mut i = self.cursor_col.min(len);
+        while i < len && chars[i].is_whitespace() {
+            i += 1;
+        }
+        while i < len && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        i
+    }
+
+    fn move_word_left(&mut self) {
+        if self.cursor_col > 0 {
+            self.cursor_col = self.prev_word_col();
+        } else {
+            // At line start the char-wise move crosses onto the previous line.
+            self.move_left();
+        }
+    }
+
+    fn move_word_right(&mut self) {
+        if self.cursor_col < self.cur_len() {
+            self.cursor_col = self.next_word_col();
+        } else {
+            self.move_right();
+        }
+    }
+
+    /// Delete the word before the cursor. At column zero there is nothing to the
+    /// left on this line, so fall back to a plain backspace (which merges lines).
+    fn delete_prev_word(&mut self) {
+        self.leave_history();
+        if self.cursor_col == 0 {
+            self.backspace();
+            return;
+        }
+        let start = self.prev_word_col();
+        let mut chars: Vec<char> = self.lines[self.cursor_row].chars().collect();
+        chars.drain(start..self.cursor_col);
+        self.lines[self.cursor_row] = chars.into_iter().collect();
+        self.cursor_col = start;
+    }
+
+    /// Kill from the cursor to the end of the current line (Ctrl+K).
+    fn kill_to_line_end(&mut self) {
+        self.leave_history();
+        let mut chars: Vec<char> = self.lines[self.cursor_row].chars().collect();
+        chars.truncate(self.cursor_col);
+        self.lines[self.cursor_row] = chars.into_iter().collect();
+    }
+
+    /// Kill from the start of the current line to the cursor (Ctrl+U).
+    fn kill_to_line_start(&mut self) {
+        self.leave_history();
+        let chars: Vec<char> = self.lines[self.cursor_row].chars().collect();
+        self.lines[self.cursor_row] = chars[self.cursor_col..].iter().collect();
+        self.cursor_col = 0;
     }
 
     /// Up on the first line recalls the previous history entry; otherwise it
@@ -638,6 +742,80 @@ mod tests {
             c3.input(keym(KeyCode::Enter, KeyModifiers::SHIFT));
         }
         assert_eq!(c3.desired_height(20), MAX_HEIGHT);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_previous_word() {
+        let mut c = Composer::new();
+        typ(&mut c, "prove the lemma");
+        c.input(keym(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(c.text(), "prove the ");
+        // Trailing whitespace is consumed together with the word before it.
+        c.input(keym(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(c.text(), "prove ");
+    }
+
+    #[test]
+    fn alt_and_ctrl_backspace_delete_word() {
+        for m in [KeyModifiers::ALT, KeyModifiers::CONTROL] {
+            let mut c = Composer::new();
+            typ(&mut c, "foo bar");
+            c.input(keym(KeyCode::Backspace, m));
+            assert_eq!(c.text(), "foo ");
+        }
+    }
+
+    #[test]
+    fn ctrl_a_and_ctrl_e_jump_line_ends() {
+        let mut c = Composer::new();
+        typ(&mut c, "middle");
+        c.input(keym(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        typ(&mut c, "<");
+        c.input(keym(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        typ(&mut c, ">");
+        assert_eq!(c.text(), "<middle>");
+    }
+
+    #[test]
+    fn ctrl_k_and_ctrl_u_kill_line_parts() {
+        let mut c = Composer::new();
+        typ(&mut c, "keep drop");
+        // Move to just before "drop" and kill to end.
+        for _ in 0..4 {
+            c.input(key(KeyCode::Left));
+        }
+        c.input(keym(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert_eq!(c.text(), "keep ");
+        // Kill from start to the cursor (which is now at end).
+        c.input(keym(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(c.text(), "");
+    }
+
+    #[test]
+    fn word_motion_moves_by_words_within_line() {
+        let mut c = Composer::new();
+        typ(&mut c, "alpha beta gamma");
+        // Two words left from the end lands at the start of "beta".
+        c.input(keym(KeyCode::Left, KeyModifiers::CONTROL));
+        c.input(keym(KeyCode::Left, KeyModifiers::CONTROL));
+        typ(&mut c, "_");
+        assert_eq!(c.text(), "alpha _beta gamma");
+        // One word right moves over "beta".
+        c.input(keym(KeyCode::Right, KeyModifiers::ALT));
+        typ(&mut c, "!");
+        assert_eq!(c.text(), "alpha _beta! gamma");
+    }
+
+    #[test]
+    fn altgr_char_still_types() {
+        // Windows AltGr is delivered as Ctrl+Alt together; it must insert the
+        // character rather than being swallowed as a chord.
+        let mut c = Composer::new();
+        c.input(keym(
+            KeyCode::Char('{'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+        assert_eq!(c.text(), "{");
     }
 
     #[test]

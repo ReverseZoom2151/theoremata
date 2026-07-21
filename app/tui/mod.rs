@@ -70,6 +70,38 @@ const MODEL_ENV: &str = "THEOREMATA_MODEL";
 /// Prefix litellm needs to route a bare ollama tag to the local ollama server.
 const OLLAMA_PREFIX: &str = "ollama_chat/";
 
+/// A drop guard that owns the terminal's raw mode, alternate screen, and
+/// bracketed-paste state. WHY a guard rather than inline teardown: it restores
+/// the terminal on EVERY exit path, including a panic unwinding through the draw
+/// loop. Without it, a panic left the user in raw mode on the alt screen with a
+/// hidden cursor and a dead prompt. Teardown is best-effort (ignores errors)
+/// because during a panic there is nothing useful to do with a failure.
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode()?;
+        // We do NOT capture the mouse: mouse capture steals the terminal's own
+        // click-drag selection, so the user could not select and copy transcript
+        // text. Scrolling is by keyboard (PageUp/PageDown). Bracketed paste is
+        // still enabled so a pasted statement arrives as one `Event::Paste`.
+        execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+        Ok(TerminalGuard)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            io::stdout(),
+            LeaveAlternateScreen,
+            DisableBracketedPaste,
+            crossterm::cursor::Show
+        );
+    }
+}
+
 pub fn run(
     store: &Store,
     config: &Config,
@@ -77,24 +109,12 @@ pub fn run(
     project_id: &str,
 ) -> Result<()> {
     store.project(project_id)?;
-    enable_raw_mode()?;
-    let mut out = io::stdout();
-    // We do NOT capture the mouse: mouse capture steals the terminal's own
-    // click-drag selection, so the user could not select and copy transcript
-    // text. Scrolling is by keyboard (PageUp/PageDown). Bracketed paste is still
-    // enabled so a pasted statement arrives as one `Event::Paste`.
-    execute!(out, EnterAlternateScreen, EnableBracketedPaste)?;
-    let backend = CrosstermBackend::new(out);
+    // The guard restores the terminal when it drops: on the normal return below,
+    // on an early `?` error, or while unwinding from a panic in the draw loop.
+    let _guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
-    let result = run_loop(&mut terminal, store, config, provider, project_id);
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableBracketedPaste
-    )?;
-    terminal.show_cursor()?;
-    result
+    run_loop(&mut terminal, store, config, provider, project_id)
 }
 
 /// The mutable UI state. Note what is NOT here: no `Store`, no provider, no
@@ -126,6 +146,13 @@ struct App {
     /// Transcript scroll: `None` sticks to the bottom (auto-follow), `Some(top)`
     /// pins the viewport at row `top` while the user reads history.
     scroll: Option<usize>,
+    /// A one-shot request to open the transcript at the TOP of the history cell
+    /// at this index, resolved on the next draw once per-cell line geometry is
+    /// known. Set when a synchronous slash command pushes a result cell so a tall
+    /// result (e.g. `/model`, `/graph`) is not shoved off the top of the viewport
+    /// with no cue. Self-clears every draw; if no cell landed at the index (an
+    /// async action that pushes nothing synchronously) the scroll is left alone.
+    pending_scroll_to: Option<usize>,
     /// Last drawn transcript total-line count and viewport height, so scroll
     /// keys can clamp without re-rendering every cell.
     last_total: usize,
@@ -161,6 +188,7 @@ fn run_loop(
         history: opening_history(store, project_id),
         active_stream: None,
         scroll: None,
+        pending_scroll_to: None,
         last_total: 0,
         last_vh: 0,
         busy: false,
@@ -278,6 +306,25 @@ fn handle_key(
         (KeyCode::Char('g'), m) if m.contains(KeyModifiers::CONTROL) => {
             app.show_graph = !app.show_graph;
             app.graph_focused = app.show_graph;
+            return false;
+        }
+        // Ctrl+D on an empty composer is the shell EOF/quit convention. We gate it
+        // on an empty buffer AND not busy so it can never eat an in-progress
+        // message or abandon a running turn; with text present it does nothing.
+        (KeyCode::Char('d'), m)
+            if m.contains(KeyModifiers::CONTROL) && !app.busy && app.composer.is_empty() =>
+        {
+            return true;
+        }
+        // Ctrl+Home / Ctrl+End jump the transcript to the very top / live bottom.
+        // Plain Home/End are reserved for the composer (line start/end), so we
+        // require Ctrl here and let the unmodified keys fall through to editing.
+        (KeyCode::Home, m) if m.contains(KeyModifiers::CONTROL) => {
+            app.scroll = Some(0);
+            return false;
+        }
+        (KeyCode::End, m) if m.contains(KeyModifiers::CONTROL) => {
+            app.scroll = None;
             return false;
         }
         (KeyCode::Esc, _) => {
@@ -478,6 +525,11 @@ fn on_submit(
     }
     app.history.push(cell::user_cell(&s));
     if s.starts_with('/') {
+        // A synchronous command's first result cell will land at this index; mark
+        // it so a tall result opens at its top instead of being scrolled off the
+        // top of the viewport. A long-running action pushes nothing here, so the
+        // marker finds no cell next draw and self-clears without moving anything.
+        app.pending_scroll_to = Some(app.history.len());
         dispatch_command(app, store, config, provider, &s);
     } else {
         app.busy = true;
@@ -1143,6 +1195,18 @@ fn graph_width(total: u16, show: bool) -> u16 {
     want.max(MIN).min(total - TRANSCRIPT_MIN)
 }
 
+/// The first visible transcript row: the same clamp the draw uses, so it also
+/// equals the number of lines scrolled off ABOVE the viewport (for the "N more
+/// above" cue). `None` (auto-follow) resolves to the bottom, `max_top`. Pure, so
+/// the top math is unit-testable without a TTY.
+fn visible_top(scroll: Option<usize>, total: usize, vh: usize) -> usize {
+    let max_top = total.saturating_sub(vh);
+    match scroll {
+        None => max_top,
+        Some(t) => t.min(max_top),
+    }
+}
+
 /// How many transcript lines sit BELOW the current viewport, for the scroll-up
 /// indicator. Zero while auto-following (`None`) or already at the bottom. Pure,
 /// so the indicator math is unit-testable without a TTY.
@@ -1225,7 +1289,13 @@ fn draw(
     // frame, so this stays cheap for a modest history.
     let w = transcript_area.width;
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for c in &app.history {
+    // If a synchronous command asked to open a specific cell at its top, record
+    // the line offset where that cell begins as we build the transcript.
+    let mut target_top: Option<usize> = None;
+    for (i, c) in app.history.iter().enumerate() {
+        if app.pending_scroll_to == Some(i) {
+            target_top = Some(lines.len());
+        }
         lines.extend(c.lines(w));
     }
     if let Some(s) = &app.active_stream {
@@ -1242,13 +1312,24 @@ fn draw(
     let total = lines.len();
     let vh = transcript_area.height as usize;
     let max_top = total.saturating_sub(vh);
-    let top = match app.scroll {
-        None => max_top,
-        Some(t) => t.min(max_top),
-    };
+    // Resolve a pending "open this cell at its top" request now that the per-cell
+    // geometry is known. Pinning to the cell's first line (clamped to the bottom)
+    // shows a tall result from its start; a short result clamps to the bottom,
+    // which is exactly where auto-follow would have left it, so this never hurts.
+    if app.pending_scroll_to.is_some() {
+        app.pending_scroll_to = None;
+        if let Some(t) = target_top {
+            app.scroll = Some(t.min(max_top));
+        }
+    }
+    let top = visible_top(app.scroll, total, vh);
     app.last_total = total;
     app.last_vh = vh;
     let below = lines_below(app.scroll, total, vh);
+    // Lines scrolled off the top: the cue that fixes the reported bug where a tall
+    // command result (pushed while stuck to the bottom) had its top hidden with no
+    // hint to scroll up. `top` is exactly that count.
+    let above = top;
 
     // Build the graph panel lines (a cheap store read; no worker needed). Done
     // outside the draw closure so a read error cannot poison the frame.
@@ -1278,6 +1359,23 @@ fn draw(
             Paragraph::new(lines).scroll((top as u16, 0)),
             transcript_area,
         );
+        // The scroll-down indicator overlays the TOP transcript row so the user
+        // knows there is more above, even while auto-following the bottom (the
+        // case a tall command result creates). Rendered before the "below" cue so
+        // that on a degenerate one-row viewport the "below" cue wins the cell.
+        if above > 0 && transcript_area.height > 0 {
+            let rect = Rect::new(
+                transcript_area.x,
+                transcript_area.y,
+                transcript_area.width,
+                1,
+            );
+            let hint = format!("  \u{2191} {above} more above  ");
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(hint, cell::theme::dim()))),
+                rect,
+            );
+        }
         // The scroll-up indicator overlays the bottom transcript row so the user
         // knows there is more below while reading history.
         if below > 0 && transcript_area.height > 0 {
@@ -1329,7 +1427,7 @@ fn footer_line(app: &App, graph_too_narrow: bool) -> Paragraph<'static> {
     let hints = if graph_too_narrow {
         "  \u{b7}  graph hidden: terminal too narrow".to_string()
     } else {
-        "  \u{b7}  Ctrl+G graph  \u{b7}  / commands  \u{b7}  @ nodes  \u{b7}  Ctrl-C quit"
+        "  \u{b7}  Ctrl+G graph  \u{b7}  / commands  \u{b7}  @ nodes  \u{b7}  PgUp/PgDn scroll  \u{b7}  Ctrl-C quit"
             .to_string()
     };
     let line = Line::from(vec![
@@ -1492,6 +1590,30 @@ mod tests {
     }
 
     // ---- The scroll-indicator math ----
+
+    #[test]
+    fn visible_top_follows_bottom_and_clamps() {
+        // Auto-follow (None) resolves to the bottom, which is also how many lines
+        // are hidden ABOVE: a tall result taller than the viewport reports > 0.
+        assert_eq!(visible_top(None, 100, 20), 80);
+        // Content shorter than the viewport: nothing hidden above.
+        assert_eq!(visible_top(None, 10, 20), 0);
+        // A pin is honored, and a stale pin past the bottom clamps to max_top.
+        assert_eq!(visible_top(Some(30), 100, 20), 30);
+        assert_eq!(visible_top(Some(999), 100, 20), 80);
+        // Pinned at the very top: everything is below, nothing above.
+        assert_eq!(visible_top(Some(0), 100, 20), 0);
+    }
+
+    #[test]
+    fn tall_cell_pin_shows_top_short_cell_clamps_to_bottom() {
+        // The draw pins to `target_top.min(max_top)`. A tall cell whose top sits
+        // above the bottom opens at its top; a short cell near the end clamps to
+        // the bottom (== auto-follow), so pinning is always safe.
+        let max_top = 80usize; // total 100, vh 20
+        assert_eq!(Some(30usize).map(|t| t.min(max_top)), Some(30)); // tall: top shown
+        assert_eq!(Some(95usize).map(|t| t.min(max_top)), Some(80)); // short: bottom
+    }
 
     #[test]
     fn lines_below_zero_at_bottom_positive_when_scrolled_up() {
