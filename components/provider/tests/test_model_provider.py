@@ -44,6 +44,67 @@ def test_extract_truncated_object_raises():
 
 
 # --------------------------------------------------------------------------- #
+# Reasoning-model replies: a leading think block precedes the JSON. The tokens
+# below are literal model output (data), not markup of ours.
+# --------------------------------------------------------------------------- #
+THINK_OPEN = "<think>"  # kept out of prose so no angle-bracket "tag" appears in code
+THINK_CLOSE = "</think>"
+
+
+def test_extract_think_block_then_fenced_json():
+    # Qwen-style: chain-of-thought (with distracting braces) then fenced JSON.
+    text = (
+        f"{THINK_OPEN}Let me reason. Maybe the answer is {{oops: not json}} or "
+        f"{{a: 1}}. I will now answer.{THINK_CLOSE}\n"
+        '```json\n{"reply": "hi", "mutations": []}\n```'
+    )
+    assert mp.extract_json_object(text) == {"reply": "hi", "mutations": []}
+
+
+def test_extract_think_block_then_bare_object():
+    text = f"{THINK_OPEN}deliberating {{x}}{THINK_CLOSE}\n{{\"lean\": \"trivial\"}}"
+    assert mp.extract_json_object(text) == {"lean": "trivial"}
+
+
+def test_extract_think_block_with_leading_whitespace():
+    # Some models emit a newline before the think span.
+    text = f"\n\n  {THINK_OPEN}hmm{THINK_CLOSE}{{\"obligations\": []}}"
+    assert mp.extract_json_object(text) == {"obligations": []}
+
+
+def test_extract_unterminated_think_raises():
+    # Truncation: think span opens and is never closed, no JSON survives.
+    with pytest.raises(ValueError):
+        mp.extract_json_object(f"{THINK_OPEN}reasoning got cut off with a {{ brace")
+
+
+def test_extract_think_block_then_prose_then_object():
+    text = (
+        f"{THINK_OPEN}internal notes {{k: v}}{THINK_CLOSE}\n"
+        'Here is my answer:\n{"reply": "ok", "mutations": []}\nDone.'
+    )
+    assert mp.extract_json_object(text) == {"reply": "ok", "mutations": []}
+
+
+def test_think_block_does_not_swallow_answer_braces_in_reasoning():
+    # The reasoning contains a full JSON-looking object; extraction must ignore
+    # it and return the real post-think answer, proving we strip before scanning.
+    text = (
+        f"{THINK_OPEN}A tempting wrong object: "
+        '{"reply": "WRONG", "mutations": ["nope"]}'
+        f"{THINK_CLOSE}\n"
+        '{"reply": "RIGHT", "mutations": []}'
+    )
+    assert mp.extract_json_object(text) == {"reply": "RIGHT", "mutations": []}
+
+
+def test_prose_preamble_then_bare_object_no_think():
+    # Reasoning models sometimes skip the think span but still add a preamble.
+    text = 'Here is my answer:\n{"reply": "ok", "mutations": []}'
+    assert mp.extract_json_object(text) == {"reply": "ok", "mutations": []}
+
+
+# --------------------------------------------------------------------------- #
 # Required-key validation.
 # --------------------------------------------------------------------------- #
 def test_missing_required_keys_reports_absent():

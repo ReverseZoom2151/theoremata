@@ -53,6 +53,34 @@ PROVIDER_NAME = "litellm"
 # --------------------------------------------------------------------------- #
 # Pure helpers (no litellm, no network) -- unit-tested directly.
 # --------------------------------------------------------------------------- #
+def _strip_think_block(text: str) -> str:
+    """Remove a leading reasoning block emitted by reasoning models.
+
+    Reasoning models (Qwen3 and most current open-weights models) prepend a
+    chain-of-thought wrapped in a "think" span before the actual answer. That
+    reasoning text routinely contains brace characters and even JSON-looking
+    fragments, so it MUST be removed before any balanced-brace scan; otherwise
+    the scan would lock onto a fragment inside the reasoning instead of the real
+    answer object. Only a leading block is stripped, so a bare/fenced reply with
+    no reasoning is returned byte-for-byte unchanged (no clean-case regression).
+    """
+    # The angle-bracket tokens below are model output data we must match
+    # literally, not markup of our own; that is why they live only in these
+    # string literals.
+    open_tag = "<think>"
+    close_tag = "</think>"
+    leading = text.lstrip()
+    if not leading.startswith(open_tag):
+        return text
+    end = leading.find(close_tag)
+    if end == -1:
+        # Truncated/unterminated reasoning with no close tag: the whole reply is
+        # reasoning and nothing usable follows. Return empty so extraction fails
+        # cleanly and the existing retry/fallback path runs, exactly as before.
+        return ""
+    return leading[end + len(close_tag) :]
+
+
 def _strip_code_fences(text: str) -> str:
     """Remove surrounding ```/```json markdown fences from a model reply."""
     stripped = text.strip()
@@ -99,13 +127,16 @@ def _find_balanced_object(text: str) -> Optional[str]:
 def extract_json_object(text: str) -> dict[str, Any]:
     """Robustly extract a single JSON object from model text.
 
-    Strips markdown code fences, tries a direct ``json.loads``, and finally
-    falls back to the first balanced ``{...}`` object embedded in prose.
-    Raises ``ValueError`` if no JSON object can be recovered.
+    Strips a leading reasoning block and markdown code fences, tries a direct
+    ``json.loads``, and finally falls back to the first balanced ``{...}``
+    object embedded in prose. Raises ``ValueError`` if no JSON object can be
+    recovered. This only makes the JSON *findable*: no field is fabricated or
+    coerced, and schema validation downstream is unchanged.
     """
     if text is None:
         raise ValueError("no text to parse")
-    candidate = _strip_code_fences(text)
+    # Order matters: drop reasoning first (it may contain braces), then fences.
+    candidate = _strip_code_fences(_strip_think_block(text))
     # Fast path: the whole thing is a JSON object.
     try:
         parsed = json.loads(candidate)
