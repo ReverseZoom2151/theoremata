@@ -388,7 +388,10 @@ pub fn run(runner: &Runner, argv: &[&str], workspace: &Path) -> ExecOutcome {
             // separate tokens and let bash glob the `*`. Single-word args from
             // the other backends (coqc/agda/isabelle flags and file names) are
             // unaffected by being quoted.
-            let args: String = argv[1..].iter().map(|a| format!(" {}", sh_quote(a))).collect();
+            let args: String = argv[1..]
+                .iter()
+                .map(|a| format!(" {}", sh_quote(a)))
+                .collect();
             let script = format!("cd {} && {}{}", sh_quote(&mnt), argv[0], args);
             let mut cmd = Command::new("wsl.exe");
             cmd.args(["-d", distro.as_str(), "--", "bash", "-lc", script.as_str()]);

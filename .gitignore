@@ -23,3 +23,6 @@ __pycache__/
 /terminals/
 /build/
 /.partial-work/
+codex-main/
+vendor/
+experiments/bin/
