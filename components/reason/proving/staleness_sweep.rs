@@ -108,10 +108,10 @@ use super::staleness::{
 use crate::checker_cache::EnvironmentFingerprint as CheckerEnvironment;
 use crate::config::Config;
 use crate::db::Store;
+use crate::prover::formal::{backend_for, FormalSystem};
 use crate::prover::lean::{
     reelaborate_pinned_statement, LeanReelaboration, DEFAULT_REELABORATION_PREAMBLE,
 };
-use crate::prover::formal::{backend_for, FormalSystem};
 
 /// The schema tag written by `formal_generate::provenance_value` (under the event
 /// key `verification_provenance`). Duplicated here (that constant is private to
@@ -456,7 +456,9 @@ impl ReelaborationRun {
         let path = config.artifacts.join(REELABORATION_CACHE_FILE);
         let cache = std::fs::read_to_string(&path)
             .ok()
-            .and_then(|raw| serde_json::from_str::<BTreeMap<String, CachedReelaboration>>(&raw).ok())
+            .and_then(|raw| {
+                serde_json::from_str::<BTreeMap<String, CachedReelaboration>>(&raw).ok()
+            })
             .unwrap_or_default();
         Self {
             cache,
@@ -801,11 +803,7 @@ pub fn sweep_with_options(
     // for its events (a missing project errors there); `None` fans out over all.
     let project_ids: Vec<String> = match project {
         Some(p) => vec![p.to_string()],
-        None => store
-            .list_projects()?
-            .into_iter()
-            .map(|p| p.id)
-            .collect(),
+        None => store.list_projects()?.into_iter().map(|p| p.id).collect(),
     };
 
     // Gather provenance records newest-first, deduplicating to the latest green per
@@ -987,10 +985,19 @@ mod tests {
             artifact_from_tag(Some("self_contained_certificate")),
             ArtifactClass::SelfContainedCertificate
         );
-        assert_eq!(artifact_from_tag(Some("proof_term")), ArtifactClass::ProofTerm);
-        assert_eq!(artifact_from_tag(Some("tactic_script")), ArtifactClass::TacticScript);
+        assert_eq!(
+            artifact_from_tag(Some("proof_term")),
+            ArtifactClass::ProofTerm
+        );
+        assert_eq!(
+            artifact_from_tag(Some("tactic_script")),
+            ArtifactClass::TacticScript
+        );
         // Unknown / missing must NOT become a certificate (the cheap route).
-        assert_eq!(artifact_from_tag(Some("mystery")), ArtifactClass::TacticScript);
+        assert_eq!(
+            artifact_from_tag(Some("mystery")),
+            ArtifactClass::TacticScript
+        );
         assert_eq!(artifact_from_tag(None), ArtifactClass::TacticScript);
     }
 
@@ -1128,7 +1135,8 @@ mod tests {
         assert_eq!(run.refused_at_bound, 1);
 
         // And the verdict it produces is Unknown: not Fresh, not a withdrawal.
-        let verdict = staleness::assess(&record.to_verified_result(), Some(&current), Some(&outcome));
+        let verdict =
+            staleness::assess(&record.to_verified_result(), Some(&current), Some(&outcome));
         assert!(!verdict.is_fresh());
         assert!(verdict.withdrawal().is_none());
     }
@@ -1186,7 +1194,10 @@ mod tests {
     #[test]
     fn the_cache_key_separates_environment_preamble_and_pin() {
         let base = reelaboration_cache_key("resolved:lake:a", "import Mathlib", "T");
-        assert_eq!(base, reelaboration_cache_key("resolved:lake:a", "import Mathlib", "T"));
+        assert_eq!(
+            base,
+            reelaboration_cache_key("resolved:lake:a", "import Mathlib", "T")
+        );
         assert_eq!(base.len(), 64);
         for other in [
             reelaboration_cache_key("resolved:lake:b", "import Mathlib", "T"),
@@ -1243,7 +1254,10 @@ mod tests {
         );
         assert_eq!(
             preamble_for(&record, &operator),
-            ("import Mathlib.Order.Basic".to_string(), "operator_supplied")
+            (
+                "import Mathlib.Order.Basic".to_string(),
+                "operator_supplied"
+            )
         );
         record.pinned_statement_imports = Some("import Mathlib.Analysis.Basic".to_string());
         assert_eq!(
@@ -1269,7 +1283,9 @@ mod tests {
             .is_none());
         v["pinned_statement_imports"] = json!("import Mathlib");
         assert_eq!(
-            parse_provenance(&v).expect("record").pinned_statement_imports,
+            parse_provenance(&v)
+                .expect("record")
+                .pinned_statement_imports,
             Some("import Mathlib".to_string())
         );
     }

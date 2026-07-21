@@ -458,9 +458,8 @@ fn agda_interaction_point_ids(
 /// is not a valid `IOTCM`, which is how the interaction loop is told there is
 /// nothing more to serve.
 fn agda_goal_context_request(encoded_filename: &str, ids: &[u64]) -> String {
-    let mut request = format!(
-        "IOTCM {encoded_filename} None Direct (Cmd_load {encoded_filename} [])\n"
-    );
+    let mut request =
+        format!("IOTCM {encoded_filename} None Direct (Cmd_load {encoded_filename} [])\n");
     for id in ids {
         request.push_str(&format!(
             "IOTCM {encoded_filename} None Direct (Cmd_goal_type_context_infer Normalised {id} noRange \"?\")\n"
@@ -1125,9 +1124,7 @@ impl ExternalBackend {
         let source = ws.map(|ws| std::fs::read(&ws.source_path));
         let source_sha256 = match &source {
             Some(Ok(bytes)) => json!(sha256_hex(bytes)),
-            Some(Err(error)) => {
-                unavailable_field(&format!("source could not be read: {error}"))
-            }
+            Some(Err(error)) => unavailable_field(&format!("source could not be read: {error}")),
             None => unavailable_field("no workspace was scaffolded for this phase"),
         };
         // Metamath's dependencies are the resolved `$[ file $]` closure. Agda's
@@ -1149,9 +1146,7 @@ impl ExternalBackend {
             (FormalSystem::Metamath, _, _) => {
                 unavailable_field("the database source could not be read")
             }
-            _ => unavailable_field(
-                "the Agda module-graph closure is not resolved by this backend",
-            ),
+            _ => unavailable_field("the Agda module-graph closure is not resolved by this backend"),
         };
         json!({
             "system": self.system.as_str(),
@@ -1405,7 +1400,9 @@ impl FormalBackend for ExternalBackend {
                 // the module-qualified one, and neither reading may let an
                 // unlisted assumption through.
                 let imported_clean = closure.qualified_postulates.iter().all(|qualified| {
-                    let bare = qualified.rsplit_once('.').map_or(qualified.as_str(), |(_, n)| n);
+                    let bare = qualified
+                        .rsplit_once('.')
+                        .map_or(qualified.as_str(), |(_, n)| n);
                     whitelist.contains(qualified) || whitelist.iter().any(|w| w == bare)
                 });
                 let complete = closure.unresolved.is_empty();
@@ -1801,9 +1798,10 @@ fn agda_imports(stripped: &str) -> Vec<String> {
 /// postulate audit. Anything else is a module this backend has not read, and
 /// per the spec an import outside the declared closure fails closed.
 fn agda_import_inside_declared_closure(module: &str) -> bool {
-    FormalSystem::Agda.default_imports().iter().any(|prefix| {
-        module == prefix.as_str() || module.starts_with(&format!("{prefix}."))
-    })
+    FormalSystem::Agda
+        .default_imports()
+        .iter()
+        .any(|prefix| module == prefix.as_str() || module.starts_with(&format!("{prefix}.")))
 }
 
 /// The three states the Agda axiom audit distinguishes, and the verdict each
@@ -1890,9 +1888,9 @@ fn agda_import_closure(
         // anything. Degrading silently to the no-map path would hide that.
         AgdaModuleMapSource::Unreadable(reason) => {
             closure.map_state = "unreadable";
-            closure
-                .unresolved
-                .push(format!("the supplied Agda module map is unusable: {reason}"));
+            closure.unresolved.push(format!(
+                "the supplied Agda module map is unusable: {reason}"
+            ));
             return closure;
         }
         AgdaModuleMapSource::Resolved(map) => {
@@ -1922,20 +1920,19 @@ fn agda_import_closure(
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) => {
-                closure
-                    .unresolved
-                    .push(format!("{module}: {} could not be read: {error}", path.display()));
+                closure.unresolved.push(format!(
+                    "{module}: {} could not be read: {error}",
+                    path.display()
+                ));
                 continue;
             }
         };
         let text = String::from_utf8_lossy(&bytes).into_owned();
         let stripped = crate::prover::formal::strip_comments(&text);
         let postulates = agda_postulate_names(stripped.as_str());
-        closure.qualified_postulates.extend(
-            postulates
-                .iter()
-                .map(|name| format!("{module}.{name}")),
-        );
+        closure
+            .qualified_postulates
+            .extend(postulates.iter().map(|name| format!("{module}.{name}")));
         closure.modules.push(json!({
             "module": module,
             "path": path.to_string_lossy(),
@@ -2158,7 +2155,10 @@ mod tests {
             .any(|f| f.starts_with("--allow-unsolved-metas")));
         let compiled = fallback_source_scan(sys, "{-# COMPILED f g #-}\n");
         assert!(!compiled.clean, "pragma must not be stripped away");
-        assert!(compiled.findings.iter().any(|f| f.starts_with("{-# COMPILED")));
+        assert!(compiled
+            .findings
+            .iter()
+            .any(|f| f.starts_with("{-# COMPILED")));
     }
 
     /// ALIAS EXPANSION. Every flag here turns a checker off, exactly as
@@ -2169,7 +2169,10 @@ mod tests {
     fn renamed_agda_hatches_are_caught() {
         let sys = FormalSystem::Agda;
         for (code, expected) in [
-            ("{-# OPTIONS --type-in-type #-}\nthm : Set\n", "--type-in-type"),
+            (
+                "{-# OPTIONS --type-in-type #-}\nthm : Set\n",
+                "--type-in-type",
+            ),
             ("{-# OPTIONS --unsafe #-}\nthm : Set\n", "--unsafe"),
             (
                 "{-# OPTIONS --no-termination-check #-}\nthm : Set\n",
@@ -2483,7 +2486,9 @@ mod tests {
         // A file with a hundred holes must not be able to stretch the gate.
         let visible = (0..100)
             .map(|id| {
-                format!(r#"{{"constraintObj":{{"id":{id},"range":[]}},"kind":"OfType","type":"Nat"}}"#)
+                format!(
+                    r#"{{"constraintObj":{{"id":{id},"range":[]}},"kind":"OfType","type":"Nat"}}"#
+                )
             })
             .collect::<Vec<_>>()
             .join(",");
@@ -2563,9 +2568,7 @@ mod tests {
         // argument to it, so it is byte-identical whatever the enrichment did.
         let signal = ExternalBackend::new(&Config::default(), FormalSystem::Agda, true)
             .compile_success_signal();
-        let verdict = |stdout: &str, code_zero: bool| {
-            signal.is_pass(true, code_zero, stdout, "")
-        };
+        let verdict = |stdout: &str, code_zero: bool| signal.is_pass(true, code_zero, stdout, "");
         let pass = verdict("", true);
         let fail = verdict("Generated.agda:3,1-4: error", false);
         assert!(pass && !fail, "batch --safe decides pass/fail on its own");
@@ -2713,7 +2716,11 @@ mod tests {
 
         // A resolvable closure hashes, and nested includes are followed.
         std::fs::write(tmp.path().join("base.mm"), "ax1 $a |- ph $.\n").unwrap();
-        std::fs::write(tmp.path().join("mid.mm"), "$[ base.mm $]\nax2 $a |- ps $.\n").unwrap();
+        std::fs::write(
+            tmp.path().join("mid.mm"),
+            "$[ base.mm $]\nax2 $a |- ps $.\n",
+        )
+        .unwrap();
         let closure = metamath_include_closure(tmp.path(), "$[ mid.mm $]\n");
         assert!(closure.unresolved.is_empty());
         assert_eq!(closure.files.len(), 2, "nested include must be walked");
@@ -2743,7 +2750,12 @@ mod tests {
         // Exit 0 with no sentinel at all is likewise not a pass.
         assert!(!signal.is_pass(true, true, "", ""));
         // Only the explicit success sentinel passes.
-        assert!(signal.is_pass(true, true, "All proofs in the database were verified in 0.01 s.", ""));
+        assert!(signal.is_pass(
+            true,
+            true,
+            "All proofs in the database were verified in 0.01 s.",
+            ""
+        ));
         // And that verdict, not the exit code, is what the re-check reports.
         assert_eq!(cross_checked_verdict(false, None), (false, false));
     }
@@ -2828,7 +2840,10 @@ mod tests {
             entry: "Generated".into(),
         };
         let provenance = backend.provenance(Some(&ws));
-        assert_eq!(provenance["source_sha256"], json!(sha256_hex(code.as_bytes())));
+        assert_eq!(
+            provenance["source_sha256"],
+            json!(sha256_hex(code.as_bytes()))
+        );
         // No includes: the closure is complete and empty, so it still hashes.
         assert!(provenance["dependency_sha256"].is_string());
     }
@@ -2881,8 +2896,7 @@ mod tests {
         )
         .unwrap();
         let source = agda_map(&[("Lib", "Lib.agda"), ("Deep", "Deep.agda")]);
-        let closure =
-            agda_import_closure(tmp.path(), &source, &["Lib".to_string()]);
+        let closure = agda_import_closure(tmp.path(), &source, &["Lib".to_string()]);
         assert!(closure.unresolved.is_empty(), "{:?}", closure.unresolved);
         assert_eq!(
             closure.qualified_postulates,
@@ -2921,11 +2935,7 @@ mod tests {
             "module A where\nopen import B\npostulate\n  fromA : Set\n",
         )
         .unwrap();
-        std::fs::write(
-            tmp.path().join("B.agda"),
-            "module B where\nopen import A\n",
-        )
-        .unwrap();
+        std::fs::write(tmp.path().join("B.agda"), "module B where\nopen import A\n").unwrap();
         let source = agda_map(&[("A", "A.agda"), ("B", "B.agda")]);
         let closure = agda_import_closure(tmp.path(), &source, &["A".to_string()]);
         assert!(closure.unresolved.is_empty(), "{:?}", closure.unresolved);
@@ -2941,11 +2951,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
 
         // 1. The module is not listed in the map.
-        let closure = agda_import_closure(
-            tmp.path(),
-            &agda_map(&[]),
-            &["Missing.Module".to_string()],
-        );
+        let closure =
+            agda_import_closure(tmp.path(), &agda_map(&[]), &["Missing.Module".to_string()]);
         assert_eq!(closure.unresolved.len(), 1);
         assert!(closure.unresolved[0].contains("not listed"));
         assert_eq!(agda_axiom_verdict(false, true, true), ("incomplete", false));
@@ -3017,8 +3024,7 @@ mod tests {
 
         // An import outside the declared closure is unresolvable without a map,
         // which is the pre-existing fail-closed behaviour.
-        let closure =
-            agda_import_closure(tmp.path(), &absent, &["Some.Untrusted.Lib".to_string()]);
+        let closure = agda_import_closure(tmp.path(), &absent, &["Some.Untrusted.Lib".to_string()]);
         assert_eq!(closure.unresolved.len(), 1);
         assert!(closure.unresolved[0].contains("no resolved Agda module map"));
         assert!(!agda_axiom_verdict(false, true, true).1);
@@ -3102,7 +3108,10 @@ mod tests {
         assert_eq!(report.axioms, Vec::<String>::new());
         assert_eq!(report.detail["local_postulates"], json!([]));
         assert_eq!(report.detail["imports"], json!(["Lib"]));
-        assert_eq!(report.detail["imports_outside_declared_closure"], json!(["Lib"]));
+        assert_eq!(
+            report.detail["imports_outside_declared_closure"],
+            json!(["Lib"])
+        );
         // The pre-existing null-with-reason shape is unchanged with no map.
         assert_eq!(
             report.detail["transitive_imported_postulates"]["unavailable"],

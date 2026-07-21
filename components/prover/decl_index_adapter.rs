@@ -275,7 +275,10 @@ impl<W: DeclWorker> PythonDeclIndex<W> {
             return Err(classify(
                 detail,
                 IndexErrorKind::Other,
-                format!("the decl_index worker ({tier} tier) reported failure: {}", clip(detail)),
+                format!(
+                    "the decl_index worker ({tier} tier) reported failure: {}",
+                    clip(detail)
+                ),
             ));
         }
 
@@ -661,7 +664,9 @@ mod tests {
     fn an_ok_false_envelope_is_an_error_never_ok_none() {
         // Non-zero exit AND ok:false — the worker's own dispatch failure.
         let body = json!({"ok": false, "error": "unknown tool: decl_index"}).to_string();
-        let idx = index(FakeWorker::responses(vec![Ok(tool_result(&body, false, ""))]));
+        let idx = index(FakeWorker::responses(vec![Ok(tool_result(
+            &body, false, "",
+        ))]));
         let e = assert_error_kind(
             idx.lookup_in_library(FormalSystem::Lean, "Nat.nope"),
             IndexErrorKind::Other,
@@ -720,7 +725,11 @@ mod tests {
 
     #[test]
     fn no_output_at_all_is_an_error_never_ok_none() {
-        let idx = index(FakeWorker::responses(vec![Ok(tool_result("   \n", false, "Traceback"))]));
+        let idx = index(FakeWorker::responses(vec![Ok(tool_result(
+            "   \n",
+            false,
+            "Traceback",
+        ))]));
         assert_error_kind(
             idx.lookup_in_library(FormalSystem::Lean, "Nat.nope"),
             IndexErrorKind::Malformed,
@@ -812,7 +821,10 @@ mod tests {
                     "",
                 ))],
             ),
-            ("malformed json", vec![Ok(tool_result("<html>500</html>", true, ""))]),
+            (
+                "malformed json",
+                vec![Ok(tool_result("<html>500</html>", true, ""))],
+            ),
             (
                 "timeout",
                 vec![Ok(tool_result(
@@ -950,7 +962,10 @@ mod tests {
             ("lean dump timed out after 300.0s", IndexErrorKind::Timeout),
             ("lake not found", IndexErrorKind::ToolchainUnavailable),
             ("lean not found", IndexErrorKind::ToolchainUnavailable),
-            ("no such file or directory", IndexErrorKind::ToolchainUnavailable),
+            (
+                "no such file or directory",
+                IndexErrorKind::ToolchainUnavailable,
+            ),
             ("something else entirely", IndexErrorKind::IndexMissing),
         ];
         for (diagnostic, expected) in cases {

@@ -602,11 +602,7 @@ impl LeanBackend {
         let (content, first_appended_line) = append_elaboration_probe(&base, decl);
         let probe_file = format!("{MODULE}_elab.lean");
         std::fs::write(root.join(&probe_file), content).ok()?;
-        let out = exec::run(
-            &self.runner,
-            &[&self.lean, "--json", &probe_file],
-            root,
-        );
+        let out = exec::run(&self.runner, &[&self.lean, "--json", &probe_file], root);
         if !out.success() {
             return None;
         }
@@ -811,10 +807,7 @@ fn parse_lean_binders(binders: &str) -> Vec<LeanBinder> {
         let (names, ty) = match ty_part {
             // `[Group G]` / `[Fact (0 < n)]` — anonymous: the whole group is type.
             None => (Vec::new(), name_part.iter().collect::<String>()),
-            Some(t) => (
-                split_lean_idents(name_part),
-                t.iter().collect::<String>(),
-            ),
+            Some(t) => (split_lean_idents(name_part), t.iter().collect::<String>()),
         };
         out.push(LeanBinder {
             names,
@@ -873,7 +866,9 @@ fn lean_head_ident(ty: &str) -> Option<String> {
         i += 1;
     }
     let start = i;
-    while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '\'' || chars[i] == '.') {
+    while i < chars.len()
+        && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '\'' || chars[i] == '.')
+    {
         i += 1;
     }
     if i == start {
@@ -892,8 +887,8 @@ fn lean_head_ident(ty: &str) -> Option<String> {
 /// function/dependent-function binders as hypotheses. `∃` IS included: `Exists`
 /// is a `Prop` unconditionally.
 const PROP_TOKENS: &[&str] = &[
-    "=", "≠", "<", ">", "≤", "≥", "∈", "∉", "⊆", "⊂", "⊇", "∣", "∤", "∧", "∨",
-    "↔", "¬", "≡", "≅", "∃", "≫", "≪",
+    "=", "≠", "<", ">", "≤", "≥", "∈", "∉", "⊆", "⊂", "⊇", "∣", "∤", "∧", "∨", "↔", "¬", "≡", "≅",
+    "∃", "≫", "≪",
 ];
 
 /// Type heads that are `Prop`-valued in Lean core / the logical prelude.
@@ -904,8 +899,23 @@ const PROP_TOKENS: &[&str] = &[
 /// [`crate::prover::hypothesis_audit`] layer's business, allowlisted via
 /// [`DESIGNATED_INPUTS_ENV`], not something this bundle parser should guess at.
 const PROP_HEADS: &[&str] = &[
-    "Eq", "Ne", "Not", "And", "Or", "Iff", "Xor", "True", "False", "Exists",
-    "LT.lt", "LE.le", "GT.gt", "GE.ge", "Dvd.dvd", "Membership.mem", "Nonempty",
+    "Eq",
+    "Ne",
+    "Not",
+    "And",
+    "Or",
+    "Iff",
+    "Xor",
+    "True",
+    "False",
+    "Exists",
+    "LT.lt",
+    "LE.le",
+    "GT.gt",
+    "GE.ge",
+    "Dvd.dvd",
+    "Membership.mem",
+    "Nonempty",
 ];
 
 /// The split heuristic: is this binder type `Prop`-shaped (a hypothesis) rather
@@ -1253,9 +1263,7 @@ fn is_ill_typed(detail: &str) -> bool {
 /// never consulted for anything but the string `#check` prints, so it introduces
 /// no axiom anywhere a proof could reach it.
 fn reelaboration_probe_source(preamble: &str, pinned_form: &str) -> String {
-    format!(
-        "{preamble}\n{AUTO_IMPLICIT_OFF}\naxiom {REELABORATION_DECL} :\n{pinned_form}\n"
-    )
+    format!("{preamble}\n{AUTO_IMPLICIT_OFF}\naxiom {REELABORATION_DECL} :\n{pinned_form}\n")
 }
 
 /// The control probe source: the same preamble and the same options, carrying a
@@ -1335,8 +1343,7 @@ pub fn reelaborate_pinned_statement(
     preamble: &str,
     pinned_form: &str,
 ) -> LeanReelaboration {
-    let unavailable =
-        |reason: String| LeanReelaboration::Unavailable { reason };
+    let unavailable = |reason: String| LeanReelaboration::Unavailable { reason };
 
     if pinned_form.trim().is_empty() {
         return unavailable("pinned elaborated statement form is empty".to_string());
@@ -1364,7 +1371,9 @@ pub fn reelaborate_pinned_statement(
     let root = match crate::prover::formal::live_workspace_dir(cfg, SYSTEM) {
         Ok(root) => root,
         Err(err) => {
-            return unavailable(format!("could not scaffold a re-elaboration workspace: {err}"))
+            return unavailable(format!(
+                "could not scaffold a re-elaboration workspace: {err}"
+            ))
         }
     };
 
@@ -1394,13 +1403,13 @@ pub fn reelaborate_pinned_statement(
                 ProbeOutcome::Failed(detail) if is_ill_typed(&detail) => {
                     LeanReelaboration::Rejected { detail }
                 }
-                ProbeOutcome::Failed(detail) if names_are_unresolved(&detail) => unavailable(
-                    format!(
+                ProbeOutcome::Failed(detail) if names_are_unresolved(&detail) => {
+                    unavailable(format!(
                         "the pinned form names something this context does not provide, which a \
                          missing import and a deleted constant share, so this is not evidence \
                          that the mathematics moved: {detail}"
-                    ),
-                ),
+                    ))
+                }
                 ProbeOutcome::Failed(detail) => unavailable(format!(
                     "lean refused the pinned form with an error this build does not recognize as \
                      ill-typedness, so it is not read as moved mathematics: {detail}"
@@ -1567,8 +1576,12 @@ impl FormalBackend for LeanBackend {
     /// `checker_cache` reads as UNAVAILABLE. Nothing here can turn a green red or
     /// a red green.
     fn verify(&self, cfg: &Config, code: &str, stmt: &str) -> Result<VerificationReport> {
-        let mut report =
-            self.verify_with_gates(cfg, code, stmt, crate::prover::formal::TierZeroGates::from_config(cfg))?;
+        let mut report = self.verify_with_gates(
+            cfg,
+            code,
+            stmt,
+            crate::prover::formal::TierZeroGates::from_config(cfg),
+        )?;
         if self.mock || !report.live || !report.lexically_verified || !elaboration_probe_enabled() {
             return Ok(report);
         }
@@ -1776,8 +1789,8 @@ impl FormalBackend for LeanBackend {
     fn hypothesis_bundle(&self, stmt: &str) -> Option<crate::prover::vacuity::HypothesisBundle> {
         use crate::prover::vacuity::{HypothesisBundle, HypothesisField};
 
-        let sig = crate::prover::statement_preservation::check_statement_preserved(stmt, "")
-            .canonical?;
+        let sig =
+            crate::prover::statement_preservation::check_statement_preserved(stmt, "").canonical?;
         // Only a proposition-bearing declaration has a hypothesis bundle. A `def`
         // (or anything else the signature parser accepts) is not our business.
         if !matches!(sig.kind.as_str(), "theorem" | "lemma" | "example") {
@@ -1940,7 +1953,10 @@ mod tier0_tests {
             ("theorem t : P := by decide +native\n", "+native"),
             ("theorem t : P := by decide +kernel +native\n", "+native"),
             ("theorem t : P := sorryAx _ false\n", "sorryAx"),
-            ("theorem t : P := by exact Lean.ofReduceNat h\n", "ofReduceNat"),
+            (
+                "theorem t : P := by exact Lean.ofReduceNat h\n",
+                "ofReduceNat",
+            ),
         ] {
             let report = fallback_source_scan(code);
             assert!(!report.clean, "alias must be caught: {code:?}");
@@ -1979,12 +1995,15 @@ mod tier0_tests {
     /// export, and nothing in the kernel or the axiom audit reports it.
     #[test]
     fn open_private_is_flagged() {
-        let report = fallback_source_scan("open private secretLemma in\ntheorem t : P := by\n  exact secretLemma\n");
+        let report = fallback_source_scan(
+            "open private secretLemma in\ntheorem t : P := by\n  exact secretLemma\n",
+        );
         assert!(!report.clean);
         assert!(report.findings.iter().any(|f| f == "open private"));
         // Line-broken between the two words: whitespace normalization means the
         // pattern still bites.
-        let split = fallback_source_scan("open\n  private secretLemma in\ntheorem t : P := trivial\n");
+        let split =
+            fallback_source_scan("open\n  private secretLemma in\ntheorem t : P := trivial\n");
         assert!(split.findings.iter().any(|f| f == "open private"));
     }
 
@@ -2011,7 +2030,10 @@ mod tier0_tests {
         let b = bundle("theorem pos (n : Nat) (hn : n > 0) : n ≠ 0")
             .expect("a well-formed Lean signature must parse");
         assert_eq!(b.goal, "pos");
-        assert!(!b.is_trivial(), "a Prop hypothesis makes the bundle non-trivial");
+        assert!(
+            !b.is_trivial(),
+            "a Prop hypothesis makes the bundle non-trivial"
+        );
 
         let hyps: Vec<_> = b.hypotheses().collect();
         assert_eq!(hyps.len(), 1, "fields: {:?}", b.fields);
@@ -2032,8 +2054,8 @@ mod tier0_tests {
     /// the vacuity check is clean without one.
     #[test]
     fn pure_data_signature_is_a_trivial_bundle() {
-        let b = bundle("theorem id_eq (α : Type) (f : Nat → Nat) (x : α) : x = x")
-            .expect("must parse");
+        let b =
+            bundle("theorem id_eq (α : Type) (f : Nat → Nat) (x : α) : x = x").expect("must parse");
         assert!(b.is_trivial(), "no Prop binder here: {:?}", b.fields);
         assert_eq!(b.fields.len(), 3);
         assert!(b.fields.iter().all(|f| f.kind == FieldKind::Datum));
@@ -2050,7 +2072,10 @@ mod tier0_tests {
             "not a declaration at all",
             "∀ n : Nat, n = n",
         ] {
-            assert!(bundle(stmt).is_none(), "must not guess a bundle for `{stmt}`");
+            assert!(
+                bundle(stmt).is_none(),
+                "must not guess a bundle for `{stmt}`"
+            );
         }
         // A `def` is not a proposition-bearing declaration either.
         assert!(bundle("def twice (n : Nat) : Nat := n + n").is_none());
@@ -2070,8 +2095,8 @@ mod tier0_tests {
     /// shape is `hypothesis_audit`'s `Opaque` mechanism on the other gate.
     #[test]
     fn bare_named_proposition_errs_toward_datum() {
-        let b = bundle("theorem cond (hR : RiemannHypothesis) (n : Nat) : n = n")
-            .expect("must parse");
+        let b =
+            bundle("theorem cond (hR : RiemannHypothesis) (n : Nat) : n = n").expect("must parse");
         assert!(b.is_trivial(), "bias is toward Datum: {:?}", b.fields);
         assert!(check_vacuity(&b, None).clean, "must not fail a good proof");
     }
@@ -2206,7 +2231,10 @@ theorem phi3 (hG : Glaisher3) : True := trivial
             "an empty allowlist must fail closed, not pass silently: {:#?}",
             on.detail
         );
-        assert_eq!(on.detail["tier0"]["hypothesis_audit"]["enforced"], json!(true));
+        assert_eq!(
+            on.detail["tier0"]["hypothesis_audit"]["enforced"],
+            json!(true)
+        );
     }
 
     /// The channel is not broken, only unpopulated: declaring the antecedent on
@@ -2329,7 +2357,10 @@ mod elaboration_tests {
             .expect("the captured lean 4.32.0 output must parse");
         assert!(form.starts_with("∀ (x : Nat)"), "{form}");
         assert!(form.contains("@GT.gt.{0} Nat instLTNat"), "{form}");
-        assert!(!form.contains("algebra_5778"), "the name must not be in the form: {form}");
+        assert!(
+            !form.contains("algebra_5778"),
+            "the name must not be in the form: {form}"
+        );
     }
 
     /// A RENAME must not move the form, or the discriminator cannot tell "your
@@ -2341,7 +2372,10 @@ mod elaboration_tests {
         assert_eq!(a, b);
         assert_eq!(a, "@Eq.{1} Nat x y");
         // Universe-parameterized names still split at the first ` : `.
-        assert_eq!(strip_check_prefix("foo.{u_1} : Type u_1").unwrap(), "Type u_1");
+        assert_eq!(
+            strip_check_prefix("foo.{u_1} : Type u_1").unwrap(),
+            "Type u_1"
+        );
         assert!(strip_check_prefix("no separator here").is_none());
     }
 
@@ -2405,7 +2439,8 @@ mod elaboration_tests {
     /// parsed by the same parser, with the name stripped the same way.
     #[test]
     fn the_pin_and_the_re_elaboration_share_one_probe_mechanism() {
-        let (pin_content, pin_line) = append_elaboration_probe("import Mathlib\ntheorem t : True := trivial\n", "t");
+        let (pin_content, pin_line) =
+            append_elaboration_probe("import Mathlib\ntheorem t : True := trivial\n", "t");
         let (re_content, re_line) = append_elaboration_probe(
             &reelaboration_probe_source("import Mathlib", "True"),
             REELABORATION_DECL,
@@ -2459,7 +2494,10 @@ mod elaboration_tests {
             ProbeOutcome::Failed("type mismatch".to_string())
         );
         assert_eq!(probe_outcome_from_json("", 4), ProbeOutcome::NoAnswer);
-        assert_eq!(probe_outcome_from_json("not json\n", 1), ProbeOutcome::NoAnswer);
+        assert_eq!(
+            probe_outcome_from_json("not json\n", 1),
+            ProbeOutcome::NoAnswer
+        );
         // And the pin path's wrapper still sees exactly `None` for both failures.
         assert_eq!(elaborated_form_from_json(err, 4), None);
         assert_eq!(elaborated_form_from_json("", 4), None);

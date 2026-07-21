@@ -692,8 +692,7 @@ pub fn saturate_spec(
 
     let mut caveats = vec![
         "search outcome only: no formal system checked this derivation".to_string(),
-        "the inference rules were supplied by the caller and were not validated"
-            .to_string(),
+        "the inference rules were supplied by the caller and were not validated".to_string(),
     ];
     if hit_step_bound {
         caveats.push(format!(
@@ -1064,10 +1063,7 @@ mod tests {
             &node,
             &["⊢ a".to_string()],
             "⊢ goal",
-            &[
-                "r1 : a => ⊢ b".to_string(),
-                "r2 : b => ⊢ goal".to_string(),
-            ],
+            &["r1 : a => ⊢ b".to_string(), "r2 : b => ⊢ goal".to_string()],
             &cfg(),
         )
         .unwrap();

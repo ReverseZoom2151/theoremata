@@ -88,8 +88,7 @@ pub fn headers_preserved(
 }
 
 pub fn guard_lean_round_trip(before_src: &str, after_src: &str) -> StatementGuardReport {
-    let mut report =
-        headers_preserved(&snapshot_headers(before_src), &snapshot_headers(after_src));
+    let mut report = headers_preserved(&snapshot_headers(before_src), &snapshot_headers(after_src));
     report.definitions = definitions_preserved(
         &snapshot_definitions(before_src),
         &snapshot_definitions(after_src),
@@ -350,7 +349,9 @@ pub fn snapshot_definitions(lean_src: &str) -> Vec<DefinitionBody> {
                 continue;
             }
             if indent_width(later) <= indent
-                && DECL_STARTERS.iter().any(|k| starts_with_word(later_head, k))
+                && DECL_STARTERS
+                    .iter()
+                    .any(|k| starts_with_word(later_head, k))
             {
                 end = j;
                 break;
@@ -670,7 +671,8 @@ mod tests {
     #[test]
     fn reformatted_identical_definition_passes() {
         let before = "def twice (n : Nat) : Nat := n + n\n";
-        let after = "-- a doc line\ndef twice (n : Nat) : Nat :=\n    n + n   /- trailing note -/\n";
+        let after =
+            "-- a doc line\ndef twice (n : Nat) : Nat :=\n    n + n   /- trailing note -/\n";
         let report = guard_lean_round_trip(before, after);
         assert!(
             report.definitions.preserved,
@@ -684,8 +686,10 @@ mod tests {
     /// change on its LAST line is still seen.
     #[test]
     fn multi_line_definition_body_change_is_caught() {
-        let before = "def f (n : Nat) : Nat :=\n  let k := n + 1\n  k * 2\n\ntheorem T : True := trivial\n";
-        let after = "def f (n : Nat) : Nat :=\n  let k := n + 1\n  k * 3\n\ntheorem T : True := trivial\n";
+        let before =
+            "def f (n : Nat) : Nat :=\n  let k := n + 1\n  k * 2\n\ntheorem T : True := trivial\n";
+        let after =
+            "def f (n : Nat) : Nat :=\n  let k := n + 1\n  k * 3\n\ntheorem T : True := trivial\n";
         let report = guard_lean_round_trip(before, after);
         assert_eq!(report.definitions.changed, vec!["f".to_string()]);
     }
@@ -761,7 +765,9 @@ mod tests {
     /// `definition` must not be read as `def`, and nothing here is a definition.
     #[test]
     fn word_boundaries_are_respected() {
-        assert!(snapshot_definitions("-- definition of A\ntheorem T : True := trivial\n").is_empty());
+        assert!(
+            snapshot_definitions("-- definition of A\ntheorem T : True := trivial\n").is_empty()
+        );
         assert!(starts_with_word("def A", "def"));
         assert!(!starts_with_word("definition A", "def"));
     }

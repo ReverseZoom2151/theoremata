@@ -217,10 +217,7 @@ impl MinimizeOutcome {
 /// and the checker (stale nodes, edges recorded before a later failure, a
 /// transposition that merged two states the checker distinguishes) makes the short
 /// path a guess. Use [`minimize_proof_checked`] when a gate is available.
-pub fn minimize_proof_unverified<G: ProofGraph>(
-    graph: &G,
-    original: &[String],
-) -> MinimizeOutcome {
+pub fn minimize_proof_unverified<G: ProofGraph>(graph: &G, original: &[String]) -> MinimizeOutcome {
     let candidate = minimal_proof(graph);
     let status = match candidate {
         Some(_) => MinimizeStatus::Unverified,

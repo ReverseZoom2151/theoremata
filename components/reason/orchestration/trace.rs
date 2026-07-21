@@ -665,11 +665,17 @@ mod tests {
     fn vacuity_signal_classifies_as_vacuous_success() {
         let mut ctx = ErrorContext::from_layer(Layer::Verify, "hypothesis bundle unwitnessed");
         ctx.vacuity_unwitnessed = true;
-        assert_eq!(FailureTaxonomy::classify(&ctx), FailureClass::VacuousSuccess);
+        assert_eq!(
+            FailureTaxonomy::classify(&ctx),
+            FailureClass::VacuousSuccess
+        );
 
         // Beats kernel_rejected...
         ctx.kernel_rejected = true;
-        assert_eq!(FailureTaxonomy::classify(&ctx), FailureClass::VacuousSuccess);
+        assert_eq!(
+            FailureTaxonomy::classify(&ctx),
+            FailureClass::VacuousSuccess
+        );
 
         // ...but not a timeout (an unfinished run has no success to call vacuous).
         ctx.timed_out = true;

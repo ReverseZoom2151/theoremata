@@ -453,8 +453,13 @@ pub fn synthesize(
     let known: BTreeSet<String> = BTreeSet::new();
     let proposer = ModelDefinitionProposer { provider };
     let screen = ModelDefinitionScreen { provider };
-    let report =
-        synthesize_definitions(statement, &known, &proposer, &screen, &SynthConfig::default());
+    let report = synthesize_definitions(
+        statement,
+        &known,
+        &proposer,
+        &screen,
+        &SynthConfig::default(),
+    );
 
     let recommended = report
         .synthesized

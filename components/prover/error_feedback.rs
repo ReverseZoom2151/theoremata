@@ -266,7 +266,9 @@ fn parse_lean(raw: &str) -> Vec<Diagnostic> {
                     // `Diagnostic` stores 1-based columns. Convert, or every
                     // `<error>` span opens one character early (e.g. on the space
                     // before the offending token).
-                    let l = rest.rsplit_once(':').and_then(|(_, l)| l.trim().parse().ok());
+                    let l = rest
+                        .rsplit_once(':')
+                        .and_then(|(_, l)| l.trim().parse().ok());
                     (l, c0.map(|c| c + 1), c1.map(|c| c + 1))
                 }
                 None => (None, None, None),
@@ -527,7 +529,11 @@ fn after_marker<'a>(haystack: &'a str, marker: &str) -> Option<&'a str> {
 
 /// The leading run of ASCII digits parsed as a `usize`.
 fn leading_usize(s: &str) -> Option<usize> {
-    let digits: String = s.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+    let digits: String = s
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     digits.parse().ok()
 }
 
@@ -570,12 +576,7 @@ fn gutter(width: usize, n: usize, text: &str) -> String {
     format!("{:>width$} | {}\n", n, text, width = width)
 }
 
-fn render_one(
-    source_lines: &[&str],
-    d: &Diagnostic,
-    cfg: &FeedbackConfig,
-    index: usize,
-) -> String {
+fn render_one(source_lines: &[&str], d: &Diagnostic, cfg: &FeedbackConfig, index: usize) -> String {
     let mut out = String::new();
     let where_ = match (d.line, d.col_start) {
         (Some(l), Some(c)) => match d.col_end {
@@ -608,12 +609,7 @@ fn render_one(
         let ctx_end = (span_end + cfg.context_lines_after).min(source_lines.len() - 1);
         let width = (ctx_end + 1).to_string().len();
 
-        for (n, text) in source_lines
-            .iter()
-            .enumerate()
-            .take(li)
-            .skip(ctx_start)
-        {
+        for (n, text) in source_lines.iter().enumerate().take(li).skip(ctx_start) {
             out.push_str(&gutter(width, n + 1, text));
         }
 
@@ -669,8 +665,7 @@ fn raw_passthrough(raw: &str) -> String {
     if lines.is_empty() {
         return "[checker produced no output]\n".to_string();
     }
-    let mut out =
-        String::from("[unrecognized checker output - raw passthrough, truncated]\n");
+    let mut out = String::from("[unrecognized checker output - raw passthrough, truncated]\n");
     for l in elide(lines, RAW_PASSTHROUGH_LINES) {
         out.push_str(&l);
         out.push('\n');
@@ -760,7 +755,12 @@ mod tests {
     fn metamath_error_line_parses() {
         let raw = "?Error on line 12 of file \"Generated.mm\": Proof of \"foo\" does not verify.\nAll proofs in the database were not verified.";
         let src: String = (1..=20).map(|i| format!("step{i} $.\n")).collect();
-        let r = render_feedback(FormalSystem::Metamath, raw, &src, &FeedbackConfig::default());
+        let r = render_feedback(
+            FormalSystem::Metamath,
+            raw,
+            &src,
+            &FeedbackConfig::default(),
+        );
         assert!(r.parsed, "a `?Error` line must parse: {}", r.text);
         assert_eq!(r.diagnostics.len(), 1);
         let d = &r.diagnostics[0];
@@ -776,12 +776,7 @@ mod tests {
     #[test]
     fn unparseable_garbage_degrades_to_truncated_passthrough() {
         let garbage = "\u{1f4a5} segfault at 0xdeadbeef\n\u{ff}\u{fe}binary noise\n";
-        let r = render_feedback(
-            FormalSystem::Lean,
-            garbage,
-            SRC,
-            &FeedbackConfig::default(),
-        );
+        let r = render_feedback(FormalSystem::Lean, garbage, SRC, &FeedbackConfig::default());
         assert!(!r.parsed, "nothing should have parsed");
         assert!(r.diagnostics.is_empty());
         assert!(r.text.contains("raw passthrough, truncated"));
@@ -838,7 +833,8 @@ mod tests {
         assert_eq!(d[0].line, Some(12));
         assert_eq!((d[0].col_start, d[0].col_end), (Some(4), Some(9)));
 
-        let isa = "*** Undefined fact: \"bogus\"\n*** At command \"by\" (line 7 of \"Generated.thy\")";
+        let isa =
+            "*** Undefined fact: \"bogus\"\n*** At command \"by\" (line 7 of \"Generated.thy\")";
         let d = parse_diagnostics(FormalSystem::Isabelle, isa);
         assert_eq!(d.len(), 1, "the `At command` line locates the block: {d:?}");
         assert_eq!(d[0].line, Some(7));

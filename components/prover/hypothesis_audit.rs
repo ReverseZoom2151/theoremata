@@ -353,13 +353,7 @@ fn audit_lean(
             };
 
             if status == HypothesisStatus::Unaccounted {
-                findings.push(unaccounted_finding(
-                    &target.name,
-                    &name,
-                    &ty,
-                    &head,
-                    flavor,
-                ));
+                findings.push(unaccounted_finding(&target.name, &name, &ty, &head, flavor));
             }
 
             hypotheses.push(Hypothesis {
@@ -1254,7 +1248,10 @@ theorem phi3 (hG : Glaisher3) : True := trivial
     /// An unparseable canonical statement fails CLOSED — never clean.
     #[test]
     fn unparsable_canonical_fails_closed() {
-        let r = audit("-- just a comment, no theorem", "theorem T : True := trivial");
+        let r = audit(
+            "-- just a comment, no theorem",
+            "theorem T : True := trivial",
+        );
         assert!(!r.clean, "unparseable input must never default to clean");
         assert!(r.target.is_none());
         assert!(r.findings.iter().any(|f| f.contains("fail-closed")));

@@ -863,7 +863,9 @@ mod tests {
     fn a_failed_negation_attempt_passes_and_inconclusive_skips() {
         let not_proved = FixedNegation(ProofOutcome::NotProved);
         assert_eq!(
-            NegationCheck.run(Some(&not_proved), INFORMAL, FORMAL).status,
+            NegationCheck
+                .run(Some(&not_proved), INFORMAL, FORMAL)
+                .status,
             CheckStatus::Passed
         );
         let inconclusive = FixedNegation(ProofOutcome::Inconclusive);

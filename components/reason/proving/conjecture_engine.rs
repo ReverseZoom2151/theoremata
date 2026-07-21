@@ -476,7 +476,8 @@ pub fn run(
 
     // The authoritative proof gate lives in the Prover seam; this verifier is a
     // defensive floor that rejects an empty proof and nothing more.
-    let verifier: crate::library::VerifierFn = Box::new(|_stmt, proof: &str| !proof.trim().is_empty());
+    let verifier: crate::library::VerifierFn =
+        Box::new(|_stmt, proof: &str| !proof.trim().is_empty());
     let library = LemmaLibrary::with_subsumption_dedup(store, verifier);
 
     let engine = ConjectureEngine::new(
@@ -767,7 +768,10 @@ mod tests {
         // The survivor (first-seen provenance) is what graduated for that orbit.
         let pool = engine.library().lemmas(&pid).unwrap();
         let dup = pool.iter().find(|l| l.statement == "⊢ dup").unwrap();
-        assert_eq!(dup.provenance, "first", "the first member of the orbit survives");
+        assert_eq!(
+            dup.provenance, "first",
+            "the first member of the orbit survives"
+        );
     }
 
     #[test]
@@ -796,7 +800,10 @@ mod tests {
         );
 
         let report = engine.run(&pid).unwrap();
-        assert_eq!(report.n_deduped, 0, "nothing collapses when all are distinct");
+        assert_eq!(
+            report.n_deduped, 0,
+            "nothing collapses when all are distinct"
+        );
         assert_eq!(report.n_proposed, 3);
         assert_eq!(report.n_proved, 3);
         assert_eq!(report.n_graduated, 3);
@@ -925,7 +932,9 @@ mod tests {
     ) -> crate::portfolio::SystemAttempt {
         crate::portfolio::SystemAttempt {
             system: crate::prover::formal::FormalSystem::Lean,
-            verified: report.as_ref().is_some_and(|r| r.live && r.lexically_verified),
+            verified: report
+                .as_ref()
+                .is_some_and(|r| r.live && r.lexically_verified),
             available: true,
             code: code.map(str::to_owned),
             report,
@@ -947,7 +956,10 @@ mod tests {
     #[test]
     fn only_a_live_clean_attempt_counts_as_a_closed_proof() {
         // A live, clean, code-bearing attempt is the only thing that graduates.
-        let live = result(vec![attempt(Some("theorem t := by decide"), Some(report(true)))]);
+        let live = result(vec![attempt(
+            Some("theorem t := by decide"),
+            Some(report(true)),
+        )]);
         assert_eq!(
             live_closed_proof(&live).as_deref(),
             Some("theorem t := by decide")
@@ -956,7 +968,10 @@ mod tests {
         // A mock (live=false) pass is NOT a proof, even though every other layer
         // is clean and code is present.
         let mock = result(vec![attempt(Some("mock proof"), Some(report(false)))]);
-        assert!(live_closed_proof(&mock).is_none(), "a mock pass never graduates");
+        assert!(
+            live_closed_proof(&mock).is_none(),
+            "a mock pass never graduates"
+        );
 
         // A live pass with no code cannot graduate (nothing to admit).
         let no_code = result(vec![attempt(None, Some(report(true)))]);

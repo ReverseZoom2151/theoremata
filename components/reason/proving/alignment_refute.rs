@@ -574,11 +574,11 @@ pub fn load_corpora_pair(path: &Path) -> anyhow::Result<Option<(LibraryCorpus, L
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::alignment::{
         AlignmentStrength, ConceptShape, OperandKind, ProposedAlignment, Proposer, SymbolRef,
         Totality,
     };
+    use super::*;
     use anyhow::Result;
     use serde_json::json;
 
@@ -670,7 +670,10 @@ mod tests {
         let refuted = refute_alignment(alignment, &falsifier);
 
         assert!(refuted.refutation.is_refuted());
-        let witness = refuted.refutation.witness().expect("a refuted alignment carries a witness");
+        let witness = refuted
+            .refutation
+            .witness()
+            .expect("a refuted alignment carries a witness");
         assert_eq!(witness.point, vec!["arg0=0".to_string()]);
         assert!(witness.observed_by.starts_with("model_falsifier:"));
 
@@ -690,7 +693,10 @@ mod tests {
         let outcome = probe_alignment(&Alignment::propose(list_pair()), &falsifier);
 
         match &outcome {
-            Refutation::Unrefuted { probes_run, classes } => {
+            Refutation::Unrefuted {
+                probes_run,
+                classes,
+            } => {
                 assert!(*probes_run >= 1, "at least one probe must have run");
                 assert!(!classes.is_empty());
             }
@@ -724,7 +730,10 @@ mod tests {
         };
         let alignment = Alignment::propose(division_pair());
         // Sanity: grading did restrict the domain, so the guard is actually live.
-        assert!(matches!(alignment.strength, AlignmentStrength::AgreesOn { .. }));
+        assert!(matches!(
+            alignment.strength,
+            AlignmentStrength::AgreesOn { .. }
+        ));
 
         let outcome = probe_alignment(&alignment, &refuting_partiality);
         assert!(
@@ -792,7 +801,11 @@ mod tests {
             4,
         );
 
-        assert_eq!(out.len(), 1, "the anchored pair must surface its other side");
+        assert_eq!(
+            out.len(),
+            1,
+            "the anchored pair must surface its other side"
+        );
         assert_eq!(out[0].name(), "ITLIST_ADD");
         assert_eq!(out[0].qualified(), "hol_light::lists::ITLIST_ADD");
         assert!(out[0].weight() > 0.0 && out[0].weight() <= 1.0);
@@ -841,15 +854,10 @@ mod tests {
         )
         .is_empty());
         // And an empty retrieval list spends no falsifier runs at all.
-        assert!(steer_retrieval(
-            &left,
-            &right,
-            &MatcherConfig::default(),
-            &falsifier,
-            &[],
-            4
-        )
-        .is_empty());
+        assert!(
+            steer_retrieval(&left, &right, &MatcherConfig::default(), &falsifier, &[], 4)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -865,10 +873,12 @@ mod tests {
         let seeds = vec!["SUM".to_string()];
 
         let probed = probe_alignment(
-            &Alignment::propose(propose_alignments(&left, &right, &MatcherConfig::default())
-                .into_iter()
-                .next()
-                .expect("the fixture must propose a pair")),
+            &Alignment::propose(
+                propose_alignments(&left, &right, &MatcherConfig::default())
+                    .into_iter()
+                    .next()
+                    .expect("the fixture must propose a pair"),
+            ),
             &offline,
         );
         assert_eq!(probed.label(), "probing_unavailable");
@@ -910,7 +920,9 @@ mod tests {
     fn the_corpora_loader_fails_safe_and_rejects_a_bad_kind() {
         // A missing file is the ordinary case: no corpora, no signal, no error.
         let missing = std::path::PathBuf::from("no_such_alignment_corpora_file.json");
-        assert!(load_corpora_pair(&missing).expect("absence is not an error").is_none());
+        assert!(load_corpora_pair(&missing)
+            .expect("absence is not an error")
+            .is_none());
 
         // An unrecognised operand kind must NOT degrade to `opaque`, which is
         // compatible with everything and would widen the proposer's type gate.
@@ -936,6 +948,9 @@ mod tests {
         let before = Alignment::propose(list_pair());
         let after = refute_alignment(before.clone(), &falsifier);
         assert_eq!(after.proposal, before.proposal, "the proposal is untouched");
-        assert_eq!(after.strength, before.strength, "the grade is never promoted");
+        assert_eq!(
+            after.strength, before.strength,
+            "the grade is never promoted"
+        );
     }
 }

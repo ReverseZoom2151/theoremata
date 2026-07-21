@@ -1623,7 +1623,10 @@ mod tests {
         // And the hint attributed to s2 slices to a real substring of it.
         let assembly = run_fixed(sketch);
         let hints = assembly.hints_for_step("s2");
-        assert!(!hints.falsify_first.is_empty(), "expected a finite-check hint");
+        assert!(
+            !hints.falsify_first.is_empty(),
+            "expected a finite-check hint"
+        );
         for region in &hints.falsify_first {
             assert!(region.start >= s2.start && region.end <= s2.end);
             let _ = &text[region.start..region.end]; // panics if mid-codepoint

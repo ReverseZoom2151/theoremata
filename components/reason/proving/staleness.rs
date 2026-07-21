@@ -596,7 +596,12 @@ impl StalenessReport {
     }
 
     /// Record one classification.
-    pub fn record(&mut self, id: impl Into<String>, artifact: ArtifactClass, verdict: StalenessVerdict) {
+    pub fn record(
+        &mut self,
+        id: impl Into<String>,
+        artifact: ArtifactClass,
+        verdict: StalenessVerdict,
+    ) {
         self.entries.push(AssessedResult {
             id: id.into(),
             artifact,
@@ -765,7 +770,11 @@ mod tests {
     #[test]
     fn different_type_under_new_environment_is_mathematics_moved() {
         let r = script_result("t3", Some("pinned type"));
-        let v = assess(&r, Some(&env("mathlib@new")), Some(&elaborated("other type")));
+        let v = assess(
+            &r,
+            Some(&env("mathlib@new")),
+            Some(&elaborated("other type")),
+        );
         assert!(!v.is_repairable());
         assert!(v.withdrawal().is_some());
         match v.into_action() {
@@ -800,7 +809,11 @@ mod tests {
     #[test]
     fn every_unassessable_path_is_unknown_and_never_fresh() {
         // No resolvable environment.
-        let a = assess(&script_result("u1", Some("T")), None, Some(&elaborated("T")));
+        let a = assess(
+            &script_result("u1", Some("T")),
+            None,
+            Some(&elaborated("T")),
+        );
         // Environment moved, nothing pinned.
         let b = assess(
             &script_result("u2", None),
@@ -808,7 +821,11 @@ mod tests {
             Some(&elaborated("T")),
         );
         // Environment moved, re-elaboration not attempted.
-        let c = assess(&script_result("u3", Some("T")), Some(&env("mathlib@new")), None);
+        let c = assess(
+            &script_result("u3", Some("T")),
+            Some(&env("mathlib@new")),
+            None,
+        );
         // Environment moved, re-elaboration produced no answer.
         let d = assess(
             &script_result("u4", Some("T")),
@@ -858,8 +875,16 @@ mod tests {
         let cur = env("mathlib@new");
         let same = elaborated("same type");
 
-        let cert = assess(&cert_result("c1", Some("same type")), Some(&cur), Some(&same));
-        let script = assess(&script_result("s1", Some("same type")), Some(&cur), Some(&same));
+        let cert = assess(
+            &cert_result("c1", Some("same type")),
+            Some(&cur),
+            Some(&same),
+        );
+        let script = assess(
+            &script_result("s1", Some("same type")),
+            Some(&cur),
+            Some(&same),
+        );
 
         // Same staleness classification.
         assert!(cert.is_repairable() && script.is_repairable());
@@ -950,13 +975,33 @@ mod tests {
         report.assess_and_record(&script_result("f1", Some("T")), Some(&old), None);
         report.assess_and_record(&cert_result("f2", Some("T")), Some(&old), None);
         // 3 repair candidates, one of them a certificate (statement only).
-        report.assess_and_record(&script_result("r1", Some("T")), Some(&new), Some(&elaborated("T")));
-        report.assess_and_record(&script_result("r2", Some("T")), Some(&new), Some(&elaborated("T")));
-        report.assess_and_record(&cert_result("r3", Some("T")), Some(&new), Some(&elaborated("T")));
+        report.assess_and_record(
+            &script_result("r1", Some("T")),
+            Some(&new),
+            Some(&elaborated("T")),
+        );
+        report.assess_and_record(
+            &script_result("r2", Some("T")),
+            Some(&new),
+            Some(&elaborated("T")),
+        );
+        report.assess_and_record(
+            &cert_result("r3", Some("T")),
+            Some(&new),
+            Some(&elaborated("T")),
+        );
         // 1 mathematics moved.
-        report.assess_and_record(&script_result("m1", Some("T")), Some(&new), Some(&elaborated("U")));
+        report.assess_and_record(
+            &script_result("m1", Some("T")),
+            Some(&new),
+            Some(&elaborated("U")),
+        );
         // 2 unknown.
-        report.assess_and_record(&script_result("k1", None), Some(&new), Some(&elaborated("T")));
+        report.assess_and_record(
+            &script_result("k1", None),
+            Some(&new),
+            Some(&elaborated("T")),
+        );
         report.assess_and_record(&script_result("k2", Some("T")), None, None);
 
         let c = report.census();
@@ -974,7 +1019,10 @@ mod tests {
 
         let drift = report.drift_by_artifact();
         assert_eq!(drift.get(&ArtifactClass::TacticScript), Some(&5));
-        assert_eq!(drift.get(&ArtifactClass::SelfContainedCertificate), Some(&1));
+        assert_eq!(
+            drift.get(&ArtifactClass::SelfContainedCertificate),
+            Some(&1)
+        );
 
         assert!(report.summary().contains("8 assessed"));
     }

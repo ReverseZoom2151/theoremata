@@ -144,10 +144,7 @@ pub const ALL: &[&str] = &[
 /// an entry is what wiring a producer looks like; adding one without a real
 /// reason is visible in review, and adding one for a type that IS emitted fails
 /// the guard.
-pub const RESERVED_UNEMITTED: &[&str] = &[
-    AXIOM_AUDIT,
-    REFORMULATION_CHECK,
-];
+pub const RESERVED_UNEMITTED: &[&str] = &[AXIOM_AUDIT, REFORMULATION_CHECK];
 
 /// True when nothing in the tree writes rows of this type. Callers that render
 /// an audit trail can use this to avoid claiming coverage that does not exist.

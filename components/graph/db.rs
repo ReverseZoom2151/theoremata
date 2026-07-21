@@ -2810,7 +2810,10 @@ mod tests {
             .unwrap();
         // No evidence is a legitimate answer, never an error.
         assert!(s.evidence(&p.id, &n.id).unwrap().is_empty());
-        assert!(s.evidence_of_kind(&p.id, &n.id, "anything").unwrap().is_empty());
+        assert!(s
+            .evidence_of_kind(&p.id, &n.id, "anything")
+            .unwrap()
+            .is_empty());
         assert!(s.project_evidence(&p.id).unwrap().is_empty());
         // Likewise for a node id that does not exist at all.
         assert!(s.evidence(&p.id, "does-not-exist").unwrap().is_empty());
@@ -2843,9 +2846,7 @@ mod tests {
         }
         // The headline defect the schema exists to catch must be storable and
         // findable by kind.
-        assert!(got
-            .iter()
-            .any(|d| d.kind == "answer_baked_into_statement"));
+        assert!(got.iter().any(|d| d.kind == "answer_baked_into_statement"));
         assert_eq!(got, s.divergences(&p.id, &n.id).unwrap());
         assert!(got.windows(2).all(|w| w[0].created_at <= w[1].created_at));
 
@@ -2857,7 +2858,11 @@ mod tests {
         s.add_divergence(&p.id, &other.id, "kind_from_a_newer_schema", "preserved")
             .unwrap();
         let unknown = s.divergences(&p.id, &other.id).unwrap();
-        assert_eq!(unknown.len(), 1, "unknown kinds must round-trip, not be dropped");
+        assert_eq!(
+            unknown.len(),
+            1,
+            "unknown kinds must round-trip, not be dropped"
+        );
         assert!(!is_known_divergence_kind(&unknown[0].kind));
         assert_eq!(
             s.project_divergences(&p.id).unwrap().len(),

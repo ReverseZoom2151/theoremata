@@ -153,10 +153,7 @@ impl HypothesisBundle {
     /// as a data binder would, but that is a type-level emptiness question this
     /// pass cannot see; callers who care should state it as a hypothesis field.)
     pub fn is_trivial(&self) -> bool {
-        !self
-            .fields
-            .iter()
-            .any(|f| f.kind == FieldKind::Hypothesis)
+        !self.fields.iter().any(|f| f.kind == FieldKind::Hypothesis)
     }
 
     /// Propositional fields, in order.
@@ -1179,7 +1176,10 @@ mod tests {
                 HypothesisField::hypothesis("b", "x <= 4"),
             ],
         );
-        assert!(refute_bundle(&ok).is_empty(), "x ≥ 4 ∧ x ≤ 4 is satisfiable");
+        assert!(
+            refute_bundle(&ok).is_empty(),
+            "x ≥ 4 ∧ x ≤ 4 is satisfiable"
+        );
 
         // x > 4 and x ≤ 4 is not.
         let bad = HypothesisBundle::new(
@@ -1236,10 +1236,7 @@ mod tests {
     #[test]
     fn false_hypothesis_is_refuted() {
         for prop in ["False", "⊥", "Empty", "(False)"] {
-            let bundle = HypothesisBundle::new(
-                "g",
-                vec![HypothesisField::hypothesis("hf", prop)],
-            );
+            let bundle = HypothesisBundle::new("g", vec![HypothesisField::hypothesis("hf", prop)]);
             let cs = refute_bundle(&bundle);
             assert!(
                 cs.iter().any(|c| c.rule == "false_hypothesis"),
@@ -1378,7 +1375,11 @@ mod tests {
         let b = check_vacuity(&bundle, None);
         assert_eq!(a, b);
         // Findings are ordered by (rule, fields).
-        let keys: Vec<_> = a.findings.iter().map(|f| (f.rule, f.fields.clone())).collect();
+        let keys: Vec<_> = a
+            .findings
+            .iter()
+            .map(|f| (f.rule, f.fields.clone()))
+            .collect();
         let mut sorted = keys.clone();
         sorted.sort();
         assert_eq!(keys, sorted);
@@ -1406,7 +1407,7 @@ mod tests {
     #[test]
     fn prefix_collision_does_not_count_as_use() {
         let bundle = plausible_bundle(); // binder `hn`
-        // `hnx` is a different identifier; `hn` is still unused.
+                                         // `hnx` is a different identifier; `hn` is still unused.
         let found = detect_unused_hypotheses(&bundle, "by simpa using hnx");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].binder, "hn");

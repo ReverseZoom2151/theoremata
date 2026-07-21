@@ -465,9 +465,7 @@ impl FormalBackend for IsabelleBackend {
                     oracle_audit_theory(&target_theory, thm),
                 )
             })
-            .and_then(|_| {
-                std::fs::write(dir.join("ROOT"), oracle_audit_root(&target_theory))
-            });
+            .and_then(|_| std::fs::write(dir.join("ROOT"), oracle_audit_root(&target_theory)));
         if let Err(err) = scaffolded {
             return Ok(blocked_audit(
                 &self.runner.tag(),
@@ -797,7 +795,8 @@ mod tests {
             "this test encodes ESCAPE_HATCH_COMMENT_POLICY == CodeOnly"
         );
         // Commented-out escape hatches: the kernel never sees them -> clean.
-        let commented = "(* sorry *)\n(* avoid oops / quick_and_dirty here *)\nlemma t: \"True\" by simp\n";
+        let commented =
+            "(* sorry *)\n(* avoid oops / quick_and_dirty here *)\nlemma t: \"True\" by simp\n";
         let report = fallback_source_scan(commented);
         assert!(
             report.clean,
@@ -821,7 +820,10 @@ mod tests {
     fn renamed_isabelle_hatches_are_caught() {
         for (code, expected) in [
             ("ML \\<open>Thm.add_oracle\\<close>\n", "add_oracle"),
-            ("axiomatization bad where bad: \"False\"\n", "axiomatization"),
+            (
+                "axiomatization bad where bad: \"False\"\n",
+                "axiomatization",
+            ),
             ("axioms bad: \"False\"\n", "axioms"),
             ("ML \\<open>Thm.oracles\\<close>\n", "oracles"),
         ] {
@@ -916,9 +918,7 @@ mod tests {
             ("t", ""),
             ("t", "not a theory name.thy"),
         ] {
-            let report = backend
-                .audit_axioms(&workspace(source), thm, &[])
-                .unwrap();
+            let report = backend.audit_axioms(&workspace(source), thm, &[]).unwrap();
             assert!(
                 !report.within_whitelist,
                 "unusable input must fail closed (thm={thm:?}, source={source:?}): {report:?}"
@@ -1030,7 +1030,10 @@ mod tests {
         let report = backend
             .audit_axioms(&workspace("Scratch.thy"), "t", &[])
             .unwrap();
-        assert!(report.within_whitelist, "the mock's canned pass is offline scaffolding");
+        assert!(
+            report.within_whitelist,
+            "the mock's canned pass is offline scaffolding"
+        );
         assert_eq!(report.detail["mock"], true);
         assert_eq!(
             report.detail["live"], false,

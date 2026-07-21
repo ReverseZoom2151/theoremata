@@ -311,7 +311,11 @@ fn json_type_name(value: &Value) -> &'static str {
     }
 }
 
-fn invoke_meta_tool(registry: &MetaToolRegistry, tool: String, mut arguments: Value) -> ApiResponse {
+fn invoke_meta_tool(
+    registry: &MetaToolRegistry,
+    tool: String,
+    mut arguments: Value,
+) -> ApiResponse {
     let Some(kind) = MetaToolKind::from_name(&tool) else {
         return error("unknown_tool", format!("unknown meta-tool: {tool}"));
     };
@@ -679,13 +683,22 @@ mod tests {
             &s,
             r#"{"op":"invoke_meta_tool","tool":"plan","arguments":{"statement":"n + 0 = n","max_rounds":null,"seed":null}}"#,
         ));
-        assert_eq!(v["result"], "meta_tool_invoked", "message: {}", v["message"]);
+        assert_eq!(
+            v["result"], "meta_tool_invoked",
+            "message: {}",
+            v["message"]
+        );
         assert_eq!(v["tool"], "plan");
         assert_eq!(v["output"]["arguments"]["statement"], "n + 0 = n");
         // The null keys reach the handler as absent, so `.get(k).unwrap_or(d)`
         // style reads see the default.
-        let args = v["output"]["arguments"].as_object().expect("arguments object");
-        assert!(!args.contains_key("max_rounds"), "null key should be stripped");
+        let args = v["output"]["arguments"]
+            .as_object()
+            .expect("arguments object");
+        assert!(
+            !args.contains_key("max_rounds"),
+            "null key should be stripped"
+        );
         assert!(!args.contains_key("seed"), "null key should be stripped");
     }
 
@@ -698,9 +711,18 @@ mod tests {
             &s,
             r#"{"op":"invoke_meta_tool","tool":"critique","arguments":{"project_id":"p","node_id":null}}"#,
         ));
-        assert_eq!(v["result"], "meta_tool_invoked", "message: {}", v["message"]);
-        let args = v["output"]["arguments"].as_object().expect("arguments object");
-        assert!(args.contains_key("node_id"), "schema-permitted null must be kept");
+        assert_eq!(
+            v["result"], "meta_tool_invoked",
+            "message: {}",
+            v["message"]
+        );
+        let args = v["output"]["arguments"]
+            .as_object()
+            .expect("arguments object");
+        assert!(
+            args.contains_key("node_id"),
+            "schema-permitted null must be kept"
+        );
         assert!(args["node_id"].is_null());
     }
 

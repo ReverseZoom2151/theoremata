@@ -187,7 +187,8 @@ fn verify_lean_round_trip_inner(
     // the first workspace build resolves Mathlib's git deps over the network.
     // The switch only decides whether the check is REQUESTED; it never decides
     // the verdict.
-    let (hardening_state, hardening_clean, hardening_detail) = run_hardening(ctx, config, after_src);
+    let (hardening_state, hardening_clean, hardening_detail) =
+        run_hardening(ctx, config, after_src);
 
     // Only `Flagged` is a real soundness failure (same rule as the certify path:
     // Inconclusive/Unavailable/Skipped mean "not audited", not "unsound"), so
@@ -414,7 +415,10 @@ mod tests {
         let with = verify_lean_output(&disabled(), PROOF, "theorem t : True").unwrap();
         // Whatever the lexical screen decides offline, hardening being off must
         // not be the thing that changed it.
-        assert_eq!(with.lexically_verified, with.lexical_clean && with.axioms_clean);
+        assert_eq!(
+            with.lexically_verified,
+            with.lexical_clean && with.axioms_clean
+        );
     }
 
     // --- state 2: requested but could not run -----------------------------
@@ -500,7 +504,10 @@ mod tests {
             summary: "no Mathlib".into(),
             details: Value::Null,
         };
-        assert_eq!(state_of(&skipped), (HardeningState::CouldNotRun, Some(false)));
+        assert_eq!(
+            state_of(&skipped),
+            (HardeningState::CouldNotRun, Some(false))
+        );
     }
 
     // --- the invariant this whole path exists to protect -------------------
@@ -529,8 +536,7 @@ mod tests {
 
     #[test]
     fn round_trip_entry_point_reports_hardening_too() {
-        let report =
-            verify_lean_round_trip(&enabled(), PROOF, PROOF, "theorem t : True").unwrap();
+        let report = verify_lean_round_trip(&enabled(), PROOF, PROOF, "theorem t : True").unwrap();
         assert_eq!(
             report_detail(&report).get("state").and_then(Value::as_str),
             Some("requested_but_could_not_run")
@@ -591,11 +597,7 @@ mod tests {
         let (project_id, node_id) = node(&store);
         // An empty id is not a node. Both halves are required together, so each
         // of these must behave exactly like the storeless path: no row.
-        for (p, n) in [
-            ("", node_id.as_str()),
-            (project_id.as_str(), ""),
-            ("", ""),
-        ] {
+        for (p, n) in [("", node_id.as_str()), (project_id.as_str(), ""), ("", "")] {
             let ctx = HardeningContext {
                 store: &store,
                 project_id: p,
@@ -636,8 +638,7 @@ mod tests {
         let rows = store.evidence(&project_id, &node_id).unwrap();
         assert_eq!(
             rows.iter()
-                .filter(|e| e.evidence_type
-                    == crate::graph::evidence::EXTERNAL_PRODUCER_CHECKED)
+                .filter(|e| e.evidence_type == crate::graph::evidence::EXTERNAL_PRODUCER_CHECKED)
                 .count(),
             1,
             "the literal `kind` and the registry constant must not drift apart"

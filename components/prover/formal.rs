@@ -715,9 +715,8 @@ pub trait FormalBackend {
         // own signature. Non-Lean systems report NOT APPLICABLE (clean, so this
         // never regresses a backend we cannot parse).
         let allowlist = self.designated_inputs();
-        let hypotheses = crate::prover::hypothesis_audit::audit_hypotheses(
-            system, stmt, code, &allowlist,
-        );
+        let hypotheses =
+            crate::prover::hypothesis_audit::audit_hypotheses(system, stmt, code, &allowlist);
         let hypotheses_discharged = hypotheses.clean;
 
         // --- Tier 0: vacuous-success guard -----------------------------------
@@ -1140,8 +1139,10 @@ fn contains_hatch_token(lowered: &[char], token: &str) -> bool {
             continue;
         }
         let before_ok = !head_is_word || i == 0 || !is_hatch_word(lowered[i - 1]);
-        let after_ok =
-            !tail_is_word || lowered.get(i + n.len()).map_or(true, |&c| !is_hatch_word(c));
+        let after_ok = !tail_is_word
+            || lowered
+                .get(i + n.len())
+                .map_or(true, |&c| !is_hatch_word(c));
         if before_ok && after_ok {
             return true;
         }
@@ -1846,19 +1847,23 @@ theorem phi3 (hG : Glaisher3) : True := trivial
             inputs: vec!["Glaisher3".to_string()],
             ..Default::default()
         };
-        assert!(by_head
-            .verify_with_gates(&cfg, COND_CODE, COND_STMT, gates)
-            .unwrap()
-            .lexically_verified);
+        assert!(
+            by_head
+                .verify_with_gates(&cfg, COND_CODE, COND_STMT, gates)
+                .unwrap()
+                .lexically_verified
+        );
         // ...and by binder name.
         let by_binder = GateTestBackend {
             inputs: vec!["hG".to_string()],
             ..Default::default()
         };
-        assert!(by_binder
-            .verify_with_gates(&cfg, COND_CODE, COND_STMT, gates)
-            .unwrap()
-            .lexically_verified);
+        assert!(
+            by_binder
+                .verify_with_gates(&cfg, COND_CODE, COND_STMT, gates)
+                .unwrap()
+                .lexically_verified
+        );
     }
 
     /// GATE ON: a declared bundle with no witness fails closed.
@@ -1922,10 +1927,12 @@ theorem phi3 (hG : Glaisher3) : True := trivial
             ),
         };
         let cfg = Config::default();
-        assert!(!backend
-            .verify_with_gates(&cfg, COND_CODE, COND_STMT, TierZeroGates::ON)
-            .unwrap()
-            .lexically_verified);
+        assert!(
+            !backend
+                .verify_with_gates(&cfg, COND_CODE, COND_STMT, TierZeroGates::ON)
+                .unwrap()
+                .lexically_verified
+        );
     }
 
     /// An UNDECLARED bundle is reported as such and never fails closed on a

@@ -20,24 +20,22 @@ mod verify;
 pub use graph::{citation, db, model, scheduler};
 pub use prover::{
     aristotle, attempt_run, axiom_audit, decl_index_adapter, declaration_lookup, error_feedback,
-    exec, formal, goal_state,
-    hypothesis_audit, isabelle, lean, proof_job, proof_log, rocq, statement_preservation, subgoal_extract, vacuity,
+    exec, formal, goal_state, hypothesis_audit, isabelle, lean, proof_job, proof_log, rocq,
+    statement_preservation, subgoal_extract, vacuity,
 };
 pub use reason::{
-    agent, alignment, alignment_propose, alignment_refute,
-    best_first, blueprint, blueprint_generate, blueprint_run, certification, chat,
-    checker_cache, concurrent, conjecture_engine, consolidate, context_assembly, critic,
-    critic_scorer, dag_projection, decompose, decomposition_admission, definition_synthesis,
-    discovery_game,
-    distance_critic, driver, evolve_sketch, falsification, fitness, formal_generate,
-    formalize_modes, formalize_portfolio, goal_cache, graph_rag, guard, guardrails, hybrid_search,
-    informal_defect_prior,
-    inverse_method, library, live_plan, mathlib_export, mcts, memory, meta_tools, method_transfer,
-    minimize, model_elimination, model_router, observe, optimize, plan_history, portfolio,
-    preference_pairs, process_reward, progress, proof_import, proof_pool, refine_ops, repair,
-    research, retry, rewriting, router, sampler, sampling, search_telemetry, skest, sketch,
-    statement_validation, statement_validity, subsumption, symmetry_dedup, tactic_outcome, taint,
-    team, trace, ttc, validity_seams, verification_ladder,
+    agent, alignment, alignment_propose, alignment_refute, best_first, blueprint,
+    blueprint_generate, blueprint_run, certification, chat, checker_cache, concurrent,
+    conjecture_engine, consolidate, context_assembly, critic, critic_scorer, dag_projection,
+    decompose, decomposition_admission, definition_synthesis, discovery_game, distance_critic,
+    driver, evolve_sketch, falsification, fitness, formal_generate, formalize_modes,
+    formalize_portfolio, goal_cache, graph_rag, guard, guardrails, hybrid_search,
+    informal_defect_prior, inverse_method, library, live_plan, mathlib_export, mcts, memory,
+    meta_tools, method_transfer, minimize, model_elimination, model_router, observe, optimize,
+    plan_history, portfolio, preference_pairs, process_reward, progress, proof_import, proof_pool,
+    refine_ops, repair, research, retry, rewriting, router, sampler, sampling, search_telemetry,
+    skest, sketch, statement_validation, statement_validity, subsumption, symmetry_dedup,
+    tactic_outcome, taint, team, trace, ttc, validity_seams, verification_ladder,
 };
 pub use verify::{hardening, lean_session};
 
@@ -1125,12 +1123,8 @@ pub fn run() -> Result<()> {
             let tools = router::ToolAvailability {
                 python: PythonCheck::new().available(),
                 lean: LeanCheck::new(&config).available(),
-                formal_verifier: prover::formal::backend_for(
-                    &config,
-                    config.target_system,
-                    false,
-                )
-                .available(),
+                formal_verifier: prover::formal::backend_for(&config, config.target_system, false)
+                    .available(),
                 mathlib_search: MathlibSearch::new(&config).available(),
                 model: model_ready,
                 external_prover: proof_job::any_prover_available(&config, model_ready),
@@ -1490,9 +1484,7 @@ pub fn run() -> Result<()> {
                 &preference_pairs::mine_critic_pairs(&store, &project, &branches)?,
             )?
         }
-        Command::ProofLogCheck { file } => {
-            print_value(true, &proof_log::check_log_file(&file)?)?
-        }
+        Command::ProofLogCheck { file } => print_value(true, &proof_log::check_log_file(&file)?)?,
         Command::AlphaSweep {
             statement,
             project,
@@ -1533,8 +1525,12 @@ pub fn run() -> Result<()> {
             // certify something.
             let request = match op.as_str() {
                 "probe" => serde_json::json!({"tool": "wolfram_link", "op": "available"}),
-                "evaluate" => serde_json::json!({"tool": "wolfram_link", "op": "evaluate", "code": input}),
-                "alpha" => serde_json::json!({"tool": "wolfram_alpha", "op": "query", "input": input}),
+                "evaluate" => {
+                    serde_json::json!({"tool": "wolfram_link", "op": "evaluate", "code": input})
+                }
+                "alpha" => {
+                    serde_json::json!({"tool": "wolfram_alpha", "op": "query", "input": input})
+                }
                 "recognize" => {
                     serde_json::json!({"tool": "wolfram_recognizer", "op": "recognize", "text": input})
                 }

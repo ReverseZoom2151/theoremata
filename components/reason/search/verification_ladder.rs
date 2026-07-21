@@ -900,7 +900,11 @@ mod tests {
         let tiers: Vec<RungTier> = run.trail.iter().map(|t| t.tier).collect();
         assert_eq!(
             tiers,
-            vec![RungTier::FastRefute, RungTier::CheapDecide, RungTier::Kernel]
+            vec![
+                RungTier::FastRefute,
+                RungTier::CheapDecide,
+                RungTier::Kernel
+            ]
         );
     }
 
@@ -913,8 +917,7 @@ mod tests {
         let cheap: RungVerdict = AlwaysAbstains::new("probe").probe("s", &RungBudget::default());
         match cheap {
             RungVerdict::Refuted(_) => {}
-            RungVerdict::Abstain => {}
-            // no `Verified` arm exists to write.
+            RungVerdict::Abstain => {} // no `Verified` arm exists to write.
         }
 
         // Every `Verified` outcome the ladder can emit is constructed on exactly
@@ -967,8 +970,14 @@ mod tests {
         );
         assert_eq!(classify(&undecodable, None), Some(Validity::Undecodable));
         // A checked-and-wrong candidate is Incorrect — a different label.
-        assert_eq!(classify(&decoded, Some(&rejected)), Some(Validity::Incorrect));
-        assert_eq!(classify(&decoded, Some(&refuted)), Some(Validity::Incorrect));
+        assert_eq!(
+            classify(&decoded, Some(&rejected)),
+            Some(Validity::Incorrect)
+        );
+        assert_eq!(
+            classify(&decoded, Some(&refuted)),
+            Some(Validity::Incorrect)
+        );
         assert_eq!(classify(&decoded, Some(&verified)), Some(Validity::Correct));
         assert_ne!(Validity::Undecodable, Validity::Incorrect);
 
@@ -1091,7 +1100,11 @@ mod tests {
             assert_eq!(bare.outcome, configured.outcome);
             assert!(bare.kernel_consulted && configured.kernel_consulted);
             assert_eq!(bare_kernel.calls.get(), 1);
-            assert_eq!(cfg_kernel.calls.get(), 1, "exactly one kernel call, as direct");
+            assert_eq!(
+                cfg_kernel.calls.get(),
+                1,
+                "exactly one kernel call, as direct"
+            );
             assert_eq!(refuter.calls.get(), 0, "disabled tiers never invoke rungs");
             assert_eq!(bare.trail.len(), 1, "only the kernel appears in the trail");
             assert_eq!(bare.trail[0].tier, RungTier::Kernel);

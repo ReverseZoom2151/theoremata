@@ -489,11 +489,7 @@ mod tests {
     fn missing_ids_fall_back_and_report_could_not_run() {
         let store = Store::open(Path::new(":memory:")).unwrap();
         let (project, node) = graph_ids(&store);
-        for ids in [
-            (None, node.clone()),
-            (project.clone(), None),
-            (None, None),
-        ] {
+        for ids in [(None, node.clone()), (project.clone(), None), (None, None)] {
             let job = job_with(&store, ids);
             let report = verify_output(&store, &config(true), &job, PROOF).unwrap();
             assert_ne!(
@@ -615,8 +611,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             rows.iter()
-                .filter(|e| e.evidence_type
-                    == crate::graph::evidence::EXTERNAL_PROVER_ARTIFACT)
+                .filter(|e| e.evidence_type == crate::graph::evidence::EXTERNAL_PROVER_ARTIFACT)
                 .count(),
             1,
             "the literal `kind` and the registry constant must not drift apart"

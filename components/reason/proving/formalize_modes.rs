@@ -793,7 +793,10 @@ mod tests {
 
         // The valid fast candidate wins without paying for the precise pass.
         assert_eq!(summary["chosen_is_valid"], serde_json::json!(true));
-        assert_eq!(summary["outcome"]["winning_mode"], serde_json::json!("FastNoCot"));
+        assert_eq!(
+            summary["outcome"]["winning_mode"],
+            serde_json::json!("FastNoCot")
+        );
         assert_eq!(summary["outcome"]["escalated"], serde_json::json!(false));
         // The stage never certifies: it only surfaces the best-screened candidate.
         assert_eq!(summary["advisory"], serde_json::json!(true));

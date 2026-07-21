@@ -475,7 +475,10 @@ pub fn opaque_precondition(axioms: &AxiomReport) -> bool {
 fn contains_token(haystack: &str, token: &str) -> bool {
     let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '\'';
     haystack.match_indices(token).any(|(idx, _)| {
-        let before_ok = haystack[..idx].chars().next_back().is_none_or(|c| !is_ident(c));
+        let before_ok = haystack[..idx]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_ident(c));
         let after_ok = haystack[idx + token.len()..]
             .chars()
             .next()
@@ -952,8 +955,18 @@ mod tests {
     fn nothing_but_a_corroborated_accusation_ever_blocks() {
         // Silence and non-accusation, from either detector, never block.
         for outcome in [
-            DetectorOutcome::silent(TOOL_TRIVIALITY, Stage::Expensive, "worker died", Value::Null),
-            DetectorOutcome::silent(TOOL_TRIVIALITY, Stage::Precondition, "no struct", Value::Null),
+            DetectorOutcome::silent(
+                TOOL_TRIVIALITY,
+                Stage::Expensive,
+                "worker died",
+                Value::Null,
+            ),
+            DetectorOutcome::silent(
+                TOOL_TRIVIALITY,
+                Stage::Precondition,
+                "no struct",
+                Value::Null,
+            ),
             outcome_from_payload(TOOL_TRIVIALITY, json!({"verdict": "not_shown_trivial"})),
             outcome_from_payload(TOOL_OPAQUE, json!({"verdict": "unknown"})),
             outcome_from_payload(TOOL_OPAQUE, json!({"verdict": "no_opaque_constant_found"})),
@@ -1020,7 +1033,8 @@ mod tests {
         let mut report = StatementQualityReport::all_silent("test", "mock".to_string());
         assert!(!report.blocks());
         assert!(!report.accuses());
-        report.opaque = outcome_from_payload(TOOL_OPAQUE, json!({"verdict": "opaque_constant_found"}));
+        report.opaque =
+            outcome_from_payload(TOOL_OPAQUE, json!({"verdict": "opaque_constant_found"}));
         assert!(report.accuses(), "an advisory accusation still accuses");
         assert!(!report.blocks(), "but it does not block");
         assert_eq!(report.accusers(), vec![TOOL_OPAQUE.to_string()]);
@@ -1033,7 +1047,9 @@ mod tests {
     #[test]
     fn the_zero_cost_triviality_precondition_needs_a_structure_declaration() {
         assert!(triviality_precondition("structure S where\n  x : Int\n"));
-        assert!(triviality_precondition("theorem t : True := trivial\n-- structure\n"));
+        assert!(triviality_precondition(
+            "theorem t : True := trivial\n-- structure\n"
+        ));
         assert!(!triviality_precondition("theorem t : True := trivial\n"));
         // Must not match inside a longer identifier.
         assert!(!triviality_precondition("def structures := 1\n"));
@@ -1097,8 +1113,12 @@ mod tests {
     fn silence_is_never_cached() {
         // A transient outage must not be frozen into a permanent one.
         let key = Some("silence-test-key".to_string());
-        let silent =
-            DetectorOutcome::silent(TOOL_TRIVIALITY, Stage::Expensive, "worker died", Value::Null);
+        let silent = DetectorOutcome::silent(
+            TOOL_TRIVIALITY,
+            Stage::Expensive,
+            "worker died",
+            Value::Null,
+        );
         cache_put(key.as_ref(), &silent);
         assert!(
             cache_get(key.as_ref()).is_none(),

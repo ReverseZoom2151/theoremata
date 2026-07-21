@@ -376,17 +376,17 @@ mod tests {
 
     #[test]
     fn formal_statement_verifies_without_lean_when_native_backend_exists() {
-        let n = node(NodeKind::FormalStatement, Some("Theorem t : True. Proof. exact I. Qed."));
+        let n = node(
+            NodeKind::FormalStatement,
+            Some("Theorem t : True. Proof. exact I. Qed."),
+        );
         let sig = NodeSignals {
             falsified: true,
             retrieved: true,
             has_formal_statement: true,
             ..Default::default()
         };
-        let tools = ToolAvailability {
-            lean: false,
-            ..ALL
-        };
+        let tools = ToolAvailability { lean: false, ..ALL };
         assert_eq!(route(&n, &sig, &tools, 5), Route::Verify);
     }
 
@@ -713,6 +713,9 @@ mod tests {
                 }
             }
         }
-        assert!(moved > 0, "the hint path never fired; the test proves nothing");
+        assert!(
+            moved > 0,
+            "the hint path never fired; the test proves nothing"
+        );
     }
 }

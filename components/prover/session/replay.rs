@@ -72,9 +72,7 @@ pub trait TacticReplay {
 /// Free function rather than a trait method because a method returning
 /// `impl FnMut` would make [`TacticReplay`] non-object-safe, and callers that hold
 /// a `&mut dyn TacticReplay` (picking the checker at runtime) need object safety.
-pub fn as_closure<R: TacticReplay + ?Sized>(
-    replay: &mut R,
-) -> impl FnMut(&[String]) -> bool + '_ {
+pub fn as_closure<R: TacticReplay + ?Sized>(replay: &mut R) -> impl FnMut(&[String]) -> bool + '_ {
     move |tactics: &[String]| replay.replays_closed(tactics)
 }
 
@@ -651,8 +649,7 @@ mod tests {
         // Bound to a local: as a temporary the Config would be dropped while the
         // replay still borrows it.
         let config = Config::default();
-        let mut replay =
-            GateReplay::for_system(&config, FormalSystem::Rocq, "Theorem t : True");
+        let mut replay = GateReplay::for_system(&config, FormalSystem::Rocq, "Theorem t : True");
         assert!(
             !replay.replays_closed(&seq(&["exact I"])),
             "Rocq shrink-replay stays declined until a real preamble is exposed"
@@ -678,10 +675,7 @@ mod tests {
         assert!(takes_replay_closure(as_closure(&mut r), &seq(&["rfl"])));
 
         let mut deny = DenyAllReplay;
-        assert!(!takes_replay_closure(
-            as_closure(&mut deny),
-            &seq(&["rfl"])
-        ));
+        assert!(!takes_replay_closure(as_closure(&mut deny), &seq(&["rfl"])));
     }
 
     #[test]

@@ -272,7 +272,11 @@ impl Declaration {
     }
 
     /// A record located in `module`.
-    pub fn in_module(system: FormalSystem, name: impl Into<String>, module: impl Into<String>) -> Self {
+    pub fn in_module(
+        system: FormalSystem,
+        name: impl Into<String>,
+        module: impl Into<String>,
+    ) -> Self {
         let module = module.into();
         Self {
             module: Some(normalize(system, &module)),
@@ -698,9 +702,13 @@ mod tests {
 
     fn mathlib() -> Vec<Declaration> {
         vec![
-            Declaration::in_module(FormalSystem::Lean, "Nat.succ_le_succ", "Mathlib.Data.Nat.Basic")
-                .with_signature("∀ {n m : ℕ}, n ≤ m → n.succ ≤ m.succ")
-                .with_kind("theorem"),
+            Declaration::in_module(
+                FormalSystem::Lean,
+                "Nat.succ_le_succ",
+                "Mathlib.Data.Nat.Basic",
+            )
+            .with_signature("∀ {n m : ℕ}, n ≤ m → n.succ ≤ m.succ")
+            .with_kind("theorem"),
             // Exists, but lives under a module the test manifest does not import.
             Declaration::in_module(
                 FormalSystem::Lean,
@@ -758,11 +766,17 @@ mod tests {
             } => {
                 assert_eq!(declaration.name, "Finset.sum_range_succ");
                 // The ACTION is concrete: this exact import.
-                assert_eq!(add_import.as_deref(), Some("Mathlib.Algebra.BigOperators.Basic"));
+                assert_eq!(
+                    add_import.as_deref(),
+                    Some("Mathlib.Algebra.BigOperators.Basic")
+                );
             }
             other => panic!("expected NotInCurrentImportScope, got {other:?}"),
         }
-        assert!(v.exists_somewhere(), "it exists — the branch is still alive");
+        assert!(
+            v.exists_somewhere(),
+            "it exists — the branch is still alive"
+        );
         assert!(
             !v.is_evidence_of_absence(),
             "an out-of-scope hit must NEVER read as absence"
@@ -890,7 +904,11 @@ mod tests {
             !v.is_evidence_of_absence(),
             "a dead index must never be read as 'the library lacks it'"
         );
-        assert_eq!(index.library_calls.get(), 1, "the library tier was attempted");
+        assert_eq!(
+            index.library_calls.get(),
+            1,
+            "the library tier was attempted"
+        );
     }
 
     #[test]
@@ -1064,7 +1082,10 @@ mod tests {
             "Nat.succ_le_succ"
         );
         assert_eq!(normalize(FormalSystem::Lean, "Nat..add"), "Nat.add");
-        assert_eq!(normalize(FormalSystem::Rocq, ".Coq.Init.Nat.add"), "Coq.Init.Nat.add");
+        assert_eq!(
+            normalize(FormalSystem::Rocq, ".Coq.Init.Nat.add"),
+            "Coq.Init.Nat.add"
+        );
         assert_eq!(normalize(FormalSystem::Lean, "«odd name»"), "odd name");
         // Case is never touched: all six systems are case-sensitive.
         assert_eq!(normalize(FormalSystem::Lean, "Nat.Add"), "Nat.Add");
@@ -1080,8 +1101,14 @@ mod tests {
             module_of(FormalSystem::Lean, "Mathlib.Data.Nat.Basic.succ_le"),
             Some("Mathlib.Data.Nat.Basic".to_string())
         );
-        assert_eq!(module_of(FormalSystem::Isabelle, "Nat.add_commute"), Some("Nat".into()));
-        assert_eq!(module_of(FormalSystem::Agda, "Data.Nat.Base.suc"), Some("Data.Nat.Base".into()));
+        assert_eq!(
+            module_of(FormalSystem::Isabelle, "Nat.add_commute"),
+            Some("Nat".into())
+        );
+        assert_eq!(
+            module_of(FormalSystem::Agda, "Data.Nat.Base.suc"),
+            Some("Data.Nat.Base".into())
+        );
         assert_eq!(module_of(FormalSystem::Lean, "unqualified"), None);
         // A record with no explicit module falls back to its dotted name.
         let d = Declaration::new(FormalSystem::Lean, "Nat.succ_le_succ");
@@ -1160,7 +1187,10 @@ mod tests {
         }
         // Only one is evidence of absence, and it is not the error.
         assert_eq!(
-            verdicts.iter().filter(|v| v.is_evidence_of_absence()).count(),
+            verdicts
+                .iter()
+                .filter(|v| v.is_evidence_of_absence())
+                .count(),
             1
         );
     }

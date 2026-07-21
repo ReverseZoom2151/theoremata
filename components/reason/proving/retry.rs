@@ -337,7 +337,10 @@ mod tests {
         let mut b = RetryState::new(limits);
         for r in requests {
             assert_eq!(a.resolve(r), b.resolve_outcome(r, false));
-            assert_eq!((a.proof, a.revision, a.attempt), (b.proof, b.revision, b.attempt));
+            assert_eq!(
+                (a.proof, a.revision, a.attempt),
+                (b.proof, b.revision, b.attempt)
+            );
         }
     }
 

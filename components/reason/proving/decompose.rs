@@ -567,11 +567,15 @@ mod tests {
         assert_eq!(admission["admitted"], json!(false));
         let would_refuse = admission["would_refuse"].as_array().unwrap();
         assert!(
-            would_refuse.iter().any(|v| v.as_str().unwrap().contains("SelfChild")),
+            would_refuse
+                .iter()
+                .any(|v| v.as_str().unwrap().contains("SelfChild")),
             "restating the parent as its own lemma should be flagged: {would_refuse:?}"
         );
         assert!(
-            would_refuse.iter().any(|v| v.as_str().unwrap().contains("ChildCount")),
+            would_refuse
+                .iter()
+                .any(|v| v.as_str().unwrap().contains("ChildCount")),
             "a one-child split should be flagged: {would_refuse:?}"
         );
     }
@@ -719,8 +723,9 @@ mod tests {
         let none = DischargeProbe::default();
         assert_eq!(none.verdict(), ProbeVerdict::NoProbe);
 
-        let report =
-            decomposition_admission::admit(&Decomposer::admission_proposal(PARENT, &children, &none));
+        let report = decomposition_admission::admit(&Decomposer::admission_proposal(
+            PARENT, &children, &none,
+        ));
 
         // Unearned is the ONLY thing wrong with this proposal...
         assert!(

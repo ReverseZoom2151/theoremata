@@ -682,7 +682,10 @@ mod tests {
         assert_eq!(summary["n_library"], 2);
         assert_eq!(summary["skipped_trivial"][0], "n = n");
         assert_eq!(summary["n_exported"], 0);
-        assert_eq!(summary["n_refused"], 1, "the non-trivial skill is refused offline");
+        assert_eq!(
+            summary["n_refused"], 1,
+            "the non-trivial skill is refused offline"
+        );
         assert!(summary["file"].is_null());
     }
 

@@ -107,7 +107,11 @@ fn witness_admissible(spec_variables: &Value, exact: &Value) -> bool {
             return false;
         }
         let start = domain.get("start").and_then(Value::as_i64).unwrap_or(0);
-        let step = domain.get("step").and_then(Value::as_i64).unwrap_or(1).abs();
+        let step = domain
+            .get("step")
+            .and_then(Value::as_i64)
+            .unwrap_or(1)
+            .abs();
         if step > 1 && (numerator - start).rem_euclid(step) != 0 {
             return false;
         }

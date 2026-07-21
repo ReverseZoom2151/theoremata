@@ -363,7 +363,11 @@ pub fn mine_critic_pairs(
 
         let mut cur = 0usize;
         for state in &branch.states[1..] {
-            cur = match children[cur].iter().copied().find(|&c| raw[c].state == *state) {
+            cur = match children[cur]
+                .iter()
+                .copied()
+                .find(|&c| raw[c].state == *state)
+            {
                 Some(shared) => shared,
                 None => {
                     let id = raw.len();

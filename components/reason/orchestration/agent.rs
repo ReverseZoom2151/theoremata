@@ -252,7 +252,9 @@ impl<'a> BoundedAlignmentFalsifier<'a> {
         let path = config.artifacts.join(ALIGNMENT_MEMO_FILE);
         let memo = std::fs::read_to_string(&path)
             .ok()
-            .and_then(|raw| serde_json::from_str::<BTreeMap<String, SettledProbeVerdict>>(&raw).ok())
+            .and_then(|raw| {
+                serde_json::from_str::<BTreeMap<String, SettledProbeVerdict>>(&raw).ok()
+            })
             .unwrap_or_default();
         Self {
             inner,
@@ -406,12 +408,8 @@ impl AgentLoop<'_> {
         }
 
         let model_ready = self.config.model_command.is_some();
-        let target_verifier = crate::formal::backend_for(
-            self.config,
-            self.config.target_system,
-            false,
-        )
-        .available();
+        let target_verifier =
+            crate::formal::backend_for(self.config, self.config.target_system, false).available();
         let tools = ToolAvailability {
             python: PythonCheck::new().available(),
             lean: LeanCheck::new(self.config).available(),
@@ -479,20 +477,21 @@ impl AgentLoop<'_> {
 
         // Warm Lean session (falls back to cold LeanCheck on failure). Only
         // warm it when a model can actually produce proofs to check.
-        let mut session = if self.config.target_system == FormalSystem::Lean && tools.lean && tools.model {
-            match LeanSession::start(self.config, &["Mathlib".to_string()]) {
-                Ok(s) => {
-                    notes.push("warm Lean session active".into());
-                    Some(s)
+        let mut session =
+            if self.config.target_system == FormalSystem::Lean && tools.lean && tools.model {
+                match LeanSession::start(self.config, &["Mathlib".to_string()]) {
+                    Ok(s) => {
+                        notes.push("warm Lean session active".into());
+                        Some(s)
+                    }
+                    Err(e) => {
+                        notes.push(format!("warm Lean unavailable, using cold checks: {e}"));
+                        None
+                    }
                 }
-                Err(e) => {
-                    notes.push(format!("warm Lean unavailable, using cold checks: {e}"));
-                    None
-                }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         // Phase 2 — solve: route each open obligation, bounded passes.
         self.store
@@ -1200,7 +1199,8 @@ impl AgentLoop<'_> {
         // statement faithfully encode the node's informal statement?
         self.validate_new_statement(project_id, run, &node.id, &node.statement, &lean)?;
         let theorem = extract_theorem(&lean);
-        let (compiles, axioms_clean, _goals) = self.verify_source(&lean, theorem.as_deref(), session)?;
+        let (compiles, axioms_clean, _goals) =
+            self.verify_source(&lean, theorem.as_deref(), session)?;
         if compiles && axioms_clean {
             let fresh = self
                 .store
@@ -1671,14 +1671,7 @@ impl AgentLoop<'_> {
         let screen = StatementValidity::default()
             .with_judge(&judge)
             .with_negation_prover(&negation);
-        self.screen_statement_validity(
-            &screen,
-            project_id,
-            Some(run),
-            node_id,
-            informal,
-            formal,
-        )?;
+        self.screen_statement_validity(&screen, project_id, Some(run), node_id, informal, formal)?;
         Ok(())
     }
 
@@ -1842,9 +1835,7 @@ impl AgentLoop<'_> {
     ) -> Result<(bool, bool, Vec<String>)> {
         if let Some(s) = session.as_mut() {
             match s.check(source, theorem) {
-                Ok(outcome) => {
-                    return Ok((outcome.ok, outcome.axioms_clean, outcome.goal_states))
-                }
+                Ok(outcome) => return Ok((outcome.ok, outcome.axioms_clean, outcome.goal_states)),
                 Err(_) => {
                     // Session died; drop it and fall back to cold checks.
                     *session = None;
@@ -2230,9 +2221,15 @@ mod tests {
             calls: std::cell::Cell::new(0),
         };
         let bounded = detached(&inner, 1);
-        assert_eq!(bounded.falsify("same claim").unwrap().verdict, "counterexample");
+        assert_eq!(
+            bounded.falsify("same claim").unwrap().verdict,
+            "counterexample"
+        );
         // The budget is spent, and the remembered refutation still answers.
-        assert_eq!(bounded.falsify("same claim").unwrap().verdict, "counterexample");
+        assert_eq!(
+            bounded.falsify("same claim").unwrap().verdict,
+            "counterexample"
+        );
         assert_eq!(inner.calls.get(), 1);
         assert_eq!(bounded.replayed.get(), 1);
         // A different claim gets the refusal, not the remembered answer.
@@ -2398,9 +2395,7 @@ mod tests {
             config: &config,
             provider: &provider,
         };
-        agent
-            .formalize_once(&node, 0, goal_states)
-            .unwrap();
+        agent.formalize_once(&node, 0, goal_states).unwrap();
         // Bound to a local first: as a tail expression the `Ref` temporary would
         // outlive `provider` and fail to borrow-check.
         let recorded = provider.0.borrow().clone();
@@ -2802,7 +2797,10 @@ mod tests {
             .expect("screen ran (flag on)");
         assert_eq!(report.verdict, StatementVerdict::Indeterminate);
         assert!(
-            report.checks.iter().all(|c| c.status == CheckStatus::Skipped),
+            report
+                .checks
+                .iter()
+                .all(|c| c.status == CheckStatus::Skipped),
             "no seams wired ⇒ every check is Skipped, never Passed"
         );
         assert!(
@@ -2846,9 +2844,10 @@ mod tests {
             .unwrap();
         assert!(result.is_none(), "flag off ⇒ screen returns None");
         let events = store.events(&project.id, 100).unwrap();
-        assert!(!events.iter().any(|e| e.event_type
-            == "statement_validity.warning"
-            || e.payload["evidence_type"] == "statement_validity"));
+        assert!(!events
+            .iter()
+            .any(|e| e.event_type == "statement_validity.warning"
+                || e.payload["evidence_type"] == "statement_validity"));
     }
 
     #[test]
@@ -2881,7 +2880,10 @@ mod tests {
             .unwrap();
         assert_eq!(report.verdict, StatementVerdict::Reject);
         assert_eq!(report.failed(), vec![Check::Triviality]);
-        assert!(report.verdict.blocks_attempt(), "the stack ADVISES a skip...");
+        assert!(
+            report.verdict.blocks_attempt(),
+            "the stack ADVISES a skip..."
+        );
 
         // ...and that advice is RECORDED as evidence plus a warning event.
         let events = store.events(&project.id, 100).unwrap();
@@ -2890,7 +2892,10 @@ mod tests {
                 && e.payload["evidence_type"] == "statement_validity"
                 && e.payload["verdict"] == "reject"
         });
-        assert!(recorded, "the validity report is persisted as node evidence");
+        assert!(
+            recorded,
+            "the validity report is persisted as node evidence"
+        );
         let warned = events
             .iter()
             .any(|e| e.event_type == "statement_validity.warning");

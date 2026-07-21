@@ -639,8 +639,8 @@ pub fn shapes_compatible(left: &ConceptShape, right: &ConceptShape) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::alignment::{grade_proposal, Alignment, Refutation, Totality};
+    use super::*;
 
     /// Token helper: a leading "@" marks a library-local constant.
     fn tok(raw: &str) -> PatternToken {
@@ -708,7 +708,10 @@ mod tests {
         );
 
         let found = propose_with_evidence(&left, &right, &MatcherConfig::default());
-        assert!(found.len() >= 2, "expected several proposals, got {found:?}");
+        assert!(
+            found.len() >= 2,
+            "expected several proposals, got {found:?}"
+        );
 
         // The rare property wins the first round outright.
         assert_eq!(found[0].proposal.left.name, "c4");
@@ -853,7 +856,9 @@ mod tests {
             vec![ConstantDecl::new("add", binop())],
             vec![thm("r", &["idem", "@add"])],
         );
-        assert!(propose_alignments(&left_unary, &right_binary, &MatcherConfig::default()).is_empty());
+        assert!(
+            propose_alignments(&left_unary, &right_binary, &MatcherConfig::default()).is_empty()
+        );
 
         // Opaque is the exporter's "unknown" and is allowed through, still only
         // as a hypothesis.
@@ -917,7 +922,10 @@ mod tests {
         let mut reversed_left = tied_left.clone();
         reversed_left.constants.reverse();
         reversed_left.theorems.reverse();
-        assert_eq!(tied, propose_with_evidence(&reversed_left, &tied_right, &config));
+        assert_eq!(
+            tied,
+            propose_with_evidence(&reversed_left, &tied_right, &config)
+        );
         if let Some(first) = tied.first() {
             assert_eq!(first.proposal.left.name, "a1");
             assert_eq!(first.proposal.right.name, "b1");
@@ -988,7 +996,10 @@ mod tests {
         let (left, right) = bootstrap_corpora();
         for proposal in propose_alignments(&left, &right, &MatcherConfig::default()) {
             assert_eq!(proposal.proposer, Proposer::PropertyPattern);
-            assert!(proposal.score.is_some(), "the raw score travels as provenance");
+            assert!(
+                proposal.score.is_some(),
+                "the raw score travels as provenance"
+            );
 
             // The output type is the one the grader consumes, and grading a
             // proposal can never reach an unrestricted claim.

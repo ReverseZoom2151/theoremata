@@ -17,17 +17,16 @@
 
 use crate::{
     checker_cache::{
-        CheckerCache, EnvironmentFingerprint, VerificationCacheKey,
-        ELABORATED_STATEMENT_DETAIL_KEY,
+        CheckerCache, EnvironmentFingerprint, VerificationCacheKey, ELABORATED_STATEMENT_DETAIL_KEY,
     },
     config::Config,
     db::Store,
     model::ModelRequest,
     prover::{
         error_feedback::{render_feedback, FeedbackConfig},
-        subgoal_extract::{extract_subgoals, to_obligations},
         formal::{backend_for, FormalBackend, FormalSystem},
         model::VerificationReport,
+        subgoal_extract::{extract_subgoals, to_obligations},
     },
     provider::ModelProvider,
     sampling,
@@ -88,10 +87,7 @@ impl CorrectionConfig {
     fn from_env() -> Self {
         let default = Self::default();
         Self {
-            max_rounds: usize_from_env(
-                "THEOREMATA_FORMAL_CORRECTION_ROUNDS",
-                default.max_rounds,
-            ),
+            max_rounds: usize_from_env("THEOREMATA_FORMAL_CORRECTION_ROUNDS", default.max_rounds),
             samples_per_round: usize_from_env(
                 "THEOREMATA_FORMAL_CORRECTION_SAMPLES",
                 default.samples_per_round,
@@ -400,11 +396,20 @@ fn generate_and_verify_inner(
         if let Some(obj) = event.as_object_mut() {
             obj.insert("correction_rounds".into(), json!(rounds_run));
             obj.insert("correction_budget".into(), json!(correction.max_rounds));
-            obj.insert("correction_samples".into(), json!(correction.samples_per_round));
+            obj.insert(
+                "correction_samples".into(),
+                json!(correction.samples_per_round),
+            );
             obj.insert("corrected_accepted".into(), json!(corrected_accepted));
         }
     }
-    store.event(None, None, "formal_generate.completed", system.as_str(), event)?;
+    store.event(
+        None,
+        None,
+        "formal_generate.completed",
+        system.as_str(),
+        event,
+    )?;
 
     Ok((sampled.value.code, sampled.value.report))
 }
@@ -1673,7 +1678,11 @@ mod tests {
     fn passing_verification_detail_is_unchanged() {
         let mut report = live_verified_report("clean");
         let before = report.detail.clone();
-        attach_error_feedback(FormalSystem::Lean, "theorem t : True := trivial", &mut report);
+        attach_error_feedback(
+            FormalSystem::Lean,
+            "theorem t : True := trivial",
+            &mut report,
+        );
         assert_eq!(report.detail, before, "a pass must never gain feedback");
         assert!(report.detail.get(ERROR_FEEDBACK_KEY).is_none());
         assert!(report.lexically_verified);
@@ -1697,7 +1706,11 @@ mod tests {
 
         // Garbage falls back to the module's bounded raw passthrough.
         let mut noisy = failed_report_with_compile("\u{1f4a5} segfault at 0xdeadbeef");
-        attach_error_feedback(FormalSystem::Lean, "theorem t : True := trivial", &mut noisy);
+        attach_error_feedback(
+            FormalSystem::Lean,
+            "theorem t : True := trivial",
+            &mut noisy,
+        );
         let text = noisy.detail[ERROR_FEEDBACK_KEY]["text"].as_str().unwrap();
         assert!(text.contains("segfault at 0xdeadbeef"), "{text}");
 
@@ -1813,11 +1826,7 @@ mod tests {
         assert!(!report.lexically_verified);
         assert!(code.contains("sorry"), "fallback is the last candidate");
         assert!(
-            provider
-                .feedback_seen
-                .borrow()
-                .iter()
-                .all(Option::is_none),
+            provider.feedback_seen.borrow().iter().all(Option::is_none),
             "no request may carry feedback at the default budget"
         );
     }
@@ -2358,7 +2367,10 @@ mod tests {
 
         // Same environment today: Fresh, with no reinterpretation anywhere.
         let today = PinnedEnv::new(env.key_field());
-        assert_eq!(assess(&recovered, Some(&today), None), StalenessVerdict::Fresh);
+        assert_eq!(
+            assess(&recovered, Some(&today), None),
+            StalenessVerdict::Fresh
+        );
 
         // A moved environment with no elaborated pin is the honest Unknown. This
         // is the state of the world until a backend publishes an elaborated form.
@@ -2399,12 +2411,18 @@ mod tests {
             p["pinned_statement_type"],
             "forall (x : Real), Real.nnrpow x (1/3) = 2"
         );
-        assert_eq!(p["pinned_statement_provenance"], "lean.repl.elaborated_type");
+        assert_eq!(
+            p["pinned_statement_provenance"],
+            "lean.repl.elaborated_type"
+        );
         assert_eq!(p["pinned_statement_absent_reason"], Value::Null);
 
         let recovered = VerifiedResult::new(
             p["id"].as_str().unwrap(),
-            classify_artifact(FormalSystem::Lean, "theorem algebra_5778 : P := by norm_num"),
+            classify_artifact(
+                FormalSystem::Lean,
+                "theorem algebra_5778 : P := by norm_num",
+            ),
             PinnedEnv::new(p["verified_against"].as_str().unwrap()),
             p["pinned_statement_type"].as_str().map(str::to_string),
         );
@@ -2412,7 +2430,9 @@ mod tests {
         // moved environment is a repair candidate, not a silent green.
         let verdict = assess(
             &recovered,
-            Some(&PinnedEnv::new(resolved_env("{\"packages\":[1]}").key_field())),
+            Some(&PinnedEnv::new(
+                resolved_env("{\"packages\":[1]}").key_field(),
+            )),
             Some(&ReelaborationOutcome::Elaborated {
                 statement_type: "forall (x : Real), Real.nnrpow x (1/3) = 2".to_string(),
             }),

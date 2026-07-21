@@ -247,7 +247,10 @@ pub fn extract_subgoals(
 /// These enter the claim DAG **unproved**, without exception. See the module
 /// docs: the extractor is a source of hypotheses, never of proof.
 pub fn to_obligations(subgoals: &[ExtractedSubgoal]) -> Vec<Obligation> {
-    subgoals.iter().map(ExtractedSubgoal::to_obligation).collect()
+    subgoals
+        .iter()
+        .map(ExtractedSubgoal::to_obligation)
+        .collect()
 }
 
 // --- internal draft -------------------------------------------------------
@@ -398,11 +401,7 @@ fn is_ident_byte(b: Option<u8>) -> bool {
 
 // --- (b) error locations --------------------------------------------------
 
-fn error_locations(
-    system: FormalSystem,
-    lines: &[&str],
-    diagnostics: &[Diagnostic],
-) -> Vec<Draft> {
+fn error_locations(system: FormalSystem, lines: &[&str], diagnostics: &[Diagnostic]) -> Vec<Draft> {
     let mut out = Vec::new();
     for d in diagnostics {
         // Never reinterpret another system's format, and never lift a warning or
@@ -418,7 +417,11 @@ fn error_locations(
             _ => continue,
         };
         let start = start.min(lines.len().max(1));
-        let end = d.end_line.unwrap_or(start).max(start).min(lines.len().max(1));
+        let end = d
+            .end_line
+            .unwrap_or(start)
+            .max(start)
+            .min(lines.len().max(1));
         out.push(Draft {
             origin: SubgoalOrigin::ErrorLocation,
             span: SourceSpan {
@@ -590,9 +593,7 @@ fn enclosing_decl(system: FormalSystem, masked: &[String], line: usize) -> Optio
                 continue;
             }
             if let Some(rest) = trimmed.strip_prefix(kw) {
-                if !rest.starts_with(|c: char| {
-                    c.is_alphanumeric() || c == '_' || c == '\''
-                }) {
+                if !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_' || c == '\'') {
                     let name = rest
                         .trim_start()
                         .split(|c: char| c.is_whitespace() || "(){}[]:,".contains(c))
@@ -619,7 +620,13 @@ fn proposed_name(parent: Option<&str>, index: usize) -> String {
 fn sanitize(raw: &str) -> String {
     let mut s: String = raw
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     if s.is_empty() {
         s.push('_');
@@ -757,13 +764,18 @@ mod tests {
             FormalSystem::Lean,
             "Generated.lean:2:2: error: unsolved goals\nsee the docs",
         );
-        let got3 = extract_subgoals(FormalSystem::Lean, "theorem t : True := by\n  skip\n", &prose);
+        let got3 = extract_subgoals(
+            FormalSystem::Lean,
+            "theorem t : True := by\n  skip\n",
+            &prose,
+        );
         assert!(!got3[0].has_statement());
     }
 
     #[test]
     fn extraction_is_deterministically_ordered() {
-        let src = "theorem a : True := by\n  sorry\n\ntheorem b : True := by\n  sorry\n  exact bogus\n";
+        let src =
+            "theorem a : True := by\n  sorry\n\ntheorem b : True := by\n  sorry\n  exact bogus\n";
         let diags = parse_diagnostics(
             FormalSystem::Lean,
             "Generated.lean:6:2: error: unknown identifier 'bogus'\nGenerated.lean:2:2: error: declaration uses 'sorry'",
@@ -804,15 +816,28 @@ mod tests {
     #[test]
     fn per_system_hole_syntax_dispatches() {
         let cases: Vec<(FormalSystem, &str, &str)> = vec![
-            (FormalSystem::Rocq, "Lemma l : True.\nProof.\n  admit.\nAdmitted.\n", "admit"),
-            (FormalSystem::Isabelle, "lemma l: \"True\"\n  sorry\n", "sorry"),
-            (FormalSystem::Agda, "module M where\npostulate p : Set\n", "postulate"),
+            (
+                FormalSystem::Rocq,
+                "Lemma l : True.\nProof.\n  admit.\nAdmitted.\n",
+                "admit",
+            ),
+            (
+                FormalSystem::Isabelle,
+                "lemma l: \"True\"\n  sorry\n",
+                "sorry",
+            ),
+            (
+                FormalSystem::Agda,
+                "module M where\npostulate p : Set\n",
+                "postulate",
+            ),
             (FormalSystem::Metamath, "mylab $p |- ph $= ? $.\n", "?"),
         ];
         for (system, src, expect) in cases {
             let got = extract_subgoals(system, src, &[]);
             assert!(
-                got.iter().any(|s| s.callsite.replaces.as_deref() == Some(expect)),
+                got.iter()
+                    .any(|s| s.callsite.replaces.as_deref() == Some(expect)),
                 "{system:?} must find `{expect}`: {got:?}"
             );
             assert!(got.iter().all(|s| s.origin == SubgoalOrigin::ExplicitHole));

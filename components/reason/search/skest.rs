@@ -711,10 +711,11 @@ pub fn run_skest_search(
         if e.from.is_empty() || e.to.is_empty() {
             bail!("skest graph edges must have non-empty endpoints");
         }
-        adjacency
-            .entry(e.from.clone())
-            .or_default()
-            .push((e.tactic.clone(), e.prior, e.to.clone()));
+        adjacency.entry(e.from.clone()).or_default().push((
+            e.tactic.clone(),
+            e.prior,
+            e.to.clone(),
+        ));
     }
 
     let root_goal = GraphGoal {
@@ -751,13 +752,7 @@ pub fn run_skest_search(
                  anything here.",
     });
 
-    store.event(
-        project_id,
-        None,
-        "skest.searched",
-        "skest",
-        summary.clone(),
-    )?;
+    store.event(project_id, None, "skest.searched", "skest", summary.clone())?;
     Ok(summary)
 }
 

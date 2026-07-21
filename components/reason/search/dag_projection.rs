@@ -378,7 +378,13 @@ pub fn project_search_dag(
         "q_targets": targets,
         "max_unroll_depth": MAX_UNROLL_DEPTH,
     });
-    store.event(Some(project_id), None, EVENT_TYPE, "dag_projection", summary.clone())?;
+    store.event(
+        Some(project_id),
+        None,
+        EVENT_TYPE,
+        "dag_projection",
+        summary.clone(),
+    )?;
     Ok(summary)
 }
 
@@ -677,7 +683,9 @@ mod tests {
 
         // The summary is readable back off the event log with no other reader.
         let events = store.events(&project.id, 50).unwrap();
-        assert!(events.iter().any(|e| e.event_type == "search.dag_projection"));
+        assert!(events
+            .iter()
+            .any(|e| e.event_type == "search.dag_projection"));
     }
 
     #[test]

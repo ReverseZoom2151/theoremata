@@ -269,7 +269,12 @@ pub fn portfolio_prove_with_ladder(
         .with_config(ladder_config)
         .run(statement);
 
-    if let LadderOutcome::Refuted { rung, tier, witness } = screen.outcome {
+    if let LadderOutcome::Refuted {
+        rung,
+        tier,
+        witness,
+    } = screen.outcome
+    {
         store.event(
             None,
             None,
@@ -885,7 +890,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(abstainer.calls.get(), 1, "the enabled tier ran the rung");
-        assert!(result.refutation.is_none(), "abstention is not a refutation");
+        assert!(
+            result.refutation.is_none(),
+            "abstention is not a refutation"
+        );
         assert_eq!(
             fingerprint(&baseline),
             fingerprint(&result),
@@ -901,7 +909,10 @@ mod tests {
         let rung = FalsifierRung::new(&OfflineProvider);
         // OfflineProvider yields `no_model`, which is NOT a refutation.
         assert_eq!(
-            rung.probe("every even integer has an even square", &RungBudget::default()),
+            rung.probe(
+                "every even integer has an even square",
+                &RungBudget::default()
+            ),
             RungVerdict::Abstain
         );
         // Nor is a spec the model declares inapplicable (`not_applicable`).
@@ -1077,7 +1088,10 @@ mod tests {
                 LadderConfig::default(),
                 "{value:?} must preserve the kernel-only default"
             );
-            assert!(!config.fast_refute.enabled, "{value:?} must not enable tier 1");
+            assert!(
+                !config.fast_refute.enabled,
+                "{value:?} must not enable tier 1"
+            );
         }
         // Only the explicit truthy set opts in, case- and whitespace-insensitively.
         for value in [
@@ -1094,7 +1108,10 @@ mod tests {
                 "{value:?} must enable the fast_refute tier"
             );
             // Tier 2 is never enabled: the portfolio registers no tier-2 rung.
-            assert!(!config.cheap_decide.enabled, "{value:?} must not enable tier 2");
+            assert!(
+                !config.cheap_decide.enabled,
+                "{value:?} must not enable tier 2"
+            );
             assert_eq!(config.fast_refute.budget, RungBudget::default());
         }
     }

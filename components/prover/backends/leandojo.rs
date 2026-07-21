@@ -443,8 +443,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             rows.iter()
-                .filter(|e| e.evidence_type
-                    == crate::graph::evidence::EXTERNAL_PROVER_ARTIFACT)
+                .filter(|e| e.evidence_type == crate::graph::evidence::EXTERNAL_PROVER_ARTIFACT)
                 .count(),
             1,
             "the literal `kind` and the registry constant must not drift apart"

@@ -900,10 +900,7 @@ mod tests {
         assert_eq!(cl.literals.len(), 1);
         let lit = &cl.literals[0];
         assert!(lit.negated);
-        assert_eq!(
-            lit.atom,
-            app("P", vec![app("f", vec![v("x"), c("a")])])
-        );
+        assert_eq!(lit.atom, app("P", vec![app("f", vec![v("x"), c("a")])]));
 
         // A disjunction with a `?`-variable and an ASCII constant.
         let cl2 = parse_clause("~P(?x) | Q(?x)").unwrap();
@@ -950,23 +947,13 @@ mod tests {
         assert!(summary.depth.is_none());
         assert!(summary.steps.is_empty());
         // Must not be dressed up as a satisfiability proof.
-        assert!(summary
-            .caveats
-            .iter()
-            .any(|c| c.contains("NOT a proof")));
+        assert!(summary.caveats.iter().any(|c| c.contains("NOT a proof")));
     }
 
     #[test]
     fn entry_point_rejects_empty_or_malformed_input() {
         let (store, project, node) = fixture();
         assert!(refute_clauses(&store, &project, &node, &[], 3).is_err());
-        assert!(refute_clauses(
-            &store,
-            &project,
-            &node,
-            &["P(a".to_string()],
-            3
-        )
-        .is_err());
+        assert!(refute_clauses(&store, &project, &node, &["P(a".to_string()], 3).is_err());
     }
 }

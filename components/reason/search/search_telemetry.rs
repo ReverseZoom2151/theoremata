@@ -311,8 +311,10 @@ pub fn report(request: &serde_json::Value) -> anyhow::Result<serde_json::Value> 
         Some(value) => {
             let rounds: Vec<Vec<Vec<String>>> = serde_json::from_value(value.clone())
                 .context("`rounds` must be an array of round bags (arrays of tactic sequences)")?;
-            let per_round: Vec<serde_json::Value> =
-                round_over_round(&rounds).iter().map(stats_to_json).collect();
+            let per_round: Vec<serde_json::Value> = round_over_round(&rounds)
+                .iter()
+                .map(stats_to_json)
+                .collect();
             serde_json::json!({
                 "recorded": true,
                 "rounds": per_round.len(),
@@ -526,7 +528,10 @@ mod tests {
     /// numbers match a direct call on the same bag.
     #[test]
     fn report_computes_proof_telemetry_from_a_bag() {
-        let bag = vec![proof(&["intro", "simp"]), proof(&["intro", "ring", "omega"])];
+        let bag = vec![
+            proof(&["intro", "simp"]),
+            proof(&["intro", "ring", "omega"]),
+        ];
         let request = serde_json::json!({
             "proofs": [["intro", "simp"], ["intro", "ring", "omega"]],
         });
@@ -535,7 +540,10 @@ mod tests {
         assert_eq!(out["proofs"]["recorded"], true);
         let stats = proof_length_stats(&bag);
         assert_eq!(out["proofs"]["length_stats"]["count"], stats.count);
-        assert_eq!(out["proofs"]["length_stats"]["max_length"], stats.max_length);
+        assert_eq!(
+            out["proofs"]["length_stats"]["max_length"],
+            stats.max_length
+        );
         let div = diversity(&bag);
         assert_eq!(
             out["proofs"]["diversity"]["distinct_tactics"],

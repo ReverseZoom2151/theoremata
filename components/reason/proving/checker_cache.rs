@@ -247,8 +247,7 @@ impl EnvironmentFingerprint {
     /// run to run; a fingerprint that is not deterministic makes the cache
     /// useless.
     pub fn from_parts(kind: &str, detail: &str, parts: &[(&str, String)]) -> Self {
-        let mut sorted: Vec<(&str, &str)> =
-            parts.iter().map(|(t, v)| (*t, v.as_str())).collect();
+        let mut sorted: Vec<(&str, &str)> = parts.iter().map(|(t, v)| (*t, v.as_str())).collect();
         sorted.sort_unstable();
         let mut hasher = Sha256::new();
         absorb(&mut hasher, b"env.kind", kind.as_bytes());
@@ -293,7 +292,10 @@ impl EnvironmentFingerprint {
                 kind,
                 digest,
                 detail,
-            } => format!("resolved {kind} [{}] {detail}", &digest[..16.min(digest.len())]),
+            } => format!(
+                "resolved {kind} [{}] {detail}",
+                &digest[..16.min(digest.len())]
+            ),
             Self::Unresolved { reason } => format!("unresolved: {reason}"),
         }
     }
@@ -481,7 +483,11 @@ impl StatementIdentity {
     /// Capture whatever identity is available for one verified input.
     fn capture(input: &VerificationCacheKey<'_>, report: &VerificationReport) -> Self {
         let mut hasher = Sha256::new();
-        absorb(&mut hasher, b"stmt.source", normalize(input.canonical_statement).as_bytes());
+        absorb(
+            &mut hasher,
+            b"stmt.source",
+            normalize(input.canonical_statement).as_bytes(),
+        );
         let source_digest = hex_lower(hasher.finalize());
         Self {
             source_digest,
@@ -1090,7 +1096,11 @@ mod tests {
     #[test]
     fn a_changed_lake_manifest_changes_the_key_with_everything_else_identical() {
         let root = scratch("manifest-bump");
-        lake_project(&root, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "leanprover/lean4:v4.19.0");
+        lake_project(
+            &root,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "leanprover/lean4:v4.19.0",
+        );
         let before = EnvironmentFingerprint::resolve_lake_project(Some(&root));
         assert!(before.is_resolved());
 
@@ -1112,7 +1122,11 @@ mod tests {
         assert!(cache.get(&key_before).is_some());
 
         // Mathlib updated in place: same path, same Lean binary, same imports.
-        lake_project(&root, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "leanprover/lean4:v4.19.0");
+        lake_project(
+            &root,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "leanprover/lean4:v4.19.0",
+        );
         let after = EnvironmentFingerprint::resolve_lake_project(Some(&root));
         assert!(after.is_resolved());
         assert_ne!(before, after, "a new manifest is a new environment");
@@ -1128,7 +1142,11 @@ mod tests {
         );
 
         // And the toolchain pin is keyed too, independently of the manifest.
-        lake_project(&root, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "leanprover/lean4:v4.20.0");
+        lake_project(
+            &root,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "leanprover/lean4:v4.20.0",
+        );
         let newer_toolchain = EnvironmentFingerprint::resolve_lake_project(Some(&root));
         assert_ne!(after, newer_toolchain);
         let _ = std::fs::remove_dir_all(&root);
@@ -1139,7 +1157,11 @@ mod tests {
     #[test]
     fn an_unchanged_environment_resolves_identically() {
         let root = scratch("stable");
-        lake_project(&root, "cccccccccccccccccccccccccccccccccccccccc", "leanprover/lean4:v4.19.0");
+        lake_project(
+            &root,
+            "cccccccccccccccccccccccccccccccccccccccc",
+            "leanprover/lean4:v4.19.0",
+        );
         let a = EnvironmentFingerprint::resolve_lake_project(Some(&root));
         let b = EnvironmentFingerprint::resolve_lake_project(Some(&root));
         assert_eq!(a, b);
@@ -1161,7 +1183,10 @@ mod tests {
     fn an_unresolvable_environment_is_never_reusable() {
         let missing = scratch("absent").join("no-such-project");
         let unresolved = EnvironmentFingerprint::resolve_lake_project(Some(&missing));
-        assert!(!unresolved.is_resolved(), "an absent project cannot resolve");
+        assert!(
+            !unresolved.is_resolved(),
+            "an absent project cannot resolve"
+        );
         assert!(!EnvironmentFingerprint::resolve_lake_project(None).is_resolved());
         // A project directory with no manifest is equally unresolvable: we know
         // where to look and found no dependency record.

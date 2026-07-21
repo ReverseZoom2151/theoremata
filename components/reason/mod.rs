@@ -17,15 +17,15 @@ pub use orchestration::{
     team, trace,
 };
 pub use proving::{
-    alignment, alignment_propose, alignment_refute,
-    blueprint, checker_cache, conjecture_engine, decompose, decomposition_admission,
-    definition_synthesis, evolve_sketch, falsification, formal_generate, formalize_modes, formalize_portfolio, graph_rag,
-    informal_defect_prior, library, mathlib_export, model_router, optimize, portfolio, refine_ops, repair, retry, router, sketch,
+    alignment, alignment_propose, alignment_refute, blueprint, checker_cache, conjecture_engine,
+    decompose, decomposition_admission, definition_synthesis, evolve_sketch, falsification,
+    formal_generate, formalize_modes, formalize_portfolio, graph_rag, informal_defect_prior,
+    library, mathlib_export, model_router, optimize, portfolio, refine_ops, repair, retry, router,
+    sketch,
 };
 pub use search::{
     best_first, concurrent, critic_scorer, dag_projection, discovery_game, distance_critic, driver,
     fitness, goal_cache, hybrid_search, inverse_method, mcts, minimize, model_elimination,
     preference_pairs, process_reward, progress, proof_pool, rewriting, sampler, sampling,
-    search_telemetry, skest, subsumption, symmetry_dedup, tactic_outcome, ttc,
-    verification_ladder,
+    search_telemetry, skest, subsumption, symmetry_dedup, tactic_outcome, ttc, verification_ladder,
 };

@@ -345,7 +345,10 @@ fn not_decidable(reason: String) -> WitnessSearch {
 /// Build the witness for a VERIFIED assignment: bind every data binder, claim
 /// every hypothesis. Both are total over `bundle.fields`, which is what makes
 /// vacuity's completeness audit pass.
-fn build_witness(bundle: &HypothesisBundle, assignment: &BTreeMap<String, i64>) -> SatisfiabilityWitness {
+fn build_witness(
+    bundle: &HypothesisBundle,
+    assignment: &BTreeMap<String, i64>,
+) -> SatisfiabilityWitness {
     let label = if assignment.is_empty() {
         "(no data binders)".to_string()
     } else {
@@ -474,10 +477,7 @@ impl Lin {
     fn var(name: &str) -> Self {
         let mut terms = BTreeMap::new();
         terms.insert(name.to_string(), 1);
-        Lin {
-            constant: 0,
-            terms,
-        }
+        Lin { constant: 0, terms }
     }
 
     fn is_constant(&self) -> bool {
@@ -563,7 +563,10 @@ impl Lin {
 enum Constraint {
     Compare(Lin, Cmp, Lin),
     /// `divisor ∣ expr`, `divisor != 0`.
-    Divides { divisor: i64, expr: Lin },
+    Divides {
+        divisor: i64,
+        expr: Lin,
+    },
     /// `expr % modulus == residue`, Euclidean (non-negative) residue, matching
     /// Lean's `Nat.mod` / `Int.emod` for a positive modulus.
     ModEq {
@@ -781,7 +784,9 @@ fn parse_membership(chars: &[char]) -> Result<Constraint, String> {
     let body = set
         .strip_prefix("Finset.")
         .or_else(|| set.strip_prefix("Set."))
-        .ok_or_else(|| format!("unsupported set `{set}` (need Finset./Set. range|Icc|Ico|Ioc|Ioo)"))?;
+        .ok_or_else(|| {
+            format!("unsupported set `{set}` (need Finset./Set. range|Icc|Ico|Ioc|Ioo)")
+        })?;
 
     let mut it = body.split_whitespace();
     let ctor = it.next().unwrap_or("");
@@ -862,9 +867,8 @@ fn split_comparison(chars: &[char]) -> Result<(String, Cmp, String), String> {
         }
         i += 1;
     }
-    let (s, e, op) = found.ok_or_else(|| {
-        "not a comparison, divisibility, parity or membership atom".to_string()
-    })?;
+    let (s, e, op) = found
+        .ok_or_else(|| "not a comparison, divisibility, parity or membership atom".to_string())?;
     let lhs: String = chars[..s].iter().collect();
     let rhs: String = chars[e..].iter().collect();
     if lhs.trim().is_empty() || rhs.trim().is_empty() {
@@ -992,9 +996,7 @@ fn split_top_level(chars: &[char], seps: &[&str]) -> Vec<String> {
         if depth == 0 {
             for s in seps {
                 let sv: Vec<char> = s.chars().collect();
-                if !sv.is_empty()
-                    && i + sv.len() <= chars.len()
-                    && chars[i..i + sv.len()] == sv[..]
+                if !sv.is_empty() && i + sv.len() <= chars.len() && chars[i..i + sv.len()] == sv[..]
                 {
                     parts.push(cur.trim().to_string());
                     cur.clear();
@@ -1148,7 +1150,10 @@ mod tests {
         );
         let w = search_witness(&bundle).into_witness().expect("witness");
         assert!(w.bindings.contains_key("n"));
-        assert!(w.bindings.contains_key("m"), "unconstrained binder must still be bound");
+        assert!(
+            w.bindings.contains_key("m"),
+            "unconstrained binder must still be bound"
+        );
         assert_eq!(w.claims, vec!["hn".to_string()]);
         assert!(check_vacuity(&bundle, Some(&w)).clean);
     }
@@ -1210,7 +1215,10 @@ mod tests {
         );
         match search_witness(&bundle) {
             WitnessSearch::NotDecidable { reason } => {
-                assert!(reason.contains("h3"), "reason should name the field: {reason}");
+                assert!(
+                    reason.contains("h3"),
+                    "reason should name the field: {reason}"
+                );
             }
             other => panic!("expected NotDecidable, got {other:?}"),
         }
@@ -1225,7 +1233,10 @@ mod tests {
                 HypothesisField::hypothesis("h2", "n < 10"),
             ],
         );
-        assert!(matches!(search_witness(&ok), WitnessSearch::WitnessFound(_)));
+        assert!(matches!(
+            search_witness(&ok),
+            WitnessSearch::WitnessFound(_)
+        ));
     }
 
     #[test]
@@ -1437,10 +1448,7 @@ mod tests {
         let a = search_witness(&bundle);
         assert_eq!(a, search_witness(&bundle));
 
-        let nd = b(
-            "thm",
-            vec![HypothesisField::hypothesis("h", "Nat.Prime p")],
-        );
+        let nd = b("thm", vec![HypothesisField::hypothesis("h", "Nat.Prime p")]);
         assert_eq!(search_witness(&nd), search_witness(&nd));
     }
 
@@ -1484,7 +1492,10 @@ mod tests {
         );
         assert!(matches!(
             search_witness(&bundle),
-            WitnessSearch::NoWitnessInBounds { exhausted: true, .. }
+            WitnessSearch::NoWitnessInBounds {
+                exhausted: true,
+                ..
+            }
         ));
         // Widen the bound and the very same bundle is witnessed.
         let wide = SearchBounds {
@@ -1507,7 +1518,10 @@ mod tests {
             ],
         );
         let w = search_witness(&bundle).into_witness().expect("witness");
-        assert!(w.bindings["n"].as_i64().unwrap() >= 0, "Nat is never negative");
+        assert!(
+            w.bindings["n"].as_i64().unwrap() >= 0,
+            "Nat is never negative"
+        );
     }
 
     #[test]

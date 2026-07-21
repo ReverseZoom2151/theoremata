@@ -715,13 +715,8 @@ mod tests {
     /// default.
     #[test]
     fn weight_without_a_critic_is_inert_at_every_value() {
-        let baseline = super::search_with_value(
-            Toy(1),
-            &critic_cfg(0.0),
-            toy_expand,
-            toy_reward,
-            |_| 0.0,
-        );
+        let baseline =
+            super::search_with_value(Toy(1), &critic_cfg(0.0), toy_expand, toy_reward, |_| 0.0);
         for w in [0.0, 0.5, 5.0, -3.0] {
             let got = super::search_with_critic(
                 Toy(1),

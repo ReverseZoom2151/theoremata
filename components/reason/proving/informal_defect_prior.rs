@@ -557,9 +557,28 @@ fn scan_commented_computations(
 /// computation that does not exist.
 fn comment_contains_math(comment: &str) -> bool {
     const MATH_COMMANDS: &[&str] = &[
-        "\\sum", "\\prod", "\\int", "\\frac", "\\sqrt", "\\le", "\\ge", "\\leq", "\\geq", "\\cdot",
-        "\\log", "\\phi", "\\varphi", "\\infty", "\\alpha", "\\epsilon", "\\left", "\\big",
-        "\\equiv", "\\approx", "\\lfloor", "\\mathbb",
+        "\\sum",
+        "\\prod",
+        "\\int",
+        "\\frac",
+        "\\sqrt",
+        "\\le",
+        "\\ge",
+        "\\leq",
+        "\\geq",
+        "\\cdot",
+        "\\log",
+        "\\phi",
+        "\\varphi",
+        "\\infty",
+        "\\alpha",
+        "\\epsilon",
+        "\\left",
+        "\\big",
+        "\\equiv",
+        "\\approx",
+        "\\lfloor",
+        "\\mathbb",
     ];
     if comment.contains('$') || comment.contains("\\[") || comment.contains("\\(") {
         return true;
@@ -773,9 +792,8 @@ impl RiskReport {
     /// Split the ranked regions into the two router buckets.
     pub fn to_routing_hints(&self) -> RoutingHints {
         let regions = rank_spans(&self.findings);
-        let (falsify_first, decompose_first): (Vec<_>, Vec<_>) = regions
-            .into_iter()
-            .partition(|r| r.route == Route::Falsify);
+        let (falsify_first, decompose_first): (Vec<_>, Vec<_>) =
+            regions.into_iter().partition(|r| r.route == Route::Falsify);
         RoutingHints {
             falsify_first,
             decompose_first,
@@ -850,8 +868,10 @@ mod tests {
     #[test]
     fn asymptotic_hand_wave_fires() {
         // The five words that cost ~150 lines of Lean.
-        assert!(categories("since phi(n) -> infinity, the term is negligible")
-            .contains(&DefectCategory::AsymptoticHandWave));
+        assert!(
+            categories("since phi(n) -> infinity, the term is negligible")
+                .contains(&DefectCategory::AsymptoticHandWave)
+        );
         for t in [
             "The quantity tends to infinity with n.",
             "For sufficiently large n the bound holds.",
@@ -900,8 +920,10 @@ mod tests {
     fn commented_arithmetic_fires_but_bare_prose_does_not() {
         assert!(categories("% here x = 12 and the total was 40\n")
             .contains(&DefectCategory::OmittedComputation));
-        assert!(!categories("% ask Alice whether this section should stay\n")
-            .contains(&DefectCategory::OmittedComputation));
+        assert!(
+            !categories("% ask Alice whether this section should stay\n")
+                .contains(&DefectCategory::OmittedComputation)
+        );
     }
 
     #[test]

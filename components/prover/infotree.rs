@@ -367,8 +367,16 @@ fn normalize(raw: &RawNode) -> Option<Node> {
         .filter_map(normalize)
         .collect();
 
-    let goals_before = body.goals_before.as_ref().map(RawGoals::to_strings).unwrap_or_default();
-    let goals_after = body.goals_after.as_ref().map(RawGoals::to_strings).unwrap_or_default();
+    let goals_before = body
+        .goals_before
+        .as_ref()
+        .map(RawGoals::to_strings)
+        .unwrap_or_default();
+    let goals_after = body
+        .goals_after
+        .as_ref()
+        .map(RawGoals::to_strings)
+        .unwrap_or_default();
 
     if span.is_none() && goals_before.is_empty() && goals_after.is_empty() && kids.is_empty() {
         return None;
@@ -587,7 +595,10 @@ mod tests {
         let tree = parse_infotree(NESTED).unwrap();
         // Line 5, column 4 (1-based) is inside all three nested ranges.
         let n = smallest_containing_node(&tree, 5, 4).expect("a node must contain 5:4");
-        assert_eq!(n.goals_before, vec!["n : Nat\nh : n > 0\n⊢ inner".to_string()]);
+        assert_eq!(
+            n.goals_before,
+            vec!["n : Nat\nh : n > 0\n⊢ inner".to_string()]
+        );
         assert!(n.kids.is_empty(), "the innermost node is the leaf");
 
         // Line 4 is outside the leaf but inside the middle node.
@@ -638,7 +649,10 @@ mod tests {
     fn a_position_outside_every_range_yields_none() {
         let tree = parse_infotree(NESTED).unwrap();
         assert!(smallest_containing_node(&tree, 999, 1).is_none());
-        assert!(smallest_containing_node(&tree, 10, 5).is_none(), "past the end column");
+        assert!(
+            smallest_containing_node(&tree, 10, 5).is_none(),
+            "past the end column"
+        );
         // Line 0 cannot exist in a 1-based convention and must not match.
         assert!(smallest_containing_node(&tree, 0, 1).is_none());
     }
@@ -702,11 +716,17 @@ mod tests {
                                   "goalsBefore": ["n : Nat\n⊢ n + 0 = n"]},
                         "kids": []}]"#;
         let mut diags = vec![lean_diag(2, 3, "unsolved goals")];
-        assert_eq!(attach_goal_states(&mut diags, json, DEFAULT_GOAL_STATE_CAP), 1);
+        assert_eq!(
+            attach_goal_states(&mut diags, json, DEFAULT_GOAL_STATE_CAP),
+            1
+        );
         let slot = diags[0].goal_state_slot.as_deref().expect("slot filled");
         assert!(slot.contains("n : Nat"), "{slot}");
         assert!(slot.contains("⊢ n + 0 = n"), "{slot}");
-        assert!(!slot.contains(AFTER_HEADING), "no after-state to show: {slot}");
+        assert!(
+            !slot.contains(AFTER_HEADING),
+            "no after-state to show: {slot}"
+        );
 
         // The mirror case: goalsAfter alone also populates, under its heading.
         let json_after = json.replace("goalsBefore", "goalsAfter");

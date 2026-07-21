@@ -59,11 +59,13 @@
 
 use crate::{
     config::Config,
-    falsification::{FalsifyVerdict, Falsifier},
+    falsification::{Falsifier, FalsifyVerdict},
     model::ModelRequest,
     prover::formal::FormalBackend,
     provider::ModelProvider,
-    statement_validity::{JudgeVerdict, NegationProver, ProofOutcome, StatementJudge, TrivialProver},
+    statement_validity::{
+        JudgeVerdict, NegationProver, ProofOutcome, StatementJudge, TrivialProver,
+    },
 };
 use anyhow::Result;
 use serde_json::json;
@@ -797,7 +799,10 @@ mod tests {
             .with_trivial_prover(&triv)
             .screen(INFORMAL, FORMAL);
         assert_eq!(report.verdict, StatementVerdict::Indeterminate);
-        assert!(report.failed().is_empty(), "nothing condemned this candidate");
+        assert!(
+            report.failed().is_empty(),
+            "nothing condemned this candidate"
+        );
 
         // Bad: a counterexample condemns the formalization.
         let provider = RecordingProvider::new(vec![

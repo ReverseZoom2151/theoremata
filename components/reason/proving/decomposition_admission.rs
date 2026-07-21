@@ -135,7 +135,11 @@ pub struct ChildProposal {
 
 impl ChildProposal {
     /// A well-formed, unproved child with no declared dependencies.
-    pub fn new(id: impl Into<String>, title: impl Into<String>, statement: impl Into<String>) -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        title: impl Into<String>,
+        statement: impl Into<String>,
+    ) -> Self {
         Self {
             id: id.into(),
             title: title.into(),
@@ -627,7 +631,8 @@ pub fn admit_with(proposal: &DecompositionProposal, cfg: &AdmissionConfig) -> Ad
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .collect();
-    let isolates_distinctly = !proposal.children.is_empty() && tags.len() == proposal.children.len();
+    let isolates_distinctly =
+        !proposal.children.is_empty() && tags.len() == proposal.children.len();
     if !reduces && !isolates_distinctly {
         violations.push(Violation::NoComplexityReduction {
             parent_score,
@@ -755,11 +760,7 @@ mod tests {
     }
 
     fn parent() -> ParentNode {
-        ParentNode::new(
-            "P",
-            "hA , hB ⊢ forall x , (f x) ∧ (g x) → (h x) ∨ (k x)",
-            1,
-        )
+        ParentNode::new("P", "hA , hB ⊢ forall x , (f x) ∧ (g x) → (h x) ∨ (k x)", 1)
     }
 
     /// Two genuinely simpler children — the happy path.
@@ -794,7 +795,9 @@ mod tests {
         ];
         let report = admit(&proposal(children));
         assert!(!report.admitted);
-        assert!(report.has(|v| matches!(v, Violation::SelfChild { child_id, .. } if child_id == "c1")));
+        assert!(
+            report.has(|v| matches!(v, Violation::SelfChild { child_id, .. } if child_id == "c1"))
+        );
     }
 
     #[test]
@@ -853,15 +856,13 @@ mod tests {
     fn out_of_range_child_counts_are_rejected() {
         // One child is a rename, not a decomposition.
         let one = vec![ChildProposal::new("c1", "Only", "hA ⊢ f x")];
-        assert!(admit(&proposal(one))
-            .has(|v| matches!(v, Violation::ChildCount { found: 1, .. })));
+        assert!(admit(&proposal(one)).has(|v| matches!(v, Violation::ChildCount { found: 1, .. })));
 
         // Seven children exceeds the max of 6.
         let many: Vec<ChildProposal> = (0..7)
             .map(|i| ChildProposal::new(format!("c{i}"), format!("Part {i}"), format!("hA ⊢ p{i}")))
             .collect();
-        assert!(admit(&proposal(many))
-            .has(|v| matches!(v, Violation::ChildCount { found: 7, .. })));
+        assert!(admit(&proposal(many)).has(|v| matches!(v, Violation::ChildCount { found: 7, .. })));
 
         // Zero children.
         assert!(admit(&proposal(Vec::new()))
@@ -874,7 +875,13 @@ mod tests {
         p.parent.depth = 6; // children would land at depth 7 > max 6
         let report = admit(&p);
         assert!(!report.admitted);
-        assert!(report.has(|v| matches!(v, Violation::DepthExceeded { child_depth: 7, max: 6 })));
+        assert!(report.has(|v| matches!(
+            v,
+            Violation::DepthExceeded {
+                child_depth: 7,
+                max: 6
+            }
+        )));
     }
 
     #[test]
@@ -921,7 +928,10 @@ mod tests {
         let mut children = good_children();
         children[0].status = ChildStatus::AssertedProved;
         let report = admit(&proposal(children));
-        assert!(!report.admitted, "asserting a child proved must never be admitted");
+        assert!(
+            !report.admitted,
+            "asserting a child proved must never be admitted"
+        );
         assert!(report.has(
             |v| matches!(v, Violation::AssertedChild { child_id, status }
                 if child_id == "c1" && *status == ChildStatus::AssertedProved)
@@ -956,7 +966,10 @@ mod tests {
         assert_eq!(probe.verdict(), ProbeVerdict::Repair);
         let p = DecompositionProposal::new(parent(), good_children(), probe);
         let report = admit(&p);
-        assert!(!report.admitted, "syntax errors must route to REPAIR, not decomposition");
+        assert!(
+            !report.admitted,
+            "syntax errors must route to REPAIR, not decomposition"
+        );
         assert!(report.has(
             |v| matches!(v, Violation::Unearned { verdict } if *verdict == ProbeVerdict::Repair)
         ));
@@ -1000,7 +1013,10 @@ mod tests {
             context_budget_tokens: 8000,
             ..Default::default()
         };
-        assert_eq!(ctx.verdict(), ProbeVerdict::EarnedContextOverBudget(9000, 8000));
+        assert_eq!(
+            ctx.verdict(),
+            ProbeVerdict::EarnedContextOverBudget(9000, 8000)
+        );
 
         let timeouts = DischargeProbe {
             ran: true,

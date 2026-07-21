@@ -1464,7 +1464,10 @@ mod tests {
         };
         let lattice_baseline = base(lattice_cfg());
         for weight in [0.0, 3.0, 100.0] {
-            for eta in [None, Some(super::super::distance_critic::EtaMctsConfig::default())] {
+            for eta in [
+                None,
+                Some(super::super::distance_critic::EtaMctsConfig::default()),
+            ] {
                 assert_identical(
                     &lattice_baseline,
                     &base(SearchConfig {
@@ -1513,7 +1516,9 @@ mod tests {
             ..SearchConfig::default()
         };
         let run = |critic: Option<Arc<dyn CriticScorer>>, cfg: SearchConfig| {
-            let mut d = ProofSearchDriver::new(wide()).with_seed(11).with_config(cfg);
+            let mut d = ProofSearchDriver::new(wide())
+                .with_seed(11)
+                .with_config(cfg);
             if let Some(c) = critic {
                 d = d.with_critic(c);
             }

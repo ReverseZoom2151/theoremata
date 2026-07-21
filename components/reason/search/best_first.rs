@@ -1129,8 +1129,7 @@ mod tests {
             Some(arc(NanCritic)),
         ] {
             let mut s = split_scorer();
-            let got =
-                best_first_search_with_critic(&mut s, MockGoal::open("root"), &cfg, critic);
+            let got = best_first_search_with_critic(&mut s, MockGoal::open("root"), &cfg, critic);
             assert_eq!(got.order, baseline.order);
             assert_eq!(got.solved, baseline.solved);
             assert_eq!(got.steps, baseline.steps);
@@ -1261,7 +1260,10 @@ mod tests {
             gate_calls += 1;
             true // a gate that says yes to everything must still be unreachable
         });
-        assert_eq!(gate_calls, 0, "the gate must not run for an unsolved search");
+        assert_eq!(
+            gate_calls, 0,
+            "the gate must not run for an unsolved search"
+        );
         assert_eq!(minimized.status, MinimizeStatus::NoProofFound);
         assert!(minimized.accepted.is_none());
     }
@@ -1480,8 +1482,7 @@ mod tests {
         // A chain that never closes within budget: the minimizer must report
         // NoProofFound and never consult the gate, so no proof is invented for a
         // search that did not close a goal.
-        let mut scorer =
-            TableScorer::new().edge("root", "t", 0.9f64.ln(), MockGoal::open("stuck"));
+        let mut scorer = TableScorer::new().edge("root", "t", 0.9f64.ln(), MockGoal::open("stuck"));
         let out = best_first_search(
             &mut scorer,
             MockGoal::open("root"),
@@ -1497,7 +1498,10 @@ mod tests {
             gate_calls += 1;
             true
         });
-        assert_eq!(gate_calls, 0, "an unsolved search must not consult the gate");
+        assert_eq!(
+            gate_calls, 0,
+            "an unsolved search must not consult the gate"
+        );
         assert_eq!(outcome.status, MinimizeStatus::NoProofFound);
         assert_eq!(outcome.accepted, None);
         assert_eq!(outcome.candidate, None);

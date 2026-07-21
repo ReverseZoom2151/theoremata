@@ -433,11 +433,7 @@ fn isabelle_live_verifies_trivial_and_rejects_sorry() {
     );
 
     let bad = backend
-        .verify(
-            &cfg,
-            "theorem t: \"True\"\n  sorry",
-            "theorem t: \"True\"",
-        )
+        .verify(&cfg, "theorem t: \"True\"\n  sorry", "theorem t: \"True\"")
         .unwrap();
     assert!(
         !bad.lexically_verified,

@@ -215,10 +215,7 @@ pub fn check_statement_preserved(
 /// The Lean theorem-signature comparison, unchanged. Kept separate from
 /// [`check_statement_preserved`] so the elaboration-option guard wraps it rather
 /// than being threaded through every early return.
-fn check_lean_signature(
-    canonical_statement: &str,
-    submitted_code: &str,
-) -> PreservationReport {
+fn check_lean_signature(canonical_statement: &str, submitted_code: &str) -> PreservationReport {
     let Some(canonical) = parse_first_decl(canonical_statement) else {
         return report(
             PreservationVerdict::CanonicalUnparsable,
@@ -631,10 +628,7 @@ fn entry_sig(kind: &str, name: &str, conclusion: &str) -> TheoremSig {
 /// the Lean sanitizer erases the very conclusion the preservation check must
 /// compare. This intentionally narrow parser covers the batch backend's emitted
 /// `theorem name: "proposition"` form and fails closed for other syntax.
-fn check_isabelle_signature(
-    canonical_statement: &str,
-    submitted_code: &str,
-) -> PreservationReport {
+fn check_isabelle_signature(canonical_statement: &str, submitted_code: &str) -> PreservationReport {
     let Some(canonical) = parse_first_isabelle_decl(canonical_statement) else {
         return report(
             PreservationVerdict::CanonicalUnparsable,
@@ -707,7 +701,9 @@ fn parse_all_isabelle_decls(src: &str) -> Vec<TheoremSig> {
                     && chars[i..i + k.len()] == k[..]
                     && chars.get(i + k.len()).map_or(true, |&c| !is_word(c))
                 {
-                    if let Some((sig, consumed)) = parse_isabelle_decl_at(&chars, keyword, i + k.len()) {
+                    if let Some((sig, consumed)) =
+                        parse_isabelle_decl_at(&chars, keyword, i + k.len())
+                    {
                         out.push(sig);
                         i = consumed;
                         break;
@@ -863,12 +859,10 @@ fn check_rocq_signature(canonical_statement: &str, submitted_code: &str) -> Pres
     let Some(canonical) = parse_rocq_decls(&canonical_src).into_iter().next() else {
         return report(
             PreservationVerdict::CanonicalUnparsable,
-            vec![
-                "Rocq canonical statement did not parse into a capitalized \
+            vec!["Rocq canonical statement did not parse into a capitalized \
                  `Theorem`/`Lemma`/… signature with a `: <conclusion>` \
                  (fail-closed: cannot confirm preservation)"
-                    .to_string(),
-            ],
+                .to_string()],
             None,
             None,
         );
@@ -1909,8 +1903,14 @@ pub fn check_context_preserved(
     let (ctx_pre, ctx_blocks) = decl_blocks(supplied_context);
     let (sub_pre, sub_blocks) = decl_blocks(submitted_code);
 
-    let ctx: Vec<&DeclBlock> = ctx_blocks.iter().filter(|b| b.name != target_name).collect();
-    let sub: Vec<&DeclBlock> = sub_blocks.iter().filter(|b| b.name != target_name).collect();
+    let ctx: Vec<&DeclBlock> = ctx_blocks
+        .iter()
+        .filter(|b| b.name != target_name)
+        .collect();
+    let sub: Vec<&DeclBlock> = sub_blocks
+        .iter()
+        .filter(|b| b.name != target_name)
+        .collect();
 
     let mut changes: Vec<ContextChange> = Vec::new();
 
@@ -2058,7 +2058,11 @@ fn decl_blocks(src: &str) -> (String, Vec<DeclBlock>) {
     let mut blocks = Vec::with_capacity(positions.len());
     for (i, p) in positions.iter().enumerate() {
         let lo = starts[i].min(raw.len());
-        let hi = starts.get(i + 1).copied().unwrap_or(raw.len()).min(raw.len());
+        let hi = starts
+            .get(i + 1)
+            .copied()
+            .unwrap_or(raw.len())
+            .min(raw.len());
         let text: String = raw[lo..hi.max(lo)].iter().collect();
         blocks.push(DeclBlock {
             name: p.name.clone(),
@@ -2371,7 +2375,8 @@ pub fn splice_canonical_statement(canonical_statement: &str, model_output: &str)
             ],
         );
     };
-    let head: String = canon_raw[canon.kw_start.min(canon_raw.len())..canon.sig_end.min(canon_raw.len())]
+    let head: String = canon_raw
+        [canon.kw_start.min(canon_raw.len())..canon.sig_end.min(canon_raw.len())]
         .iter()
         .collect();
     let head = head.trim().to_string();
@@ -2421,7 +2426,8 @@ pub fn splice_canonical_statement(canonical_statement: &str, model_output: &str)
     // (`#eval`, `attribute`, `open`, `axiom`) that must not ride along unaudited.
     let soft_end = column_zero_cut(&model_raw, body_start, hard_end);
 
-    let body_raw: String = model_raw[body_start.min(model_raw.len())..soft_end.min(model_raw.len())]
+    let body_raw: String = model_raw
+        [body_start.min(model_raw.len())..soft_end.min(model_raw.len())]
         .iter()
         .collect();
     if body_raw.trim().is_empty() {
@@ -3488,7 +3494,10 @@ def aux : Nat := 0
         for (canonical, submitted) in cases {
             let via_entry = check_entry_signature(FormalSystem::Lean, canonical, submitted);
             let direct = check_statement_preserved(canonical, submitted);
-            assert_eq!(via_entry, direct, "Lean routing must not change: {canonical}");
+            assert_eq!(
+                via_entry, direct,
+                "Lean routing must not change: {canonical}"
+            );
         }
         // Rocq vernacular is not Lean vernacular: the Lean parser sees no
         // declaration in it, exactly as before.
@@ -3512,7 +3521,11 @@ def aux : Nat := 0
             "Theorem t : True",
             "Theorem t : True.\nProof.\n  exact I.\nQed.\n",
         );
-        assert!(r.preserved, "correct Rocq proof must pass: {:?}", r.findings);
+        assert!(
+            r.preserved,
+            "correct Rocq proof must pass: {:?}",
+            r.findings
+        );
         assert_eq!(r.verdict, PreservationVerdict::Preserved);
         assert!(r.into_scan_report().clean);
     }
@@ -3572,7 +3585,10 @@ def aux : Nat := 0
             "Theorem t : Factorial 3 = 6",
             "Theorem t : Factorial 3 = 6.\nProof.\n  auto.\nQed.\n",
         );
-        assert!(prefix.preserved, "`Factorial` is not the keyword `Fact`: {prefix:?}");
+        assert!(
+            prefix.preserved,
+            "`Factorial` is not the keyword `Fact`: {prefix:?}"
+        );
     }
 
     /// A pure bound-variable rename is accepted up to alpha, as on the Lean path.
@@ -3759,7 +3775,10 @@ def aux : Nat := 0
         );
         assert_eq!(bare_name.verdict, PreservationVerdict::CanonicalUnparsable);
         assert!(
-            bare_name.findings.iter().any(|f| f.contains("NO proposition")),
+            bare_name
+                .findings
+                .iter()
+                .any(|f| f.contains("NO proposition")),
             "the finding must say the statement carries no proposition: {:?}",
             bare_name.findings
         );
@@ -3863,11 +3882,7 @@ def aux : Nat := 0
 
         // The right name bound to something with no term at all is not a proof
         // of the canonical statement.
-        let no_term = check_entry_signature(
-            FormalSystem::Candle,
-            canonical,
-            "let T1 = TRUTH;;\n",
-        );
+        let no_term = check_entry_signature(FormalSystem::Candle, canonical, "let T1 = TRUTH;;\n");
         assert!(!no_term.preserved, "{no_term:?}");
         assert_eq!(no_term.verdict, PreservationVerdict::SubmittedMissing);
     }
@@ -3943,8 +3958,11 @@ def aux : Nat := 0
         let b = check_entry_signature(FormalSystem::Candle, canonical, submitted);
         assert_eq!(a, b, "the check must be deterministic");
 
-        let truncated =
-            check_entry_signature(FormalSystem::Candle, "let T1 = prove(`!x. x = x", "let T1 =");
+        let truncated = check_entry_signature(
+            FormalSystem::Candle,
+            "let T1 = prove(`!x. x = x",
+            "let T1 =",
+        );
         assert!(!truncated.preserved);
         let unterminated_comment =
             check_entry_signature(FormalSystem::Candle, canonical, "(* let T1 = prove(`x`,");
@@ -3980,7 +3998,10 @@ def aux : Nat := 0
         for (canonical, submitted) in cases {
             let via_entry = check_entry_signature(FormalSystem::Lean, canonical, submitted);
             let direct = check_statement_preserved(canonical, submitted);
-            assert_eq!(via_entry, direct, "Lean routing must not change: {canonical}");
+            assert_eq!(
+                via_entry, direct,
+                "Lean routing must not change: {canonical}"
+            );
         }
         // The exact Lean report, pinned so a future parser change is visible.
         let r = check_statement_preserved(
@@ -4155,7 +4176,11 @@ theorem tan_arctan (x : Real) : Real.tan (Real.arctan x) = x := by
         assert!(escape_hatch_scan_report(code).clean);
         // The signal is not thrown away, it is demoted.
         let advisory = commented_escape_hatch_advisory(code);
-        assert_eq!(advisory.len(), 2, "both mentions are advisory: {advisory:?}");
+        assert_eq!(
+            advisory.len(),
+            2,
+            "both mentions are advisory: {advisory:?}"
+        );
         assert!(advisory.iter().all(|a| a.contains("non-gating")));
         // A REAL `sorry` in code still gates.
         let real = "theorem t : True := by sorry\n";
@@ -4558,8 +4583,10 @@ theorem main (n : Nat) : n + 0 = n := by exact helper n
     /// A rewritten non-target lemma is reported as modified.
     #[test]
     fn rewritten_non_target_lemma_is_reported() {
-        let context = "lemma helper (a : Nat) : a + 0 = a := by simp\ntheorem main : True := by sorry\n";
-        let submitted = "lemma helper (a : Nat) : a = a := by rfl\ntheorem main : True := by trivial\n";
+        let context =
+            "lemma helper (a : Nat) : a + 0 = a := by simp\ntheorem main : True := by sorry\n";
+        let submitted =
+            "lemma helper (a : Nat) : a = a := by rfl\ntheorem main : True := by trivial\n";
         let r = check_context_preserved(context, submitted, "main");
         assert!(!r.intact);
         assert!(r
@@ -4589,7 +4616,8 @@ theorem main (n : Nat) : n + 0 = n := by exact helper n
     /// Reindentation / rewrapping alone is tolerated; only real text changes fire.
     #[test]
     fn reformatting_is_tolerated() {
-        let context = "lemma helper (a : Nat) : a + 0 = a := by simp\ntheorem main : True := by sorry\n";
+        let context =
+            "lemma helper (a : Nat) : a + 0 = a := by simp\ntheorem main : True := by sorry\n";
         let submitted =
             "lemma helper\n    (a : Nat)\n    : a + 0 = a := by\n  simp\ntheorem main : True := by trivial\n";
         let r = check_context_preserved(context, submitted, "main");
@@ -4736,7 +4764,10 @@ theorem backdoor : False := by sorry
 ";
         let out = splice_canonical_statement(canonical, model);
         let spliced = out.spliced.unwrap();
-        assert!(!spliced.contains("backdoor"), "unaudited tail rode along: {spliced}");
+        assert!(
+            !spliced.contains("backdoor"),
+            "unaudited tail rode along: {spliced}"
+        );
         assert!(!spliced.contains("sorry"));
         assert!(out
             .discarded_tail
@@ -4772,7 +4803,10 @@ axiom cheat : False
         let canonical = "theorem main (n : Nat) : n = n";
         let model = "theorem main (n : Nat) : n = n := rfl\n";
         let out = splice_canonical_statement(canonical, model);
-        assert_eq!(out.spliced.as_deref(), Some("theorem main (n : Nat) : n = n := rfl\n"));
+        assert_eq!(
+            out.spliced.as_deref(),
+            Some("theorem main (n : Nat) : n = n := rfl\n")
+        );
     }
 
     /// Fail-closed verdicts produce no splice.
@@ -4783,13 +4817,15 @@ axiom cheat : False
                 .verdict,
             SpliceVerdict::CanonicalUnparsable
         );
-        let missing = splice_canonical_statement("theorem main : True", "theorem other : True := trivial");
+        let missing =
+            splice_canonical_statement("theorem main : True", "theorem other : True := trivial");
         assert_eq!(missing.verdict, SpliceVerdict::TargetNotFound);
         assert!(missing.spliced.is_none());
         let bodyless = splice_canonical_statement("theorem main : True", "theorem main : True");
         assert_eq!(bodyless.verdict, SpliceVerdict::NoProofBody);
         assert!(bodyless.spliced.is_none());
-        let empty_by = splice_canonical_statement("theorem main : True", "theorem main : True := by\n");
+        let empty_by =
+            splice_canonical_statement("theorem main : True", "theorem main : True := by\n");
         assert_eq!(empty_by.verdict, SpliceVerdict::NoProofBody);
         assert!(empty_by.spliced_with_preamble().is_none());
     }

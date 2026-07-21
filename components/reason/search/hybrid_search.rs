@@ -305,7 +305,15 @@ pub fn multi_alpha_union_minimized<Sc: TacticScorer, F>(
 where
     F: FnMut(&[String]) -> bool,
 {
-    multi_alpha_union_minimized_with_critic(scorer, root, alphas, per_alpha_budget, 0.0, None, replay)
+    multi_alpha_union_minimized_with_critic(
+        scorer,
+        root,
+        alphas,
+        per_alpha_budget,
+        0.0,
+        None,
+        replay,
+    )
 }
 
 /// [`multi_alpha_union_minimized`] with a critic steering the sweep.
@@ -1100,16 +1108,11 @@ mod tests {
     fn minimized_sweep_accepts_a_shortcut_the_replay_confirms() {
         let mut scorer = shortcut_scorer();
         let mut seen: Vec<Vec<String>> = Vec::new();
-        let (outcome, minimized) = multi_alpha_union_minimized(
-            &mut scorer,
-            MockGoal::open("root"),
-            &[0.0],
-            50,
-            |cand| {
+        let (outcome, minimized) =
+            multi_alpha_union_minimized(&mut scorer, MockGoal::open("root"), &[0.0], 50, |cand| {
                 seen.push(cand.to_vec());
                 true
-            },
-        );
+            });
 
         assert!(outcome.solved);
         assert_eq!(outcome.proof_tactics, vec!["t1", "t3"]);
@@ -1179,10 +1182,13 @@ mod tests {
         // against *that* pass's arena, so both stages compose without either one
         // deciding solvedness on its own.
         let mut scorer = two_path_scorer();
-        let (outcome, minimized) =
-            multi_alpha_union_minimized(&mut scorer, MockGoal::open("root"), &[0.0, 1.0], 50, |_| {
-                true
-            });
+        let (outcome, minimized) = multi_alpha_union_minimized(
+            &mut scorer,
+            MockGoal::open("root"),
+            &[0.0, 1.0],
+            50,
+            |_| true,
+        );
         assert_eq!(outcome.proof_tactics, vec!["sx"], "alpha=0 wins the sweep");
         let m = minimized.expect("solved");
         // Already minimal: the arena's shortest close is the winning line itself.
@@ -1288,8 +1294,7 @@ mod tests {
     }
     impl CriticScorer for CountingCritic {
         fn score(&self, state: &dyn super::super::critic_scorer::GoalStateLike) -> f64 {
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if state.state_text().starts_with(self.prefix) {
                 1.0
             } else {
