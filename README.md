@@ -58,22 +58,26 @@ question is whether you can check it without taking anyone's word for it.
 
 ## Watch it run
 
-Break it first. A false conjecture never reaches the prover:
+Break it first. A bounded counter-search runs offline in milliseconds, and a false
+conjecture never reaches the prover. Give it the variables with a search box and the claim
+as an expression:
 
 ```console
-$ theoremata falsify "x,y" "x^2 + y^2 >= 3*x*y"
-{ "verdict": "counterexample", "assignment": { "x": 1, "y": 1 } }
-  1 + 1 = 2, but 3*x*y = 3.  Rejected before a single proof attempt.
+$ theoremata falsify '{"x":{"start":0,"stop":6},"y":{"start":0,"stop":6}}' "x**2 + y**2 >= 3*x*y"
+{ "verdict": "counterexample", "assignment": { "x": 1, "y": 1 }, "checked": 8 }
 ```
 
-Prove what survives, and read the verdict off the gate, layer by layer:
+`x=1, y=1` gives `2 >= 3`, which is false. Rejected before a single proof attempt. The true
+form survives the same search and earns its shot at a proof:
 
 ```console
-$ theoremata formal-prove lean "1 + 1 = 2"
-{ "lexically_verified": true, "axioms_clean": true,
-  "statement_preserved": true, "live": true }
-  compile ok -> axioms whitelisted -> leanchecker ok -> statement is the one you asked for
+$ theoremata falsify '{"x":{"start":0,"stop":6},"y":{"start":0,"stop":6}}' "x**2 + y**2 >= 2*x*y"
+{ "verdict": "no_counterexample_in_domain", "checked": 36 }
 ```
+
+Then `theoremata formal-prove <system> "<statement>"` formalizes the survivor with your
+configured model and runs it through the gate, returning a report whose fields are the
+verdict: `lexically_verified`, `axioms_clean`, `statement_preserved`, and `live`.
 
 > [!NOTE]
 > `live: true` is the field that matters. A backend without its toolchain still runs, but

@@ -34,34 +34,34 @@ Type "# 1. Break it first. A false claim never reaches the prover."
 Enter
 Sleep 1.2s
 
-Type `theoremata falsify "x,y" "x^2 + y^2 >= 3*x*y"`
+Type `theoremata falsify '{"x":{"start":0,"stop":6},"y":{"start":0,"stop":6}}' "x**2 + y**2 >= 3*x*y"`
 Enter
 Sleep 3s
 
-Type "# A counterexample, in seconds. x=1, y=1 gives 2 >= 3, which is false."
+Type "# counterexample: x=1, y=1 gives 2 >= 3, which is false. Milliseconds, no model."
 Enter
 Sleep 2s
 
-Type "# 2. A true claim survives the same search."
+Type "# 2. The true form survives the same search."
 Enter
 Sleep 1.2s
 
-Type `theoremata falsify "x,y" "x^2 + y^2 >= 2*x*y"`
+Type `theoremata falsify '{"x":{"start":0,"stop":6},"y":{"start":0,"stop":6}}' "x**2 + y**2 >= 2*x*y"`
 Enter
 Sleep 3s
 
-Type "# No counterexample. Now it has earned a real proof attempt."
+Type "# no_counterexample_in_domain. Now it has earned a real proof attempt."
 Enter
 Sleep 2s
 
-Type "# 3. Prove it, and read the verdict off the gate."
+Type "# 3. What the machine can actually check, six proof assistants deep."
 Enter
 Sleep 1.2s
 
-Type `theoremata formal-prove lean "1 + 1 = 2"`
+Type "theoremata doctor"
 Enter
-Sleep 4s
+Sleep 3s
 
-Type "# live: true. A kernel re-checked it. Not a claim, a receipt."
+Type "# Every accepted proof is kernel re-checked. Not a claim, a receipt."
 Enter
 Sleep 3s
