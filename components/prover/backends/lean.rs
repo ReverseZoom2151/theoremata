@@ -595,14 +595,11 @@ impl LeanBackend {
             return None;
         }
         let base = std::fs::read_to_string(root.join(format!("{MODULE}.lean"))).ok()?;
-        let mut content = base;
-        if !content.ends_with('\n') {
-            content.push('\n');
-        }
-        // 1-based line of the first line we append, so a `#check` that was already
-        // in the submitted source cannot be mistaken for ours.
-        let first_appended_line = content.lines().count() + 1;
-        content.push_str(&elaboration_probe_block(decl));
+        // Shared with the staleness re-elaboration path
+        // ([`reelaborate_pinned_statement`]) so the two forms being compared can
+        // never have been produced by two different mechanisms. See
+        // [`append_elaboration_probe`].
+        let (content, first_appended_line) = append_elaboration_probe(&base, decl);
         let probe_file = format!("{MODULE}_elab.lean");
         std::fs::write(root.join(&probe_file), content).ok()?;
         let out = exec::run(
@@ -613,7 +610,7 @@ impl LeanBackend {
         if !out.success() {
             return None;
         }
-        let form = elaborated_form_from_json(&out.stdout, first_appended_line)?;
+        let form = probe_outcome_from_json(&out.stdout, first_appended_line).into_form()?;
         if form.len() > MAX_ELABORATED_FORM_BYTES {
             return None;
         }
@@ -656,6 +653,53 @@ fn elaboration_probe_enabled() -> bool {
             !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
         }
         Err(_) => true,
+    }
+}
+
+/// Append the probe block to a source and report the 1-based line the appended
+/// block starts on.
+///
+/// THE SINGLE PLACE a probe is assembled. Both the pin path
+/// ([`LeanBackend::elaborated_statement`]) and the staleness re-elaboration path
+/// ([`reelaborate_pinned_statement`]) go through it, because a comparison between
+/// a form produced by one mechanism and a form produced by another mechanism is
+/// meaningless: it would report pretty-printer differences as moved mathematics.
+/// Factoring it here means the two cannot drift without a compile error.
+fn append_elaboration_probe(base: &str, decl: &str) -> (String, usize) {
+    let mut content = base.to_string();
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    // 1-based line of the first line we append, so a `#check` that was already in
+    // the submitted source cannot be mistaken for ours.
+    let first_appended_line = content.lines().count() + 1;
+    content.push_str(&elaboration_probe_block(decl));
+    (content, first_appended_line)
+}
+
+/// What one probe run said. Three states, not two: "the elaborator ran and
+/// refused" and "we got no answer" are the distinction the whole staleness
+/// discriminator rests on, so the parser must not collapse them into `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProbeOutcome {
+    /// `#check` printed a type.
+    Form(String),
+    /// The elaborator reported an error. Carries its text verbatim; the CALLER
+    /// decides whether that text is evidence of moved mathematics or merely of a
+    /// context that does not provide what the form names.
+    Failed(String),
+    /// The run produced neither. No answer is not a negative answer.
+    NoAnswer,
+}
+
+impl ProbeOutcome {
+    /// The form, discarding WHY there is none. Used by the pin path, which
+    /// publishes nothing on every doubt and so needs no reason.
+    fn into_form(self) -> Option<String> {
+        match self {
+            ProbeOutcome::Form(f) => Some(f),
+            ProbeOutcome::Failed(_) | ProbeOutcome::NoAnswer => None,
+        }
     }
 }
 
@@ -1046,6 +1090,16 @@ fn strip_check_prefix(printed: &str) -> Option<String> {
 /// probe file did not elaborate, so whatever else it printed says nothing about
 /// the accepted statement.
 fn elaborated_form_from_json(stdout: &str, first_appended_line: usize) -> Option<String> {
+    probe_outcome_from_json(stdout, first_appended_line).into_form()
+}
+
+/// The parser both probe paths share. Fails closed on ANY error message in the
+/// run: an error means the probe file did not elaborate, so whatever else it
+/// printed says nothing about the accepted statement. The error TEXT is kept
+/// rather than discarded, because the staleness discriminator has to read it to
+/// tell "this term is ill-typed here" (moved mathematics) from "this context does
+/// not provide what the term names" (no answer at all).
+fn probe_outcome_from_json(stdout: &str, first_appended_line: usize) -> ProbeOutcome {
     let mut found: Option<String> = None;
     for line in stdout.lines() {
         let Ok(msg) = serde_json::from_str::<Value>(line.trim()) else {
@@ -1053,7 +1107,12 @@ fn elaborated_form_from_json(stdout: &str, first_appended_line: usize) -> Option
         };
         let severity = msg.get("severity").and_then(Value::as_str).unwrap_or("");
         if severity == "error" {
-            return None;
+            return ProbeOutcome::Failed(
+                msg.get("data")
+                    .and_then(Value::as_str)
+                    .unwrap_or("lean reported an error with no message body")
+                    .to_string(),
+            );
         }
         if severity != "information" {
             continue;
@@ -1077,7 +1136,312 @@ fn elaborated_form_from_json(stdout: &str, first_appended_line: usize) -> Option
             found = Some(ty);
         }
     }
-    found
+    match found {
+        Some(form) => ProbeOutcome::Form(form),
+        None => ProbeOutcome::NoAnswer,
+    }
+}
+
+// ===========================================================================
+// Phase 1.2: re-elaborating a PINNED statement under the CURRENT environment
+// ===========================================================================
+
+/// Opt-in for the staleness re-elaboration probe. **Default OFF.**
+///
+/// Re-elaboration spawns Lean twice per assessed node (a control probe and the
+/// statement probe). Against a real Mathlib that is seconds per node, so a sweep
+/// over a large store must not do it unconditionally: the census stays exactly as
+/// cheap as it is today unless someone asks for the expensive answer. Accepted
+/// truthy values mirror the rest of the file (`1`/`true`/`on`).
+pub const REELABORATION_OPT_IN_ENV: &str = "THEOREMATA_STALENESS_REELABORATE";
+
+/// Import header used when neither the stored record nor the operator supplies
+/// one. `import Mathlib` is the maximal Mathlib context, so it is a SUPERSET of
+/// whatever a Mathlib-derived statement was originally elaborated under, which is
+/// the safe direction: a too-narrow context would make a perfectly good statement
+/// fail to resolve, and this file must never read that as moved mathematics.
+pub const DEFAULT_REELABORATION_PREAMBLE: &str = "import Mathlib";
+
+/// Name the re-elaborated statement is introduced under. The name is irrelevant
+/// to the result: [`strip_check_prefix`] drops it before anything is compared, on
+/// exactly the same grounds as on the pin side.
+const REELABORATION_DECL: &str = "theoremataReelaboratedStatement";
+
+/// Name of the control declaration. See [`reelaborate_pinned_statement`] step 1.
+const REELABORATION_CONTROL_DECL: &str = "theoremataReelaborationControl";
+
+/// Options turned off around the re-elaborated declaration.
+///
+/// `autoImplicit` is the load-bearing one and was confirmed live on lean 4.32.0.
+/// With it ON, a constant the current environment no longer provides is silently
+/// auto-bound as a fresh implicit variable, and the probe then fails with a
+/// downstream complaint ("function expected at f") that is indistinguishable from
+/// a genuine type error. With it OFF the same case reports `Unknown identifier`,
+/// which is precisely the marker [`names_are_unresolved`] needs to route the node
+/// to "no answer" instead of to a withdrawal.
+const AUTO_IMPLICIT_OFF: &str =
+    "set_option autoImplicit false\nset_option relaxedAutoImplicit false\n";
+
+/// What re-elaborating a pinned statement produced.
+///
+/// Deliberately the same three-way shape as the reason layer's
+/// `staleness::ReelaborationOutcome`, and deliberately NOT that type: this file
+/// is a prover backend and should not depend on the reason layer. The caller
+/// (`reason::proving::staleness_sweep`) does the one-to-one conversion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeanReelaboration {
+    /// The statement elaborated, to this form. Produced by the SAME mechanism
+    /// that produced the pin, so the two are comparable by exact string equality.
+    Elaborated { form: String },
+    /// The elaborator ran, in a context proved healthy by the control probe, and
+    /// refused the statement as ILL-TYPED. A checked negative.
+    Rejected { detail: String },
+    /// We got no usable answer. Never evidence of anything.
+    Unavailable { reason: String },
+}
+
+/// Whether the staleness re-elaboration probe is enabled. Default OFF, which is
+/// the opposite of [`elaboration_probe_enabled`]: publishing a pin costs one run
+/// per successful verification, re-elaborating costs two runs per stale node.
+pub fn reelaboration_opt_in() -> bool {
+    match std::env::var(REELABORATION_OPT_IN_ENV) {
+        Ok(v) => {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+        }
+        Err(_) => false,
+    }
+}
+
+/// Lean error markers meaning THE CONTEXT DOES NOT PROVIDE A NAME the pinned form
+/// uses.
+///
+/// This is the "unrelated reason" case the plan warns about: a missing import, a
+/// narrower preamble than the pin was elaborated under, or a constant that was
+/// deleted. Those are not distinguishable from each other from here, and none of
+/// them is evidence that the mathematics moved, so all of them degrade to
+/// `Unavailable` and therefore to `Unknown`. Withdrawing a green on a missing
+/// import would be the most damaging error this component can make.
+const UNRESOLVED_NAME_MARKERS: [&str; 4] = [
+    "unknown identifier",
+    "unknown constant",
+    "unknown namespace",
+    "unknown package",
+];
+
+/// Lean error markers meaning THE TERM IS ILL-TYPED IN A CONTEXT THAT RESOLVED.
+///
+/// An ALLOWLIST, not a denylist, and that direction is deliberate: only an error
+/// we positively recognize as ill-typedness may produce the loud
+/// `MathematicsMoved` verdict. Every unrecognized error falls through to
+/// `Unavailable`, so a new or reworded Lean diagnostic costs us an `Unknown`
+/// (recoverable) rather than a wrongful withdrawal (not).
+const ILL_TYPED_MARKERS: [&str; 4] = [
+    "type mismatch",
+    "function expected",
+    "has type",
+    "is not definitionally equal",
+];
+
+/// True when a Lean error is about a name the context does not provide.
+fn names_are_unresolved(detail: &str) -> bool {
+    let lowered = detail.to_lowercase();
+    UNRESOLVED_NAME_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+}
+
+/// True when a Lean error is a recognized ill-typedness AND is not about an
+/// unresolved name. Order matters: an "unknown identifier" message can also carry
+/// a `has type` clause further down, and the unresolved reading must win.
+fn is_ill_typed(detail: &str) -> bool {
+    if names_are_unresolved(detail) {
+        return false;
+    }
+    let lowered = detail.to_lowercase();
+    ILL_TYPED_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+}
+
+/// The probe source for one re-elaboration: a preamble, then the pinned form
+/// introduced as a declaration, then the SHARED probe block.
+///
+/// `axiom` is used to introduce the type because we want the type ELABORATED and
+/// nothing else; a `theorem` would need a proof and a `def` would need a value,
+/// and both would make the probe fail for reasons that have nothing to do with
+/// the statement. The declaration exists only inside a throwaway file that is
+/// never imported, never compiled into a workspace that backs a verdict, and
+/// never consulted for anything but the string `#check` prints, so it introduces
+/// no axiom anywhere a proof could reach it.
+fn reelaboration_probe_source(preamble: &str, pinned_form: &str) -> String {
+    format!(
+        "{preamble}\n{AUTO_IMPLICIT_OFF}\naxiom {REELABORATION_DECL} :\n{pinned_form}\n"
+    )
+}
+
+/// The control probe source: the same preamble and the same options, carrying a
+/// declaration whose type is `True` and therefore cannot depend on the library.
+fn reelaboration_control_source(preamble: &str) -> String {
+    format!("{preamble}\n{AUTO_IMPLICIT_OFF}\naxiom {REELABORATION_CONTROL_DECL} : True\n")
+}
+
+/// Run one probe file under the same runner and the same `lean --json`
+/// invocation the pin path uses.
+fn run_probe(
+    runner: &Runner,
+    lean: &str,
+    root: &Path,
+    file_name: &str,
+    body: &str,
+    decl: &str,
+) -> ProbeOutcome {
+    let (content, first_appended_line) = append_elaboration_probe(body, decl);
+    if std::fs::write(root.join(file_name), content).is_err() {
+        return ProbeOutcome::NoAnswer;
+    }
+    let out = exec::run(runner, &[lean, "--json", file_name], root);
+    if !out.launched {
+        return ProbeOutcome::NoAnswer;
+    }
+    probe_outcome_from_json(&out.stdout, first_appended_line)
+}
+
+/// Re-elaborate a PINNED elaborated statement form under the CURRENT environment
+/// (plan Phase 1.2).
+///
+/// # Why the pinned FORM is the input, and not the original source text
+///
+/// The pin published by [`LeanBackend::elaborated_statement`] is `pp.all` output:
+/// fully explicit, with every universe level, implicit argument and instance
+/// argument named. That makes it re-parseable Lean, and it makes it SENSITIVE in
+/// exactly the way the discriminator needs. Verified live on lean 4.32.0 against
+/// the built Mathlib: an `abbrev T := Nat` changed to `abbrev T := Int` keeps the
+/// surface statement byte-identical and keeps the DEFAULT pretty-printing
+/// identical, while the `pp.all` form names `instAddNat` explicitly and so fails
+/// to re-elaborate. Surface text would have said "nothing changed".
+///
+/// # The three answers, and how they are kept apart
+///
+/// 1. **Control probe first.** A declaration of type `True` under the same
+///    preamble and the same options. If that does not elaborate, the workspace,
+///    the toolchain or the preamble is broken, and NOTHING we learn from the
+///    statement probe means anything. Returns `Unavailable`.
+/// 2. **Statement probe.** With the control green:
+///    - it printed a form -> `Elaborated`. The caller compares strings; equal is a
+///      repair task, different is a withdrawal.
+///    - it errored with an ill-typedness we recognize ([`ILL_TYPED_MARKERS`]) ->
+///      `Rejected`. This is the only path to a withdrawal-by-non-elaboration.
+///    - it errored about a name the context does not provide
+///      ([`UNRESOLVED_NAME_MARKERS`]) -> `Unavailable`. A missing import and a
+///      deleted constant are indistinguishable from here, and the plan's own
+///      honest risk (a statement whose local definitions also moved) lands here.
+///    - anything else, including no output at all -> `Unavailable`.
+///
+/// Every early return in this function is `Unavailable`. There is no path from a
+/// failure of any kind to `Elaborated`, so the caller can never be handed
+/// something that assesses to `Fresh` because we did not manage to look.
+pub fn reelaborate_pinned_statement(
+    cfg: &Config,
+    preamble: &str,
+    pinned_form: &str,
+) -> LeanReelaboration {
+    let unavailable =
+        |reason: String| LeanReelaboration::Unavailable { reason };
+
+    if !reelaboration_opt_in() {
+        return unavailable(format!(
+            "re-elaboration is opt-in and {REELABORATION_OPT_IN_ENV} is not set"
+        ));
+    }
+    if pinned_form.trim().is_empty() {
+        return unavailable("pinned elaborated statement form is empty".to_string());
+    }
+    if preamble.trim().is_empty() {
+        return unavailable(
+            "no import preamble is available to re-elaborate the pinned form against".to_string(),
+        );
+    }
+    if cfg.prover_mock {
+        // A mock consults no library, so it cannot say anything about whether the
+        // library moved. Silence, not a verdict.
+        return unavailable(
+            "prover is pinned to mock, which elaborates against no library".to_string(),
+        );
+    }
+
+    let backend = LeanBackend::live(cfg);
+    if !backend.available() {
+        return unavailable(format!(
+            "lean toolchain unavailable through runner {}",
+            backend.runner.tag()
+        ));
+    }
+    let root = match crate::prover::formal::live_workspace_dir(cfg, SYSTEM) {
+        Ok(root) => root,
+        Err(err) => {
+            return unavailable(format!("could not scaffold a re-elaboration workspace: {err}"))
+        }
+    };
+
+    // 1. Control probe. Proves the preamble, the runner and the toolchain can
+    //    elaborate ANYTHING here, so a later failure is about the statement.
+    let control = run_probe(
+        &backend.runner,
+        &backend.lean,
+        &root,
+        "ReelaborationControl.lean",
+        &reelaboration_control_source(preamble),
+        REELABORATION_CONTROL_DECL,
+    );
+    let outcome = match control {
+        ProbeOutcome::Form(_) => {
+            // 2. Statement probe, in a context now known to be healthy.
+            let probe = run_probe(
+                &backend.runner,
+                &backend.lean,
+                &root,
+                "Reelaboration.lean",
+                &reelaboration_probe_source(preamble, pinned_form),
+                REELABORATION_DECL,
+            );
+            match probe {
+                ProbeOutcome::Form(form) => LeanReelaboration::Elaborated { form },
+                ProbeOutcome::Failed(detail) if is_ill_typed(&detail) => {
+                    LeanReelaboration::Rejected { detail }
+                }
+                ProbeOutcome::Failed(detail) if names_are_unresolved(&detail) => unavailable(
+                    format!(
+                        "the pinned form names something this context does not provide, which a \
+                         missing import and a deleted constant share, so this is not evidence \
+                         that the mathematics moved: {detail}"
+                    ),
+                ),
+                ProbeOutcome::Failed(detail) => unavailable(format!(
+                    "lean refused the pinned form with an error this build does not recognize as \
+                     ill-typedness, so it is not read as moved mathematics: {detail}"
+                )),
+                ProbeOutcome::NoAnswer => unavailable(
+                    "the statement probe printed neither a type nor an error".to_string(),
+                ),
+            }
+        }
+        ProbeOutcome::Failed(detail) => unavailable(format!(
+            "control probe failed, so the re-elaboration context itself is unusable and nothing \
+             about the statement can be concluded: {detail}"
+        )),
+        ProbeOutcome::NoAnswer => unavailable(
+            "control probe produced no output, so the re-elaboration context could not be \
+             confirmed usable"
+                .to_string(),
+        ),
+    };
+
+    // Best effort: a sweep can create one of these per node, and leaving them all
+    // behind is how a census fills a disk. A failure to clean up is not a reason
+    // to change the verdict.
+    let _ = std::fs::remove_dir_all(&root);
+    outcome
 }
 
 /// Offline lexical fallback for [`LeanBackend::source_scan`]: the Lean escape
@@ -2048,6 +2412,167 @@ mod elaboration_tests {
     fn provenance_is_honest_about_being_a_pretty_printed_type() {
         assert_eq!(ELABORATED_PROVENANCE, "lean.check.pp_all");
         assert!(!ELABORATED_PROVENANCE.contains("kernel"));
+    }
+
+    // -- Phase 1.2: re-elaboration -----------------------------------------
+
+    /// The pin and the re-elaboration must be produced by ONE mechanism. This
+    /// pins the shared pieces: the same probe block, appended by the same helper,
+    /// parsed by the same parser, with the name stripped the same way.
+    #[test]
+    fn the_pin_and_the_re_elaboration_share_one_probe_mechanism() {
+        let (pin_content, pin_line) = append_elaboration_probe("import Mathlib\ntheorem t : True := trivial\n", "t");
+        let (re_content, re_line) = append_elaboration_probe(
+            &reelaboration_probe_source("import Mathlib", "True"),
+            REELABORATION_DECL,
+        );
+        // Same trailing block, differing only in the declaration name, which
+        // `strip_check_prefix` removes before anything is compared.
+        assert!(pin_content.ends_with(&elaboration_probe_block("t")));
+        assert!(re_content.ends_with(&elaboration_probe_block(REELABORATION_DECL)));
+        // Same line accounting on both sides.
+        assert_eq!(pin_line, pin_content.lines().count() - 3);
+        assert_eq!(re_line, re_content.lines().count() - 3);
+    }
+
+    /// The re-elaborated declaration's own name never reaches a comparison, for
+    /// the same reason the pin strips its theorem name: a name inside the form
+    /// would make every rename look like moved mathematics.
+    #[test]
+    fn the_re_elaborated_declaration_name_is_stripped_like_the_pin() {
+        let printed = format!("{REELABORATION_DECL} : ∀ (x : Nat), @Eq.{{1}} Nat x x");
+        assert_eq!(
+            strip_check_prefix(&printed).as_deref(),
+            Some("∀ (x : Nat), @Eq.{1} Nat x x")
+        );
+    }
+
+    /// `autoImplicit` OFF is what makes a missing constant say `Unknown
+    /// identifier` instead of silently becoming a fresh variable and failing
+    /// later with something that reads like a type error.
+    #[test]
+    fn the_re_elaboration_probe_disables_auto_implicit() {
+        let src = reelaboration_probe_source("import Mathlib", "True");
+        assert!(src.contains("set_option autoImplicit false"));
+        assert!(src.contains("set_option relaxedAutoImplicit false"));
+        assert!(src.contains(&format!("axiom {REELABORATION_DECL} :")));
+        assert!(reelaboration_control_source("import Mathlib")
+            .contains("set_option autoImplicit false"));
+    }
+
+    /// The parser must keep "ran and refused" apart from "no answer". Collapsing
+    /// them into `None` is what would let a timeout withdraw a good green.
+    #[test]
+    fn the_probe_parser_separates_a_refusal_from_silence() {
+        let ok = r#"{"severity":"information","pos":{"line":4},"data":"t : True"}"#;
+        assert_eq!(
+            probe_outcome_from_json(ok, 4),
+            ProbeOutcome::Form("True".to_string())
+        );
+        let err = r#"{"severity":"error","pos":{"line":4},"data":"type mismatch"}"#;
+        assert_eq!(
+            probe_outcome_from_json(err, 4),
+            ProbeOutcome::Failed("type mismatch".to_string())
+        );
+        assert_eq!(probe_outcome_from_json("", 4), ProbeOutcome::NoAnswer);
+        assert_eq!(probe_outcome_from_json("not json\n", 1), ProbeOutcome::NoAnswer);
+        // And the pin path's wrapper still sees exactly `None` for both failures.
+        assert_eq!(elaborated_form_from_json(err, 4), None);
+        assert_eq!(elaborated_form_from_json("", 4), None);
+    }
+
+    /// The most damaging possible error is withdrawing a green because an import
+    /// was missing. Real lean 4.32.0 message text, captured live.
+    #[test]
+    fn an_unresolved_name_is_never_read_as_ill_typedness() {
+        // Live text from lean 4.32.0 with `autoImplicit` off.
+        let unknown = "Unknown identifier `f`\n\nNote: It is not possible to treat `f` as an \
+                       implicitly bound variable here because the `autoImplicit` option is set";
+        assert!(names_are_unresolved(unknown));
+        assert!(!is_ill_typed(unknown));
+        for text in [
+            "unknown constant 'Real.nnrpow'",
+            "unknown namespace 'Mathlib.Analysis'",
+        ] {
+            assert!(names_are_unresolved(text));
+            assert!(!is_ill_typed(text));
+        }
+    }
+
+    /// And the converse: a genuine ill-typedness, also live text, is recognized.
+    #[test]
+    fn a_genuine_ill_typedness_is_recognized() {
+        // Live text from lean 4.32.0, `def f (x : Nat)` changed to `def f (x : Int)`
+        // with the pinned `pp.all` form re-elaborated against it.
+        let moved = "Application type mismatch: The argument\n  f ↑x\nhas type\n  ℤ but is \
+                     expected to have type\n  ℕ in the application\n  Eq (f ↑x)";
+        assert!(is_ill_typed(moved));
+        assert!(!names_are_unresolved(moved));
+        // Live text from the `abbrev T := Nat` -> `abbrev T := Int` fixture.
+        let abbrev_moved = "Application type mismatch: The argument\n  instAddNat\nhas type\n  \
+                            Add ℕ\nbut is expected to have type\n  Add T";
+        assert!(is_ill_typed(abbrev_moved));
+    }
+
+    /// An error we do not recognize must cost an `Unknown`, not a withdrawal.
+    /// This is the allowlist direction, asserted rather than assumed.
+    #[test]
+    fn an_unrecognized_error_is_not_ill_typedness() {
+        for text in [
+            "(deterministic) timeout at `whnf`, maximum number of heartbeats (200000) has been reached",
+            "maximum recursion depth has been reached",
+            "failed to synthesize\n  Add T",
+            "",
+        ] {
+            assert!(!is_ill_typed(text), "must not license a withdrawal: {text}");
+        }
+    }
+
+    /// Re-elaboration is OFF by default. The census must stay as cheap as it was.
+    #[test]
+    fn re_elaboration_is_opt_in_and_defaults_off() {
+        std::env::remove_var(REELABORATION_OPT_IN_ENV);
+        assert!(!reelaboration_opt_in());
+        for on in ["1", "true", "ON"] {
+            std::env::set_var(REELABORATION_OPT_IN_ENV, on);
+            assert!(reelaboration_opt_in(), "{on} must enable re-elaboration");
+        }
+        for off in ["0", "false", "", "no"] {
+            std::env::set_var(REELABORATION_OPT_IN_ENV, off);
+            assert!(!reelaboration_opt_in(), "{off} must not enable re-elaboration");
+        }
+        std::env::remove_var(REELABORATION_OPT_IN_ENV);
+    }
+
+    /// Every refusal path out of the entry point is `Unavailable`. There is no
+    /// input that turns a failure into an `Elaborated`.
+    #[test]
+    fn every_refusal_out_of_the_entry_point_is_unavailable() {
+        std::env::remove_var(REELABORATION_OPT_IN_ENV);
+        let cfg = Config::default();
+        // Opt-in unset.
+        assert!(matches!(
+            reelaborate_pinned_statement(&cfg, "import Mathlib", "True"),
+            LeanReelaboration::Unavailable { .. }
+        ));
+        std::env::set_var(REELABORATION_OPT_IN_ENV, "1");
+        // Empty pin, empty preamble.
+        assert!(matches!(
+            reelaborate_pinned_statement(&cfg, "import Mathlib", "  "),
+            LeanReelaboration::Unavailable { .. }
+        ));
+        assert!(matches!(
+            reelaborate_pinned_statement(&cfg, "", "True"),
+            LeanReelaboration::Unavailable { .. }
+        ));
+        // A mock prover consults no library and so can say nothing.
+        let mut mock = Config::default();
+        mock.prover_mock = true;
+        assert!(matches!(
+            reelaborate_pinned_statement(&mock, "import Mathlib", "True"),
+            LeanReelaboration::Unavailable { .. }
+        ));
+        std::env::remove_var(REELABORATION_OPT_IN_ENV);
     }
 
     /// Header-only import parsing: a later `import` line (or one inside a

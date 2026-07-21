@@ -632,6 +632,38 @@ fn has_word(text: &str, word: &str) -> bool {
 /// `Unknown(NoPinnedStatementType)` rather than guessing. Deriving a stand-in
 /// from the source text would hand the discriminator something confident and
 /// wrong, which is the exact failure the pin exists to prevent.
+/// The verbatim import header of a source file: every leading line up to the
+/// first that is neither blank, a comment, a `prelude`, a `set_option`, nor an
+/// `import`.
+///
+/// Verbatim rather than a parsed module list, because this is fed back into a
+/// generated file to re-elaborate a pinned statement, and reconstructing a
+/// header from parsed names would silently drop anything the parser did not
+/// model. Lean's own header ends at the first non-header line, so stopping
+/// there cannot pick up an `import` inside a string literal or a doc comment.
+fn import_header_of(code: &str) -> String {
+    let mut header: Vec<&str> = Vec::new();
+    for raw in code.lines() {
+        let line = raw.trim();
+        if line.is_empty()
+            || line.starts_with("--")
+            || line == "prelude"
+            || line.starts_with("set_option ")
+            || line.starts_with("import ")
+        {
+            header.push(raw);
+            continue;
+        }
+        break;
+    }
+    // Trailing blank lines carry no information and would only make two equal
+    // headers compare unequal.
+    while header.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
+        header.pop();
+    }
+    header.join("\n")
+}
+
 fn provenance_value(
     system: FormalSystem,
     statement: &str,
@@ -666,6 +698,14 @@ fn provenance_value(
             .and_then(|node| node.get("provenance"))
             .cloned()
             .unwrap_or(Value::Null),
+        // The import header the pin was elaborated UNDER. Without it a later
+        // re-elaboration has to guess a preamble, and a statement re-elaborated
+        // against a different import set is not a comparison of the same thing.
+        // Only recorded when a pin exists, since it exists to serve the pin.
+        "pinned_statement_imports": match elaborated {
+            Some(_) => Value::String(import_header_of(code)),
+            None => Value::Null,
+        },
         // Present exactly when the pin is absent, so a sweep can report WHY a
         // result is unassessable instead of only that it is.
         "pinned_statement_absent_reason": match elaborated {

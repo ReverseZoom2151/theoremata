@@ -28,18 +28,40 @@
 //! "unresolved for the same reason" strings would compare equal and read as Fresh.
 //! That is the exact false-clean the plan forbids.
 //!
-//! ## Re-elaboration
+//! ## Re-elaboration (Phase 1.2)
 //!
-//! Phase 1.2's live re-elaboration engine does not exist, and no backend publishes
-//! an elaborated statement form yet (so every stored `pinned_statement_type` is
-//! null). This sweep therefore passes `None` for the re-elaboration argument on
-//! every node and is honest about it: `any_reelaborated` is reported, and it is
-//! false today. Under those inputs `assess` can only return Fresh (exact
-//! fingerprint match) or Unknown (moved, and unassessable because there is neither
-//! a pin nor a re-elaboration). MathematicsMoved and RepairCandidate stay
-//! reachable in the code and the tests for when those inputs land, but they cannot
-//! arise from real data today, and the report says so rather than implying
-//! otherwise.
+//! The discriminator is wired, and it is OPT-IN. `SweepOptions::reelaborate` is
+//! false by default and the default census costs exactly what it cost before: no
+//! prover is spawned, `assess` is handed `None`, and the only reachable verdicts
+//! from real data are Fresh (exact fingerprint match) and Unknown.
+//!
+//! With the opt-in set, a node that is BOTH stale and carries a pinned elaborated
+//! form is re-elaborated through
+//! [`crate::prover::lean::reelaborate_pinned_statement`], which uses the
+//! very mechanism that produced the pin. That is what makes RepairCandidate and
+//! MathematicsMoved reachable from real data.
+//!
+//! Three things bound the cost, in this order, so the expensive call is made only
+//! when its answer can change the verdict:
+//!
+//! 1. the opt-in must be set,
+//! 2. the current environment must have RESOLVED (an unresolved one is
+//!    `Unknown(EnvironmentUnresolved)` whatever a re-elaboration said),
+//! 3. the fingerprint must have MOVED and a pinned form must exist (a fresh node
+//!    needs no answer, and an unpinned one cannot use one).
+//!
+//! ## The one thing re-elaboration must never do
+//!
+//! Turn "we could not elaborate" into "the mathematics moved". A missing import,
+//! an absent toolchain, a timeout or a preamble narrower than the pin was
+//! elaborated under all produce `Unavailable`, which becomes
+//! `Unknown(ReelaborationUnavailable)`. Only an ill-typedness reported by a Lean
+//! that has just proved, on a control probe, that it can elaborate in this context
+//! becomes a withdrawal. See the backend function for how the two are told apart.
+//!
+//! This sweep still never repairs, re-verifies or mutates a stored verdict. A
+//! re-elaboration is a read: it elaborates a type in a throwaway workspace and
+//! reports a string.
 
 use anyhow::Result;
 use serde::Serialize;
@@ -51,6 +73,10 @@ use super::staleness::{
 use crate::checker_cache::EnvironmentFingerprint as CheckerEnvironment;
 use crate::config::Config;
 use crate::db::Store;
+use crate::prover::lean::{
+    reelaborate_pinned_statement, LeanReelaboration, DEFAULT_REELABORATION_PREAMBLE,
+    REELABORATION_OPT_IN_ENV,
+};
 use crate::prover::formal::{backend_for, FormalSystem};
 
 /// The schema tag written by `formal_generate::provenance_value` (under the event
@@ -83,6 +109,11 @@ struct ParsedProvenance {
     verified_against: String,
     environment_resolved: bool,
     pinned_statement_type: Option<String>,
+    /// The import header the pin was elaborated under, when the record carries
+    /// one. Absent today (the provenance writer does not emit the field yet), and
+    /// absence is why [`SweepOptions::reelaboration_preamble`] exists. Read
+    /// tolerantly so that a writer adding the field later needs no change here.
+    pinned_statement_imports: Option<String>,
     verdict_verified: bool,
 }
 
@@ -146,6 +177,11 @@ fn parse_provenance(value: &serde_json::Value) -> Option<ParsedProvenance> {
         .get("pinned_statement_type")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let pinned_statement_imports = map
+        .get("pinned_statement_imports")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.trim().is_empty());
     // Only a real green is a subject of the census. Failed attempts also emit
     // provenance; they are counted separately and excluded from classification.
     let verdict_verified = map
@@ -159,6 +195,7 @@ fn parse_provenance(value: &serde_json::Value) -> Option<ParsedProvenance> {
         verified_against,
         environment_resolved,
         pinned_statement_type,
+        pinned_statement_imports,
         verdict_verified,
     })
 }
@@ -245,6 +282,108 @@ fn resolve_current_environment(config: &Config, system_tag: &str) -> CurrentEnvi
 }
 
 // ===========================================================================
+// Options: the Phase 1.2 opt-in
+// ===========================================================================
+
+/// What a sweep is allowed to spend.
+///
+/// [`Default`] is the CHEAP CENSUS, byte for byte what the sweep did before
+/// Phase 1.2 landed: no prover, no re-elaboration. That default is the cost gate
+/// the plan asks for. Turning re-elaboration on spawns Lean twice per stale,
+/// pinned, resolvable node, which over a large store is minutes to hours.
+#[derive(Debug, Clone, Default)]
+pub struct SweepOptions {
+    /// Run the Phase 1.2 discriminator. **Default false.**
+    ///
+    /// Even when true, the backend enforces its own opt-in
+    /// ([`REELABORATION_OPT_IN_ENV`]) and answers `Unavailable` without it, so a
+    /// caller cannot spend prover time by accident from one side alone. Both must
+    /// agree, and the disagreement is reported rather than silently downgraded.
+    pub reelaborate: bool,
+    /// Import header to re-elaborate a pinned form against, when the stored record
+    /// does not carry its own.
+    ///
+    /// The record's `pinned_statement_imports` always wins when present, because
+    /// only it is the context the pin was actually elaborated under. This is the
+    /// operator's stand-in for that, and `None` falls back to
+    /// [`DEFAULT_REELABORATION_PREAMBLE`]. Which of the three was used is reported
+    /// per node, so no reader has to guess whether the comparison was made against
+    /// the real context or a substitute for it.
+    pub reelaboration_preamble: Option<String>,
+}
+
+/// Where a re-elaboration preamble came from. Reported per node because a
+/// substituted preamble is a weaker comparison than the recorded one, and the
+/// difference must be visible rather than inferred.
+fn preamble_for(record: &ParsedProvenance, options: &SweepOptions) -> (String, &'static str) {
+    if let Some(imports) = record.pinned_statement_imports.as_deref() {
+        return (imports.to_string(), "provenance_record");
+    }
+    if let Some(supplied) = options.reelaboration_preamble.as_deref() {
+        return (supplied.to_string(), "operator_supplied");
+    }
+    (DEFAULT_REELABORATION_PREAMBLE.to_string(), "default")
+}
+
+/// Run the Phase 1.2 discriminator for one node, or explain why it was not run.
+///
+/// Returns the outcome to hand `assess` plus a human-readable note. `None` means
+/// NOT ATTEMPTED, which `assess` already turns into
+/// `Unknown(ReelaborationUnavailable)` when the fingerprint moved: not attempting
+/// is never a road to Fresh.
+fn reelaborate_node(
+    config: &Config,
+    record: &ParsedProvenance,
+    current: Option<&EnvironmentFingerprint>,
+    options: &SweepOptions,
+) -> Option<(staleness::ReelaborationOutcome, String)> {
+    if !options.reelaborate {
+        return None;
+    }
+    // An unresolved current environment is `Unknown(EnvironmentUnresolved)` no
+    // matter what a re-elaboration says, so paying for one would buy nothing.
+    let current = current?;
+    // A node whose fingerprint still matches is Fresh and needs no answer; a node
+    // with no pin has nothing to re-elaborate. Both are skipped for cost, and both
+    // already land on the correct verdict without us.
+    if record.verified_against.as_str() == current.as_str() {
+        return None;
+    }
+    let pinned = record.pinned_statement_type.as_deref()?;
+    // Only Lean publishes a pinned elaborated form and only Lean can re-elaborate
+    // one. Any other system is honestly reported as having no discriminator rather
+    // than being run through Lean's.
+    if record.system.as_str() != FormalSystem::Lean.as_str() {
+        return Some((
+            staleness::ReelaborationOutcome::Unavailable {
+                reason: format!(
+                    "no re-elaboration mechanism exists for `{}`; only lean publishes and \
+                     re-elaborates a pinned form",
+                    record.system
+                ),
+            },
+            format!("skipped: no re-elaborator for {}", record.system),
+        ));
+    }
+
+    let (preamble, preamble_source) = preamble_for(record, options);
+    let outcome = match reelaborate_pinned_statement(config, &preamble, pinned) {
+        LeanReelaboration::Elaborated { form } => {
+            staleness::ReelaborationOutcome::Elaborated {
+                statement_type: form,
+            }
+        }
+        LeanReelaboration::Rejected { detail } => {
+            staleness::ReelaborationOutcome::Rejected { detail }
+        }
+        LeanReelaboration::Unavailable { reason } => {
+            staleness::ReelaborationOutcome::Unavailable { reason }
+        }
+    };
+    Some((outcome, format!("preamble from {preamble_source}")))
+}
+
+// ===========================================================================
 // Output
 // ===========================================================================
 
@@ -286,9 +425,13 @@ pub struct NodeVerdict {
     pub verified_against: String,
     /// Whether that environment was resolved when the result was recorded.
     pub verified_environment_resolved: bool,
-    /// Whether this node received a real re-elaboration this sweep. Always false
-    /// today (Phase 1.2 engine absent, no pinned type published).
+    /// Whether this node received a real re-elaboration this sweep. False unless
+    /// [`SweepOptions::reelaborate`] was set AND the node was worth spending one
+    /// on (stale, pinned, resolvable environment).
     pub reelaborated: bool,
+    /// Why the re-elaboration was or was not run, and which preamble it used.
+    /// `None` when it was not attempted at all.
+    pub reelaboration_note: Option<String>,
 }
 
 /// The full census result. Serializable and `Debug`, so a CLI arm can hand it
@@ -304,9 +447,20 @@ pub struct SweepOutcome {
     pub statement_only_repairs: usize,
     /// Non-fresh counts split by artifact class.
     pub drift_by_artifact: BTreeMap<String, usize>,
-    /// True iff any node got a real re-elaboration. False today, and reported so
-    /// the census cannot be mistaken for one backed by live re-elaboration.
+    /// True iff any node got a real re-elaboration, so the census can never be
+    /// mistaken for one backed by live re-elaboration when it was not.
     pub any_reelaborated: bool,
+    /// Whether the caller ASKED for re-elaboration. Distinct from
+    /// `any_reelaborated`: asking and getting nothing (no stale node had a pin, or
+    /// the backend opt-in was unset) is a different fact from not asking.
+    pub reelaboration_requested: bool,
+    /// How many nodes a re-elaboration was actually spent on.
+    pub reelaborations_attempted: usize,
+    /// The backend env var that must ALSO be set for a re-elaboration to run, and
+    /// whether it was. Reported so an operator who asked for the discriminator and
+    /// got no answers can see why in the output rather than in the source.
+    pub reelaboration_opt_in_env: &'static str,
+    pub reelaboration_opt_in_set: bool,
     /// The current environment resolved per system encountered.
     pub current_environments: BTreeMap<String, EnvironmentOut>,
     /// Every withdrawal's audit line (mathematics moved). Empty today.
@@ -377,6 +531,18 @@ pub fn sweep(
     project: Option<&str>,
     limit: usize,
 ) -> Result<SweepOutcome> {
+    sweep_with_options(store, config, project, limit, &SweepOptions::default())
+}
+
+/// [`sweep`] with the Phase 1.2 opt-in exposed. `SweepOptions::default()` is the
+/// cheap census and is exactly what `sweep` runs.
+pub fn sweep_with_options(
+    store: &Store,
+    config: &Config,
+    project: Option<&str>,
+    limit: usize,
+    options: &SweepOptions,
+) -> Result<SweepOutcome> {
     // Which projects to walk. An explicit project is validated by asking the store
     // for its events (a missing project errors there); `None` fans out over all.
     let project_ids: Vec<String> = match project {
@@ -429,6 +595,7 @@ pub fn sweep(
     let mut report = StalenessReport::new();
     let mut nodes: Vec<NodeVerdict> = Vec::new();
     let mut any_reelaborated = false;
+    let mut reelaborations_attempted = 0usize;
 
     for record in &records {
         let verified = record.to_verified_result();
@@ -436,12 +603,16 @@ pub fn sweep(
             .get(&record.system)
             .and_then(|c| c.fingerprint.as_ref());
 
-        // Re-elaboration: none is available today. Phase 1.2's engine does not
-        // exist and no pin was published, so we honestly pass `None`. If a real
-        // re-elaboration is ever wired here, set `any_reelaborated` when it returns
-        // an outcome; the classification below already handles every case.
-        let reelaboration: Option<&staleness::ReelaborationOutcome> = None;
-        any_reelaborated |= reelaboration.is_some();
+        // Phase 1.2. `None` (not attempted) still means `assess` returns
+        // `Unknown(ReelaborationUnavailable)` for a moved fingerprint, so the
+        // cheap default cannot produce a false Fresh. Bound to a local because
+        // `assess` borrows it and the `NodeVerdict` below reads it back.
+        let attempt = reelaborate_node(config, record, current, options);
+        let reelaboration = attempt.as_ref().map(|(outcome, _)| outcome);
+        if reelaboration.is_some() {
+            any_reelaborated = true;
+            reelaborations_attempted += 1;
+        }
 
         let verdict = staleness::assess(&verified, current, reelaboration);
 
@@ -455,6 +626,7 @@ pub fn sweep(
             verified_against: record.verified_against.clone(),
             verified_environment_resolved: record.environment_resolved,
             reelaborated: reelaboration.is_some(),
+            reelaboration_note: attempt.as_ref().map(|(_, note)| note.clone()),
         });
 
         // Record consumes the verdict; the strings above were taken first.
@@ -496,6 +668,10 @@ pub fn sweep(
         statement_only_repairs: report.statement_only_repairs(),
         drift_by_artifact,
         any_reelaborated,
+        reelaboration_requested: options.reelaborate,
+        reelaborations_attempted,
+        reelaboration_opt_in_env: REELABORATION_OPT_IN_ENV,
+        reelaboration_opt_in_set: crate::prover::lean::reelaboration_opt_in(),
         current_environments,
         withdrawals,
         nodes,
@@ -583,6 +759,138 @@ mod tests {
         });
         let p = parse_provenance(&v).expect("record");
         assert!(p.verified_against.starts_with("unresolved:"));
+    }
+
+    fn parsed(system: &str, verified_against: &str, pinned: Option<&str>) -> ParsedProvenance {
+        ParsedProvenance {
+            system: system.to_string(),
+            id: "thm".to_string(),
+            artifact: ArtifactClass::TacticScript,
+            verified_against: verified_against.to_string(),
+            environment_resolved: true,
+            pinned_statement_type: pinned.map(|s| s.to_string()),
+            pinned_statement_imports: None,
+            verdict_verified: true,
+        }
+    }
+
+    #[test]
+    fn the_default_sweep_never_spends_a_re_elaboration() {
+        // The cost gate. `SweepOptions::default()` must not reach the prover for
+        // ANY node, including one that is stale, pinned and lean.
+        let opts = SweepOptions::default();
+        assert!(!opts.reelaborate);
+        let record = parsed("lean", "resolved:lake:old", Some("T"));
+        let current = EnvironmentFingerprint::new("resolved:lake:new");
+        let config = Config::default();
+        assert!(reelaborate_node(&config, &record, Some(&current), &opts).is_none());
+    }
+
+    #[test]
+    fn re_elaboration_is_skipped_where_its_answer_could_not_change_the_verdict() {
+        let opts = SweepOptions {
+            reelaborate: true,
+            reelaboration_preamble: None,
+        };
+        let config = Config::default();
+        let current = EnvironmentFingerprint::new("resolved:lake:new");
+
+        // Environment unresolved: `assess` is Unknown(EnvironmentUnresolved)
+        // regardless, so no prover time is spent.
+        assert!(
+            reelaborate_node(&config, &parsed("lean", "resolved:lake:old", Some("T")), None, &opts)
+                .is_none()
+        );
+        // Fingerprint still matches: the node is Fresh without us.
+        assert!(reelaborate_node(
+            &config,
+            &parsed("lean", "resolved:lake:new", Some("T")),
+            Some(&current),
+            &opts
+        )
+        .is_none());
+        // No pin: nothing to re-elaborate, and `assess` says NoPinnedStatementType.
+        assert!(reelaborate_node(
+            &config,
+            &parsed("lean", "resolved:lake:old", None),
+            Some(&current),
+            &opts
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn a_system_with_no_re_elaborator_is_unavailable_and_never_moved() {
+        let opts = SweepOptions {
+            reelaborate: true,
+            reelaboration_preamble: None,
+        };
+        let config = Config::default();
+        let current = EnvironmentFingerprint::new("resolved:x:new");
+        let (outcome, _note) = reelaborate_node(
+            &config,
+            &parsed("rocq", "resolved:x:old", Some("T")),
+            Some(&current),
+            &opts,
+        )
+        .expect("an explicit outcome, not silence");
+        assert!(matches!(
+            outcome,
+            staleness::ReelaborationOutcome::Unavailable { .. }
+        ));
+        // And it must classify as Unknown, never as a withdrawal.
+        let verdict = staleness::assess(
+            &parsed("rocq", "resolved:x:old", Some("T")).to_verified_result(),
+            Some(&current),
+            Some(&outcome),
+        );
+        assert!(!verdict.is_fresh());
+        assert!(verdict.withdrawal().is_none());
+    }
+
+    #[test]
+    fn the_recorded_preamble_beats_the_operators_and_both_beat_the_default() {
+        let mut record = parsed("lean", "resolved:lake:old", Some("T"));
+        let operator = SweepOptions {
+            reelaborate: true,
+            reelaboration_preamble: Some("import Mathlib.Order.Basic".to_string()),
+        };
+
+        assert_eq!(
+            preamble_for(&record, &SweepOptions::default()),
+            (DEFAULT_REELABORATION_PREAMBLE.to_string(), "default")
+        );
+        assert_eq!(
+            preamble_for(&record, &operator),
+            ("import Mathlib.Order.Basic".to_string(), "operator_supplied")
+        );
+        record.pinned_statement_imports = Some("import Mathlib.Analysis.Basic".to_string());
+        assert_eq!(
+            preamble_for(&record, &operator),
+            (
+                "import Mathlib.Analysis.Basic".to_string(),
+                "provenance_record"
+            )
+        );
+    }
+
+    #[test]
+    fn an_absent_or_blank_imports_field_reads_as_absent() {
+        let mut v = provenance("lean", "t", "tactic_script", "resolved:lake:a", true, true);
+        assert!(parse_provenance(&v)
+            .expect("record")
+            .pinned_statement_imports
+            .is_none());
+        v["pinned_statement_imports"] = json!("   ");
+        assert!(parse_provenance(&v)
+            .expect("record")
+            .pinned_statement_imports
+            .is_none());
+        v["pinned_statement_imports"] = json!("import Mathlib");
+        assert_eq!(
+            parse_provenance(&v).expect("record").pinned_statement_imports,
+            Some("import Mathlib".to_string())
+        );
     }
 
     #[test]
