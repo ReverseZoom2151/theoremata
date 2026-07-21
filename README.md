@@ -2,10 +2,10 @@
 
 # Theoremata
 
-### an AI mathematician that shows its work
+### an AI mathematician
 
-Hand it a conjecture. It tries to break it, drafts a proof the way a mathematician would,
-fills every gap inside a proof assistant, and gives you a receipt you can check yourself.
+An autonomous agent that takes a mathematical conjecture, proves it inside a formal proof
+assistant, and returns a machine-checkable certificate of the result.
 
 ![Rust](https://img.shields.io/badge/Rust-2021-000000?style=flat-square&logo=rust&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white)
