@@ -588,6 +588,13 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         from theoremata_tools.statement_roundtrip import run as statement_roundtrip_run
 
         return statement_roundtrip_run(request)
+    if tool == "statement_triviality":
+        from theoremata_tools.statement_triviality import run as statement_triviality_run
+
+        # Consumers must branch ONLY on verdict == "trivial". Both
+        # "not_shown_trivial" and "withheld" mean no signal, never approval:
+        # surviving mutation does not make a statement meaningful.
+        return statement_triviality_run(request)
     if tool == "lp_geometry":
         from theoremata_tools.lp_geometry import run as lp_geometry_run
 
