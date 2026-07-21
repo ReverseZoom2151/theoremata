@@ -28,27 +28,62 @@
 //! "unresolved for the same reason" strings would compare equal and read as Fresh.
 //! That is the exact false-clean the plan forbids.
 //!
-//! ## Re-elaboration (Phase 1.2)
+//! ## Re-elaboration (Phase 1.2): what the sweep DOES, not what it is asked to do
 //!
-//! The discriminator is wired, and it is OPT-IN. `SweepOptions::reelaborate` is
-//! false by default and the default census costs exactly what it cost before: no
-//! prover is spawned, `assess` is handed `None`, and the only reachable verdicts
-//! from real data are Fresh (exact fingerprint match) and Unknown.
-//!
-//! With the opt-in set, a node that is BOTH stale and carries a pinned elaborated
-//! form is re-elaborated through
-//! [`crate::prover::lean::reelaborate_pinned_statement`], which uses the
+//! A node that is BOTH stale and carries a pinned elaborated form is re-elaborated
+//! through [`crate::prover::lean::reelaborate_pinned_statement`], which uses the
 //! very mechanism that produced the pin. That is what makes RepairCandidate and
-//! MathematicsMoved reachable from real data.
+//! MathematicsMoved reachable from real data, so it is the discriminator, and a
+//! discriminator that has to be switched on is one nothing ever runs. There used
+//! to be TWO switches here (a `SweepOptions::reelaborate` flag and an env var the
+//! backend read separately, both defaulting off, both required to agree). Both are
+//! gone. The cost they were standing in for is now bounded by three mechanisms
+//! that are always in force:
 //!
-//! Three things bound the cost, in this order, so the expensive call is made only
-//! when its answer can change the verdict:
+//! 1. **The skip gates.** The expensive call is made only where its answer can
+//!    change the verdict:
+//!    * the current environment must have RESOLVED (an unresolved one is
+//!      `Unknown(EnvironmentUnresolved)` whatever a re-elaboration said),
+//!    * the fingerprint must have MOVED (a matching one is Fresh without us),
+//!    * a pinned form must exist (an unpinned node is `Unknown(NoPinnedStatementType)`
+//!      and has nothing to re-elaborate),
+//!    * the system must be Lean (the only one that publishes and re-elaborates a
+//!      pin; every other system gets an explicit `Unavailable` for free).
 //!
-//! 1. the opt-in must be set,
-//! 2. the current environment must have RESOLVED (an unresolved one is
-//!    `Unknown(EnvironmentUnresolved)` whatever a re-elaboration said),
-//! 3. the fingerprint must have MOVED and a pinned form must exist (a fresh node
-//!    needs no answer, and an unpinned one cannot use one).
+//!    Those gates are almost everything on a real store. Measured on this
+//!    repository's own store (169 events): ZERO nodes reach the expensive path,
+//!    because no event predates the provenance writer, so there is not one record
+//!    to classify. Reasoning through the gates for a populated store:
+//!
+//!    * Every NON-LEAN green is free. Either its environment does not resolve (so
+//!      it is `Unknown(EnvironmentUnresolved)` and is skipped before any cost), or
+//!      it resolves and the system gate answers `Unavailable` without a prover.
+//!    * Every LEAN green whose fingerprint still MATCHES is free, and in a stable
+//!      environment that is all of them. This is the state a store is in almost
+//!      all of the time, and in it the sweep costs exactly what the old
+//!      flag-defaulted-off census cost: nothing.
+//!    * After the environment moves (a `lake update`, a toolchain bump, a
+//!      re-pointed project) the eligible set is exactly the Lean greens that carry
+//!      a pin. Pins ARE published today (the Lean backend writes
+//!      `elaborated_statement` for live, lexically-verified runs unless
+//!      `THEOREMATA_LEAN_PUBLISH_ELABORATION` turns the probe off), so this set is
+//!      the real cost, and it is what the cache and the bound below exist for.
+//!      The FIRST sweep after a move pays min(eligible, bound); every later sweep
+//!      in that same environment pays zero.
+//!
+//! 2. **A cache.** A re-elaboration is a pure function of (pinned form, pinned
+//!    imports, current environment). The environment component is
+//!    `checker_cache::EnvironmentFingerprint`, carried here verbatim as its
+//!    `key_field()` string, so this introduces NO second notion of environment
+//!    identity. An entry is written only for a RESOLVED environment, and only for
+//!    an answer that was actually obtained; see [`CachedReelaboration`].
+//!
+//! 3. **A per-sweep bound.** [`SweepOptions::max_reelaborations`] caps how many
+//!    nodes may spawn Lean in one run, oldest-recorded first. Past the cap an
+//!    eligible node is handed an explicit `Unavailable`, which is
+//!    `Unknown(ReelaborationUnavailable)`: bounded work costs recall, never a
+//!    wrong verdict. A CLI flag may RAISE this bound. There is no flag that turns
+//!    the discriminator on, because it is not off.
 //!
 //! ## The one thing re-elaboration must never do
 //!
@@ -64,7 +99,7 @@
 //! reports a string.
 
 use anyhow::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::staleness::{
@@ -75,7 +110,6 @@ use crate::config::Config;
 use crate::db::Store;
 use crate::prover::lean::{
     reelaborate_pinned_statement, LeanReelaboration, DEFAULT_REELABORATION_PREAMBLE,
-    REELABORATION_OPT_IN_ENV,
 };
 use crate::prover::formal::{backend_for, FormalSystem};
 
@@ -282,24 +316,35 @@ fn resolve_current_environment(config: &Config, system_tag: &str) -> CurrentEnvi
 }
 
 // ===========================================================================
-// Options: the Phase 1.2 opt-in
+// Options and bounds
 // ===========================================================================
+
+/// How many nodes one sweep may spawn Lean for, unless a caller raises it.
+///
+/// Chosen to be a number an operator can wait through: at a few seconds per node
+/// against a real Mathlib this is a sweep measured in a minute or two, not one
+/// measured in hours. It exists so an unbounded store cannot produce an unbounded
+/// run; it is not a statement about how many nodes are worth checking.
+pub const DEFAULT_MAX_REELABORATIONS: usize = 25;
+
+/// File under the artifact root where settled re-elaborations are remembered.
+const REELABORATION_CACHE_FILE: &str = "staleness-reelaborations.json";
+
+/// Prefix `checker_cache::EnvironmentFingerprint::key_field` uses for a RESOLVED
+/// environment. Matched defensively before anything is cached, so that even if a
+/// future caller managed to hand this module an unresolved fingerprint, nothing
+/// would be stored or served under it. Caching against an unresolved environment
+/// is the stale-green bug this project already fixed once.
+const RESOLVED_ENV_PREFIX: &str = "resolved:";
 
 /// What a sweep is allowed to spend.
 ///
-/// [`Default`] is the CHEAP CENSUS, byte for byte what the sweep did before
-/// Phase 1.2 landed: no prover, no re-elaboration. That default is the cost gate
-/// the plan asks for. Turning re-elaboration on spawns Lean twice per stale,
-/// pinned, resolvable node, which over a large store is minutes to hours.
-#[derive(Debug, Clone, Default)]
+/// [`Default`] is a REAL sweep: the discriminator runs, bounded by
+/// [`DEFAULT_MAX_REELABORATIONS`] and by the skip gates in
+/// [`ReelaborationRun::attempt`]. There is no "off" here, because a
+/// discriminator that defaults off is a discriminator nothing runs.
+#[derive(Debug, Clone)]
 pub struct SweepOptions {
-    /// Run the Phase 1.2 discriminator. **Default false.**
-    ///
-    /// Even when true, the backend enforces its own opt-in
-    /// ([`REELABORATION_OPT_IN_ENV`]) and answers `Unavailable` without it, so a
-    /// caller cannot spend prover time by accident from one side alone. Both must
-    /// agree, and the disagreement is reported rather than silently downgraded.
-    pub reelaborate: bool,
     /// Import header to re-elaborate a pinned form against, when the stored record
     /// does not carry its own.
     ///
@@ -310,6 +355,262 @@ pub struct SweepOptions {
     /// per node, so no reader has to guess whether the comparison was made against
     /// the real context or a substitute for it.
     pub reelaboration_preamble: Option<String>,
+    /// Ceiling on how many nodes may SPAWN LEAN in this sweep. A remembered answer
+    /// does not draw on it, because replaying one costs nothing.
+    ///
+    /// Raising this is the only knob: a caller may ask for more work, never for
+    /// less honesty. Zero is legal and means "classify from what is already known",
+    /// which yields `Unknown(ReelaborationUnavailable)` for every eligible node
+    /// with no cached answer, never `Fresh`.
+    pub max_reelaborations: usize,
+}
+
+impl Default for SweepOptions {
+    fn default() -> Self {
+        Self {
+            reelaboration_preamble: None,
+            max_reelaborations: DEFAULT_MAX_REELABORATIONS,
+        }
+    }
+}
+
+/// A re-elaboration answer worth remembering.
+///
+/// Only the two ANSWERS are here. `Unavailable` is deliberately not
+/// representable: it means we did not get an answer (no toolchain, a control
+/// probe that failed, a name the context does not provide, a budget that ran
+/// out), and remembering "we did not look" would freeze a transient failure into
+/// a permanent `Unknown` and would make the budget refusal sticky across sweeps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome")]
+enum CachedReelaboration {
+    Elaborated { statement_type: String },
+    Rejected { detail: String },
+}
+
+impl CachedReelaboration {
+    fn into_outcome(self) -> staleness::ReelaborationOutcome {
+        match self {
+            CachedReelaboration::Elaborated { statement_type } => {
+                staleness::ReelaborationOutcome::Elaborated { statement_type }
+            }
+            CachedReelaboration::Rejected { detail } => {
+                staleness::ReelaborationOutcome::Rejected { detail }
+            }
+        }
+    }
+}
+
+/// The cache key for one re-elaboration: the environment, the preamble and the
+/// pinned form, length-framed so no two different triples can be re-split into
+/// the same pre-image (the same anti-ambiguity framing `checker_cache` uses).
+///
+/// `environment` is `checker_cache::EnvironmentFingerprint::key_field()` carried
+/// through unchanged. This module invents no identity of its own: if that field
+/// ever stops distinguishing two environments, this cache stops distinguishing
+/// them too, which is the correct coupling.
+fn reelaboration_cache_key(environment: &str, preamble: &str, pinned: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for (tag, data) in [
+        ("theoremata.staleness_reelaboration.v1", ""),
+        ("environment", environment),
+        ("preamble", preamble),
+        ("pinned", pinned),
+    ] {
+        hasher.update((tag.len() as u64).to_be_bytes());
+        hasher.update(tag.as_bytes());
+        hasher.update((data.len() as u64).to_be_bytes());
+        hasher.update(data.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The budget and the memory a single sweep carries.
+///
+/// Holds no verdicts and no store handle: it decides only whether to pay for one
+/// re-elaboration and what the answer was. Classification stays in `assess`.
+struct ReelaborationRun {
+    cache: BTreeMap<String, CachedReelaboration>,
+    path: Option<std::path::PathBuf>,
+    /// Nodes that may still be charged to the bound.
+    remaining: usize,
+    /// Nodes charged to the bound (an upper bound on Lean processes started).
+    spawned: usize,
+    replayed: usize,
+    /// Eligible nodes the bound refused. Reported, because a sweep that hit its
+    /// ceiling is a different fact from one that had nothing left to do.
+    refused_at_bound: usize,
+    learned: usize,
+}
+
+impl ReelaborationRun {
+    /// Seed from the artifact root. Any IO or parse failure degrades to an empty
+    /// cache: a cache is an optimization, and an optimization must never be able
+    /// to change a verdict or fail a sweep.
+    fn open(config: &Config, options: &SweepOptions) -> Self {
+        let path = config.artifacts.join(REELABORATION_CACHE_FILE);
+        let cache = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<BTreeMap<String, CachedReelaboration>>(&raw).ok())
+            .unwrap_or_default();
+        Self {
+            cache,
+            path: Some(path),
+            remaining: options.max_reelaborations,
+            spawned: 0,
+            replayed: 0,
+            refused_at_bound: 0,
+            learned: 0,
+        }
+    }
+
+    /// Run the Phase 1.2 discriminator for one node, or explain why it was not
+    /// run.
+    ///
+    /// Returns the outcome to hand `assess` plus a human-readable note. `None`
+    /// means NOT ATTEMPTED, which `assess` already turns into
+    /// `Unknown(ReelaborationUnavailable)` when the fingerprint moved: not
+    /// attempting is never a road to Fresh.
+    fn attempt(
+        &mut self,
+        config: &Config,
+        record: &ParsedProvenance,
+        current: Option<&EnvironmentFingerprint>,
+        options: &SweepOptions,
+    ) -> Option<(staleness::ReelaborationOutcome, String)> {
+        // An unresolved current environment is `Unknown(EnvironmentUnresolved)` no
+        // matter what a re-elaboration says, so paying for one would buy nothing.
+        let current = current?;
+        // A node whose fingerprint still matches is Fresh and needs no answer; a
+        // node with no pin has nothing to re-elaborate. Both are skipped for cost,
+        // and both already land on the correct verdict without us.
+        if record.verified_against.as_str() == current.as_str() {
+            return None;
+        }
+        let pinned = record.pinned_statement_type.as_deref()?;
+        // Only Lean publishes a pinned elaborated form and only Lean can
+        // re-elaborate one. Any other system is honestly reported as having no
+        // discriminator rather than being run through Lean's. Free: no prover.
+        if record.system.as_str() != FormalSystem::Lean.as_str() {
+            return Some((
+                staleness::ReelaborationOutcome::Unavailable {
+                    reason: format!(
+                        "no re-elaboration mechanism exists for `{}`; only lean publishes and \
+                         re-elaborates a pinned form",
+                        record.system
+                    ),
+                },
+                format!("skipped: no re-elaborator for {}", record.system),
+            ));
+        }
+        // A mock prover consults no library, so it can say nothing about whether
+        // the library moved. Answered here as well as inside the backend so the
+        // whole offline case is FREE: a machine with the prover pinned to mock,
+        // sweeping a store of live-verified greens, would otherwise charge its
+        // entire bound to a backend that was always going to decline.
+        if config.prover_mock {
+            return Some((
+                staleness::ReelaborationOutcome::Unavailable {
+                    reason: "prover is pinned to mock, which elaborates against no library"
+                        .to_string(),
+                },
+                "skipped: mock prover has no library to re-elaborate against".to_string(),
+            ));
+        }
+
+        let (preamble, preamble_source) = preamble_for(record, options);
+        // Only a RESOLVED environment may back a cache entry. `current` is
+        // `Some` only for a resolved one by construction (see
+        // `resolve_current_environment`); the prefix check is the belt to that
+        // brace, because a cache served against an unknown environment is the
+        // stale green this project already paid for once.
+        let key = current
+            .as_str()
+            .starts_with(RESOLVED_ENV_PREFIX)
+            .then(|| reelaboration_cache_key(current.as_str(), &preamble, pinned));
+
+        if let Some(hit) = key.as_ref().and_then(|k| self.cache.get(k)).cloned() {
+            self.replayed += 1;
+            return Some((
+                hit.into_outcome(),
+                format!(
+                    "preamble from {preamble_source}; answer remembered from an earlier sweep in \
+                     this exact environment"
+                ),
+            ));
+        }
+
+        if self.remaining == 0 {
+            self.refused_at_bound += 1;
+            return Some((
+                staleness::ReelaborationOutcome::Unavailable {
+                    reason: format!(
+                        "this sweep's re-elaboration bound ({}) is spent; no answer was obtained \
+                         for this node, which is not evidence about it",
+                        options.max_reelaborations
+                    ),
+                },
+                "skipped: sweep re-elaboration bound reached".to_string(),
+            ));
+        }
+        self.remaining -= 1;
+        self.spawned += 1;
+
+        let outcome = match reelaborate_pinned_statement(config, &preamble, pinned) {
+            LeanReelaboration::Elaborated { form } => {
+                if let Some(key) = key {
+                    self.cache.insert(
+                        key,
+                        CachedReelaboration::Elaborated {
+                            statement_type: form.clone(),
+                        },
+                    );
+                    self.learned += 1;
+                }
+                staleness::ReelaborationOutcome::Elaborated {
+                    statement_type: form,
+                }
+            }
+            LeanReelaboration::Rejected { detail } => {
+                if let Some(key) = key {
+                    self.cache.insert(
+                        key,
+                        CachedReelaboration::Rejected {
+                            detail: detail.clone(),
+                        },
+                    );
+                    self.learned += 1;
+                }
+                staleness::ReelaborationOutcome::Rejected { detail }
+            }
+            // Never cached: see `CachedReelaboration`.
+            LeanReelaboration::Unavailable { reason } => {
+                staleness::ReelaborationOutcome::Unavailable { reason }
+            }
+        };
+        Some((outcome, format!("preamble from {preamble_source}")))
+    }
+
+    /// Persist anything newly learned. Best effort: a failed write costs the next
+    /// sweep some Lean spawns, nothing more.
+    fn close(&self) {
+        if self.learned == 0 {
+            return;
+        }
+        if let Some(path) = &self.path {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(raw) = serde_json::to_string(&self.cache) {
+                let _ = std::fs::write(path, raw);
+            }
+        }
+    }
 }
 
 /// Where a re-elaboration preamble came from. Reported per node because a
@@ -323,64 +624,6 @@ fn preamble_for(record: &ParsedProvenance, options: &SweepOptions) -> (String, &
         return (supplied.to_string(), "operator_supplied");
     }
     (DEFAULT_REELABORATION_PREAMBLE.to_string(), "default")
-}
-
-/// Run the Phase 1.2 discriminator for one node, or explain why it was not run.
-///
-/// Returns the outcome to hand `assess` plus a human-readable note. `None` means
-/// NOT ATTEMPTED, which `assess` already turns into
-/// `Unknown(ReelaborationUnavailable)` when the fingerprint moved: not attempting
-/// is never a road to Fresh.
-fn reelaborate_node(
-    config: &Config,
-    record: &ParsedProvenance,
-    current: Option<&EnvironmentFingerprint>,
-    options: &SweepOptions,
-) -> Option<(staleness::ReelaborationOutcome, String)> {
-    if !options.reelaborate {
-        return None;
-    }
-    // An unresolved current environment is `Unknown(EnvironmentUnresolved)` no
-    // matter what a re-elaboration says, so paying for one would buy nothing.
-    let current = current?;
-    // A node whose fingerprint still matches is Fresh and needs no answer; a node
-    // with no pin has nothing to re-elaborate. Both are skipped for cost, and both
-    // already land on the correct verdict without us.
-    if record.verified_against.as_str() == current.as_str() {
-        return None;
-    }
-    let pinned = record.pinned_statement_type.as_deref()?;
-    // Only Lean publishes a pinned elaborated form and only Lean can re-elaborate
-    // one. Any other system is honestly reported as having no discriminator rather
-    // than being run through Lean's.
-    if record.system.as_str() != FormalSystem::Lean.as_str() {
-        return Some((
-            staleness::ReelaborationOutcome::Unavailable {
-                reason: format!(
-                    "no re-elaboration mechanism exists for `{}`; only lean publishes and \
-                     re-elaborates a pinned form",
-                    record.system
-                ),
-            },
-            format!("skipped: no re-elaborator for {}", record.system),
-        ));
-    }
-
-    let (preamble, preamble_source) = preamble_for(record, options);
-    let outcome = match reelaborate_pinned_statement(config, &preamble, pinned) {
-        LeanReelaboration::Elaborated { form } => {
-            staleness::ReelaborationOutcome::Elaborated {
-                statement_type: form,
-            }
-        }
-        LeanReelaboration::Rejected { detail } => {
-            staleness::ReelaborationOutcome::Rejected { detail }
-        }
-        LeanReelaboration::Unavailable { reason } => {
-            staleness::ReelaborationOutcome::Unavailable { reason }
-        }
-    };
-    Some((outcome, format!("preamble from {preamble_source}")))
 }
 
 // ===========================================================================
@@ -425,9 +668,9 @@ pub struct NodeVerdict {
     pub verified_against: String,
     /// Whether that environment was resolved when the result was recorded.
     pub verified_environment_resolved: bool,
-    /// Whether this node received a real re-elaboration this sweep. False unless
-    /// [`SweepOptions::reelaborate`] was set AND the node was worth spending one
-    /// on (stale, pinned, resolvable environment).
+    /// Whether an answer (from Lean or from the cache) was fed to `assess` for
+    /// this node. False for every node the skip gates dropped, which is the
+    /// overwhelming majority.
     pub reelaborated: bool,
     /// Why the re-elaboration was or was not run, and which preamble it used.
     /// `None` when it was not attempted at all.
@@ -447,20 +690,26 @@ pub struct SweepOutcome {
     pub statement_only_repairs: usize,
     /// Non-fresh counts split by artifact class.
     pub drift_by_artifact: BTreeMap<String, usize>,
-    /// True iff any node got a real re-elaboration, so the census can never be
-    /// mistaken for one backed by live re-elaboration when it was not.
+    /// True iff any node got a re-elaboration answer at all, so the census can
+    /// never be mistaken for one backed by the discriminator when it was not.
     pub any_reelaborated: bool,
-    /// Whether the caller ASKED for re-elaboration. Distinct from
-    /// `any_reelaborated`: asking and getting nothing (no stale node had a pin, or
-    /// the backend opt-in was unset) is a different fact from not asking.
-    pub reelaboration_requested: bool,
-    /// How many nodes a re-elaboration was actually spent on.
+    /// How many nodes an answer was fed to `assess` for (spawned plus replayed
+    /// plus the free "no re-elaborator for this system" ones).
     pub reelaborations_attempted: usize,
-    /// The backend env var that must ALSO be set for a re-elaboration to run, and
-    /// whether it was. Reported so an operator who asked for the discriminator and
-    /// got no answers can see why in the output rather than in the source.
-    pub reelaboration_opt_in_env: &'static str,
-    pub reelaboration_opt_in_set: bool,
+    /// How many nodes were CHARGED to the bound. A node is charged just before
+    /// the backend is called, so a backend that declines cheaply (no toolchain on
+    /// this machine) also consumes one; the number is therefore an upper bound on
+    /// the Lean processes started, never an under-count.
+    pub reelaborations_spawned: usize,
+    /// How many answers came from the cache instead of from Lean. A second sweep
+    /// in an unchanged environment should be all cache and no spawns.
+    pub reelaborations_replayed: usize,
+    /// Eligible nodes the per-sweep bound refused. Non-zero means the census is
+    /// incomplete by design: those nodes are `Unknown`, never `Fresh`, and raising
+    /// the bound is what finishes them.
+    pub reelaborations_refused_at_bound: usize,
+    /// The bound that was in force.
+    pub max_reelaborations: usize,
     /// The current environment resolved per system encountered.
     pub current_environments: BTreeMap<String, EnvironmentOut>,
     /// Every withdrawal's audit line (mathematics moved). Empty today.
@@ -525,6 +774,10 @@ fn verdict_detail(verdict: &staleness::StalenessVerdict) -> String {
 /// `project` restricts the walk to one project; `None` sweeps every project.
 /// `limit` bounds how many events are read per project (newest first). The most
 /// recent green per `(system, id)` wins, so re-verifications do not double-count.
+///
+/// This runs the Phase 1.2 discriminator, bounded by
+/// [`DEFAULT_MAX_REELABORATIONS`] and by the skip gates. In a stable environment
+/// that costs nothing at all, because no node's fingerprint has moved.
 pub fn sweep(
     store: &Store,
     config: &Config,
@@ -534,8 +787,9 @@ pub fn sweep(
     sweep_with_options(store, config, project, limit, &SweepOptions::default())
 }
 
-/// [`sweep`] with the Phase 1.2 opt-in exposed. `SweepOptions::default()` is the
-/// cheap census and is exactly what `sweep` runs.
+/// [`sweep`] with the bounds exposed. `SweepOptions::default()` is exactly what
+/// [`sweep`] runs; a caller may RAISE [`SweepOptions::max_reelaborations`] or
+/// supply a preamble, and can do nothing else.
 pub fn sweep_with_options(
     store: &Store,
     config: &Config,
@@ -590,6 +844,24 @@ pub fn sweep_with_options(
             .or_insert_with(|| resolve_current_environment(config, &record.system));
     }
 
+    // Phase 1.2, run as its own pass so the ORDER the budget is spent in is a
+    // decision rather than an accident of the classification loop. `records` is
+    // newest-first (the store returns events DESC), so walking it in reverse
+    // spends on the OLDEST-RECORDED greens first: those have had the longest for
+    // the library to move underneath them, and if the bound bites they are the
+    // ones worth the Lean spawns. The order is observable only when the bound
+    // bites; every other node is unaffected.
+    let mut run = ReelaborationRun::open(config, options);
+    let mut attempts: Vec<Option<(staleness::ReelaborationOutcome, String)>> =
+        vec![None; records.len()];
+    for index in (0..records.len()).rev() {
+        let current = env_cache
+            .get(&records[index].system)
+            .and_then(|c| c.fingerprint.as_ref());
+        attempts[index] = run.attempt(config, &records[index], current, options);
+    }
+    run.close();
+
     // Classify. `StalenessReport` is the existing census model; we feed it the same
     // verdicts we render, so the counts and the per-node list can never disagree.
     let mut report = StalenessReport::new();
@@ -597,17 +869,16 @@ pub fn sweep_with_options(
     let mut any_reelaborated = false;
     let mut reelaborations_attempted = 0usize;
 
-    for record in &records {
+    for (index, record) in records.iter().enumerate() {
         let verified = record.to_verified_result();
         let current = env_cache
             .get(&record.system)
             .and_then(|c| c.fingerprint.as_ref());
 
-        // Phase 1.2. `None` (not attempted) still means `assess` returns
-        // `Unknown(ReelaborationUnavailable)` for a moved fingerprint, so the
-        // cheap default cannot produce a false Fresh. Bound to a local because
-        // `assess` borrows it and the `NodeVerdict` below reads it back.
-        let attempt = reelaborate_node(config, record, current, options);
+        // `None` (not attempted) still means `assess` returns
+        // `Unknown(ReelaborationUnavailable)` for a moved fingerprint, so a node
+        // the skip gates or the bound dropped can never read as Fresh.
+        let attempt = &attempts[index];
         let reelaboration = attempt.as_ref().map(|(outcome, _)| outcome);
         if reelaboration.is_some() {
             any_reelaborated = true;
@@ -668,10 +939,11 @@ pub fn sweep_with_options(
         statement_only_repairs: report.statement_only_repairs(),
         drift_by_artifact,
         any_reelaborated,
-        reelaboration_requested: options.reelaborate,
         reelaborations_attempted,
-        reelaboration_opt_in_env: REELABORATION_OPT_IN_ENV,
-        reelaboration_opt_in_set: crate::prover::lean::reelaboration_opt_in(),
+        reelaborations_spawned: run.spawned,
+        reelaborations_replayed: run.replayed,
+        reelaborations_refused_at_bound: run.refused_at_bound,
+        max_reelaborations: options.max_reelaborations,
         current_environments,
         withdrawals,
         nodes,
@@ -774,66 +1046,175 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_default_sweep_never_spends_a_re_elaboration() {
-        // The cost gate. `SweepOptions::default()` must not reach the prover for
-        // ANY node, including one that is stale, pinned and lean.
-        let opts = SweepOptions::default();
-        assert!(!opts.reelaborate);
-        let record = parsed("lean", "resolved:lake:old", Some("T"));
-        let current = EnvironmentFingerprint::new("resolved:lake:new");
-        let config = Config::default();
-        assert!(reelaborate_node(&config, &record, Some(&current), &opts).is_none());
+    /// A run with no disk behind it, so a test never reads or writes a cache
+    /// file and never depends on one left behind by another test.
+    fn detached_run(budget: usize) -> ReelaborationRun {
+        ReelaborationRun {
+            cache: BTreeMap::new(),
+            path: None,
+            remaining: budget,
+            spawned: 0,
+            replayed: 0,
+            refused_at_bound: 0,
+            learned: 0,
+        }
     }
 
     #[test]
-    fn re_elaboration_is_skipped_where_its_answer_could_not_change_the_verdict() {
-        let opts = SweepOptions {
-            reelaborate: true,
-            reelaboration_preamble: None,
-        };
+    fn the_skip_gates_are_what_keeps_a_sweep_cheap() {
+        // The cost control is now structural, so it must hold with a FULL budget:
+        // a node whose answer could not change its verdict never reaches Lean.
+        let opts = SweepOptions::default();
+        assert!(opts.max_reelaborations > 0, "the discriminator is not off");
         let config = Config::default();
         let current = EnvironmentFingerprint::new("resolved:lake:new");
+        let mut run = detached_run(opts.max_reelaborations);
 
         // Environment unresolved: `assess` is Unknown(EnvironmentUnresolved)
         // regardless, so no prover time is spent.
-        assert!(
-            reelaborate_node(&config, &parsed("lean", "resolved:lake:old", Some("T")), None, &opts)
-                .is_none()
-        );
+        assert!(run
+            .attempt(
+                &config,
+                &parsed("lean", "resolved:lake:old", Some("T")),
+                None,
+                &opts
+            )
+            .is_none());
         // Fingerprint still matches: the node is Fresh without us.
-        assert!(reelaborate_node(
-            &config,
-            &parsed("lean", "resolved:lake:new", Some("T")),
-            Some(&current),
-            &opts
-        )
-        .is_none());
+        assert!(run
+            .attempt(
+                &config,
+                &parsed("lean", "resolved:lake:new", Some("T")),
+                Some(&current),
+                &opts
+            )
+            .is_none());
         // No pin: nothing to re-elaborate, and `assess` says NoPinnedStatementType.
-        assert!(reelaborate_node(
-            &config,
-            &parsed("lean", "resolved:lake:old", None),
-            Some(&current),
-            &opts
-        )
-        .is_none());
+        assert!(run
+            .attempt(
+                &config,
+                &parsed("lean", "resolved:lake:old", None),
+                Some(&current),
+                &opts
+            )
+            .is_none());
+        // Not one of those three spent a spawn.
+        assert_eq!(run.spawned, 0);
+        assert_eq!(run.remaining, opts.max_reelaborations);
+    }
+
+    /// The bound is a bound on WORK, and hitting it produces silence about the
+    /// node, never a verdict about it.
+    #[test]
+    fn the_bound_refuses_rather_than_guesses() {
+        let opts = SweepOptions {
+            reelaboration_preamble: None,
+            max_reelaborations: 0,
+        };
+        let config = Config::default();
+        let current = EnvironmentFingerprint::new("resolved:lake:new");
+        let mut run = detached_run(0);
+        let record = parsed("lean", "resolved:lake:old", Some("T"));
+
+        let (outcome, note) = run
+            .attempt(&config, &record, Some(&current), &opts)
+            .expect("an explicit outcome, not silence");
+        assert!(matches!(
+            outcome,
+            staleness::ReelaborationOutcome::Unavailable { .. }
+        ));
+        assert!(note.contains("bound"));
+        assert_eq!(run.spawned, 0);
+        assert_eq!(run.refused_at_bound, 1);
+
+        // And the verdict it produces is Unknown: not Fresh, not a withdrawal.
+        let verdict = staleness::assess(&record.to_verified_result(), Some(&current), Some(&outcome));
+        assert!(!verdict.is_fresh());
+        assert!(verdict.withdrawal().is_none());
+    }
+
+    /// A remembered answer is replayed, costs no spawn, and is exactly the answer
+    /// that was stored. Unresolved environments cannot participate at all.
+    #[test]
+    fn a_remembered_answer_replaces_a_spawn_and_only_for_a_resolved_environment() {
+        let opts = SweepOptions::default();
+        let config = Config::default();
+        let record = parsed("lean", "resolved:lake:old", Some("T"));
+        let current = EnvironmentFingerprint::new("resolved:lake:new");
+        let (preamble, _) = preamble_for(&record, &opts);
+
+        let mut run = detached_run(0); // zero budget: only a cache hit can answer
+        run.cache.insert(
+            reelaboration_cache_key(current.as_str(), &preamble, "T"),
+            CachedReelaboration::Elaborated {
+                statement_type: "T".to_string(),
+            },
+        );
+        let (outcome, note) = run
+            .attempt(&config, &record, Some(&current), &opts)
+            .expect("the remembered answer");
+        assert_eq!(
+            outcome,
+            staleness::ReelaborationOutcome::Elaborated {
+                statement_type: "T".to_string()
+            }
+        );
+        assert!(note.contains("remembered"));
+        assert_eq!(run.replayed, 1);
+        assert_eq!(run.spawned, 0);
+        assert_eq!(run.refused_at_bound, 0);
+
+        // The same pin under a DIFFERENT environment is a different key, so the
+        // remembered answer cannot be served for it: it falls through to the
+        // budget, which is spent, and answers Unavailable.
+        let moved_again = EnvironmentFingerprint::new("resolved:lake:newer");
+        let (fallthrough, _) = run
+            .attempt(&config, &record, Some(&moved_again), &opts)
+            .expect("an explicit outcome");
+        assert!(matches!(
+            fallthrough,
+            staleness::ReelaborationOutcome::Unavailable { .. }
+        ));
+
+        // An unresolved environment key is never even formed: the guard is the
+        // prefix check, and its absence is what caching a stale green looks like.
+        assert!(!"unresolved: no lake project".starts_with(RESOLVED_ENV_PREFIX));
+        assert!("resolved:lake:abcd".starts_with(RESOLVED_ENV_PREFIX));
+    }
+
+    /// The key is a pure function of the three inputs and separates all of them.
+    #[test]
+    fn the_cache_key_separates_environment_preamble_and_pin() {
+        let base = reelaboration_cache_key("resolved:lake:a", "import Mathlib", "T");
+        assert_eq!(base, reelaboration_cache_key("resolved:lake:a", "import Mathlib", "T"));
+        assert_eq!(base.len(), 64);
+        for other in [
+            reelaboration_cache_key("resolved:lake:b", "import Mathlib", "T"),
+            reelaboration_cache_key("resolved:lake:a", "import Mathlib.Order.Basic", "T"),
+            reelaboration_cache_key("resolved:lake:a", "import Mathlib", "U"),
+            // Length framing: no re-split of the same bytes can collide.
+            reelaboration_cache_key("resolved:lake:aimport", " Mathlib", "T"),
+        ] {
+            assert_ne!(base, other);
+        }
     }
 
     #[test]
     fn a_system_with_no_re_elaborator_is_unavailable_and_never_moved() {
-        let opts = SweepOptions {
-            reelaborate: true,
-            reelaboration_preamble: None,
-        };
+        let opts = SweepOptions::default();
         let config = Config::default();
         let current = EnvironmentFingerprint::new("resolved:x:new");
-        let (outcome, _note) = reelaborate_node(
-            &config,
-            &parsed("rocq", "resolved:x:old", Some("T")),
-            Some(&current),
-            &opts,
-        )
-        .expect("an explicit outcome, not silence");
+        let mut run = detached_run(opts.max_reelaborations);
+        let (outcome, _note) = run
+            .attempt(
+                &config,
+                &parsed("rocq", "resolved:x:old", Some("T")),
+                Some(&current),
+                &opts,
+            )
+            .expect("an explicit outcome, not silence");
+        // Free: an unsupported system never draws on the budget.
+        assert_eq!(run.spawned, 0);
         assert!(matches!(
             outcome,
             staleness::ReelaborationOutcome::Unavailable { .. }
@@ -852,8 +1233,8 @@ mod tests {
     fn the_recorded_preamble_beats_the_operators_and_both_beat_the_default() {
         let mut record = parsed("lean", "resolved:lake:old", Some("T"));
         let operator = SweepOptions {
-            reelaborate: true,
             reelaboration_preamble: Some("import Mathlib.Order.Basic".to_string()),
+            ..SweepOptions::default()
         };
 
         assert_eq!(

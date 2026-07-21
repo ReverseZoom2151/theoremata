@@ -1146,15 +1146,6 @@ fn probe_outcome_from_json(stdout: &str, first_appended_line: usize) -> ProbeOut
 // Phase 1.2: re-elaborating a PINNED statement under the CURRENT environment
 // ===========================================================================
 
-/// Opt-in for the staleness re-elaboration probe. **Default OFF.**
-///
-/// Re-elaboration spawns Lean twice per assessed node (a control probe and the
-/// statement probe). Against a real Mathlib that is seconds per node, so a sweep
-/// over a large store must not do it unconditionally: the census stays exactly as
-/// cheap as it is today unless someone asks for the expensive answer. Accepted
-/// truthy values mirror the rest of the file (`1`/`true`/`on`).
-pub const REELABORATION_OPT_IN_ENV: &str = "THEOREMATA_STALENESS_REELABORATE";
-
 /// Import header used when neither the stored record nor the operator supplies
 /// one. `import Mathlib` is the maximal Mathlib context, so it is a SUPERSET of
 /// whatever a Mathlib-derived statement was originally elaborated under, which is
@@ -1198,19 +1189,6 @@ pub enum LeanReelaboration {
     Rejected { detail: String },
     /// We got no usable answer. Never evidence of anything.
     Unavailable { reason: String },
-}
-
-/// Whether the staleness re-elaboration probe is enabled. Default OFF, which is
-/// the opposite of [`elaboration_probe_enabled`]: publishing a pin costs one run
-/// per successful verification, re-elaborating costs two runs per stale node.
-pub fn reelaboration_opt_in() -> bool {
-    match std::env::var(REELABORATION_OPT_IN_ENV) {
-        Ok(v) => {
-            let v = v.trim();
-            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
-        }
-        Err(_) => false,
-    }
 }
 
 /// Lean error markers meaning THE CONTEXT DOES NOT PROVIDE A NAME the pinned form
@@ -1341,6 +1319,17 @@ fn run_probe(
 /// Every early return in this function is `Unavailable`. There is no path from a
 /// failure of any kind to `Elaborated`, so the caller can never be handed
 /// something that assesses to `Fresh` because we did not manage to look.
+///
+/// # Cost is the caller's to bound, not this function's
+///
+/// Two Lean spawns per call is genuinely expensive, and this function used to
+/// guard that with an env opt-in of its own. That was the wrong place: a
+/// backend primitive that refuses to run unless an env var is set is a primitive
+/// nothing calls. The bounding belongs where the fan-out is known, which is the
+/// sweep: it skips every node whose answer could not change the verdict, it
+/// remembers an answer per (pinned form, preamble, resolved environment), and it
+/// caps how many nodes may spawn Lean in one run. See
+/// `reason::proving::staleness_sweep`.
 pub fn reelaborate_pinned_statement(
     cfg: &Config,
     preamble: &str,
@@ -1349,11 +1338,6 @@ pub fn reelaborate_pinned_statement(
     let unavailable =
         |reason: String| LeanReelaboration::Unavailable { reason };
 
-    if !reelaboration_opt_in() {
-        return unavailable(format!(
-            "re-elaboration is opt-in and {REELABORATION_OPT_IN_ENV} is not set"
-        ));
-    }
     if pinned_form.trim().is_empty() {
         return unavailable("pinned elaborated statement form is empty".to_string());
     }
@@ -2528,34 +2512,18 @@ mod elaboration_tests {
         }
     }
 
-    /// Re-elaboration is OFF by default. The census must stay as cheap as it was.
-    #[test]
-    fn re_elaboration_is_opt_in_and_defaults_off() {
-        std::env::remove_var(REELABORATION_OPT_IN_ENV);
-        assert!(!reelaboration_opt_in());
-        for on in ["1", "true", "ON"] {
-            std::env::set_var(REELABORATION_OPT_IN_ENV, on);
-            assert!(reelaboration_opt_in(), "{on} must enable re-elaboration");
-        }
-        for off in ["0", "false", "", "no"] {
-            std::env::set_var(REELABORATION_OPT_IN_ENV, off);
-            assert!(!reelaboration_opt_in(), "{off} must not enable re-elaboration");
-        }
-        std::env::remove_var(REELABORATION_OPT_IN_ENV);
-    }
-
     /// Every refusal path out of the entry point is `Unavailable`. There is no
     /// input that turns a failure into an `Elaborated`.
+    ///
+    /// This function used to carry its own env opt-in on top of the sweep's
+    /// flag, so two switches had to agree before anything ran. Both are gone:
+    /// cost is the CALLER's bound now (the sweep's skip gates, its cache and its
+    /// per-sweep budget), and this function's only job is to be unable to lie.
+    /// No env var is read here, so this test also no longer mutates the process
+    /// environment, which is what made it race under the parallel harness.
     #[test]
     fn every_refusal_out_of_the_entry_point_is_unavailable() {
-        std::env::remove_var(REELABORATION_OPT_IN_ENV);
         let cfg = Config::default();
-        // Opt-in unset.
-        assert!(matches!(
-            reelaborate_pinned_statement(&cfg, "import Mathlib", "True"),
-            LeanReelaboration::Unavailable { .. }
-        ));
-        std::env::set_var(REELABORATION_OPT_IN_ENV, "1");
         // Empty pin, empty preamble.
         assert!(matches!(
             reelaborate_pinned_statement(&cfg, "import Mathlib", "  "),
@@ -2572,7 +2540,6 @@ mod elaboration_tests {
             reelaborate_pinned_statement(&mock, "import Mathlib", "True"),
             LeanReelaboration::Unavailable { .. }
         ));
-        std::env::remove_var(REELABORATION_OPT_IN_ENV);
     }
 
     /// Header-only import parsing: a later `import` line (or one inside a

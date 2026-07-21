@@ -161,6 +161,206 @@ fn goal_state_feedback(goal_states: &[String]) -> Option<String> {
     Some(out)
 }
 
+// ===========================================================================
+// Bounding what alignment steering may spend in one Retrieve arm
+// ===========================================================================
+
+/// How many REAL falsifier searches alignment probing may spend in one Retrieve
+/// arm.
+///
+/// Anchoring already bounds the probeable pairs by the candidate list retrieval
+/// produced, but one popular premise name can anchor many pairs in a large
+/// corpora file, and each pair generates several probes. This is the hard
+/// ceiling on that fan-out. It is deliberately a constant rather than a config
+/// key: the point of this change is to stop expressing cost control as a switch
+/// somebody has to know to set.
+const ALIGNMENT_PROBE_BUDGET: usize = 24;
+
+/// How many foreign names one Retrieve arm may append. Unchanged from when this
+/// path was behind a flag; the suggestions go on the TAIL of the candidate list,
+/// so they can never displace a premise the ordinary retrievers earned.
+const ALIGNMENT_STEER_BUDGET: usize = 4;
+
+/// File under the artifact root where settled alignment probe verdicts live.
+const ALIGNMENT_MEMO_FILE: &str = "alignment-probe-verdicts.json";
+
+/// The part of a [`crate::falsification::FalsifyVerdict`] that is worth
+/// remembering, and the only part [`crate::alignment_refute::steer_retrieval`]
+/// reads.
+///
+/// `spec` and `details` are the model's working, not the answer; they are
+/// deliberately not persisted, so a replayed verdict cannot be mistaken for a
+/// fresh run whose provenance we still hold.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SettledProbeVerdict {
+    applicable: bool,
+    verdict: String,
+    assignment: Option<Value>,
+}
+
+/// A [`Falsify`](crate::validity_seams::Falsify) that spends a bounded number of
+/// real searches and remembers the ones that SETTLED.
+///
+/// ## What may be remembered, and why that is safe
+///
+/// Only two verdicts are stored: `counterexample` (the pair is refuted, and a
+/// refuted alignment is permanently inert, so this is exactly the verdict worth
+/// never paying for twice) and `no_counterexample_in_domain` (a bounded search
+/// ran to completion and found nothing). Every other string means WE DID NOT
+/// LOOK, and caching "we did not look" would freeze a transient outage into a
+/// permanent one, so those are never written and never replayed.
+///
+/// The memo key mixes the MODEL PROVIDER NAME with the claim text, because the
+/// searches these verdicts come from are model-derived: a verdict earned under
+/// one provider is not a verdict under another, and replaying it across the two
+/// would be a second identity for the same fact.
+///
+/// ## What happens at the budget
+///
+/// A verdict of `budget_exhausted` with `applicable: false`. That is neither
+/// `counterexample` nor `no_counterexample_in_domain`, so `probe_alignment`
+/// counts it toward neither refutation nor coverage, and a pair that got only
+/// such answers ends at [`crate::alignment::Refutation::Unavailable`], which
+/// `steer_retrieval` drops. Running out of budget therefore costs recall and
+/// never soundness: it cannot surface a name and cannot refute one either.
+struct BoundedAlignmentFalsifier<'a> {
+    inner: &'a dyn crate::validity_seams::Falsify,
+    /// Settled verdicts by key, seeded from disk and written back on close.
+    memo: std::cell::RefCell<BTreeMap<String, SettledProbeVerdict>>,
+    /// Where the memo is persisted. `None` disables persistence entirely (the
+    /// artifact root was unusable), which costs speed and nothing else.
+    path: Option<std::path::PathBuf>,
+    /// Identity of the searcher whose verdicts these are.
+    provider: String,
+    remaining: std::cell::Cell<usize>,
+    searched: std::cell::Cell<usize>,
+    replayed: std::cell::Cell<usize>,
+    refused: std::cell::Cell<usize>,
+    learned: std::cell::Cell<usize>,
+}
+
+impl<'a> BoundedAlignmentFalsifier<'a> {
+    /// Wrap `inner`, seeding the memo from the artifact root when one is
+    /// readable. Every IO failure here degrades to an empty memo: this is an
+    /// optimization, and an optimization must never be able to fail a call.
+    fn open(
+        inner: &'a dyn crate::validity_seams::Falsify,
+        config: &Config,
+        provider: &str,
+        budget: usize,
+    ) -> Self {
+        let path = config.artifacts.join(ALIGNMENT_MEMO_FILE);
+        let memo = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<BTreeMap<String, SettledProbeVerdict>>(&raw).ok())
+            .unwrap_or_default();
+        Self {
+            inner,
+            memo: std::cell::RefCell::new(memo),
+            path: Some(path),
+            provider: provider.to_string(),
+            remaining: std::cell::Cell::new(budget),
+            searched: std::cell::Cell::new(0),
+            replayed: std::cell::Cell::new(0),
+            refused: std::cell::Cell::new(0),
+            learned: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Length-framed digest over the searcher identity and the claim, so no two
+    /// different (provider, claim) pairs can be re-split into the same
+    /// pre-image. Same framing discipline as `checker_cache::absorb`.
+    fn key(&self, claim: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for (tag, data) in [
+            ("theoremata.alignment_probe.v1", ""),
+            ("provider", self.provider.as_str()),
+            ("claim", claim),
+        ] {
+            hasher.update((tag.len() as u64).to_be_bytes());
+            hasher.update(tag.as_bytes());
+            hasher.update((data.len() as u64).to_be_bytes());
+            hasher.update(data.as_bytes());
+        }
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// Persist anything newly learned and report what the call spent. Best
+    /// effort: a failed write costs the next call some time, nothing more.
+    fn close(self) -> Value {
+        if self.learned.get() > 0 {
+            if let Some(path) = &self.path {
+                if let Ok(raw) = serde_json::to_string(&*self.memo.borrow()) {
+                    let _ = std::fs::write(path, raw);
+                }
+            }
+        }
+        json!({
+            "budget": ALIGNMENT_PROBE_BUDGET,
+            "searched": self.searched.get(),
+            "replayed_from_memo": self.replayed.get(),
+            "refused_at_budget": self.refused.get(),
+        })
+    }
+}
+
+impl crate::validity_seams::Falsify for BoundedAlignmentFalsifier<'_> {
+    fn falsify(&self, statement: &str) -> Result<crate::falsification::FalsifyVerdict> {
+        let key = self.key(statement);
+        // A remembered verdict costs nothing, so it does not draw on the budget.
+        if let Some(settled) = self.memo.borrow().get(&key).cloned() {
+            self.replayed.set(self.replayed.get() + 1);
+            return Ok(crate::falsification::FalsifyVerdict {
+                applicable: settled.applicable,
+                verdict: settled.verdict,
+                assignment: settled.assignment,
+                spec: Value::Null,
+                // Named so nobody reading a witness later mistakes a replay for
+                // a search that ran during this call.
+                details: json!({"source": "remembered settled alignment probe verdict"}),
+            });
+        }
+        if self.remaining.get() == 0 {
+            self.refused.set(self.refused.get() + 1);
+            return Ok(crate::falsification::FalsifyVerdict {
+                applicable: false,
+                verdict: "budget_exhausted".into(),
+                assignment: None,
+                spec: Value::Null,
+                details: json!({
+                    "reason": "alignment probe budget for this retrieve is spent; this is no \
+                               signal, exactly like an offline falsifier",
+                }),
+            });
+        }
+        self.remaining.set(self.remaining.get() - 1);
+        self.searched.set(self.searched.get() + 1);
+        let verdict = self.inner.falsify(statement)?;
+        // Only a search that SETTLED the question is remembered. `applicable` is
+        // required alongside the string for the same reason `probe_alignment`
+        // requires it: an inapplicable check did not look.
+        let settled = verdict.verdict == "counterexample"
+            || (verdict.applicable && verdict.verdict == "no_counterexample_in_domain");
+        if settled {
+            self.memo.borrow_mut().insert(
+                key,
+                SettledProbeVerdict {
+                    applicable: verdict.applicable,
+                    verdict: verdict.verdict.clone(),
+                    assignment: verdict.assignment.clone(),
+                },
+            );
+            self.learned.set(self.learned.get() + 1);
+        }
+        Ok(verdict)
+    }
+}
+
 impl AgentLoop<'_> {
     pub fn run(&self, project_id: &str) -> Result<AgentSummary> {
         let project = self.store.project(project_id)?;
@@ -714,12 +914,33 @@ impl AgentLoop<'_> {
                 // statement, a grade or an obligation off an alignment. The
                 // whole exchange is a list of names.
                 //
-                // Refutation costs falsifier runs, so the block is gated OFF by
-                // default. When the switch is off nothing below executes and the
-                // recorded evidence is byte-identical to what it was before this
-                // consumer existed.
+                // Refutation costs falsifier runs, and that cost is bounded by
+                // STRUCTURE rather than by a switch. There used to be a
+                // `alignment_retrieval_steer` flag here, defaulting off, which
+                // made this whole consumer dead code carrying a name. The three
+                // bounds below are what the flag was standing in for, and unlike
+                // the flag they are load-bearing every single call:
+                //
+                // 1. ABSENCE IS THE NO-OP. With no corpora file on disk there is
+                //    nothing to propose, so not one falsifier run is spent. That
+                //    is the ordinary state of a checkout and it stays a silent
+                //    no-op, never an error.
+                // 2. ANCHORING BOUNDS THE WORK BY WHAT RETRIEVAL ALREADY FOUND.
+                //    `steer_retrieval` probes a pair only when one of its two
+                //    sides is already a name in `lemmas`, and it skips the pair
+                //    BEFORE calling the falsifier. So the number of probeable
+                //    pairs is bounded by the candidate list the graph and the
+                //    external retriever earned, not by the size of the corpora.
+                // 3. A PROBE BUDGET AND A REMEMBERED VERDICT. Anchoring still
+                //    leaves a large corpora file able to attach many pairs to one
+                //    popular name, so the falsifier handed in is wrapped: it runs
+                //    at most `ALIGNMENT_PROBE_BUDGET` real searches per Retrieve,
+                //    and it replays a verdict it has already SETTLED for the same
+                //    claim under the same model instead of paying again. Past the
+                //    budget it answers "no signal", which drops the pair; it can
+                //    never invent one.
                 let mut alignment_detail = Value::Null;
-                if self.config.alignment_retrieval_steer {
+                {
                     let corpora_path = self.config.resources.join("alignments/corpora.json");
                     match crate::alignment_refute::load_corpora_pair(&corpora_path) {
                         Ok(Some((left, right))) => {
@@ -728,16 +949,23 @@ impl AgentLoop<'_> {
                             let falsifier = crate::falsification::Falsifier {
                                 provider: self.provider,
                             };
+                            let bounded = BoundedAlignmentFalsifier::open(
+                                &falsifier,
+                                self.config,
+                                self.provider.name(),
+                                ALIGNMENT_PROBE_BUDGET,
+                            );
                             let surfaced = crate::alignment_refute::steer_retrieval(
                                 &left,
                                 &right,
                                 &crate::alignment_propose::MatcherConfig::default(),
-                                &falsifier,
+                                &bounded,
                                 &lemmas,
-                                4,
+                                ALIGNMENT_STEER_BUDGET,
                             );
                             alignment_detail = json!({
                                 "corpora": corpora_path.to_string_lossy(),
+                                "probing": bounded.close(),
                                 "surfaced": surfaced
                                     .iter()
                                     .map(|c| c.to_json())
@@ -1921,7 +2149,139 @@ fn record_live_plan_snapshot(
 mod tests {
     use super::*;
     use crate::model::{ModelResponse, NodeKind};
+    use crate::validity_seams::Falsify;
     use std::path::Path;
+
+    // ------------------------------------------------------------------
+    // The alignment probe bound
+    // ------------------------------------------------------------------
+
+    /// A falsifier that answers a fixed verdict and counts how often it was
+    /// actually asked. Nothing here searches; the bound is what is under test.
+    struct CountingFalsifier {
+        verdict: &'static str,
+        applicable: bool,
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl Falsify for CountingFalsifier {
+        fn falsify(&self, _statement: &str) -> Result<crate::falsification::FalsifyVerdict> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(crate::falsification::FalsifyVerdict {
+                applicable: self.applicable,
+                verdict: self.verdict.to_string(),
+                assignment: None,
+                spec: Value::Null,
+                details: Value::Null,
+            })
+        }
+    }
+
+    /// A wrapper with no disk behind it, so a test never reads or writes a memo
+    /// file and never depends on one another test left behind.
+    fn detached<'a>(inner: &'a dyn Falsify, budget: usize) -> BoundedAlignmentFalsifier<'a> {
+        BoundedAlignmentFalsifier {
+            inner,
+            memo: std::cell::RefCell::new(BTreeMap::new()),
+            path: None,
+            provider: "test".to_string(),
+            remaining: std::cell::Cell::new(budget),
+            searched: std::cell::Cell::new(0),
+            replayed: std::cell::Cell::new(0),
+            refused: std::cell::Cell::new(0),
+            learned: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Past the budget the wrapper answers with something that is neither a
+    /// counterexample nor a completed bounded search, so `probe_alignment` counts
+    /// it toward neither refutation nor coverage and the pair steers nothing.
+    #[test]
+    fn the_probe_budget_answers_no_signal_rather_than_a_verdict() {
+        let inner = CountingFalsifier {
+            verdict: "no_counterexample_in_domain",
+            applicable: true,
+            calls: std::cell::Cell::new(0),
+        };
+        let bounded = detached(&inner, 2);
+        assert_eq!(
+            bounded.falsify("claim one").unwrap().verdict,
+            "no_counterexample_in_domain"
+        );
+        assert_eq!(
+            bounded.falsify("claim two").unwrap().verdict,
+            "no_counterexample_in_domain"
+        );
+        let past = bounded.falsify("claim three").unwrap();
+        assert_eq!(past.verdict, "budget_exhausted");
+        assert!(!past.applicable);
+        assert_ne!(past.verdict, "counterexample");
+        assert_eq!(inner.calls.get(), 2, "the bound must stop real searches");
+        assert_eq!(bounded.refused.get(), 1);
+    }
+
+    /// A settled verdict is replayed and does not draw on the budget. This is why
+    /// a refuted alignment is only ever paid for once.
+    #[test]
+    fn a_settled_verdict_is_remembered_and_replayed_for_free() {
+        let inner = CountingFalsifier {
+            verdict: "counterexample",
+            applicable: true,
+            calls: std::cell::Cell::new(0),
+        };
+        let bounded = detached(&inner, 1);
+        assert_eq!(bounded.falsify("same claim").unwrap().verdict, "counterexample");
+        // The budget is spent, and the remembered refutation still answers.
+        assert_eq!(bounded.falsify("same claim").unwrap().verdict, "counterexample");
+        assert_eq!(inner.calls.get(), 1);
+        assert_eq!(bounded.replayed.get(), 1);
+        // A different claim gets the refusal, not the remembered answer.
+        assert_eq!(
+            bounded.falsify("other claim").unwrap().verdict,
+            "budget_exhausted"
+        );
+    }
+
+    /// "We did not look" is never remembered. Caching an offline falsifier would
+    /// freeze a transient outage into a permanent one.
+    #[test]
+    fn an_unsettled_verdict_is_never_remembered() {
+        for unsettled in ["no_model", "unavailable", "inconclusive", "error"] {
+            let inner = CountingFalsifier {
+                verdict: unsettled,
+                applicable: false,
+                calls: std::cell::Cell::new(0),
+            };
+            let bounded = detached(&inner, 5);
+            bounded.falsify("claim").unwrap();
+            bounded.falsify("claim").unwrap();
+            assert_eq!(inner.calls.get(), 2, "{unsettled} must not be remembered");
+            assert_eq!(bounded.learned.get(), 0);
+            assert_eq!(bounded.replayed.get(), 0);
+        }
+    }
+
+    /// The memo key separates providers and claims, and its length framing means
+    /// no two different pairs can be re-split into one pre-image.
+    #[test]
+    fn the_memo_key_separates_provider_and_claim() {
+        let inner = CountingFalsifier {
+            verdict: "no_model",
+            applicable: false,
+            calls: std::cell::Cell::new(0),
+        };
+        let a = detached(&inner, 1);
+        let mut b = detached(&inner, 1);
+        b.provider = "other".to_string();
+        assert_eq!(a.key("claim"), a.key("claim"));
+        assert_eq!(a.key("claim").len(), 64);
+        assert_ne!(a.key("claim"), a.key("claim2"));
+        assert_ne!(a.key("claim"), b.key("claim"));
+        // Re-splitting the same bytes across the two fields must not collide.
+        let mut c = detached(&inner, 1);
+        c.provider = "testclaim".to_string();
+        assert_ne!(a.key("claim"), c.key(""));
+    }
 
     struct MockProvider;
     impl ModelProvider for MockProvider {

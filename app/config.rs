@@ -137,12 +137,6 @@ pub struct Config {
     /// the pipeline on ordinary decompositions.
     #[serde(default = "default_enforce_decomposition_admission")]
     pub enforce_decomposition_admission: bool,
-    /// Whether an UNREFUTED alignment may SURFACE a foreign premise name in the
-    /// retrieval route (plan Phase 2.4). OFF by default: refutation costs
-    /// falsifier runs, and an alignment never licenses anything, so paying for
-    /// it must be an explicit choice.
-    #[serde(default = "default_alignment_retrieval_steer")]
-    pub alignment_retrieval_steer: bool,
 }
 
 /// Env-derived default for [`Config::validate_statements`]. Read ONCE at Config
@@ -217,12 +211,6 @@ fn default_vacuity_gate() -> bool {
 /// truthy.
 fn default_enforce_decomposition_admission() -> bool {
     default_off_gate("THEOREMATA_ENFORCE_DECOMPOSITION_ADMISSION")
-}
-
-/// Env-derived default for [`Config::alignment_retrieval_steer`]. OFF unless
-/// explicitly truthy.
-fn default_alignment_retrieval_steer() -> bool {
-    default_off_gate("THEOREMATA_ALIGNMENT_RETRIEVAL_STEER")
 }
 
 fn default_lean_bin() -> String {
@@ -312,7 +300,6 @@ impl Default for Config {
             hypothesis_gate: default_hypothesis_gate(),
             vacuity_gate: default_vacuity_gate(),
             enforce_decomposition_admission: default_enforce_decomposition_admission(),
-            alignment_retrieval_steer: default_alignment_retrieval_steer(),
         }
     }
 }

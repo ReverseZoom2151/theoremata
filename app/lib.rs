@@ -312,15 +312,16 @@ enum Command {
         /// Max events read per project (newest first).
         #[arg(long, default_value_t = 100_000)]
         limit: usize,
-        /// Phase 1.2 discriminator: re-elaborate each stale pinned statement
-        /// under the current environment. Spawns Lean twice per stale node.
-        /// Also requires THEOREMATA_STALENESS_REELABORATE=1.
-        #[arg(long)]
-        reelaborate: bool,
         /// Import header to re-elaborate against when the stored record carries
         /// none. Defaults to `import Mathlib`.
         #[arg(long)]
         reelaborate_preamble: Option<String>,
+        /// RAISE the per-sweep cap on how many stale pinned nodes may be
+        /// re-elaborated. The discriminator always runs; this only buys more of
+        /// it. Nodes are charged oldest-recorded first, since the oldest greens
+        /// have had the longest to rot.
+        #[arg(long, default_value_t = reason::proving::staleness_sweep::DEFAULT_MAX_REELABORATIONS)]
+        max_reelaborate: usize,
     },
     Tactics {
         goal: String,
@@ -1048,8 +1049,8 @@ pub fn run() -> Result<()> {
         Command::Sweep {
             project,
             limit,
-            reelaborate,
             reelaborate_preamble,
+            max_reelaborate,
         } => print_value(
             true,
             &reason::proving::staleness_sweep::sweep_with_options(
@@ -1058,8 +1059,8 @@ pub fn run() -> Result<()> {
                 project.as_deref(),
                 limit,
                 &reason::proving::staleness_sweep::SweepOptions {
-                    reelaborate,
                     reelaboration_preamble: reelaborate_preamble,
+                    max_reelaborations: max_reelaborate,
                 },
             )?,
         )?,
