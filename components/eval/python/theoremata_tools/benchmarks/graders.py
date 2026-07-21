@@ -24,9 +24,10 @@ misreport.
   the existing :mod:`theoremata_tools.grader`, with an LLM-judge fallback (the
   mock-capable provider) only when symbolic parsing is inconclusive. That judge
   is the one genuinely COMPARATIVE path here (it relates two answers under a
-  symmetric relation), so it supports order-swapped two-pass judging with a
-  first-class UNSTABLE outcome; see :func:`_order_swapped_equivalence_judge` and
-  :func:`judge_stability_report`.
+  symmetric relation), so it runs order-swapped two-pass judging BY DEFAULT with
+  a first-class UNSTABLE outcome; see :func:`_order_swapped_equivalence_judge`,
+  :data:`JUDGE_MIGRATION_NOTE`, :func:`judge_stability_report` and
+  :func:`judge_informativeness_report`.
 * :func:`grade_falsification` — flaw / counterexample detection, or must-reject
   for the negative fixture.
 
@@ -573,6 +574,29 @@ _EQUIVALENCE_SCHEMA = {
     },
 }
 
+#: What changed when order-swapped judging stopped being opt-in, stated where a
+#: report can print it. Honesty about the direction matters more than the size:
+#: turning the instrument on can ONLY lower a pass rate, because a judge that
+#: contradicts itself under an order swap is UNSTABLE and unstable fails closed.
+#: An item that used to pass on one arbitrary reading now does not pass.
+JUDGE_MIGRATION_NOTE = (
+    "Order-swapped judging is now the DEFAULT for the comparative "
+    "answer-equivalence judge. Pass rates can only MOVE DOWN, never up: an item "
+    "that a single pass called equivalent now needs both orderings to agree, and "
+    "a disagreement is UNSTABLE, which fails closed. The blast radius is bounded "
+    "by how rarely this judge runs. It is a fallback behind the deterministic "
+    "symbolic grader, reached only on parse_error / sympy_unavailable / "
+    "structural for a symbolic-route answer: measured over the full registered "
+    "corpus (4902 items, 200 of them nl_answer), 0.63 percent of a run whose "
+    "answers are parseable-but-wrong reaches it, and 2.04 percent in the worst "
+    "case where every nl_answer response is unparseable prose. Replayed over "
+    "that corpus with a judge carrying the mined 20.9 percent instability, the "
+    "whole-run pass count moves 31 -> 24 (-0.143 points) and 100 -> 90 (-0.204 "
+    "points) for those two runs: -3.5 and -5.0 points on the nl_answer track "
+    "itself. Single-pass verdicts keep exactly their old meaning and are still "
+    "excluded from the instability denominator rather than counted as stable."
+)
+
 _EQUIVALENCE_RUBRIC = (
     "Exact forms only: 1/2 == 0.5 is True, but a decimal approximation of an "
     "exact expression (2*pi vs 6.28) is False."
@@ -607,6 +631,68 @@ def _equivalence_call(
         # Fail closed: an unbound reply is no verdict at all, never a pass.
         return None, unbound_reason, model
     return verdict, "", model
+
+
+def _equivalence_cache_key(gold: str, pred: str) -> str:
+    """Content key for one answer-equivalence judgement.
+
+    Keyed on the JUDGED CONTENT and nothing else. The per-call binding marker is
+    deliberately unpredictable, so keying on it would give every call a unique
+    key and the cache would never hit; more importantly the marker is a
+    credential, not an identity, and a cache must identify the question, not the
+    proof that one particular reply answered it.
+
+    The pair is SORTED because the judged relation is symmetric and the swapped
+    judgement covers both presentations at once. Sorting is what makes a rerun,
+    in either order, free.
+    """
+    return judge_binding.JudgeCache.key(
+        "answer_equivalence", sorted([str(gold), str(pred)])
+    )
+
+
+def _single_pass_equivalence_judge(
+    gold: str, pred: str, sampling_reason: str
+) -> dict[str, Any]:
+    """One-pass answer-equivalence judging, for the bounded escape only.
+
+    This is EXACTLY the semantics single-pass callers always had: one bound call,
+    one verdict, no stability claim of any kind. The only thing that changed is
+    that reaching it is now a recorded event (``sampled``/``sampling_reason``)
+    rather than the silent default, so a single-pass verdict can no longer be
+    mistaken for a swapped one in an aggregate.
+    """
+    marker = judge_binding.mint_marker()
+    verdict, reason, model = _equivalence_call(
+        (
+            "Decide if the predicted answer is mathematically EQUIVALENT to "
+            "the gold answer. " + _EQUIVALENCE_RUBRIC
+        ),
+        {"gold": gold, "pred": pred},
+        marker,
+    )
+    stability = judge_binding.single_pass_report(sampling_reason)
+    if verdict is None:
+        return {
+            "equivalent": False,
+            "reason": reason,
+            "order_swapped": False,
+            "order_stable": None,
+            "stability": stability,
+        }
+    equivalent = bool(verdict.get("equivalent"))
+    stability["outcome"] = equivalent
+    stability["decided"] = True
+    return {
+        "equivalent": equivalent,
+        "reason": f"llm_judge:{model}",
+        "analysis": verdict.get("analysis"),
+        # A single pass measures no stability at all. Saying so explicitly keeps
+        # it out of the instability denominator instead of scoring it stable.
+        "order_swapped": False,
+        "order_stable": None,
+        "stability": stability,
+    }
 
 
 def _order_swapped_equivalence_judge(gold: str, pred: str) -> dict[str, Any]:
@@ -646,9 +732,12 @@ def _order_swapped_equivalence_judge(gold: str, pred: str) -> dict[str, Any]:
             "model": model,
         }
 
-    report = judge_binding.two_pass_swapped(one_pass)
-    models = [p.get("model") for p in report["passes"] if p.get("model")]
-    model = models[0] if models else "unknown"
+    report = judge_binding.two_pass_swapped(
+        one_pass, cache_key=_equivalence_cache_key(gold, pred)
+    )
+    passes = report.get("passes") or []
+    models = [p.get("model") for p in passes if p.get("model")]
+    model = models[0] if models else ("cache" if report.get("cached") else "unknown")
     if report["status"] == judge_binding.STABLE:
         return {
             "equivalent": bool(report["outcome"]),
@@ -656,7 +745,7 @@ def _order_swapped_equivalence_judge(gold: str, pred: str) -> dict[str, Any]:
             "outcome": report["outcome"],
             "order_stable": True,
             "reason": f"llm_judge_order_stable:{model}",
-            "analysis": report["passes"][0].get("analysis"),
+            "analysis": passes[0].get("analysis") if passes else None,
             "stability": report,
         }
     return {
@@ -677,41 +766,29 @@ def _default_llm_judge(
     Uses the IneqMath rubric (exact forms only; decimals never equal exact).
     Deterministic in mock mode so tests never hit the network.
 
-    ``order_swap`` (or ``THEOREMATA_JUDGE_ORDER_SWAP=1``) runs the judge twice
-    with the two answers swapped and only believes a verdict both passes reach.
-    It is OFF by default because it doubles the token cost of every judged item.
+    ORDER-SWAPPED BY DEFAULT. The judge runs twice with the two answers swapped
+    and only believes a verdict both passes reach; a disagreement is UNSTABLE and
+    fails closed. The second pass is affordable because this judge is a narrow
+    fallback (see :data:`JUDGE_MIGRATION_NOTE`), because an identical
+    ``(gold, pred)`` pair is served from the content-keyed cache instead of being
+    re-judged, and because a per-process budget bounds pathological batches.
+
+    ``order_swap=False`` still opts a caller out, with the same single-pass
+    meaning it always had, and the opt-out is recorded on the item.
     """
     try:
         from theoremata_tools.model_provider import generate  # noqa: F401
     except Exception as exc:  # provider component not on path
         return {"equivalent": False, "reason": f"judge_unavailable:{exc}"}
 
-    if judge_binding.order_swap_enabled(order_swap):
+    swap, sampling_reason = judge_binding.decide_order_swap(order_swap)
+    if swap:
         return _order_swapped_equivalence_judge(gold, pred)
 
-    # Single pass. gold/pred are untrusted corpus text, so the verdict is read
-    # only from the region after a per-call marker the corpus author could not
-    # have predicted.
-    marker = judge_binding.mint_marker()
-    verdict, reason, model = _equivalence_call(
-        (
-            "Decide if the predicted answer is mathematically EQUIVALENT to "
-            "the gold answer. " + _EQUIVALENCE_RUBRIC
-        ),
-        {"gold": gold, "pred": pred},
-        marker,
-    )
-    if verdict is None:
-        return {"equivalent": False, "reason": reason}
-    return {
-        "equivalent": bool(verdict.get("equivalent")),
-        "reason": f"llm_judge:{model}",
-        "analysis": verdict.get("analysis"),
-        # A single pass measures no stability at all. Saying so explicitly keeps
-        # it out of the instability denominator instead of scoring it stable.
-        "order_swapped": False,
-        "order_stable": None,
-    }
+    # The bounded escape. gold/pred are untrusted corpus text, so the verdict is
+    # still read only from the region after a per-call marker the corpus author
+    # could not have predicted.
+    return _single_pass_equivalence_judge(gold, pred, sampling_reason or "unspecified")
 
 
 def grade_nl_answer(
@@ -745,25 +822,58 @@ def grade_nl_answer(
     # LLM-judge fallback ONLY when the deterministic symbolic path was
     # inconclusive (parse error) and we're on a symbolic/bound answer.
     judge_stability: dict[str, Any] | None = None
+    judge_informativeness: dict[str, Any] | None = None
     if (
         not is_correct
         and route == "symbolic"
         and str(method).startswith(("parse_error", "sympy_unavailable", "structural"))
     ):
-        jfn = judge or _default_llm_judge
-        j = jfn(gold, pred)
-        if j.get("equivalent"):
-            is_correct = True
-        method = f"{method}->{j.get('reason', 'llm_judge')}"
-        # Carry the per-item stability observation so a batch can be measured.
-        # A judge that ran once reports order_swapped False rather than nothing,
-        # so it is excluded from the rate instead of counted as stable.
-        judge_stability = j.get("stability") or {
-            "order_swapped": bool(j.get("order_swapped")),
-            "status": judge_binding.STABLE
-            if j.get("order_stable")
-            else judge_binding.UNSTABLE,
-        }
+        # THE INFORMATIVENESS GATE. An arm that errored or produced nothing is
+        # not an arm that lost, so we refuse to judge the comparison at all
+        # rather than record a judgement about it. In the mined corpus 31.1
+        # percent of run records were errors, and every one of them read as
+        # judge opinion to anyone looking only at the totals.
+        judge_informativeness = judge_binding.screen_comparison(gold, pred)
+        if judge_informativeness["informative"]:
+            jfn = judge or _default_llm_judge
+            j = jfn(gold, pred)
+            if j.get("equivalent"):
+                is_correct = True
+            method = f"{method}->{j.get('reason', 'llm_judge')}"
+            # Carry the per-item stability observation so a batch can be
+            # measured. A judge that ran once reports order_swapped False rather
+            # than nothing, so it is excluded from the rate instead of counted
+            # as stable.
+            judge_stability = j.get("stability") or {
+                "order_swapped": bool(j.get("order_swapped")),
+                "status": judge_binding.STABLE
+                if j.get("order_stable")
+                else judge_binding.UNSTABLE,
+            }
+            # A judge whose replies never bound produced a parse failure, not an
+            # opinion. 20.6 percent of the mined corpus's judgements were parse
+            # failures concentrated in ONE model-prompt cell, which is what a
+            # broken cell looks like when it is counted as a verdict.
+            if (
+                judge_stability.get("unstable_reason")
+                == judge_binding.UNSTABLE_UNAVAILABLE
+            ):
+                judge_informativeness = {
+                    "informative": False,
+                    "ungraded": True,
+                    "ungraded_reason": (
+                        judge_binding.UNINFORMATIVE_JUDGE_PARSE_FAILURE
+                    ),
+                    "note": (
+                        "The judge produced no bound verdict, so the comparison "
+                        "is excluded from judge rates. The ITEM still fails "
+                        "closed: an unusable judge never turns into a pass."
+                    ),
+                }
+            else:
+                judge_informativeness = {**judge_informativeness, "outcome": j.get("outcome")}
+        else:
+            method = f"{method}->judge_refused:{judge_informativeness['ungraded_reason']}"
 
     detail = {
         "track": "nl_answer",
@@ -774,6 +884,8 @@ def grade_nl_answer(
     }
     if judge_stability is not None:
         detail["judge_order_swap"] = judge_stability
+    if judge_informativeness is not None:
+        detail["judge_informativeness"] = judge_informativeness
     return {
         "is_solved": is_solved,
         "is_correct": is_correct,
@@ -798,7 +910,31 @@ def judge_stability_report(verdicts: Any) -> dict[str, Any]:
         block = detail.get("judge_order_swap") if isinstance(detail, dict) else None
         if isinstance(block, dict):
             reports.append(block)
-    return judge_binding.instability_rate(reports)
+    stats = judge_binding.instability_rate(reports)
+    stats["migration_note"] = JUDGE_MIGRATION_NOTE
+    stats["cache"] = judge_binding.CACHE.stats()
+    stats["budget"] = judge_binding.BUDGET.snapshot()
+    return stats
+
+
+def judge_informativeness_report(verdicts: Any) -> dict[str, Any]:
+    """How many judged comparisons were REFUSED as uninformative, and why.
+
+    Reads the per-item ``detail["judge_informativeness"]`` blocks left by
+    :func:`grade_nl_answer`. An errored arm, a missing arm, a forced tie or an
+    unparseable judge reply is excluded from every judge rate and counted here
+    instead. It is deliberately its OWN report: folding a refused comparison into
+    a win rate is how an infrastructure failure becomes evidence about a model.
+    """
+    records = []
+    for verdict in verdicts or []:
+        if not isinstance(verdict, dict):
+            continue
+        detail = verdict.get("detail")
+        block = detail.get("judge_informativeness") if isinstance(detail, dict) else None
+        if isinstance(block, dict):
+            records.append(block)
+    return judge_binding.comparison_rates(records)
 
 
 # --------------------------------------------------------------------------- #

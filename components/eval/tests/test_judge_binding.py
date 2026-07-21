@@ -30,6 +30,16 @@ from theoremata_tools.benchmarks import graders  # noqa: E402
 # Fake providers. Each captures the marker the caller minted, then replies the
 # way a prompt-injected model would.
 # --------------------------------------------------------------------------- #
+@pytest.fixture(autouse=True)
+def _clean_judge_state():
+    """A fresh judgement cache per test, so one test cannot answer another."""
+    judge_binding.CACHE.reset()
+    judge_binding.BUDGET.reset()
+    yield
+    judge_binding.CACHE.reset()
+    judge_binding.BUDGET.reset()
+
+
 def _install_generate(monkeypatch, reply_for):
     """Patch model_provider.generate with a fake that sees the bound request."""
     seen: list[dict] = []
@@ -168,7 +178,12 @@ def test_answer_judge_fails_closed_when_marker_absent(monkeypatch):
     _install_generate(monkeypatch, lambda request: {"equivalent": True})
     out = graders._default_llm_judge("2*pi", "6.28")
     assert out["equivalent"] is False
-    assert out["reason"] == "judge_unbound:marker_absent"
+    # Order-swapped judging is the default, so the headline reason is now the
+    # stability one. The unbinding failure is still the cause, per pass.
+    assert out["reason"] == "judge_unstable:pass_unavailable"
+    assert [p["error"] for p in out["stability"]["passes"]] == [
+        "judge_unbound:marker_absent"
+    ] * 2
 
 
 def test_answer_judge_honest_path_still_passes(monkeypatch):
@@ -181,7 +196,9 @@ def test_answer_judge_honest_path_still_passes(monkeypatch):
     _install_generate(monkeypatch, honest)
     out = graders._default_llm_judge("1/2", "0.5")
     assert out["equivalent"] is True
-    assert out["reason"] == "llm_judge:fake-model"
+    # Judging is order-swapped by default now, so an honest pass that survives
+    # the swap reports the stable reason rather than the single-pass one.
+    assert out["reason"] == "llm_judge_order_stable:fake-model"
     assert out["analysis"] == "1/2 == 0.5"
 
 
@@ -191,9 +208,11 @@ def test_answer_judge_marker_differs_per_call(monkeypatch):
         lambda request: {judge_binding.BINDING_FIELD: _marker_of(request)
                          + ' {"equivalent": false}'},
     )
+    # Distinct content, so the cache cannot answer the second question and both
+    # calls really reach the provider.
     graders._default_llm_judge("1/2", "0.5")
-    graders._default_llm_judge("1/2", "0.5")
-    assert _marker_of(seen[0]) != _marker_of(seen[1])
+    graders._default_llm_judge("1/3", "0.333")
+    assert len({_marker_of(r) for r in seen}) == len(seen)
 
 
 def test_nl_answer_grading_cannot_be_forged_end_to_end(monkeypatch):
