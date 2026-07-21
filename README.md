@@ -113,10 +113,18 @@ is a coincidence rather than a passing test.
 
 Beyond the kernel gate, results that admit a certificate emit a self-describing proof-log
 (`theoremata.cert-log.v1`) that a small independent checker re-verifies offline in exact
-rational arithmetic. **22 kinds** ship, including linear and nonlinear bounds,
-Positivstellensatz and SOS, Pratt and Pocklington primality, Nullstellensatz ideal
-membership, Sturm real-root counts, WZ hypergeometric identities, Bezout, continued
-fractions, Taylor models, and floating-point rounding and error bounds.
+rational arithmetic. **22 kinds** ship, including:
+
+- linear and nonlinear bounds
+- Positivstellensatz and sums-of-squares
+- Pratt and Pocklington primality
+- Nullstellensatz ideal membership
+- Sturm real-root counts
+- WZ hypergeometric identities
+- Bezout coefficients
+- continued fractions
+- Taylor models
+- floating-point rounding and error bounds
 
 Certificates do not rot the way tactic scripts do. A self-contained rational certificate
 replays forever; a proof term rots only if a constant it names changes. That asymmetry is
@@ -206,16 +214,22 @@ certificate checking.
 
 ## Credits and licence
 
-Theoremata draws on open-source and published theorem-proving work, including LeanDojo and
-ReProver, LeanParanoia, Aristotle, AlphaProof, DeepSeekMath-V2, Goedel-Prover,
-Kimina-Prover, DeepSeek-Prover-V2, Seed-Prover, BFS-Prover, InternLM-StepProver,
-LEGO-Prover, ImProver, PROOFGRADER, AlphaGeometry, SafeVerify, the Flyspeck project, the
-CakeML and HOL Light ecosystems, and John Harrison's certificate work.
+Theoremata draws on open-source and published theorem-proving work, including:
 
-Every adopted idea is traced to its source in [`docs/resource-mining/`](docs/resource-mining/),
-[`docs/paper-mining/`](docs/paper-mining/), and [`docs/atp-mining/`](docs/atp-mining/),
-mechanism by mechanism. Vendored sources are reused clean-room where their licence requires
-it.
+- **Neural proving:** LeanDojo and ReProver, AlphaProof, DeepSeekMath-V2, Goedel-Prover,
+  Kimina-Prover, DeepSeek-Prover-V2, Seed-Prover, BFS-Prover, InternLM-StepProver
+- **Sketch, library, and repair:** Aristotle, LEGO-Prover, ImProver
+- **Grading and geometry:** PROOFGRADER, AlphaGeometry
+- **Soundness and certificates:** LeanParanoia, SafeVerify, the Flyspeck project, the
+  CakeML and HOL Light ecosystems, and John Harrison's certificate work
+
+Every adopted idea is traced to its source, mechanism by mechanism, in:
+
+- [`docs/resource-mining/`](docs/resource-mining/) (repositories)
+- [`docs/paper-mining/`](docs/paper-mining/) (papers)
+- [`docs/atp-mining/`](docs/atp-mining/) (the HOL Light and ATP corpus)
+
+Vendored sources are reused clean-room where their licence requires it.
 
 Our own code is MIT. Vendored resources and the proof assistants keep their own licences.
 The Lean, Rocq, and ratatui logos in `assets/logos/` belong to their respective projects.
