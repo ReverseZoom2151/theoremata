@@ -525,7 +525,7 @@ impl TierZeroGates {
 
 /// Default-OFF truthiness for a gate env var: set to anything other than
 /// (empty) / `0` / `false` / `off` turns it on.
-fn env_gate_on(var: &str) -> bool {
+pub(crate) fn env_gate_on(var: &str) -> bool {
     match std::env::var(var) {
         Ok(v) => !matches!(
             v.trim().to_ascii_lowercase().as_str(),
@@ -730,6 +730,25 @@ pub trait FormalBackend {
         });
         let bundle_satisfiable = vacuity.as_ref().map_or(true, |v| v.clean);
 
+        // --- Statement-quality accusers (ADVISORY layer) ----------------------
+        // Two detectors that ask whether the STATEMENT says anything, rather
+        // than whether the derivation is sound. Both can only ACCUSE: every
+        // other outcome, including an unavailable worker, is silence and cannot
+        // move the verdict. Their invocation is behind default-off switches
+        // because each one spawns Lean compiles.
+        let quality_gates = crate::prover::statement_quality::StatementQualityGates::from_config(cfg);
+        let statement_quality = crate::prover::statement_quality::consult(
+            cfg,
+            quality_gates,
+            system,
+            &ws,
+            code,
+            &name,
+        );
+        // Blocking requires BOTH the enforcement switch and a positive
+        // accusation; silence can never reach this.
+        let quality_blocks = statement_quality.blocks();
+
         // Conjoin ONLY behind the (default-off) switches. With the gates off this
         // expression is byte-for-byte the historical one.
         let lexically_verified = kernel_clean
@@ -737,7 +756,8 @@ pub trait FormalBackend {
             && lexical_clean
             && statement_preserved
             && (!gates.hypothesis_discharge || hypotheses_discharged)
-            && (!gates.vacuity || bundle_satisfiable);
+            && (!gates.vacuity || bundle_satisfiable)
+            && !quality_blocks;
 
         Ok(VerificationReport {
             lexically_verified,
@@ -776,6 +796,17 @@ pub trait FormalBackend {
                         "enforced": gates.vacuity,
                         "report": vacuity,
                     },
+                },
+                // Statement-quality accusers. `accused` is the only actionable
+                // field; `blocked` records whether it actually moved
+                // `lexically_verified`. There is deliberately no field here
+                // meaning "the statement is good": not being accused is the
+                // absence of evidence of emptiness, never evidence of content.
+                "statement_quality": {
+                    "accused": statement_quality.accuses(),
+                    "accusers": statement_quality.accusers(),
+                    "blocked": quality_blocks,
+                    "report": statement_quality,
                 },
             }),
         })
