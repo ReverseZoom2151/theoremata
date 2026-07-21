@@ -19,6 +19,10 @@ assistant, and returns a machine-checkable certificate of the result.
 
 [Watch it run](#watch-it-run) • [The gate](#the-gate) • [Proof it bites](#proof-it-bites) • [Certificates](#certificates) • [Install](#install) • [CLI](#cli)
 
+<!-- Demo GIF: run `vhs demo/theoremata.tape` to generate assets/demo.gif, then
+     uncomment the next line. Kept commented so the hero never shows a broken image. -->
+<!-- ![Theoremata falsify-then-prove demo](assets/demo.gif) -->
+
 </div>
 
 ---
