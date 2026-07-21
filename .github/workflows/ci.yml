@@ -24,6 +24,15 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      # Runs before the build because it is seconds against minutes, and a
+      # formatting complaint is not worth a full compile to discover. It is only
+      # a useful signal now that the tree is uniformly formatted; before that it
+      # reported diffs in files nobody had touched.
+      - name: cargo fmt --check
+        run: cargo fmt --check
 
       - name: Cache cargo registry + build
         uses: actions/cache@v6
