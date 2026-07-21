@@ -16,15 +16,34 @@ copy-paste reference.
 Live formal backends here: **Lean** (native), **Rocq** and **Isabelle** (via WSL Ubuntu).
 Candle, Agda, Metamath are not installed.
 
-## One-time shell setup (per terminal, from the repo root)
+## Which terminal: PowerShell, not WSL
 
-Run everything from the repo root, because `model_command` uses a relative `PYTHONPATH`.
+Run it in **Windows Terminal / PowerShell**. The binary is a native Windows console app,
+so the full-screen TUI renders correctly there. Do **not** launch it from a WSL shell: that
+runs it as a Windows process through a Linux pty and the TUI breaks.
+
+One catch: the model call runs via `bash -lc`, and in a plain PowerShell `bash` resolves to
+the WSL launcher, which is the wrong `python` (no litellm). So put **Git's bin first on
+PATH** so `bash` means Git Bash, whose `python` is the Windows one with litellm. The setup
+line below does that.
+
+## One-time shell setup (PowerShell, from the repo root)
+
+Run from the repo root, because `model_command` uses a relative `PYTHONPATH`.
+
+```powershell
+cd C:\Users\adria\Downloads\math-agent
+# Git's bin FIRST so `bash` is Git Bash (Windows python + litellm), not the WSL launcher.
+$env:PATH = "C:\Program Files\Git\bin;$PWD\target\release;$env:PATH"
+$env:THEOREMATA_MODEL = "ollama_chat/qwen3.6:35b"
+```
+
+Prefer Git Bash instead? It already resolves `bash` correctly, so you only need:
 
 ```bash
 cd /c/Users/adria/Downloads/math-agent
-export PATH="$PWD/target/release:$PATH"     # so `theoremata` resolves
+export PATH="$PWD/target/release:$PATH"
 export THEOREMATA_MODEL=ollama_chat/qwen3.6:35b
-export THEOREMATA_TEMPERATURE=0.1
 ```
 
 Swap the model any time: `ollama_chat/qwen3.6:27b` (smaller, faster) or
@@ -47,7 +66,7 @@ Tab switches panes, Esc clears the input, Ctrl-C exits.
 
 You drive it like any CLI agent: type natural language, and it can **act**, not just talk.
 
-```
+```text
 > /model qwen3.6:35b                       switch the active model, live
 > /new fermat | for all a b : Nat, (a+b)^2 = a^2 + 2*a*b + b^2   create a goal, switch to it
 > prove the main theorem                   plain English; the agent runs the real gate
@@ -65,7 +84,7 @@ You drive it like any CLI agent: type natural language, and it can **act**, not 
 
 Commands inside the chat:
 
-| | |
+| Command | What it does |
 |---|---|
 | `/model [name]` | list local models / switch the active one, live |
 | `/project [name]` | list projects / switch to one |
