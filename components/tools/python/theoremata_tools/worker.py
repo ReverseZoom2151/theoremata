@@ -595,6 +595,15 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         # "not_shown_trivial" and "withheld" mean no signal, never approval:
         # surviving mutation does not make a statement meaningful.
         return statement_triviality_run(request)
+    if tool == "opaque_statement":
+        from theoremata_tools.opaque_statement import run as opaque_statement_run
+
+        # Gate ONLY on verdict == "opaque_constant_found". Both
+        # "no_opaque_constant_found" and "unknown" mean no signal, never approval.
+        # This does not replace the layer-2 axiom audit: that audit already reports
+        # sorryAx here. What this adds is ATTRIBUTION, naming which statement
+        # constants caused it, which the flat closure cannot express.
+        return opaque_statement_run(request)
     if tool == "lp_geometry":
         from theoremata_tools.lp_geometry import run as lp_geometry_run
 
