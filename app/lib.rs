@@ -662,7 +662,7 @@ pub fn run() -> Result<()> {
             store.set_node_status(&project, &node, status, "user")?;
             print_value(cli.json, &serde_json::json!({"updated":true}))?
         }
-        Command::Chat { project } => tui::run(&store, provider.as_ref(), &project)?,
+        Command::Chat { project } => tui::run(&store, &config, provider.as_ref(), &project)?,
         Command::Send { project, message } => {
             let mut on_event = |event: model::ModelStreamEvent| {
                 if !cli.json {
