@@ -356,6 +356,12 @@ def _default_llm_judge(problem: str, steps: list[str]) -> dict[str, Any]:
     Deterministic in mock mode (``THEOREMATA_MODEL_MOCK=1``) so tests never hit
     the network. Returns ``{"per_step": [...], "verdict": ...}``; on any failure
     returns an empty ``per_step`` so the caller can fall back to determinism.
+
+    NOT order-swapped, deliberately. This judge grades ONE candidate against a
+    rubric; there is no second candidate to put first, so an order swap would
+    permute nothing and the resulting "stable" label would be a measurement of
+    nothing. Order-swapped two-pass judging (``judge_binding.two_pass_swapped``)
+    belongs to the genuinely comparative paths only.
     """
     try:
         from theoremata_tools.model_provider import generate
@@ -930,6 +936,10 @@ def _default_scheme_grader(
     sample: int = 0,
 ) -> dict[str, Any]:
     """Deterministic offline scheme-conditioned grader on the 0-``max_points`` scale.
+
+    Also NOT order-swapped: the candidate and the reference have fixed, unequal
+    roles (the reference is authoritative), so swapping them would not test
+    position bias, it would ask a different question.
 
     Awards each checkpoint's points when the candidate covers it, caps the sum at
     ``max_points``, then scales by the mean step-quality (so hand-waved coverage

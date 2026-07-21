@@ -22,7 +22,11 @@ pass-rate denominator or reported separately; counting it either way is a
 misreport.
 * :func:`grade_nl_answer` — deterministic symbolic/integer/relation grading via
   the existing :mod:`theoremata_tools.grader`, with an LLM-judge fallback (the
-  mock-capable provider) only when symbolic parsing is inconclusive.
+  mock-capable provider) only when symbolic parsing is inconclusive. That judge
+  is the one genuinely COMPARATIVE path here (it relates two answers under a
+  symmetric relation), so it supports order-swapped two-pass judging with a
+  first-class UNSTABLE outcome; see :func:`_order_swapped_equivalence_judge` and
+  :func:`judge_stability_report`.
 * :func:`grade_falsification` — flaw / counterexample detection, or must-reject
   for the negative fixture.
 
@@ -560,50 +564,153 @@ def _bound_value(s: str) -> str:
     return s.strip()
 
 
-def _default_llm_judge(gold: str, pred: str) -> dict[str, Any]:
-    """LLM-judge fallback for answer equivalence via the mock-capable provider.
+_EQUIVALENCE_SCHEMA = {
+    "type": "object",
+    "required": ["equivalent"],
+    "properties": {
+        "equivalent": {"type": "boolean"},
+        "analysis": {"type": "string"},
+    },
+}
 
-    Uses the IneqMath rubric (exact forms only; decimals never equal exact).
-    Deterministic in mock mode so tests never hit the network.
+_EQUIVALENCE_RUBRIC = (
+    "Exact forms only: 1/2 == 0.5 is True, but a decimal approximation of an "
+    "exact expression (2*pi vs 6.28) is False."
+)
+
+
+def _equivalence_call(
+    task: str, context: dict[str, Any], marker: str
+) -> tuple[dict[str, Any] | None, str, str]:
+    """One bound answer-equivalence judge call.
+
+    Returns ``(verdict, reason, model)`` with ``verdict`` None on every failure
+    path, so no caller can mistake a broken call for a decision.
     """
-    try:
-        from theoremata_tools.model_provider import generate
-    except Exception as exc:  # provider component not on path
-        return {"equivalent": False, "reason": f"judge_unavailable:{exc}"}
-    # gold/pred are untrusted corpus text, so the verdict is read only from the
-    # region after a per-call marker the corpus author could not have predicted.
-    marker = judge_binding.mint_marker()
+    from theoremata_tools.model_provider import generate
+
     request = judge_binding.bind_request(
         {
             "role": "answer_equivalence_judge",
-            "task": (
-                "Decide if the predicted answer is mathematically EQUIVALENT to "
-                "the gold answer. Exact forms only: 1/2 == 0.5 is True, but a "
-                "decimal approximation of an exact expression (2*pi vs 6.28) is "
-                "False."
-            ),
-            "context": {"gold": gold, "pred": pred},
-            "output_schema": {
-                "type": "object",
-                "required": ["equivalent"],
-                "properties": {"equivalent": {"type": "boolean"},
-                               "analysis": {"type": "string"}},
-            },
+            "task": task,
+            "context": context,
+            "output_schema": _EQUIVALENCE_SCHEMA,
         },
         marker,
     )
     try:
         content, model = generate(request)
     except Exception as exc:  # noqa: BLE001
-        return {"equivalent": False, "reason": f"judge_error:{exc}"}
+        return None, f"judge_error:{exc}", ""
     verdict, unbound_reason = judge_binding.unbind(content, marker)
     if verdict is None:
         # Fail closed: an unbound reply is no verdict at all, never a pass.
-        return {"equivalent": False, "reason": unbound_reason}
+        return None, unbound_reason, model
+    return verdict, "", model
+
+
+def _order_swapped_equivalence_judge(gold: str, pred: str) -> dict[str, Any]:
+    """Two-pass, order-swapped answer-equivalence judging.
+
+    Equivalence is a SYMMETRIC relation, so which answer is presented first must
+    not change the verdict. That makes this judge genuinely comparative and the
+    swap meaningful. The two answers are presented under neutral ``answer_a`` /
+    ``answer_b`` labels rather than ``gold`` / ``pred``: labelling them by role
+    would tell the judge which is which and the "swap" would swap nothing.
+
+    A disagreement between the passes is UNSTABLE. The returned ``equivalent``
+    stays False on that path because the plumbing contract of this judge is a
+    boolean and an undecided item must never grade as a pass, but False there
+    does NOT mean "the judge decided not equivalent": read ``decided`` and
+    ``outcome`` for that. ``outcome`` is None exactly when the judge did not
+    decide.
+    """
+    task = (
+        "Decide if the two candidate answers below are mathematically "
+        "EQUIVALENT to each other. They are given in an arbitrary order and "
+        "neither is authoritative, so judge the relation, not the labels. "
+        + _EQUIVALENCE_RUBRIC
+    )
+
+    def one_pass(order: str, marker: str) -> dict[str, Any]:
+        first, second = (gold, pred) if order == judge_binding.ORDER_AB else (pred, gold)
+        # A fresh marker per pass, minted by two_pass_swapped and threaded here.
+        verdict, reason, model = _equivalence_call(
+            task, {"answer_a": first, "answer_b": second}, marker
+        )
+        if verdict is None:
+            return {"outcome": None, "error": reason, "model": model}
+        return {
+            "outcome": bool(verdict.get("equivalent")),
+            "analysis": verdict.get("analysis"),
+            "model": model,
+        }
+
+    report = judge_binding.two_pass_swapped(one_pass)
+    models = [p.get("model") for p in report["passes"] if p.get("model")]
+    model = models[0] if models else "unknown"
+    if report["status"] == judge_binding.STABLE:
+        return {
+            "equivalent": bool(report["outcome"]),
+            "decided": True,
+            "outcome": report["outcome"],
+            "order_stable": True,
+            "reason": f"llm_judge_order_stable:{model}",
+            "analysis": report["passes"][0].get("analysis"),
+            "stability": report,
+        }
+    return {
+        "equivalent": False,  # fail closed; see the docstring
+        "decided": False,
+        "outcome": None,
+        "order_stable": False,
+        "reason": f"judge_unstable:{report['unstable_reason']}",
+        "stability": report,
+    }
+
+
+def _default_llm_judge(
+    gold: str, pred: str, *, order_swap: bool | None = None
+) -> dict[str, Any]:
+    """LLM-judge fallback for answer equivalence via the mock-capable provider.
+
+    Uses the IneqMath rubric (exact forms only; decimals never equal exact).
+    Deterministic in mock mode so tests never hit the network.
+
+    ``order_swap`` (or ``THEOREMATA_JUDGE_ORDER_SWAP=1``) runs the judge twice
+    with the two answers swapped and only believes a verdict both passes reach.
+    It is OFF by default because it doubles the token cost of every judged item.
+    """
+    try:
+        from theoremata_tools.model_provider import generate  # noqa: F401
+    except Exception as exc:  # provider component not on path
+        return {"equivalent": False, "reason": f"judge_unavailable:{exc}"}
+
+    if judge_binding.order_swap_enabled(order_swap):
+        return _order_swapped_equivalence_judge(gold, pred)
+
+    # Single pass. gold/pred are untrusted corpus text, so the verdict is read
+    # only from the region after a per-call marker the corpus author could not
+    # have predicted.
+    marker = judge_binding.mint_marker()
+    verdict, reason, model = _equivalence_call(
+        (
+            "Decide if the predicted answer is mathematically EQUIVALENT to "
+            "the gold answer. " + _EQUIVALENCE_RUBRIC
+        ),
+        {"gold": gold, "pred": pred},
+        marker,
+    )
+    if verdict is None:
+        return {"equivalent": False, "reason": reason}
     return {
         "equivalent": bool(verdict.get("equivalent")),
         "reason": f"llm_judge:{model}",
         "analysis": verdict.get("analysis"),
+        # A single pass measures no stability at all. Saying so explicitly keeps
+        # it out of the instability denominator instead of scoring it stable.
+        "order_swapped": False,
+        "order_stable": None,
     }
 
 
@@ -637,6 +744,7 @@ def grade_nl_answer(
 
     # LLM-judge fallback ONLY when the deterministic symbolic path was
     # inconclusive (parse error) and we're on a symbolic/bound answer.
+    judge_stability: dict[str, Any] | None = None
     if (
         not is_correct
         and route == "symbolic"
@@ -647,18 +755,50 @@ def grade_nl_answer(
         if j.get("equivalent"):
             is_correct = True
         method = f"{method}->{j.get('reason', 'llm_judge')}"
+        # Carry the per-item stability observation so a batch can be measured.
+        # A judge that ran once reports order_swapped False rather than nothing,
+        # so it is excluded from the rate instead of counted as stable.
+        judge_stability = j.get("stability") or {
+            "order_swapped": bool(j.get("order_swapped")),
+            "status": judge_binding.STABLE
+            if j.get("order_stable")
+            else judge_binding.UNSTABLE,
+        }
 
+    detail = {
+        "track": "nl_answer",
+        "method": method,
+        "answer_kind": answer_kind,
+        "gold": gold,
+        "extracted": pred,
+    }
+    if judge_stability is not None:
+        detail["judge_order_swap"] = judge_stability
     return {
         "is_solved": is_solved,
         "is_correct": is_correct,
-        "detail": {
-            "track": "nl_answer",
-            "method": method,
-            "answer_kind": answer_kind,
-            "gold": gold,
-            "extracted": pred,
-        },
+        "detail": detail,
     }
+
+
+def judge_stability_report(verdicts: Any) -> dict[str, Any]:
+    """Order-stability of the comparative judge over a batch of verdicts.
+
+    Reads the per-item ``detail["judge_order_swap"]`` blocks left by
+    :func:`grade_nl_answer` and returns the aggregate. This is where our own
+    version of the mined corpus's 79.1 percent survival number surfaces: if we
+    do not print it, a judge emitting one arbitrary decision in five looks
+    exactly like a judge that decided.
+    """
+    reports = []
+    for verdict in verdicts or []:
+        if not isinstance(verdict, dict):
+            continue
+        detail = verdict.get("detail")
+        block = detail.get("judge_order_swap") if isinstance(detail, dict) else None
+        if isinstance(block, dict):
+            reports.append(block)
+    return judge_binding.instability_rate(reports)
 
 
 # --------------------------------------------------------------------------- #
