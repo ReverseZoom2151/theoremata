@@ -187,11 +187,13 @@ fn draw(
         // Priority: a live stream, then captured command output, then the pane.
         if let Some(buf) = app.stream.as_ref() {
             f.render_widget(
-                Paragraph::new(buf.as_str()).wrap(Wrap { trim: false }).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Model (streaming)… "),
-                ),
+                Paragraph::new(buf.as_str())
+                    .wrap(Wrap { trim: false })
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(" Model (streaming)… "),
+                    ),
                 cols[0],
             );
         } else if !app.output.is_empty() {
@@ -390,7 +392,10 @@ fn slash(
             out.push("/sweep                 staleness census for this project".into());
             out.push("/agent                 run the autonomous loop on this project".into());
             out.push(String::new());
-            out.push("Plain text talks to the agent, which may itself prove/falsify/hammer/sweep.".into());
+            out.push(
+                "Plain text talks to the agent, which may itself prove/falsify/hammer/sweep."
+                    .into(),
+            );
             out.push("Esc clears output · Tab cycles panes · Ctrl-C exits".into());
             "Command reference".into()
         }
@@ -731,8 +736,10 @@ fn execute_action(
                 }
                 None => (
                     false,
-                    vec!["hammer produced no reconstruction (worker unavailable or no proof found)"
-                        .into()],
+                    vec![
+                        "hammer produced no reconstruction (worker unavailable or no proof found)"
+                            .into(),
+                    ],
                 ),
             }
         }
@@ -1133,7 +1140,10 @@ mod tests {
     fn model_name_prefix_normalization() {
         // Bare and prefixed inputs both store WITH the prefix; bare strips it.
         assert_eq!(stored_name("qwen3:32b"), "ollama_chat/qwen3:32b");
-        assert_eq!(stored_name("ollama_chat/qwen3:32b"), "ollama_chat/qwen3:32b");
+        assert_eq!(
+            stored_name("ollama_chat/qwen3:32b"),
+            "ollama_chat/qwen3:32b"
+        );
         assert_eq!(bare_name("ollama_chat/qwen3:32b"), "qwen3:32b");
         assert_eq!(bare_name("qwen3:32b"), "qwen3:32b");
     }

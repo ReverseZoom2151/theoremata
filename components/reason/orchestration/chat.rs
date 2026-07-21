@@ -196,7 +196,8 @@ impl ChatEngine<'_> {
         on_event: &mut dyn FnMut(ModelStreamEvent),
     ) -> Result<ChatTurn> {
         if record_user {
-            self.store.add_message(project_id, "user", task, json!({}))?;
+            self.store
+                .add_message(project_id, "user", task, json!({}))?;
         }
         let graph = self.store.export(project_id)?;
         let history = self.store.messages(project_id, 30)?;
