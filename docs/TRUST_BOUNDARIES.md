@@ -40,10 +40,20 @@ producer nor a reservation, so this table can no longer silently drift from the 
 | `hardening` | `agent.rs` | EMITTED | Adversarial battery on certified nodes |
 | `falsification` | `agent.rs` | EMITTED | Numeric/symbolic counterexample screen |
 | `retrieval` | `agent.rs` | EMITTED | Candidate lemmas (untrusted hints) |
-| `external_prover_artifact` | intended: the three external-prover backends | RESERVED | Externally generated Lean + request provenance |
-| `external_producer_checked` | intended: `session/verify.rs` | RESERVED | Output locally re-verified (trust-but-verify) |
+| `external_prover_artifact` | the external-prover backends | EMITTED | Externally generated Lean + request provenance |
+| `external_producer_checked` | `session/verify.rs` | EMITTED | Output locally re-verified (trust-but-verify) |
 | `reformulation_check` | none possible | RESERVED | No FLARE or MILP code exists in the tree. Either build the track or delete the constant |
-| `repair_loop` | intended: `proving/repair.rs` | RESERVED | Structured verifier output from repair |
+| `repair_loop` | `proving/repair.rs` | EMITTED | Structured verifier output from repair |
+| `statement_citation` | `graph/citation.rs` | EMITTED | What a statement CLAIMS to encode, and where that claim comes from |
+
+`statement_citation` is the one evidence type that is not a verdict about our own work.
+It records an assertion made by whoever wrote a corpus: this statement is meant to encode
+that published result. It NEVER contributes to a green. Its status lattice is two-valued,
+`Unverified` (the default and the ceiling) or `Contradicted`, so there is no state meaning
+"the statement does match its citation" for a gate to pattern-match a pass out of. Absence
+of a citation is NOT a defect: most statements will have none, and there is deliberately no
+"nodes missing citations" query, because a coverage query is the shape a coverage metric
+grows out of and a coverage metric would turn absence into a finding.
 
 Note also that `components/verify/hardening.rs` writes kind `lean_paranoia` with source
 `hardening`, which is the two fields in the opposite order from `agent.rs`. It is easy

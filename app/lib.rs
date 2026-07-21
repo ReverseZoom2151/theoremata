@@ -17,7 +17,7 @@ mod verify;
 // Re-export the grouped modules at the crate root so every component source
 // keeps its flat `crate::model` / `crate::workflow` / `crate::lean_session`
 // paths unchanged — the physical layout is by component, the namespace is flat.
-pub use graph::{db, model, scheduler};
+pub use graph::{citation, db, model, scheduler};
 pub use prover::{
     aristotle, attempt_run, axiom_audit, decl_index_adapter, declaration_lookup, error_feedback,
     exec, formal, goal_state,

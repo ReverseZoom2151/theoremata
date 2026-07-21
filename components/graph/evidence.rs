@@ -107,6 +107,19 @@ pub const REFORMULATION_CHECK: &str = "reformulation_check";
 /// excludes proof and candidate bodies, which are untrusted model text.
 pub const REPAIR_LOOP: &str = "repair_loop";
 
+/// A claim about which published result a statement is meant to encode.
+///
+/// EMITTED by `components/graph/citation.rs::record_citation`, the single
+/// producer, which is also the only constructor path for the record.
+///
+/// This one is NOT evidence of anything about the mathematics, despite living
+/// on the evidence trail. Verdict is `citation_recorded` or
+/// `citation_contradicted`: the record is an assertion by whoever wrote it, its
+/// type has no verified state to reach, and the payload writes
+/// `licenses_verdict: false` on every row so a reader with only JSON sees the
+/// same rule. A row of this kind must never contribute to a gate result.
+pub const STATEMENT_CITATION: &str = "statement_citation";
+
 /// Every canonical type declared above. The guard checks that this list and the
 /// `pub const` declarations agree, so a new constant that is not registered
 /// here fails the tests rather than silently escaping the drift check.
@@ -121,6 +134,7 @@ pub const ALL: &[&str] = &[
     EXTERNAL_PRODUCER_CHECKED,
     REFORMULATION_CHECK,
     REPAIR_LOOP,
+    STATEMENT_CITATION,
 ];
 
 /// Types that are declared but that nothing emits yet, each with a note above
